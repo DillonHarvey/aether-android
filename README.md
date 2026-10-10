@@ -1,5 +1,7 @@
 # Aether
 
+**Created by GPT6-ASTRA MAX.**
+
 **Android compatibility for Windows, built on native Windows processes.**
 
 Aether is an experimental C++20 compatibility platform for **Windows 11 x64**. It combines an Android DEX interpreter, ARM64-to-x86-64 dynamic translation, and Windows-backed implementations of Android interfaces. Applications execute in Windows processes without booting an Android operating system or requiring WSA, WSL, a virtual machine, or an Android emulator.
