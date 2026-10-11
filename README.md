@@ -40,8 +40,8 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Development phases** | **8 complete · 1 in progress**, numbered 0–8 |
 | **Current focus** | **Phase 8:** Windows installation, launch, updates and wider compatibility |
 | **Distinct working test apps** | **2**, towards the Phase 8 minimum of **3** |
-| **Compatibility checklist** | **1,020 candidate features** across **20 areas** |
-| **Checklist entries reviewed** | **25 reviewed · 995 still to assess** |
+| **Compatibility checklist** | **3,589 planning entries** across **43 areas** |
+| **Catalogue review** | **25 of 3,589 assessed (0.70%)** · **3,564 still unassessed** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -55,10 +55,10 @@ The [project progress record](docs/PROGRESS.md) and [app compatibility record](d
 | **Read app files** | Inspect supported APKs and show details such as the app name, version and requested permissions. Report unsupported formats. |
 | **Run our test apps** | Open supported app screens in resizable Windows windows and handle mouse and keyboard input. |
 | **Install and remove apps** | Keep installed packages and app data separately, create Start shortcuts and Windows uninstall entries, and ask for installation and permission choices. |
-| **Limit app access** | Run installed app code in restricted Windows processes, check package integrity before launch, and control access to supported services. |
+| **Limit app access** | Run installed app code with Windows restrictions, check that installed files have not changed before launch, and control access to supported services. |
 | **Check and update apps** | Verify supported app signatures and update eligible apps while keeping their identity, data and permissions. Handle tested interrupted updates. |
 | **Reopen the right app** | Keep an app-specific launch command working after a supported app update. Actual pinned-taskbar behaviour still needs checking. |
-| **Update Aether itself** | Support compatible shared-runtime upgrades at the same location while preserving installed apps and their Windows entries. |
+| **Update Aether itself** | Update the shared Aether software at the same location while preserving installed apps and their Windows entries, when the versions are compatible. |
 | **Graphics and sound foundations** | Separate test programs demonstrate graphics through Windows' graphics hardware and audio through Windows' sound system. General Android graphics and media support is unfinished. |
 
 These features have specific limits. A successful installation or signature check does not establish that an app will run correctly. The graphics and audio demonstrations are separate from the test apps' ordinary screens.
@@ -68,7 +68,7 @@ These features have specific limits. A successful installation or signature chec
 - **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. [Details](docs/adr/0039-verified-apk-updates.md)
 - **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. [Details](docs/adr/0040-installed-window-relaunch.md)
 - **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. [Details](docs/adr/0041-compatible-runtime-upgrades.md)
-- **A countable compatibility checklist:** each candidate feature has a stable entry, a recorded status and space for evidence. [Explore the checklist](docs/compatibility/README.md)
+- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements are now in the 3,589-entry main catalogue, with source links and future goals. [Explore the checklist](docs/compatibility/FUTURE_GOALS.md)
 
 ## Roadmap
 
@@ -78,10 +78,10 @@ The plan starts at **Phase 0**, so there are **nine phases** in total. “Comple
 | :---: | :--- | :--- |
 | **0** | Set up the project, build tools and tests | ✅ Complete |
 | **1** | Read and inspect Android installation files | ✅ Complete |
-| **2** | Translate supported phone-processor instructions for a PC | ✅ Complete |
-| **3** | Load and run supported Android native code | ✅ Complete |
+| **2** | Translate supported instructions used by phone processors for a PC | ✅ Complete |
+| **3** | Load and run the extra code packaged inside supported apps | ✅ Complete |
 | **4** | Run Android app logic and connect its different code parts | ✅ Complete |
-| **5** | Support basic app screens, events and lifecycle | ✅ Complete |
+| **5** | Support basic screens and opening, using and closing an app | ✅ Complete |
 | **6** | Connect windows, input, graphics and audio to Windows | ✅ Complete |
 | **7** | Establish app isolation and security controls | ✅ Complete |
 | **8** | Make installation, updates and everyday Windows use work with more apps | 🔨 In progress |
@@ -97,30 +97,32 @@ Phase 7 is complete under the recorded owner acceptance. Its evidence and verifi
 - **Improve user controls and troubleshooting.** Finish the needed per-app settings and diagnostics, alongside usability and performance work.
 - **Prepare for release.** Resolve distribution signing, privacy, licensing and the remaining release checks.
 
-Alongside this work, the next checklist review covers **25 Windows integration features**. This records what the code and tests already prove; it does not automatically add new app support.
+Alongside this work, the [future compatibility goals](docs/compatibility/FUTURE_GOALS.md) now include every owner v0.2 list plus additional researched requirements. This update prepares the lists; it does not inspect code or test whether features work.
 
 The [engineering roadmap](docs/ROADMAP.md) and [master plan](AETHER_MASTER_PLAN_v1.1.md) hold the full requirements. The full project remains unfinished.
 
 ## Progress counts
 
-The compatibility checklist asks a different question from the phase roadmap: **which individual Android and Windows behaviours have we examined, implemented and fully checked?**
+The compatibility checklist is a list of **future Android and Windows requirements**. It now contains **3,589 planning entries**, including broad requirements and their more detailed refinements.
 
-Its current **1,020 entries are a draft**, not a complete list of everything Android can do. The target may change as the project learns more.
+<p align="center">
+  <img src="docs/assets/compatibility-progress.svg" alt="Catalogue review: 25 of 3,589 entries assessed (0.70%); 3,564 unassessed. Recorded statuses: 13 implemented, 8 in progress, 4 not started." width="1200" />
+</p>
 
-| Checklist status | Count | What it means |
-| :--- | ---: | :--- |
-| **Fully verified** | **0** | All required implementation, test and evidence checks are complete for that entry. |
-| **Implemented, awaiting full verification** | **13** | The described behaviour exists within its recorded limits; complete verification is still outstanding. |
-| **In progress** | **8** | Some behaviour exists, with known parts still missing. |
-| **Not started** | **4** | Review confirmed that the requested behaviour is not implemented. |
-| **Not yet assessed** | **995** | These entries still need review; some may already have working code. |
-| **Total candidates** | **1,020** | All entries in the current draft checklist. |
+The bar shows **recorded catalogue review coverage**: **25 of 3,589 entries (0.70%)** have a prior assessment, and **3,564 remain Unassessed**. The assessed entries comprise 13 recorded as Implemented, 8 In progress and 4 Not started. Their implementation and test evidence has not been rechecked.
 
-**25 reviewed = 13 implemented + 8 in progress + 4 not started.** There are currently **0 blocked** and **0 excluded** entries.
+| Inventory source | Entries |
+| :--- | ---: |
+| Original catalogue, preserved | 1,020 |
+| Owner's v0.2 additions, integrated | 2,435 |
+| Further researched requirements | 134 |
+| **Total planning entries** | **3,589** |
 
-**Why zero fully verified if parts already work?** The new checklist requires complete tests for each feature and a fixed version of the code tied to those results. Working demonstrations and passing tests exist, but the reviewed entries have not met every requirement for that stronger label. “Not yet assessed” also does not mean “missing”.
+The new requirements cover areas such as accessibility, text input, credentials/autofill, background work, Binder communication, WebView, native graphics buffers and newer Android behavior rules. [Read the future goals and sources](docs/compatibility/FUTURE_GOALS.md).
 
-These counts describe the checklist, not a percentage of all Android apps supported. See the [detailed counts](docs/compatibility/PROGRESS.md), [first audit report](docs/compatibility/AUDIT_REPORT_2026-10-11.md), or [Excel checklist](docs/compatibility/capabilities.xlsx).
+All new entries are **Unassessed**. Existing recorded statuses and evidence are retained without rechecking them. **No builds, tests or implementation checks were run for this list update.** A planning entry does not mean a feature is missing or working. Review coverage describes catalogue records. Overlapping requirements mean it cannot be used as a feature-completion percentage or an Android app success rate.
+
+Browse the [detailed inventory counts](docs/compatibility/PROGRESS.md), [main CSV](docs/compatibility/capabilities.csv) or [Excel checklist](docs/compatibility/capabilities.xlsx). The [earlier audit report](docs/compatibility/AUDIT_REPORT_2026-10-11.md) remains a historical record.
 
 ## Which apps have been tried?
 
@@ -151,6 +153,7 @@ If you just want to follow the project, start with the roadmap and counts above.
 | **APK** | A file used to distribute and install an Android app. |
 | **Runtime** | The shared Aether software that runs compatible apps. |
 | **Compatibility** | How well an app's required features behave through Aether. |
+| **App signature** | A digital seal used to check that an app file has not changed. It does not prove an app is safe. |
 | **Sandbox / isolation** | Restrictions on an app's access to the PC and other apps' data. |
 | **Test app / fixture** | A small app made specifically to check whether something works. |
 
