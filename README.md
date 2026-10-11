@@ -68,7 +68,7 @@ These features have specific limits. A successful installation or signature chec
 - **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. [Details](docs/adr/0039-verified-apk-updates.md)
 - **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. [Details](docs/adr/0040-installed-window-relaunch.md)
 - **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. [Details](docs/adr/0041-compatible-runtime-upgrades.md)
-- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements are now in the 3,589-entry main catalogue, with source links and future goals. [Explore the checklist](docs/compatibility/FUTURE_GOALS.md)
+- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements were integrated into the main catalogue, with source links and future goals. [Explore the checklist](docs/compatibility/FUTURE_GOALS.md)
 
 ## Roadmap
 
@@ -103,13 +103,20 @@ The [engineering roadmap](docs/ROADMAP.md) and [master plan](AETHER_MASTER_PLAN_
 
 ## Progress counts
 
-The compatibility checklist is a list of **future Android and Windows requirements**. It now contains **3,589 planning entries**, including broad requirements and their more detailed refinements.
+The compatibility checklist is a list of **future Android and Windows requirements**, including broad requirements and their more detailed refinements.
 
-<p align="center">
-  <img src="docs/assets/compatibility-progress.svg" alt="Catalogue review: 25 of 3,589 entries assessed (0.70%); 3,564 unassessed. Recorded statuses: 13 implemented, 8 in progress, 4 not started." width="1200" />
-</p>
+<!-- aether:compatibility-progress:start -->
 
-The bar shows **recorded catalogue review coverage**: **25 of 3,589 entries (0.70%)** have a prior assessment, and **3,564 remain Unassessed**. The assessed entries comprise 13 recorded as Implemented, 8 In progress and 4 Not started. Their implementation and test evidence has not been rechecked.
+**3,589 planning entries** across **43 areas**.
+
+```text
+CATALOGUE REVIEW
+▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0.70%
+
+25 / 3,589 entries assessed  |  3,564 unassessed
+```
+
+Recorded labels: **13 Implemented** · **8 In progress** · **4 Not started** · **3,564 Unassessed**.
 
 | Inventory source | Entries |
 | :--- | ---: |
@@ -118,9 +125,13 @@ The bar shows **recorded catalogue review coverage**: **25 of 3,589 entries (0.7
 | Further researched requirements | 134 |
 | **Total planning entries** | **3,589** |
 
+<!-- aether:compatibility-progress:end -->
+
+The bar shows **recorded catalogue review coverage**: entries with an existing assessment rather than an Unassessed label. Code recalculates its fill, percentage and totals from the CSV whenever the catalogue is synchronized. [How the counts update](docs/compatibility/README.md#list-only-generation).
+
 The new requirements cover areas such as accessibility, text input, credentials/autofill, background work, Binder communication, WebView, native graphics buffers and newer Android behavior rules. [Read the future goals and sources](docs/compatibility/FUTURE_GOALS.md).
 
-All new entries are **Unassessed**. Existing recorded statuses and evidence are retained without rechecking them. **No builds, tests or implementation checks were run for this list update.** A planning entry does not mean a feature is missing or working. Review coverage describes catalogue records. Overlapping requirements mean it cannot be used as a feature-completion percentage or an Android app success rate.
+All new entries were added as **Unassessed**. Existing recorded statuses and evidence are retained without rechecking them. **No builds, tests or implementation checks were run for this list update.** A planning entry does not mean a feature is missing or working. Review coverage describes catalogue records. Overlapping requirements mean it cannot be used as a feature-completion percentage or an Android app success rate.
 
 Browse the [detailed inventory counts](docs/compatibility/PROGRESS.md), [main CSV](docs/compatibility/capabilities.csv) or [Excel checklist](docs/compatibility/capabilities.xlsx). The [earlier audit report](docs/compatibility/AUDIT_REPORT_2026-10-11.md) remains a historical record.
 
