@@ -1,174 +1,175 @@
+<p align="center">
+  <img src="docs/assets/aether-banner.svg" alt="Aether — Android apps, at home on Windows. An illustration of the project vision." width="1200" />
+</p>
+
 # Aether
 
-**Created by GPT6-ASTRA MAX.**
+**Bringing Android apps to your Windows desktop.**
 
-**Android compatibility for Windows, built on native Windows processes.**
+Aether is a project working towards a simple idea: install an Android app on your PC, open it in a normal Windows window, and manage it through Windows.
 
-Aether is an experimental C++20 compatibility platform for **Windows 11 x64**. It combines an Android DEX interpreter, ARM64-to-x86-64 dynamic translation, and Windows-backed implementations of Android interfaces. Applications execute in Windows processes without booting an Android operating system or requiring WSA, WSL, a virtual machine, or an Android emulator.
+This page explains the project in everyday language. No programming knowledge needed.
 
-The goal is a shared runtime that lets you install Android apps through File Explorer, launch them from Windows Start/Search, and remove them through Windows Installed apps. Each app gets its own identity, window, and private storage.
+**Project snapshot · 11 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
-> **Development status:** Phase 8, native Windows integration, is in progress. Execution and installation are restricted to exact, self-authored development fixtures. General third-party APK support is disabled.
+[The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Roadmap](#roadmap) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
-[Quick start](#quick-start) | [Current capabilities](#current-capabilities) | [Roadmap](#roadmap) | [Documentation](#documentation) | [Licensing](#licensing)
+> **Currently in development.** Eight development phases are complete. Phase 8, Windows integration and wider app support, is in progress. Aether can run its own test apps, but everyday Android app compatibility is still limited.
 
-## Current capabilities
+## The idea
 
-| Area | Implemented scope |
-| --- | --- |
-| APK inspection | Bounded ZIP, manifest, resource, DEX, and ELF inspection; package metadata, permissions, checksums, labels, and supported PNG icons. |
-| Managed and native execution | An original DEX interpreter and JNI bridge, an Android ARM64 ELF loader, and Dynarmic translation into x86-64 machine code. |
-| Activity and input | The included HelloAether Activity runs in a resizable Win32/GDI window. Mouse and keyboard input reaches its DEX/JNI/ARM64 code. |
-| Graphics | A separate native fixture renders verified EGL/OpenGL ES pixels through an isolated ANGLE service backed by hardware Direct3D 11. |
-| Audio | A separate native AAudio fixture sends verified PCM through broker-owned WASAPI playback in a private, muted test session. |
-| Isolation | Less Privileged AppContainer (LPAC) workers, resource limits, permission-checked broker calls, protected per-app storage, and durable audit records. |
-| Windows integration | Durable fixture installation, installed-ID launch, explicit permissions, Start shortcuts, per-app uninstall entries, labels/icons, and native uninstall confirmation. |
+Android apps expect features that Windows does not provide in the same way. Aether acts as a translator: it runs supported Android app code and connects supported app features to Windows.
 
-These are deliberately bounded implementations. The Activity uses GDI; the native graphics and audio demonstrations are separate fixtures. They do not establish general Android graphics, media, or application compatibility. See the [compatibility matrix](docs/COMPATIBILITY_MATRIX.md), [API support matrix](docs/API_SUPPORT_MATRIX.md), and [ABI support matrix](docs/ABI_SUPPORT_MATRIX.md) for the tested scope.
+Windows does the underlying work, without needing to start an Android operating system or a virtual machine. Aether also translates supported ARM64 code, commonly used by Android phones, for Intel and AMD PCs.
 
-## Quick start
+### The experience we are building
 
-### Requirements
+1. **Install Aether once.** One shared installation supports your compatible Android apps.
+2. **Open an Android app file.** An **APK** is an Android installation file. Open it through File Explorer, review the app details and permissions, then approve installation.
+3. **Launch it like a Windows app.** Find it in Start or Search and use it in its own window, with its own name, icon and private app data.
+4. **Manage it through Windows.** Update compatible apps while keeping their data, and remove individual apps through Windows Settings.
 
-- **Windows 11 x64** on an Intel or AMD processor.
-- **Visual Studio 2022 Build Tools** with the Desktop development with C++ workload, MSVC x64, Windows SDK, and C++ CMake tools/Ninja.
-- **CMake 3.25 or newer** and **Python 3.10 or newer**.
-- Git for working with the repository.
+You can choose Aether to open APK files when you double-click them. Opening an APK brings up installation review; it does not silently run the app.
 
-Dependencies and compiled first-party fixtures are retained in the repository. Configure/build does not download dependencies. Android SDK, NDK, and Java tools are needed only to rebuild Android fixtures; they are not runtime requirements.
+**This is the intended finished experience.** Much of the underlying installation and launch system exists, while checks of the actual Windows menus, taskbar and Settings screens are still unfinished. The plan uses Windows' familiar controls, with small Aether dialogs when needed.
 
-### Build
+## Where we are
 
-Run from the repository root in PowerShell:
+| At a glance | Current position |
+| :--- | :--- |
+| **Development phases** | **8 complete · 1 in progress**, numbered 0–8 |
+| **Current focus** | **Phase 8:** Windows installation, launch, updates and wider compatibility |
+| **Distinct working test apps** | **2**, towards the Phase 8 minimum of **3** |
+| **Compatibility checklist** | **1,020 candidate features** across **20 areas** |
+| **Checklist entries reviewed** | **25 reviewed · 995 still to assess** |
+| **Public release** | Still in development; release requirements remain open |
 
-```powershell
-./tools/build.ps1 -Preset windows-debug
-./out/build/windows-debug/aether.exe --help
-./out/build/windows-debug/aether.exe doctor --verbose
-```
+Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
 
-The build wrapper discovers the installed Visual Studio toolchain. Build outputs go to `out/build/windows-debug/`. Use `windows-release` for a Release build. See the [Windows build guide](docs/BUILD_WINDOWS.md) for toolchain details and fixture development.
+The [project progress record](docs/PROGRESS.md) and [app compatibility record](docs/COMPATIBILITY_MATRIX.md) contain the evidence behind this snapshot.
 
-### Run HelloAether
+## What works today
 
-Inspect the included APK, then open its Activity:
+| Area | What Aether can currently do |
+| :--- | :--- |
+| **Read app files** | Inspect supported APKs and show details such as the app name, version and requested permissions. Report unsupported formats. |
+| **Run our test apps** | Open supported app screens in resizable Windows windows and handle mouse and keyboard input. |
+| **Install and remove apps** | Keep installed packages and app data separately, create Start shortcuts and Windows uninstall entries, and ask for installation and permission choices. |
+| **Limit app access** | Run installed app code in restricted Windows processes, check package integrity before launch, and control access to supported services. |
+| **Check and update apps** | Verify supported app signatures and update eligible apps while keeping their identity, data and permissions. Handle tested interrupted updates. |
+| **Reopen the right app** | Keep an app-specific launch command working after a supported app update. Actual pinned-taskbar behaviour still needs checking. |
+| **Update Aether itself** | Support compatible shared-runtime upgrades at the same location while preserving installed apps and their Windows entries. |
+| **Graphics and sound foundations** | Separate test programs demonstrate graphics through Windows' graphics hardware and audio through Windows' sound system. General Android graphics and media support is unfinished. |
 
-```powershell
-./out/build/windows-debug/aether.exe inspect ./tests/fixtures/hello-aether.apk --json
-./out/build/windows-debug/aether.exe run ./tests/fixtures/hello-aether.apk
-```
+These features have specific limits. A successful installation or signature check does not establish that an app will run correctly. The graphics and audio demonstrations are separate from the test apps' ordinary screens.
 
-Click **Translate ARM64** in the window. The button executes DEX, crosses JNI into the translated ARM64 library, and displays **ARM64 result: 42**. The Activity executes in the isolated worker while the trusted Windows host presents its window.
+### Recent additions
 
-For the Activity/lifecycle proof without opening a window:
-
-```powershell
-./out/build/windows-debug/aether.exe framework-selftest --apk ./tests/fixtures/hello-aether.apk --verbose
-```
-
-The fixture is built from [included source](tests/fixtures/README.md) and admitted by its exact checksum. Repacked, modified, or unrelated APKs are not admitted for execution.
-
-### Preview fixture installation
-
-```powershell
-./out/build/windows-debug/aether.exe install ./tests/fixtures/hello-aether.apk --dry-run --json
-```
-
-This reports metadata, presentation, installation eligibility, and unverified signing without creating a package store or executing the app. The [Windows integration guide](docs/WINDOWS_NATIVE_INTEGRATION.md) covers confirmed installation, permission decisions, registration, installed-ID launch, and removal.
-
-## Build and test
-
-Both Debug and Release use CMake, Ninja, and CTest through the PowerShell wrappers. Run the presets sequentially because integration tests share Windows shell surfaces.
-
-The current Phase 8 regression selection preserves the owner's stopped Phase 7 parser campaign:
-
-```powershell
-$phase8Exclusions = '^aether\.security\.(parser_(apk|dex|elf|supervision)|package_admission)$'
-
-./tools/build.ps1 -Preset windows-debug
-./tools/test.ps1 -Preset windows-debug -ExcludeRegex $phase8Exclusions -ReportName phase8-test-results.xml
-
-./tools/build.ps1 -Preset windows-release
-./tools/test.ps1 -Preset windows-release -ExcludeRegex $phase8Exclusions -ReportName phase8-test-results.xml
-```
-
-These commands select regression tests; they are not full-suite runs. They exclude five owner-stopped tests and keep the historical full-suite report separate. See the [test-selection contract](docs/BUILD_WINDOWS.md#build-and-test-from-ordinary-powershell).
-
-Integration tests exercise real Windows processes, windows, storage, graphics, and audio. Relevant device tests require a hardware D3D11 adapter, a usable playback endpoint, and the documented physical webcam/integrated-microphone controls. Missing device prerequisites fail their checks. Current command results and environment limits are recorded in [progress and evidence](docs/PROGRESS.md).
-
-## How it works
-
-Aether implements three connected layers: managed DEX execution, native ARM64 translation, and Android API behavior backed by Windows.
-
-```mermaid
-flowchart TD
-    APK[APK package] --> Host[Trusted host: inspection, installation, permissions]
-    Host --> DEX
-    subgraph Worker[Isolated app worker]
-        DEX[Aether DEX interpreter] <-->|JNI bridge| Native[ARM64 ELF loader + Dynarmic JIT]
-        DEX --> Android[Android framework subset]
-        Native --> Bionic[Bionic / POSIX subset]
-    end
-    Android --> Broker[Permission-checked broker IPC]
-    Bionic --> Broker
-    Broker --> Windows[Windows host services]
-```
-
-The host owns window presentation, policy, and app storage. Guest execution receives bounded services through the broker. The native graphics path uses a separate isolated ANGLE renderer; the native audio path uses broker-owned WASAPI. Public contracts live under `include/aether/`, with implementations split into explicit modules.
-
-See the [architecture](docs/ARCHITECTURE.md), [security model](docs/SECURITY_MODEL.md), and [architecture decisions](docs/adr/) for the detailed boundaries.
+- **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. [Details](docs/adr/0039-verified-apk-updates.md)
+- **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. [Details](docs/adr/0040-installed-window-relaunch.md)
+- **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. [Details](docs/adr/0041-compatible-runtime-upgrades.md)
+- **A countable compatibility checklist:** each candidate feature has a stable entry, a recorded status and space for evidence. [Explore the checklist](docs/compatibility/README.md)
 
 ## Roadmap
 
-**Phase 7 is complete by owner acceptance, recorded on 2026-10-10.** Its protections and retained evidence remain in place. That acceptance does not enable outside APK execution; the [security evidence ledger](docs/PHASE7_SECURITY_EVIDENCE.md) records the scope.
+The plan starts at **Phase 0**, so there are **nine phases** in total. “Complete” means the phase's recorded milestone has been accepted within its documented scope; support continues to grow afterwards.
 
-**Phase 8 is in progress.** The package store, installed-app launch, Windows registration, and bounded artwork are implemented for HelloAether. Remaining work includes:
+| Phase | In everyday language | Status |
+| :---: | :--- | :--- |
+| **0** | Set up the project, build tools and tests | ✅ Complete |
+| **1** | Read and inspect Android installation files | ✅ Complete |
+| **2** | Translate supported phone-processor instructions for a PC | ✅ Complete |
+| **3** | Load and run supported Android native code | ✅ Complete |
+| **4** | Run Android app logic and connect its different code parts | ✅ Complete |
+| **5** | Support basic app screens, events and lifecycle | ✅ Complete |
+| **6** | Connect windows, input, graphics and audio to Windows | ✅ Complete |
+| **7** | Establish app isolation and security controls | ✅ Complete |
+| **8** | Make installation, updates and everyday Windows use work with more apps | 🔨 In progress |
 
-- Native install confirmation with permission choices, and optional Explorer APK integration that respects Windows file-association choices.
-- Actual Start/Search, Settings, and pinned-taskbar acceptance, plus broader icon/resource support.
-- Verified APK signing and updates, shared-runtime installer/removal behavior, and safe dependency handling.
-- At least three distinct compatible APKs and further Android framework, native ABI, graphics, and media coverage.
+Phase 7 is complete under the recorded owner acceptance. Its evidence and verification exceptions remain documented in the [security record](docs/PHASE7_SECURITY_EVIDENCE.md).
 
-The intended product uses one shared runtime and Windows' existing app surfaces. No standalone app manager is planned. The full project is not complete; the [ordered roadmap](docs/ROADMAP.md) and [master engineering plan](AETHER_MASTER_PLAN_v1.1.md) define the remaining gates.
+### What comes next
 
-## Compatibility limits
+- **Finish the Windows experience.** Check real File Explorer, Open With, Start, Search, Settings and taskbar pinning, including app icons after updates.
+- **Validate installation on a fresh PC.** Complete installer and recovery checks beyond the current development machine.
+- **Run more distinct apps.** Reach at least three compatible apps and expand the Android features they need. Repackaging an existing test app does not count as another app.
+- **Broaden updates and compatibility.** Add more supported package and signature formats, and handle upgrades that require changes to stored data or runtime formats.
+- **Improve user controls and troubleshooting.** Finish the needed per-app settings and diagnostics, alongside usability and performance work.
+- **Prepare for release.** Resolve distribution signing, privacy, licensing and the remaining release checks.
 
-- Execution currently targets the tested **arm64-v8a** subset. Other Android ABIs and universal instruction/API compatibility are outside the implemented scope.
-- Broad Android framework services, Java Surface/media integration, concurrent guest threads, native TLS, and several ELF/Bionic features remain unfinished.
-- APK signature verification, general installation admission, split-package installation, and verified update continuity remain unfinished.
-- Google Play Services, Play Integrity, DRM, banking apps, and anti-cheat compatibility are not promised. No proprietary Google components or third-party APKs are bundled.
+Alongside this work, the next checklist review covers **25 Windows integration features**. This records what the code and tests already prove; it does not automatically add new app support.
 
-Unsupported behavior should produce an explicit diagnostic. The [known limitations](docs/KNOWN_LIMITATIONS.md) and support matrices describe the exact boundaries.
+The [engineering roadmap](docs/ROADMAP.md) and [master plan](AETHER_MASTER_PLAN_v1.1.md) hold the full requirements. The full project remains unfinished.
 
-## Repository layout
+## Progress counts
 
-| Path | Purpose |
-| --- | --- |
-| `apps/` | CLI, shared shell launcher, isolated workers, and runtime setup entry points. |
-| `include/aether/` | Public module contracts. |
-| `src/` | Runtime, translation adapters, Android compatibility, security, and Windows backends. |
-| `tests/` | Unit, integration, security, and original fixture sources/data. |
-| `tools/` | Build, test, installation, fixture, and dependency verification tools. |
-| `cmake/` | Build configuration and dependency adapters. |
-| `docs/` | Architecture, decisions, support matrices, evidence, and roadmap. |
-| `third_party/` | Pinned dependencies, provenance, integration records, and license notices. |
-| `out/` | Local build and test outputs; excluded from Git. |
+The compatibility checklist asks a different question from the phase roadmap: **which individual Android and Windows behaviours have we examined, implemented and fully checked?**
 
-## Documentation
+Its current **1,020 entries are a draft**, not a complete list of everything Android can do. The target may change as the project learns more.
 
-- [Build on Windows](docs/BUILD_WINDOWS.md) and [Windows application integration](docs/WINDOWS_NATIVE_INTEGRATION.md).
-- [DEX/JNI runtime](docs/DEX_JNI_RUNTIME.md), [ARM64 translation](docs/A64_TRANSLATION.md), and [ELF/native ABI](docs/ELF_NATIVE_ABI.md).
-- [Android framework](docs/ANDROID_FRAMEWORK.md), [window/input](docs/WINDOW_HOST.md), [graphics](docs/GUEST_GRAPHICS.md), and [audio](docs/GUEST_AUDIO.md).
-- [Isolated workers](docs/ISOLATED_WORKER.md), [security evidence](docs/PHASE7_SECURITY_EVIDENCE.md), and [current progress](docs/PROGRESS.md).
+| Checklist status | Count | What it means |
+| :--- | ---: | :--- |
+| **Fully verified** | **0** | All required implementation, test and evidence checks are complete for that entry. |
+| **Implemented, awaiting full verification** | **13** | The described behaviour exists within its recorded limits; complete verification is still outstanding. |
+| **In progress** | **8** | Some behaviour exists, with known parts still missing. |
+| **Not started** | **4** | Review confirmed that the requested behaviour is not implemented. |
+| **Not yet assessed** | **995** | These entries still need review; some may already have working code. |
+| **Total candidates** | **1,020** | All entries in the current draft checklist. |
 
-## Development
+**25 reviewed = 13 implemented + 8 in progress + 4 not started.** There are currently **0 blocked** and **0 excluded** entries.
 
-Use C++20, preserve module boundaries, and keep Windows x64 as the primary target. Compatibility changes need reproducible first-party fixtures, precise unsupported diagnostics, and current Debug/Release evidence. Follow [AGENTS.md](AGENTS.md), the [master plan](AETHER_MASTER_PLAN_v1.1.md), and the relevant [architecture decisions](docs/adr/) before making changes.
+**Why zero fully verified if parts already work?** The new checklist requires complete tests for each feature and a fixed version of the code tied to those results. Working demonstrations and passing tests exist, but the reviewed entries have not met every requirement for that stronger label. “Not yet assessed” also does not mean “missing”.
 
-Record dependency provenance and license obligations before importing code. Document observed behavior and known gaps alongside implementation changes.
+These counts describe the checklist, not a percentage of all Android apps supported. See the [detailed counts](docs/compatibility/PROGRESS.md), [first audit report](docs/compatibility/AUDIT_REPORT_2026-10-11.md), or [Excel checklist](docs/compatibility/capabilities.xlsx).
 
-## Licensing
+## Which apps have been tried?
 
-**A distribution license for Aether-owned code has not yet been selected.** This repository does not grant an open-source or commercial license for that code. See the [owner licensing decision](docs/LICENSING_DECISION.md).
+| App | What the record shows |
+| :--- | :--- |
+| **HelloAether** — our own test app | Opens a Windows window. Its button runs Android app code and translated ARM64 code, then displays **ARM64 result: 42**. |
+| **PlainAether** — our second test app | Runs a separate, simpler Android app through the installed-app system. Its versions are also used to check updates and preserved app data. |
+| **TikTok** — an owner-supplied APK | Inspection reaches unsupported package details. It has **not been executed or shown to work**. |
 
-Third-party components retain their own copyrights and licenses. Dynarmic provides ARM64 translation, ANGLE provides the graphics backend, miniz supplies archive/compression support, and doctest supports testing. Exact revisions, local patches, dependency notices, and fixture/toolchain attribution are recorded in [third-party provenance](third_party/README.md).
+That is **two distinct working test apps**. Signed versions and modified copies of those apps do not increase the count. No downloaded third-party app is currently claimed compatible.
+
+Installation of other APKs is enabled experimentally, with app isolation and explicit consent. Many will be refused or encounter missing features. The current execution path supports a limited standalone APK format with one app-code file and one main screen; many larger apps need more.
+
+Support for Google Play Services, protected streaming, banking apps, games with anti-cheat, and universal Android compatibility is not promised. The [app compatibility record](docs/COMPATIBILITY_MATRIX.md) and [known limitations](docs/KNOWN_LIMITATIONS.md) give the exact boundaries.
+
+## Can I try it?
+
+**Aether is currently a development project.** A Windows installer is built by the project, but it is an unsigned development build and the complete public-release experience is still unfinished.
+
+The current target is **Windows 11 on a 64-bit Intel or AMD PC**. Windows on ARM, macOS and Linux are outside the current target.
+
+If you just want to follow the project, start with the roadmap and counts above. If you want to build and test it, the [Windows build guide](docs/BUILD_WINDOWS.md) lists the tools and commands, and the [Windows installation guide](docs/WINDOWS_NATIVE_INTEGRATION.md) explains installation and app management. Building currently requires developer tools.
+
+### A few useful words
+
+| Word | Plain-English meaning |
+| :--- | :--- |
+| **APK** | A file used to distribute and install an Android app. |
+| **Runtime** | The shared Aether software that runs compatible apps. |
+| **Compatibility** | How well an app's required features behave through Aether. |
+| **Sandbox / isolation** | Restrictions on an app's access to the PC and other apps' data. |
+| **Test app / fixture** | A small app made specifically to check whether something works. |
+
+## Explore further
+
+| If you want to… | Read this |
+| :--- | :--- |
+| Follow recent work | [Progress and session reports](docs/PROGRESS.md) |
+| See the detailed plan | [Roadmap](docs/ROADMAP.md) |
+| Explore feature counts | [Compatibility catalogue](docs/compatibility/README.md) |
+| See which apps work | [App compatibility](docs/COMPATIBILITY_MATRIX.md) |
+| Understand current gaps | [Known limitations](docs/KNOWN_LIMITATIONS.md) |
+| Build or install Aether | [Build guide](docs/BUILD_WINDOWS.md) · [Windows integration](docs/WINDOWS_NATIVE_INTEGRATION.md) |
+| Understand the design | [Architecture](docs/ARCHITECTURE.md) · [Security model](docs/SECURITY_MODEL.md) |
+
+## Credits and licensing
+
+**Created by GPT6-ASTRA MAX.**
+
+Aether uses third-party libraries, including Dynarmic for ARM64 translation and ANGLE for graphics. Their authors, licences and source records are acknowledged in the [third-party documentation](third_party/README.md).
+
+**A distribution licence for Aether-owned code has not yet been chosen.** This repository does not grant an open-source or commercial licence for that code. See the [licensing decision](docs/LICENSING_DECISION.md).
