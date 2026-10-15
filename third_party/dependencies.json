@@ -1,0 +1,469 @@
+{
+  "schemaVersion": 1,
+  "dependencies": [
+    {
+      "name": "doctest",
+      "version": "2.4.12",
+      "revision": "1da23a3e8119ec5cce4f9388e91b065e20bf06f5",
+      "license": "MIT",
+      "scope": "test",
+      "files": [
+        {
+          "path": "third_party/doctest/doctest.h",
+          "source": "https://raw.githubusercontent.com/doctest/doctest/1da23a3e8119ec5cce4f9388e91b065e20bf06f5/doctest/doctest.h",
+          "sha256": "94029a7d32da24a56249658147dbd2b33ff0b9ed665295cbbaf19aafff5b0ced"
+        },
+        {
+          "path": "third_party/licenses/doctest-MIT.txt",
+          "source": "https://raw.githubusercontent.com/doctest/doctest/1da23a3e8119ec5cce4f9388e91b065e20bf06f5/LICENSE.txt",
+          "sha256": "0fe0b331fa1513dcce8604ff1fa925f32d1cea17d8aeb1c2471fad40d291adc5"
+        }
+      ]
+    },
+    {
+      "name": "miniz",
+      "version": "3.1.2",
+      "revision": "77d0dce8627735138c51770d1799a1ef48f2117d",
+      "license": "MIT",
+      "scope": "runtime",
+      "files": [
+        {
+          "path": "third_party/miniz/miniz.c",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz.c",
+          "sha256": "f23204efee2bfaffb72a974d2e28c64c3c1d9787144b5c5890f129c465e467bd"
+        },
+        {
+          "path": "third_party/miniz/miniz.h",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz.h",
+          "sha256": "f0b67217bdd8e45b74eb9b7c2c7ae20ed6760a1d76f3276b93617039ebd082df"
+        },
+        {
+          "path": "third_party/miniz/miniz_common.h",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_common.h",
+          "sha256": "f1ba29821c8caef83585b328196aa346c5da7c82890a70a3d10d77c6cec0ed39"
+        },
+        {
+          "path": "third_party/miniz/miniz_tdef.c",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_tdef.c",
+          "sha256": "85b93205232d51d092f24041934d951f11f9edc02df1f475e8ceb7b281a1e7f6"
+        },
+        {
+          "path": "third_party/miniz/miniz_tdef.h",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_tdef.h",
+          "sha256": "d62da02953c3834dfcbde4db026c6d9345013ef9b0e53185131016a3a4e48c33"
+        },
+        {
+          "path": "third_party/miniz/miniz_tinfl.c",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_tinfl.c",
+          "sha256": "2296ebd21ef9af5ebbefd5b454d4bb67d8fb4af2d24945e7fb32114374f75a76"
+        },
+        {
+          "path": "third_party/miniz/miniz_tinfl.h",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_tinfl.h",
+          "sha256": "da4850920fdf09f8877d9affabe1ebba1852ce4b1ebbd121f2ba7a7ea8e57e5d"
+        },
+        {
+          "path": "third_party/miniz/miniz_zip.c",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_zip.c",
+          "sha256": "b70e502c425e2a31146178c1466dccaf1874390009950774be2be9bd4ec908a9"
+        },
+        {
+          "path": "third_party/miniz/miniz_zip.h",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/miniz_zip.h",
+          "sha256": "b062a5def545445c73fd1d664e35a89165dfb0d996ab848f507244e819cfcf04"
+        },
+        {
+          "path": "third_party/licenses/miniz-MIT.txt",
+          "source": "https://raw.githubusercontent.com/richgel999/miniz/77d0dce8627735138c51770d1799a1ef48f2117d/LICENSE",
+          "sha256": "0115478d567121238cf6cc1c0c361926cf07a49d9e4c9e66da97fac6a01646b3"
+        }
+      ]
+    },
+    {
+      "name": "libwebp",
+      "version": "1.6.0",
+      "revision": "4fa21912338357f89e4fd51cf2368325b59e9bd9",
+      "license": "BSD-3-Clause; WebM patent grant",
+      "scope": "runtime-metadata-decoder",
+      "archiveSource": "https://codeload.github.com/webmproject/libwebp/tar.gz/4fa21912338357f89e4fd51cf2368325b59e9bd9",
+      "archiveSha256": "923f3382a47a2af185c3240c954cf004428b237bd7317413a95146d01eb4b94b",
+      "files": [
+        {
+          "path": "third_party/libwebp/AUTHORS",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/AUTHORS",
+          "sha256": "f251be89fd442bd9d701360730aea163cc8e2076ff03528f59267dc2c4f8b60a"
+        },
+        {
+          "path": "third_party/libwebp/COPYING",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/COPYING",
+          "sha256": "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf"
+        },
+        {
+          "path": "third_party/libwebp/NEWS",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/NEWS",
+          "sha256": "a171d79c17e6b0d5857786a9727f6a44bc52bc0c42e0981527b71c51f08bffd1"
+        },
+        {
+          "path": "third_party/libwebp/PATENTS",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/PATENTS",
+          "sha256": "cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c"
+        },
+        {
+          "path": "third_party/libwebp/README.md",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/README.md",
+          "sha256": "0d50b504f133d1c65199521cafbfdb4024585809265884b99c00145ae64f644e"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/alpha_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/alpha_dec.c",
+          "sha256": "fdc26ce284c26ad819a7ce7c35f7bb4b146b844cafcabf9c6c421a8178c4101e"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/alphai_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/alphai_dec.h",
+          "sha256": "051d1ec0195bb7fd5e44b18dc3f0c8a928f5597c4e28cb36d47de35ef532a41c"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/buffer_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/buffer_dec.c",
+          "sha256": "448981ff77aae496fae9ec1c9292011f5239f58704cf3a89899ab153d1072963"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/common_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/common_dec.h",
+          "sha256": "89eb36f74a027e5e40176ba73d8e1e95e62803cb3de97bd798922079f412a2f6"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/frame_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/frame_dec.c",
+          "sha256": "0cf084285d0fb94e9f27ba7a4c5381afcff13d3fb0bfa2123a73ce31a6f2be72"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/idec_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/idec_dec.c",
+          "sha256": "3665583e435c97f94baf8589e67286bdb390358e0702183f056b3ce6aafd84e1"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/io_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/io_dec.c",
+          "sha256": "5f5c1c75d6440bcf44f7d39a8fc9012f8781c0ac621b918d27b29b3c86723328"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/quant_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/quant_dec.c",
+          "sha256": "08b20b9b4b8352f4cd46c672730a2687c6e8c9873599460670950de0a81d9ee4"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/tree_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/tree_dec.c",
+          "sha256": "d49bcf9ea2e7b2bdee239be9848aaae90f3be83f392500fa9b2f163132f59320"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/vp8_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/vp8_dec.c",
+          "sha256": "548c31dc8a3eae05b1ec285e2da750aba159079d4fadee4b5f0f73b34fba7856"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/vp8_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/vp8_dec.h",
+          "sha256": "2e34adde9a6d4ae4bba16a03d9d604a49b90dfc30dbec7e436b9934a24120e37"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/vp8i_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/vp8i_dec.h",
+          "sha256": "56422f4c59e25d44b0e7045a8e6c80f196862dcc77a9948054ac0b1e1c093d00"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/vp8l_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/vp8l_dec.c",
+          "sha256": "49e4aec24d95d70df3c53e9ae53d5f3bc5646012d9f1d0968a5f88936f310653"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/vp8li_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/vp8li_dec.h",
+          "sha256": "4f1bc8d0a4ad64816f5d19ed6ef95533d00fb548b1b51a7ba85b65d88fd6ae14"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/webp_dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/webp_dec.c",
+          "sha256": "76c61ca30205025c758cc215af96296ecc5cde882c1d668ded9e89d7d2bae80c"
+        },
+        {
+          "path": "third_party/libwebp/src/dec/webpi_dec.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dec/webpi_dec.h",
+          "sha256": "78a7d476c29c7c2ca41ca88f2d9111e33855b8b7c6eb186f23ab01585f252475"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/alpha_processing.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/alpha_processing.c",
+          "sha256": "dd3ffe4d16382e4175ab9c9b96ababc4e0363a01d9d98737b20869c51df62444"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/common_sse2.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/common_sse2.h",
+          "sha256": "1c299ca6a84bf59d9e0bf0c2edad93f231c0a9a35bc2f75f0789df78b65231b2"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/common_sse41.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/common_sse41.h",
+          "sha256": "d8cff4e7687b071d2fba3270f1b0dc6548e9151d1ec726d85b63c43bbc7b0df6"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/cpu.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/cpu.c",
+          "sha256": "cd231d22bb17d9ec9a6f17daa3429be2a3e03adb5eb1472807857e43622c684c"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/cpu.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/cpu.h",
+          "sha256": "272cb2a8aa81d6355afecdea7ea344c90c2df58e6f51e01aa8bc4bf866d0be59"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/dec.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/dec.c",
+          "sha256": "ceea12ceb6266d129e97448da20394769b003b1b29a1a0b20f09c9e837b425d3"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/dec_clip_tables.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/dec_clip_tables.c",
+          "sha256": "4581e8fe4a4a71a1b247adfad0cb84831378d2fe405a2c057c41b0ae0fe17c0e"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/dsp.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/dsp.h",
+          "sha256": "de2cd2249ac7354e303deaff8691a32c6758fb41d9acba922d3b91141709b8d8"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/filters.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/filters.c",
+          "sha256": "57ae0d3cac9588febbf8e232232d8e417336dad5bf5e84560a4eaa4cf02b540c"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/lossless.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/lossless.c",
+          "sha256": "bd5a856ad112eb33b3e470b483d48f86c8250728b36dfe1d137f5b36a2c70b76"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/lossless.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/lossless.h",
+          "sha256": "3c0883abadfd6ca043e60c212a129e35633c9deb7fdaacb214a5680666b1bc8a"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/lossless_common.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/lossless_common.h",
+          "sha256": "1e37c5f845073710fd7ccaabbc9b7b8d1a3a1cd17e09e49ffcea9b09f5723258"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/mips_macro.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/mips_macro.h",
+          "sha256": "7de2aa5c1d20047a70cce0af915baf3e83e4e8a3dc3cc30de73862ae157cb22c"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/msa_macro.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/msa_macro.h",
+          "sha256": "18acd36196f13f911a99dbd8ba9a32d4a74cc804ecf678819b321c74c88d12c2"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/neon.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/neon.h",
+          "sha256": "69bca778703e422ffcdc4fd546599cbd916fcf32bcc1a91cdc49cc22ed0e553f"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/quant.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/quant.h",
+          "sha256": "d4cb87bf72e8fec7c846203f94ea8f8398cb10780aaefad947f472a65e5fede0"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/rescaler.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/rescaler.c",
+          "sha256": "47e45d83fbb3eec2ede6b02e107f1df83de693282d5441d4a8d41b13c52f236e"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/upsampling.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/upsampling.c",
+          "sha256": "21b05126aff3fbe902655a7081e3a538f8d1ca6cc9e0907c607e1c4c50ba0a9f"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/yuv.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/yuv.c",
+          "sha256": "1d334957aee6eb67862e7c06f60ffd19b7661f3fce831385de1ba408dc426311"
+        },
+        {
+          "path": "third_party/libwebp/src/dsp/yuv.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/dsp/yuv.h",
+          "sha256": "5805c01f84a677e50bf0d16cd903b78d25c2a0c46fe17c67ce0e48f11f3d512b"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/bit_reader_inl_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/bit_reader_inl_utils.h",
+          "sha256": "2fd9be790a86039e443e5f49f61dc2cc5cb8e8d313cbb40e164362fa4db23241"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/bit_reader_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/bit_reader_utils.c",
+          "sha256": "f639602d395ff4a02ea351b04d3b92ae170751889a9d313e1b196ddb883521f3"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/bit_reader_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/bit_reader_utils.h",
+          "sha256": "e08a177ee1ae47c945fe0f029673c6edba09c69bd81e2fae8f6e3ed671bd79d5"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/bit_writer_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/bit_writer_utils.h",
+          "sha256": "3c7748abafcab71facb7b0169785f1ca1141ba9c1332d1aad45a2316c97c7a03"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/color_cache_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/color_cache_utils.c",
+          "sha256": "c7dd35a6d3cee5ff7f928d900a5bdc02b20cc7018f3a9f7a2f87ae8e87457e8f"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/color_cache_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/color_cache_utils.h",
+          "sha256": "82ba22d02e8d03c5785237badb9784d32ad8a0e78b12724ffe744892fd902032"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/endian_inl_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/endian_inl_utils.h",
+          "sha256": "7bdca5f4b45730eecdb92b2ece48618a664466065886e0e0115b122ecd2fc748"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/filters_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/filters_utils.c",
+          "sha256": "dfbd55abe3c7e4684e2b8fe5efe0093b19d55cd3b7b982685cdbf31370eba1ff"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/filters_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/filters_utils.h",
+          "sha256": "72c0dbf2ef0a33813030cfa471ffc425ae2c9b716ebff07d73681362b3fe92b3"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/huffman_encode_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/huffman_encode_utils.h",
+          "sha256": "97cf4d442aebcf3cb6cd68ec81573a9df5ce7bd2de1b815f97947fe27a639b6d"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/huffman_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/huffman_utils.c",
+          "sha256": "15c1d89d7567c2121bae05ce8dea6deba160945dd398bc6d6b9a88b40ba523eb"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/huffman_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/huffman_utils.h",
+          "sha256": "6a4c855766558f22a0ee204089fb86c3dcca548ed0f44a85e8d6cdf0f73cc177"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/palette.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/palette.c",
+          "sha256": "26e90df0dc0b2bc7a251d2dc021f923af7f1529f8dddeeb80ea50b7dd6c31c9a"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/palette.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/palette.h",
+          "sha256": "a4a08586739af0748fdb8dcb53501b1ea74b2fa1589f8170c95ad3082283e7f6"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/quant_levels_dec_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/quant_levels_dec_utils.c",
+          "sha256": "d453e3595e19123e9af2696201bf55e404477d6ca3628d9324f5830ea3e73417"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/quant_levels_dec_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/quant_levels_dec_utils.h",
+          "sha256": "bb046261ae6e07530a0aedbb9f73e8e83924815734119dca8c88afa4e1588350"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/quant_levels_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/quant_levels_utils.h",
+          "sha256": "5d6a84f7603aa6a4bd9676966de2eb4bc3b2e0fc4c7aa2cf75170221b54572aa"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/random_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/random_utils.c",
+          "sha256": "b41422c972d1b76ee1f99fbf419d5e026ec2baa0a4fe08bb7939c31d083c7b28"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/random_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/random_utils.h",
+          "sha256": "c30dac4531cbb06de6463854175c106d8f1de10e64b00fa47e62f8d12d15f0cb"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/rescaler_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/rescaler_utils.c",
+          "sha256": "8a3afac6a5a917a0508c1d8f2c1daf595f0d77bc66b3ed9136c5af9e432c8431"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/rescaler_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/rescaler_utils.h",
+          "sha256": "ea2e5cb89d1c6050613f758a91f9a35c53b5e0d9d4dfa9245e837b3e2c4835ae"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/thread_utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/thread_utils.c",
+          "sha256": "474b6d6cc3f8c3197af2d31cb1cdc7d6e88db964db260f2e7d5e9916b2e65594"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/thread_utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/thread_utils.h",
+          "sha256": "dbac595ac7ea89f43fe6b796ed0e2b6944e3d2326caf35aaeb58f3289b918bf1"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/utils.c",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/utils.c",
+          "sha256": "c8d90b4ccd536136ac710321c2632912a1f6ee2492a423e14ab9deb159490a56"
+        },
+        {
+          "path": "third_party/libwebp/src/utils/utils.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/utils/utils.h",
+          "sha256": "9770471e412a9429fef2c1b3b8adb12e5e8716b79ae87ab28a3a220a285b5dd8"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/decode.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/decode.h",
+          "sha256": "e554551d085f234e930f36b5879a77ef58bfea34c48ebfd620426e63b224025c"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/demux.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/demux.h",
+          "sha256": "9b0d10c0fa1ac2dc750c4d687b038e40a685bb9240cb045759f5b9546017361d"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/encode.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/encode.h",
+          "sha256": "928e8d3ed502baa0f47ed10913ee018ed6172afcd4f308e0ea005a126b83f27e"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/format_constants.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/format_constants.h",
+          "sha256": "6f26d54038b770c5f9ddcd8f8e2da05d43c92168cb30f0e7060240f90df5fd7f"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/mux.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/mux.h",
+          "sha256": "c72cf593f8194c671efcade33f1678294380120d45a337511d612a3acb643f35"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/mux_types.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/mux_types.h",
+          "sha256": "ca789c9fe2edc52f759cb3888e9171ee44b5c12f2db21458f96176d578bc897e"
+        },
+        {
+          "path": "third_party/libwebp/src/webp/types.h",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/src/webp/types.h",
+          "sha256": "992d2ffe864adb6d80cc91b7a062074d167ed96772f28d104a650148eca31794"
+        },
+        {
+          "path": "third_party/licenses/libwebp-BSD-3-Clause.txt",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/COPYING",
+          "sha256": "5aec868f669e384a22372a4e8a1a6cd7d44c64cd451f960ca69cc170d1e13acf"
+        },
+        {
+          "path": "third_party/licenses/libwebp-PATENTS.txt",
+          "source": "https://raw.githubusercontent.com/webmproject/libwebp/4fa21912338357f89e4fd51cf2368325b59e9bd9/PATENTS",
+          "sha256": "cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c"
+        }
+      ]
+    }
+  ]
+}

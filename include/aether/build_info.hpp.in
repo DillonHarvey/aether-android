@@ -1,0 +1,9 @@
+#pragma once
+#include <string_view>
+
+namespace aether::build {
+inline constexpr std::string_view version = "@PROJECT_VERSION@";
+inline constexpr std::string_view compiler = "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@";
+inline constexpr std::string_view cmake = "@CMAKE_VERSION@";
+inline constexpr std::string_view configuration = "@CMAKE_BUILD_TYPE@";
+} // namespace aether::build

@@ -1,0 +1,59 @@
+#include <windows.h>
+#include "app_dialog_ids.h"
+#include "privacy_ids.h"
+
+IDD_APP_SETTINGS DIALOGEX 0, 0, 420, 352
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Aether - App settings"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Reading this app...", IDC_APP_NAME, 12, 10, 396, 20, SS_NOPREFIX
+    CONTROL "Allow &timekeeping (required to run)", IDC_APP_CLOCK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 34, 396, 14
+    CONTROL "Allow access to this app's &private files", IDC_APP_FILES, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 54, 396, 14
+    LTEXT "Other host capabilities are unavailable. Apply saves only these permission choices.", -1, 12, 76, 396, 22
+    LTEXT "&Diagnostics for this app:", -1, 12, 100, 396, 12
+    EDITTEXT IDC_APP_REPORT, 12, 114, 396, 114, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Checking automatically...", IDC_APP_READ_STATUS, 12, 234, 396, 24, SS_NOPREFIX
+    LTEXT "", IDC_APP_ACTION_STATUS, 12, 262, 396, 24, SS_NOPREFIX
+    PUSHBUTTON "&Save report...", IDC_APP_SAVE, 12, 296, 84, 18
+    PUSHBUTTON "T&roubleshoot...", IDC_APP_TROUBLESHOOT, 104, 296, 104, 18
+    PUSHBUTTON "Pri&vacy...", IDC_PRIVACY_OPEN, 216, 296, 96, 18
+    PUSHBUTTON "&Discard edits", IDC_APP_DISCARD, 104, 324, 84, 18
+    PUSHBUTTON "&Apply permissions", IDC_APP_APPLY, 214, 324, 102, 18
+    DEFPUSHBUTTON "Close", IDCANCEL, 324, 324, 84, 18
+END
+
+IDD_APP_DIAGNOSTICS DIALOGEX 0, 0, 420, 286
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Aether - App diagnostics"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Reading this app...", IDC_APP_NAME, 12, 10, 396, 20, SS_NOPREFIX
+    LTEXT "&Diagnostics for this app:", -1, 12, 34, 396, 12
+    EDITTEXT IDC_APP_REPORT, 12, 48, 396, 142, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Checking automatically...", IDC_APP_READ_STATUS, 12, 198, 396, 24, SS_NOPREFIX
+    LTEXT "", IDC_APP_ACTION_STATUS, 12, 226, 396, 24, SS_NOPREFIX
+    PUSHBUTTON "&Save report...", IDC_APP_SAVE, 12, 258, 96, 18
+    PUSHBUTTON "T&roubleshoot...", IDC_APP_TROUBLESHOOT, 116, 258, 104, 18
+    PUSHBUTTON "Pri&vacy...", IDC_PRIVACY_OPEN, 228, 258, 88, 18
+    DEFPUSHBUTTON "Close", IDCANCEL, 324, 258, 84, 18
+END
+
+IDD_APP_TROUBLESHOOT DIALOGEX 0, 0, 444, 344
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "Aether - Troubleshooting bundle"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "Choose optional details for this app. Collect preview reads your choices once. Review the captured report before saving or sharing.", -1, 12, 10, 420, 28
+    CONTROL "Include &Windows and Aether build details", IDC_BUNDLE_HOST, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 44, 420, 14
+    CONTROL "Include &audit summaries (session completion and request/error counts)", IDC_BUNDLE_AUDIT, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 64, 420, 24
+    LTEXT "No private file contents, raw logs, host paths, usernames, environment or memory. Nothing is uploaded. Choices apply only to this collection.", -1, 12, 94, 420, 28
+    LTEXT "Captured &preview:", -1, 12, 130, 420, 12
+    EDITTEXT IDC_APP_REPORT, 12, 144, 420, 114, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Select details, then collect a preview.", IDC_APP_ACTION_STATUS, 12, 264, 420, 36, SS_NOPREFIX
+    PUSHBUTTON "&Collect preview", IDC_BUNDLE_COLLECT, 12, 316, 110, 18
+    PUSHBUTTON "&Save bundle...", IDC_APP_SAVE, 130, 316, 110, 18
+    DEFPUSHBUTTON "Close", IDCANCEL, 348, 316, 84, 18
+END

@@ -1,0 +1,5 @@
+#pragma once
+#include <string_view>
+namespace aether::install::detail {
+inline constexpr std::string_view uninstall_controller = R"AETHERPS(@AETHER_UNINSTALL_CONTROLLER@)AETHERPS";
+}

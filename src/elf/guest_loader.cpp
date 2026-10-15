@@ -1,0 +1,347 @@
+#include "aether/elf/guest_loader.hpp"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <map>
+#include <set>
+
+namespace aether::elf {
+namespace {
+constexpr Address page = a64::GuestMemory::page_size;
+Address down(Address value) { return value & ~(page - 1); }
+Address up(Address value) { return down(value + page - 1); }
+Address add_signed(Address value, std::int64_t addend) {
+    if (addend >= 0) {
+        if (static_cast<std::uint64_t>(addend) > std::numeric_limits<Address>::max() - value)
+            throw ElfError("AETHER_ELF_RELOCATION_OVERFLOW", "Relocation result overflows 64 bits");
+        return value + static_cast<std::uint64_t>(addend);
+    }
+    const auto magnitude = std::uint64_t{0} - static_cast<std::uint64_t>(addend);
+    if (magnitude > value)
+        throw ElfError("AETHER_ELF_RELOCATION_OVERFLOW", "Relocation result underflows 64 bits");
+    return value - magnitude;
+}
+GuestSymbol located(const GuestModule &m, const Symbol &s) {
+    return {s.name, m.image.soname, s.version, s.absolute ? s.value : m.base + s.value, s.size, s.type};
+}
+} // namespace
+struct GuestLoader::Impl {
+    a64::GuestMemory &memory;
+    const ImportResolver &imports;
+    std::vector<GuestModule> modules;
+    std::vector<std::size_t> scope, init_order;
+    std::vector<Address> mappings;
+    // Names refer to immutable parsed images after the complete graph is built.
+    // Each list retains breadth-first module order and dynamic symbol order.
+    std::map<std::string_view, std::vector<std::pair<std::size_t, std::size_t>>, std::less<>> exports;
+    std::size_t resolution_steps = 0;
+    std::size_t relocations = 0;
+    bool loaded = false, initialization_started = false, initialization_failed = false;
+    Impl(a64::GuestMemory &m, const ImportResolver &i) : memory(m), imports(i) {}
+    ~Impl() { clear(); }
+    void clear() noexcept {
+        // Only mappings successfully created by this loader are owned here.
+        for (const auto address : mappings) {
+            try {
+                memory.unmap(address);
+            } catch (...) { /* Already unmapped by the owner. */
+            }
+        }
+        mappings.clear();
+        exports.clear();
+        modules.clear();
+        scope.clear();
+        init_order.clear();
+        loaded = false;
+        relocations = 0;
+        resolution_steps = 0;
+    }
+    std::optional<std::size_t> index(std::string_view name) const {
+        for (std::size_t i = 0; i < modules.size(); ++i)
+            if (modules[i].image.soname == name)
+                return i;
+        return std::nullopt;
+    }
+    void dependencies(std::size_t root) {
+        scope.push_back(root);
+        for (std::size_t i = 0; i < scope.size(); ++i)
+            for (const auto &name : modules[scope[i]].image.needed) {
+                const auto dep = index(name);
+                if (!dep && !imports.has_library(name))
+                    throw ElfError("AETHER_ELF_DEPENDENCY_MISSING", "No registered dependency: " + name);
+                if (dep && std::find(scope.begin(), scope.end(), *dep) == scope.end())
+                    scope.push_back(*dep);
+            }
+        if (scope.size() != modules.size())
+            throw ElfError("AETHER_ELF_DEPENDENCY_UNUSED",
+                           "Input contains a module outside the dependency closure");
+        std::vector<unsigned> state(modules.size());
+        const auto visit = [&](auto &&self, std::size_t at) -> void {
+            if (state[at] == 2)
+                return;
+            if (state[at] == 1)
+                throw ElfError("AETHER_ELF_DEPENDENCY_CYCLE",
+                               "Cyclic guest dependency initialization is unsupported");
+            state[at] = 1;
+            for (const auto &name : modules[at].image.needed)
+                if (const auto dep = index(name))
+                    self(self, *dep);
+            state[at] = 2;
+            init_order.push_back(at);
+        };
+        visit(visit, root);
+        for (const auto at : scope)
+            for (std::size_t i = 0; i < modules[at].image.symbols.size(); ++i) {
+                const auto &s = modules[at].image.symbols[i];
+                if (s.defined && s.binding != 0 && s.visibility != 1 && s.visibility != 2)
+                    exports[s.name].emplace_back(at, i);
+            }
+    }
+    void resolution_step() {
+        // One full maximum-size graph scan, shared by all relocation lookups.
+        // The name index avoids quadratic scans for ordinary distinct exports;
+        // ambiguous version candidates and repeated import searches remain bounded.
+        if (resolution_steps == 16 * 65536)
+            throw ElfError("AETHER_ELF_LIMIT", "Symbol resolution exceeds 1048576 candidate visits");
+        ++resolution_steps;
+    }
+    std::optional<GuestSymbol> resolve(const GuestModule &owner, const Symbol &s) {
+        if (s.defined && (s.binding == 0 || s.visibility != 0))
+            return located(owner, s);
+        if (const auto found = exports.find(s.name); found != exports.end())
+            for (const auto &[at, symbol] : found->second) {
+                resolution_step();
+                const auto &m = modules[at];
+                const auto &candidate = m.image.symbols[symbol];
+                if ((s.version_library.empty() || s.defined || m.image.soname == s.version_library) &&
+                    (s.version.empty() ? !candidate.version_hidden : s.version == candidate.version))
+                    return located(m, candidate);
+            }
+        std::set<std::string> visited;
+        for (const auto at : scope)
+            for (const auto &dependency : modules[at].image.needed) {
+                resolution_step();
+                if (index(dependency) || !visited.insert(dependency).second ||
+                    (!s.version_library.empty() && dependency != s.version_library))
+                    continue;
+                if (const auto found = imports.resolve(dependency, s.name, s.version))
+                    return found;
+            }
+        return std::nullopt;
+    }
+    void call(a64::GuestCpu &cpu, Address address, Address stack_top) const {
+        if (!address || address == std::numeric_limits<Address>::max())
+            return;
+        if (address % 4 || !memory.accessible(address, 4, a64::Permission::execute))
+            throw ElfError("AETHER_ELF_INITIALIZER", "Initializer/finalizer target is not guest executable");
+        constexpr std::array<std::uint64_t, 3> arguments{}; // argc, argv, envp for Android constructors.
+        const auto result = cpu.call(address, arguments, stack_top);
+        if (!result.returned)
+            throw ElfError("AETHER_ELF_INITIALIZER_FAILED", "Guest initializer/finalizer failed: " +
+                                                                std::string(a64::fault_name(result.fault)));
+    }
+    Address read_pointer(Address address) const {
+        std::array<std::uint8_t, 8> bytes{};
+        if (!memory.read(address, bytes))
+            throw ElfError("AETHER_ELF_INITIALIZER", "Cannot read initializer/finalizer array");
+        Address value = 0;
+        for (std::size_t i = 0; i < bytes.size(); ++i)
+            value |= Address{bytes[i]} << (i * 8);
+        return value;
+    }
+};
+GuestLoader::GuestLoader(a64::GuestMemory &memory, const ImportResolver &imports)
+    : impl_(std::make_unique<Impl>(memory, imports)) {}
+GuestLoader::~GuestLoader() = default;
+void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view root) {
+    auto &p = *impl_;
+    if (p.loaded || inputs.empty() || inputs.size() > native_graph_modules)
+        throw ElfError("AETHER_ELF_LOAD_STATE",
+                       "One dependency graph of 1..16 modules is supported per loader");
+    try {
+        Address next = 0x10000000;
+        std::uint64_t total_bytes = 0, total_relocations = 0, mapped_bytes = 0;
+        std::vector<std::shared_ptr<ModuleSource>> sources;
+        const bool streaming =
+            std::any_of(inputs.begin(), inputs.end(), [](const auto &input) { return bool(input.source); });
+        for (const auto &input : inputs) {
+            if (input.source && !input.bytes.empty())
+                throw ElfError("AETHER_ELF_SOURCE", "Native input has two competing byte representations");
+            const auto size = input.source ? input.source->size() : input.bytes.size();
+            if (size > streamed_native_bytes - total_bytes)
+                throw ElfError("AETHER_ELF_LIMIT", "Dependency graph exceeds 128 MiB of ELF input");
+            total_bytes += size;
+            auto image = input.source ? parse(*input.source) : parse(input.bytes);
+            if (image.relocations.size() > 1'048'576 - total_relocations)
+                throw ElfError("AETHER_ELF_LIMIT", "Dependency graph exceeds 1048576 relocations");
+            total_relocations += image.relocations.size();
+            for (const auto &s : image.segments) {
+                const auto bytes = up(s.address + s.memory_size) - down(s.address);
+                const auto limit = streaming ? streamed_native_bytes : a64::GuestMemory::maximum_bytes;
+                if (bytes > limit - mapped_bytes)
+                    throw ElfError("AETHER_ELF_LIMIT",
+                                   "Native dependency graph exceeds its mapped-image budget");
+                mapped_bytes += bytes;
+            }
+            if (input.name != image.soname || p.index(input.name) || p.imports.has_library(input.name))
+                throw ElfError("AETHER_ELF_SONAME",
+                               "Input identity differs from SONAME or shadows a registered module");
+            const auto span = image.span;
+            p.modules.push_back({std::move(image), next});
+            sources.push_back(input.source);
+            next += (span + 0xffff) & ~Address{0xffff};
+        }
+        const auto root_index = p.index(root);
+        if (!root_index)
+            throw ElfError("AETHER_ELF_DEPENDENCY_MISSING", "Root module was not supplied");
+        p.dependencies(*root_index);
+        struct Write {
+            Address address, value;
+        };
+        std::vector<Write> writes;
+        writes.reserve(static_cast<std::size_t>(total_relocations));
+        // All symbols/relocations resolve before the first guest mapping is made.
+        for (const auto &m : p.modules)
+            for (const auto &r : m.image.relocations) {
+                Address value = m.base;
+                if (r.type == 1027) {
+                    if (r.addend < 0 || static_cast<std::uint64_t>(r.addend) >= m.image.span)
+                        throw ElfError("AETHER_ELF_RELOCATION",
+                                       "Relative relocation points outside its module span");
+                } else {
+                    const auto &s = m.image.symbols[r.symbol];
+                    const auto symbol = p.resolve(m, s);
+                    if (!symbol && (s.binding != 2 || s.defined))
+                        throw ElfError(
+                            s.version.empty() ? "AETHER_ELF_SYMBOL_UNRESOLVED" : "AETHER_ELF_SYMBOL_VERSION",
+                            "Unresolved symbol " + s.name + (s.version.empty() ? "" : "@" + s.version));
+                    if (symbol &&
+                        ((s.type != 0 && symbol->type != s.type) || (r.type == 1026 && symbol->type != 2)))
+                        throw ElfError("AETHER_ELF_SYMBOL_TYPE",
+                                       "Incompatible relocation symbol type: " + s.name);
+                    value = symbol ? symbol->address : 0;
+                }
+                writes.push_back({m.base + r.offset, add_signed(value, r.addend)});
+            }
+        struct Protection {
+            Address address;
+            a64::Permission permissions;
+        };
+        std::vector<Protection> protections;
+        for (std::size_t module = 0; module < p.modules.size(); ++module) {
+            const auto &m = p.modules[module];
+            for (const auto &s : m.image.segments) {
+                const auto begin = down(s.address), end = up(s.address + s.memory_size);
+                std::vector<Address> cuts{begin, end};
+                for (auto bound : {m.image.relro_begin, m.image.relro_end})
+                    if (bound > begin && bound < end)
+                        cuts.push_back(bound);
+                std::sort(cuts.begin(), cuts.end());
+                cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+                for (std::size_t i = 1; i < cuts.size(); ++i) {
+                    auto permissions = s.permissions;
+                    if (cuts[i - 1] >= m.image.relro_begin && cuts[i] <= m.image.relro_end)
+                        permissions = a64::Permission::read;
+                    const auto address = m.base + cuts[i - 1];
+                    // Reserve vector capacity before map so allocation failure cannot lose ownership.
+                    p.mappings.reserve(p.mappings.size() + 1);
+                    p.memory.map(address, static_cast<std::size_t>(cuts[i] - cuts[i - 1]), a64::read_write);
+                    p.mappings.push_back(address);
+                    protections.push_back({address, permissions});
+                }
+                if (!sources[module] && s.file_size &&
+                    !p.memory.write(m.base + s.address,
+                                    Bytes{m.image.bytes}.subspan(static_cast<std::size_t>(s.offset),
+                                                                 static_cast<std::size_t>(s.file_size))))
+                    throw ElfError("AETHER_ELF_MAPPING", "Could not populate guest load segment");
+            }
+            if (sources[module]) {
+                std::uint64_t consumed = 0;
+                const auto size = sources[module]->size();
+                sources[module]->stream([&](std::uint64_t offset, Bytes bytes) {
+                    if (offset != consumed || bytes.empty() || bytes.size() > 65536 || offset > size ||
+                        bytes.size() > size - offset)
+                        throw ElfError("AETHER_ELF_SOURCE",
+                                       "Native stream has a gap, overlap or invalid chunk");
+                    for (const auto &s : m.image.segments) {
+                        const auto begin = (std::max)(offset, s.offset);
+                        const auto end = (std::min)(offset + bytes.size(), s.offset + s.file_size);
+                        if (begin < end &&
+                            !p.memory.write(m.base + s.address + begin - s.offset,
+                                            bytes.subspan(static_cast<std::size_t>(begin - offset),
+                                                          static_cast<std::size_t>(end - begin))))
+                            throw ElfError("AETHER_ELF_MAPPING", "Could not stream guest load segment");
+                    }
+                    consumed += bytes.size();
+                });
+                if (consumed != size)
+                    throw ElfError("AETHER_ELF_SOURCE",
+                                   "Native stream ended before the declared file extent");
+            }
+        }
+        for (const auto &w : writes) {
+            std::array<std::uint8_t, 8> bytes{};
+            for (std::size_t i = 0; i < bytes.size(); ++i)
+                bytes[i] = static_cast<std::uint8_t>(w.value >> (i * 8));
+            if (!p.memory.write(w.address, bytes))
+                throw ElfError("AETHER_ELF_RELOCATION", "Could not write guest relocation");
+        }
+        for (const auto &protection : protections)
+            p.memory.protect(protection.address, protection.permissions);
+        p.relocations = writes.size();
+        p.loaded = true;
+    } catch (...) {
+        p.clear();
+        throw;
+    }
+}
+GuestSymbol GuestLoader::symbol(std::string_view module, std::string_view name) const {
+    const auto &p = *impl_;
+    if (!p.loaded)
+        throw ElfError("AETHER_ELF_LOAD_STATE", "No loaded dependency graph");
+    if (const auto at = p.index(module))
+        for (const auto &s : p.modules[*at].image.symbols)
+            if (s.name == name && s.defined && s.binding && s.visibility != 1 && s.visibility != 2 &&
+                !s.version_hidden)
+                return located(p.modules[*at], s);
+    throw ElfError("AETHER_ELF_SYMBOL_UNRESOLVED", "Export was not found: " + std::string(name));
+}
+void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top) {
+    auto &p = *impl_;
+    if (!p.loaded || p.initialization_started)
+        throw ElfError("AETHER_ELF_LOAD_STATE",
+                       "Initialization requires a fresh, fully loaded dependency graph");
+    p.initialization_started = true;
+    try {
+        for (const auto at : p.init_order) {
+            auto &m = p.modules[at];
+            if (m.image.init)
+                p.call(cpu, m.base + m.image.init, stack_top);
+            for (std::uint64_t i = 0; i < m.image.init_count; ++i)
+                p.call(cpu, p.read_pointer(m.base + m.image.init_array + i * 8), stack_top);
+            m.initialized = true;
+        }
+    } catch (...) {
+        p.initialization_failed = true;
+        throw;
+    }
+}
+void GuestLoader::finalize(a64::GuestCpu &cpu, Address stack_top) {
+    auto &p = *impl_;
+    if (!p.loaded || !p.initialization_started || p.initialization_failed)
+        throw ElfError("AETHER_ELF_LOAD_STATE", "Finalization requires successful initialization");
+    for (auto i = p.init_order.rbegin(); i != p.init_order.rend(); ++i) {
+        auto &m = p.modules[*i];
+        if (m.finalized)
+            continue;
+        // Do not repeat partially executed finalizers after a guest fault.
+        m.finalized = true;
+        for (auto j = m.image.fini_count; j > 0; --j)
+            p.call(cpu, p.read_pointer(m.base + m.image.fini_array + (j - 1) * 8), stack_top);
+        if (m.image.fini)
+            p.call(cpu, m.base + m.image.fini, stack_top);
+    }
+}
+const std::vector<GuestModule> &GuestLoader::modules() const noexcept { return impl_->modules; }
+std::size_t GuestLoader::relocation_count() const noexcept { return impl_->relocations; }
+} // namespace aether::elf

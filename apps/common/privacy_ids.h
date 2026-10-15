@@ -1,0 +1,4 @@
+#pragma once
+#define IDD_PRIVACY 1200
+#define IDC_PRIVACY_TEXT 1201
+#define IDC_PRIVACY_OPEN 1202

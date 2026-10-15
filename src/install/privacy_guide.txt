@@ -1,0 +1,63 @@
+# Aether privacy and permissions
+
+This guide describes the current Windows x64 development build and its installed Android-app path, reviewed on 2026-10-11. Aether is experimental: installation eligibility and a successful diagnostic report do not establish that an app works. See the [tested apps and limits](COMPATIBILITY_MATRIX.md) and [release status](ALPHA_READINESS.md).
+
+Read this build's guide offline through **Privacy...** in runtime setup, APK installation, app settings or diagnostics. You can also open `aether-shell.exe privacy` or print it with `aether.exe privacy`; `aether.exe privacy --json` includes the source document's checksum. Reading the guide does not install or run an app, change permissions or save a report. The text is embedded when Aether is built, so an older installed build retains its own guide until upgraded. Project-document references below are descriptive text in the native view; it opens no links or browser.
+
+## What happens on this PC
+
+Aether inspects an APK before installation, asks for an installation decision and copies the reviewed package into its local store. Installing does not start the app. Launching a registered app starts an isolated worker; a trusted host checks its requests against that app's permissions. Apps have separate identities and private storage.
+
+The current installation, launch, settings and report flows run locally and have no automatic report upload or built-in telemetry endpoint. Aether does keep the local installation history and security audit described below. This guide covers Aether's behavior; Windows, security software and any synchronization software managing a chosen export folder have their own behavior.
+
+## Permissions you can choose
+
+Android permissions declared inside an APK do not grant access to Windows resources. An APK signature identifies the signing certificate when its format is supported; it does not authenticate a publisher name, make an app safe or grant permissions.
+
+| Choice | What it permits in an installed app | Default and effect |
+|---|---|---|
+| Monotonic clock | Elapsed-time queries through Aether's host | Requires an explicit grant. The current installed Activity path cannot launch without it. It is not a calendar, location or network permission. |
+| App-private files | Bounded file operations in this app's own Aether data directory | Denied unless granted. It does not expose Documents, Downloads, another app's data or arbitrary host paths. |
+| Other host resources | No installed-app grant currently exists for network, clipboard, camera, microphone, audio or graphics services | Unsupported requests are refused. Separate developer audio/graphics fixtures do not establish these capabilities for installed apps. |
+
+Use the selected app's on-demand settings dialog (`aether-shell.exe settings --app-id ID`) or the [CLI settings commands](WINDOWS_NATIVE_INTEGRATION.md#current-commands). Close the app before changing permissions; changes to a running app are refused. Apply is an explicit action. Automatic one-second reads preserve unsaved choices and recover after read failures without granting permissions or retrying a write. Revoking private-file permission prevents future brokered access; it does not delete existing files.
+
+## Local data and retention
+
+Windows resolves the actual user folders. The usual runtime destination is `%LOCALAPPDATA%\Programs\Aether`, and the default package store is `%LOCALAPPDATA%\Aether`. An explicitly selected development store can use a different protected local path.
+
+| Material | Purpose and retention |
+|---|---|
+| APK, app icon and per-app data | The selected package and app-created files stay in the app's opaque-ID directory. Updates preserve private data and permissions; successful update cleanup removes retired package material. Interrupted cleanup may need explicit repair. |
+| Installation journal (`registry.log`) | Records app identity, package/version/checksums, signing state, permission decisions, lifecycle and Windows registration metadata. Removal adds a history record; it does not erase the journal or compact earlier records. |
+| Per-app security audit (`audit/`) | Records request types, sizes, results, app/session IDs, process IDs, timestamps and hash links. These are operational records, not copies of request payloads or private file contents. |
+| Windows registrations | Start shortcuts, app-specific uninstall entries and optional Explorer registration identify the installed app and shared launcher. These are ordinary Windows-visible metadata. |
+| Runtime catalogue | Records the installed runtime's payload and enrolled store locations so upgrades and removal can check dependencies. |
+| Exported reports | A file you explicitly save at your chosen destination. Aether does not remove this separate file when you uninstall an app. |
+
+Audits are mandatory for the current brokered launch path. Each app retains at most 16 session files, each bounded to one MiB. On a new launch, the oldest completed sessions can be retired to make room. Damaged or unfinished evidence is preserved; if no completed session can be retired, launch is refused. This is a capacity policy, not a promise to delete records after a number of days. Opting out of an audit-summary export does not disable local auditing.
+
+The store uses Windows access controls for the current user and SYSTEM, with guest access mediated by Aether. Aether does not encrypt these files. These controls and unkeyed checksums do not protect against an administrator or a malicious host process running as the same user.
+
+## Reviewing and saving diagnostics
+
+The app's diagnostics dialog inspects installation, package, signing, format admission, permissions and Windows registrations without running the APK or reading private app files. A report includes the app/package IDs, version, lifecycle, package size/hash, signing certificate fingerprints, grants and check results. It excludes host paths, private files, audit records, environment and memory. Identifiers and hashes can link reports to an app or installation; the report is not anonymous.
+
+The **Troubleshoot** dialog offers two optional choices, initially unchecked:
+
+- **Windows and Aether build details:** Windows build and native architecture, plus the collecting Aether build's version, configuration and compiler.
+- **Audit session summaries:** selected-app session IDs, source-file hashes, completion state and request/result counts. Raw records, their process IDs and absolute timestamps are excluded. Active apps and unsafe sources produce unavailable findings instead of relaxed access checks.
+
+Collect captures a preview. Save writes that capture to a new JSON file only when its choices still match. Reopening the dialog resets the optional choices. No private file contents, raw logs, host paths, usernames, environment or memory are included in the troubleshooting bundle. Audit hashes do not authenticate who wrote a log, explain a crash or identify the APK version used by a retained session.
+
+The CLI equivalent, `aether.exe troubleshoot --app-id ID`, previews collection scope; optional flags select build details and/or audit summaries. `--yes` explicitly collects them, and `--output PATH` saves that captured report. [Exact commands and bounds](WINDOWS_NATIVE_INTEGRATION.md#current-commands) are documented separately.
+
+Review a captured report before sharing it. Aether does not send it anywhere. Save refuses an existing destination; cancellation writes nothing. A failed write can leave a partial final file. No automatic write retry or backup is made. Other developer/CLI outputs are not governed by the report's field exclusions and may contain local paths or detailed execution observations.
+
+## Removing an app or Aether
+
+The app's uninstall confirmation offers **keep data** or **delete data**. Both remove that app's package, owned Windows registrations and isolation profile. Keep data retains its private data and audits; it does not provide an implemented restore/reinstall feature. Delete data also removes those owned files after validation. Unknown or changed material can block cleanup and requires explicit resolution. Neither option securely overwrites disk contents, erases installation history or deletes exported reports or the original APK you selected.
+
+A retained-data record can later be removed with the explicit delete-data command. Removing the shared runtime is blocked while installed apps, pending operations, retained data or unreadable tracked stores remain. Aether does not silently delete all apps to remove itself. See [uninstall and recovery commands](WINDOWS_NATIVE_INTEGRATION.md).
+
+Implementation references: [app diagnostics](adr/0042-read-only-app-diagnostics.md), [native controls](adr/0044-native-per-app-controls.md), [troubleshooting](adr/0045-opt-in-troubleshooting-bundles.md), [store boundary](adr/0027-durable-package-store.md) and [runtime dependencies](adr/0033-managed-runtime-lifecycle.md).

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "description": "Retained NDK r30 distribution notice provenance, independent of development fixtures.",
+  "origin": "Reviewed NDK r30 notices already retained with the Pocket Tally source record; no new dependency import.",
+  "ndk": "Pkg.Desc = Android NDK\nPkg.Revision = 30.0.16248370\nPkg.BaseRevision = 30.0.16248370\nPkg.ReleaseName = r30\n",
+  "noticeHashes": {
+    "android-ndk-r30-NOTICE.txt": "a3c12eee897f63991da71464b690433a15d0d74a508ce0e275436279bdcaff58",
+    "android-ndk-r30-toolchain-NOTICE.txt": "6b8633011d874b75629180e60de13ebfd546a10e56dc7d0380a35f6609f30617"
+  }
+}

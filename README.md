@@ -46,7 +46,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
 
-The [project progress record](docs/PROGRESS.md) and [app compatibility record](docs/COMPATIBILITY_MATRIX.md) contain the evidence behind this snapshot.
+The project progress record (maintained locally) and app compatibility record (maintained locally) contain the evidence behind this snapshot.
 
 ## What works today
 
@@ -65,10 +65,10 @@ These features have specific limits. A successful installation or signature chec
 
 ### Recent additions
 
-- **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. [Details](docs/adr/0039-verified-apk-updates.md)
-- **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. [Details](docs/adr/0040-installed-window-relaunch.md)
-- **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. [Details](docs/adr/0041-compatible-runtime-upgrades.md)
-- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements were integrated into the main catalogue, with source links and future goals. [Explore the checklist](docs/compatibility/FUTURE_GOALS.md)
+- **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. Details (maintained locally)
+- **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. Details (maintained locally)
+- **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. Details (maintained locally)
+- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements were integrated into the main catalogue, with source links and future goals. Explore the checklist (maintained locally)
 
 ## Roadmap
 
@@ -86,7 +86,7 @@ The plan starts at **Phase 0**, so there are **nine phases** in total. “Comple
 | **7** | Establish app isolation and security controls | ✅ Complete |
 | **8** | Make installation, updates and everyday Windows use work with more apps | 🔨 In progress |
 
-Phase 7 is complete under the recorded owner acceptance. Its evidence and verification exceptions remain documented in the [security record](docs/PHASE7_SECURITY_EVIDENCE.md).
+Phase 7 is complete under the recorded owner acceptance. Its evidence and verification exceptions remain documented in the security record (maintained locally).
 
 ### What comes next
 
@@ -97,9 +97,9 @@ Phase 7 is complete under the recorded owner acceptance. Its evidence and verifi
 - **Improve user controls and troubleshooting.** Finish the needed per-app settings and diagnostics, alongside usability and performance work.
 - **Prepare for release.** Resolve distribution signing, privacy, licensing and the remaining release checks.
 
-Alongside this work, the [future compatibility goals](docs/compatibility/FUTURE_GOALS.md) now include every owner v0.2 list plus additional researched requirements. This update prepares the lists; it does not inspect code or test whether features work.
+Alongside this work, the future compatibility goals (maintained locally) now include every owner v0.2 list plus additional researched requirements. This update prepares the lists; it does not inspect code or test whether features work.
 
-The [engineering roadmap](docs/ROADMAP.md) and [master plan](AETHER_MASTER_PLAN_v1.1.md) hold the full requirements. The full project remains unfinished.
+The engineering roadmap and master plan are maintained locally and hold the full requirements. The full project remains unfinished.
 
 ## Progress counts
 
@@ -127,13 +127,13 @@ Recorded labels: **13 Implemented** · **8 In progress** · **4 Not started** ·
 
 <!-- aether:compatibility-progress:end -->
 
-The bar shows **recorded catalogue review coverage**: entries with an existing assessment rather than an Unassessed label. Code recalculates its fill, percentage and totals from the CSV whenever the catalogue is synchronized. [How the counts update](docs/compatibility/README.md#list-only-generation).
+The bar shows **recorded catalogue review coverage**: entries with an existing assessment rather than an Unassessed label. Code recalculates its fill, percentage and totals from the CSV whenever the catalogue is synchronized. How the counts update (maintained locally).
 
-The new requirements cover areas such as accessibility, text input, credentials/autofill, background work, Binder communication, WebView, native graphics buffers and newer Android behavior rules. [Read the future goals and sources](docs/compatibility/FUTURE_GOALS.md).
+The new requirements cover areas such as accessibility, text input, credentials/autofill, background work, Binder communication, WebView, native graphics buffers and newer Android behavior rules. Read the future goals and sources (maintained locally).
 
 All new entries were added as **Unassessed**. Existing recorded statuses and evidence are retained without rechecking them. **No builds, tests or implementation checks were run for this list update.** A planning entry does not mean a feature is missing or working. Review coverage describes catalogue records. Overlapping requirements mean it cannot be used as a feature-completion percentage or an Android app success rate.
 
-Browse the [detailed inventory counts](docs/compatibility/PROGRESS.md), [main CSV](docs/compatibility/capabilities.csv) or [Excel checklist](docs/compatibility/capabilities.xlsx). The [earlier audit report](docs/compatibility/AUDIT_REPORT_2026-10-11.md) remains a historical record.
+Browse the detailed inventory counts (maintained locally), main CSV (maintained locally) or Excel checklist (maintained locally). The earlier audit report (maintained locally) remains a historical record.
 
 ## Which apps have been tried?
 
@@ -147,7 +147,7 @@ That is **two distinct working test apps**. Signed versions and modified copies 
 
 Installation of other APKs is enabled experimentally, with app isolation and explicit consent. Many will be refused or encounter missing features. The current execution path supports a limited standalone APK format with one app-code file and one main screen; many larger apps need more.
 
-Support for Google Play Services, protected streaming, banking apps, games with anti-cheat, and universal Android compatibility is not promised. The [app compatibility record](docs/COMPATIBILITY_MATRIX.md) and [known limitations](docs/KNOWN_LIMITATIONS.md) give the exact boundaries.
+Support for Google Play Services, protected streaming, banking apps, games with anti-cheat, and universal Android compatibility is not promised. The app compatibility record (maintained locally) and known limitations (maintained locally) give the exact boundaries.
 
 ## Can I try it?
 
@@ -155,7 +155,7 @@ Support for Google Play Services, protected streaming, banking apps, games with 
 
 The current target is **Windows 11 on a 64-bit Intel or AMD PC**. Windows on ARM, macOS and Linux are outside the current target.
 
-If you just want to follow the project, start with the roadmap and counts above. If you want to build and test it, the [Windows build guide](docs/BUILD_WINDOWS.md) lists the tools and commands, and the [Windows installation guide](docs/WINDOWS_NATIVE_INTEGRATION.md) explains installation and app management. Building currently requires developer tools.
+To follow the project, start with the roadmap and counts above. To build the published source, use the instructions below. Building currently requires developer tools.
 
 ### A few useful words
 
@@ -168,22 +168,64 @@ If you just want to follow the project, start with the roadmap and counts above.
 | **Sandbox / isolation** | Restrictions on an app's access to the PC and other apps' data. |
 | **Test app / fixture** | A small app made specifically to check whether something works. |
 
-## Explore further
+## Build from this repository
 
-| If you want to… | Read this |
-| :--- | :--- |
-| Follow recent work | [Progress and session reports](docs/PROGRESS.md) |
-| See the detailed plan | [Roadmap](docs/ROADMAP.md) |
-| Explore feature counts | [Compatibility catalogue](docs/compatibility/README.md) |
-| See which apps work | [App compatibility](docs/COMPATIBILITY_MATRIX.md) |
-| Understand current gaps | [Known limitations](docs/KNOWN_LIMITATIONS.md) |
-| Build or install Aether | [Build guide](docs/BUILD_WINDOWS.md) · [Windows integration](docs/WINDOWS_NATIVE_INTEGRATION.md) |
-| Understand the design | [Architecture](docs/ARCHITECTURE.md) · [Security model](docs/SECURITY_MODEL.md) |
+The GitHub repository contains project source, required third-party source and
+licence notices, build and publishing scripts, and this README with its banner.
+Development tests, fixtures, engineering documents, owner APKs and generated
+binaries stay in the local development workspace.
+
+On Windows 11 x64, install Visual Studio 2022 Build Tools with the Desktop
+development with C++ workload (including its CMake/Ninja tools), the Windows SDK,
+Git and Python 3.12. In PowerShell at the project root, run:
+
+```powershell
+./tools/build.ps1 -Preset windows-source-release
+```
+
+This builds the runtime and unsigned development installer without the local test
+suite. The installer is written to
+`out/distribution/windows-source-release/AetherSetup.exe`. No Android emulator or
+Android system image is required. The privacy text shown inside the application
+is a product resource at `src/install/privacy_guide.txt`; complete third-party
+notices are in `third_party/licenses/`.
+
+The full development workspace retains its existing Debug/Release test presets
+and CI checks. Their test sources are intentionally excluded from this repository.
+A successful source build does not establish app compatibility or release readiness.
+
+## Weekly source uploads
+
+The owner's development PC is configured to publish saved project files every
+**Friday at 6:00 pm Sydney time**. The Windows task is named
+**Aether Weekly GitHub Upload** and follows Sydney daylight saving. It needs the
+PC running, an internet connection, the owner signed in, and GitHub credentials
+stored by Git Credential Manager. Missed schedules run when available.
+
+The file selection is recorded in `.gitignore`; the publisher independently
+rejects excluded paths and possible credentials. It preserves Git history, stops
+if GitHub has new commits that need reconciliation, and never forces a push.
+Only changed project files create a new commit. Runtime diagnostic commands are
+part of the project source; standalone test suites and fixtures are excluded.
+
+```powershell
+# Preview the saved files that would be uploaded:
+python -B tools/publish-source.py
+# Publish now using the same rules:
+python -B tools/publish-source.py --publish
+# Register or update the owner's weekly Windows task:
+./tools/register-github-upload.ps1
+```
+
+Scheduled results are recorded locally in `out/github/weekly-upload.log`. Uploads
+read the existing project directly and do not create backup or staging copies.
+The schedule is development tooling; the Aether application does not upload itself
+or user APKs.
 
 ## Credits and licensing
 
 **Created by GPT6-ASTRA MAX.**
 
-Aether uses third-party libraries, including Dynarmic for ARM64 translation and ANGLE for graphics. Their authors, licences and source records are acknowledged in the [third-party documentation](third_party/README.md).
+Aether uses third-party libraries, including Dynarmic for ARM64 translation and ANGLE for graphics. Their authors and licences are acknowledged in [third-party notices](third_party/licenses/); pinned source and hash records are retained alongside the dependency source.
 
-**A distribution licence for Aether-owned code has not yet been chosen.** This repository does not grant an open-source or commercial licence for that code. See the [licensing decision](docs/LICENSING_DECISION.md).
+**A distribution licence for Aether-owned code has not yet been chosen.** This repository does not grant an open-source or commercial licence for that code. See the licensing decision (maintained locally).

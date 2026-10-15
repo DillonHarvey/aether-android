@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "upstreamRevision": "a46601580d5512d324104f985b5f0209dc980ddc",
+  "patches": [
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp",
+      "upstreamSha256": "978bca9c0d112b602bc99f5a5762d17350615dd6d5a9c4220054b98f679ccfd5",
+      "patchedSha256": "3ed4c173a179ae017740bff6659ae881d0c91b8a7fda3dcfca08d33790a69aca",
+      "reason": "Check Win32 commit/protection failures, ignore zero-size pre-commit protection, flush instruction cache on RX; protection failure terminates with diagnostic and 0xAEE00001 instead of returning through potentially non-executable dispatcher memory."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/interface/A64/config.h",
+      "upstreamSha256": "51271d2f7df0ea50bc7ef57405fb24c3e98805e999da9030ac45320f87a7eafc",
+      "patchedSha256": "f6b856c8e2bba2c70c1fd14482ad6788f87517135a91decaff736aa55c789324",
+      "reason": "Per-instance noexcept observers for actual block lookup and compilation evidence."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp",
+      "upstreamSha256": "290ce9e654325ee5661e49059dfcbf9dd67a517b9428f73d177cb21ab089969d",
+      "patchedSha256": "aedb0cb2234b73cb5e53e63132f95f15e3c32f20be67f619dde806f34e28f776",
+      "reason": "Invoke block observers on real cache hit/miss and after Emit seals generated code RX; measure compilation with steady_clock. Reject non-canonical raw program counters before descriptor masking can alias a valid cached code address."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp",
+      "upstreamSha256": "450e9bc6c6497c053e9f39223542b0d3cc247bec358783ce178615f4d65827b4",
+      "patchedSha256": "bcaa0d863259f757d4cbaf9218af3c1eed53b5669c611120708bdc98954232f2",
+      "reason": "Initialize Windows exception metadata before PreludeComplete makes its code allocation RX."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/common/spin_lock_x64.cpp",
+      "upstreamSha256": "d34ee04dcfafa98d68404c6f7dafc1f6d9444b937ec0d00009ae6f74008cd1d5",
+      "patchedSha256": "5a8b0266eef3bfa149ecf943d4c6c77b8bad121a3a85523c6661220386c00e66",
+      "reason": "Use Windows atomic intrinsics for host spinlock operations; eliminate global Xbyak RWX allocation before main. Retain inline JIT spinlock emitters and non-Windows original path."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/a64_translate.cpp",
+      "upstreamSha256": "8df5b462793222293df008a0410a7c073b9577b925fe7bd09f017cdb848ce36e",
+      "patchedSha256": "00027643e7976ac9de98c5d2abd7871e84ac04fd156562bc0be0612718887676",
+      "reason": "Bound straight-line translation blocks to 256 guest instructions and dispatch to the continuation, limiting IR growth and budget overshoot."
+    }
+  ]
+}

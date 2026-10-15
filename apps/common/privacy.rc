@@ -1,0 +1,12 @@
+#include <windows.h>
+#include "privacy_ids.h"
+
+IDD_PRIVACY DIALOGEX 0, 0, 460, 350
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "Aether - Privacy and permissions"
+FONT 9, "Segoe UI"
+BEGIN
+    LTEXT "&Privacy and permissions for this Aether build:", -1, 12, 10, 436, 14
+    EDITTEXT IDC_PRIVACY_TEXT, 12, 28, 436, 280, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "Close", IDCANCEL, 364, 320, 84, 18
+END

@@ -1,0 +1,4 @@
+LIBRARY AetherShellIcons
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
