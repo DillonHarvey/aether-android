@@ -42,7 +42,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue review** | **886 of 3,589 assessed (24.69%)** · **2,703 still unassessed** |
+| **Catalogue implementation** | **177 of 3,589 implemented (4.93%)** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -130,173 +130,83 @@ The engineering roadmap and master plan are maintained locally and hold the full
 
 ## Progress counts
 
-The checklist organizes **future Android and Windows requirements**. Its progress bars measure **how much of the catalogue has a saved assessment**. The [working capabilities above](#what-works-today), [development phases](#roadmap) and [app results below](#which-apps-have-been-tried) answer different questions.
-
-An **Implemented** label records assessed behaviour within its documented limits; **In progress** records partial work; **Not started** records assessed absence; **Unassessed** means the entry has not been reviewed. These saved labels are not new test results.
-
-The 16 October source reconciliation matched all 3,589 IDs to the supplied 43-area review and added exact opcode, JNI slot, guest graphics command, native symbol and framework-method assessments. **Review coverage includes unsupported operations.** No new full acceptance pass or working app was established; 2,703 entries still need individual assessment. Local records retain the source evidence and unresolved mappings.
+The tables count **implemented catalogue requirements**. Partial work and unsupported requirements do not increase the percentage. Implementation and complete test verification remain separate, and successful real-app workflows are reported separately below.
 
 <!-- aether:compatibility-progress:start -->
 
-**3,589 planning entries · 13 categories · 43 detailed areas**
+**177 / 3,589 entries implemented (4.93%)**
 
-**Catalogue review: 886 / 3,589 assessed (24.69%)** · 2,703 awaiting assessment.
+Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
-`█████████▊░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░` **24.69% reviewed**
+The denominator retains overlapping parents and refinements; this is the implemented share of this catalogue, not a percentage of Android.
 
-Recorded labels: **13 Implemented** · **382 In progress** · **491 Not started** · **2,703 Unassessed**.
+| Category | Entries | Implemented | % |
+| :--- | ---: | ---: | ---: |
+| Packages & signing | 140 | 40 | 28.57% |
+| ARM64 translation | 238 | 1 | 0.42% |
+| Native libraries & POSIX | 457 | 15 | 3.28% |
+| DEX & Java runtime | 601 | 24 | 3.99% |
+| Java/native bridge (JNI) | 285 | 18 | 6.32% |
+| Android framework | 231 | 0 | 0.00% |
+| Screens & graphics | 862 | 4 | 0.46% |
+| Files & networking | 198 | 7 | 3.54% |
+| Media & devices | 236 | 0 | 0.00% |
+| App engines | 128 | 0 | 0.00% |
+| Security & permissions | 88 | 26 | 29.55% |
+| Windows integration | 65 | 29 | 44.62% |
+| Quality & reproducibility | 60 | 13 | 21.67% |
+| **Total** | **3,589** | **177** | **4.93%** |
 
-```mermaid
-flowchart LR
-    accTitle: Compatibility catalogue review
-    accDescr: Saved assessment labels, not feature completion or app compatibility.
-    all["3,589 planning entries"]
-    all --> assessed["886 assessed · 24.69%"]
-    all --> pending["2,703 unassessed"]
-    assessed --> status0["13 implemented"]:::implemented
-    assessed --> status1["382 in progress"]:::progress
-    assessed --> status2["491 not started"]:::pending
-    classDef implemented fill:#dcfce7,stroke:#15803d,color:#14532d
-    classDef progress fill:#fef3c7,stroke:#b45309,color:#78350f
-    classDef pending fill:#f1f5f9,stroke:#64748b,color:#0f172a
-    classDef blocked fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
-    class all,assessed progress
-    class pending pending
-```
-
-### Review progress by category
-
-Every entry belongs to one display category. Broader requirements and their refinements remain separate planning records.
-
-| Category | Planning entries | Assessed | Review coverage |
-| :--- | ---: | ---: | :--- |
-| 📦 **Packages & signing** | 140 | 0 / 140 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🧠 **ARM64 translation** | 238 | 0 / 238 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🧩 **Native libraries & POSIX** | 457 | 12 / 457 | `▍░░░░░░░░░░░░░░░` **2.63%** |
-| ⚙️ **DEX & Java runtime** | 601 | 224 / 601 | `█████▉░░░░░░░░░░` **37.27%** |
-| 🔗 **Java/native bridge (JNI)** | 285 | 230 / 285 | `████████████▉░░░` **80.70%** |
-| 📱 **Android framework** | 231 | 12 / 231 | `▊░░░░░░░░░░░░░░░` **5.19%** |
-| 🎨 **Screens & graphics** | 862 | 408 / 862 | `███████▌░░░░░░░░` **47.33%** |
-| 🗄️ **Files & networking** | 198 | 0 / 198 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🎧 **Media & devices** | 236 | 0 / 236 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🎮 **App engines** | 128 | 0 / 128 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🔒 **Security & permissions** | 88 | 0 / 88 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🪟 **Windows integration** | 65 | 0 / 65 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🧪 **Quality & reproducibility** | 60 | 0 / 60 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| **All categories** | **3,589** | **886 / 3,589** | **24.69% assessed** |
-
-**0% means no saved catalogue assessment in that category.** Working subsets can already exist; see the separate implementation summary.
+Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
 <details>
-<summary>All 43 areas: review progress and recorded labels</summary>
+<summary>All 43 areas</summary>
 
-#### 📦 Packages & signing
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| APK, signing and distribution | 46 | 0 / 46 | 0.00% | 46 unassessed |
-| APK and manifest detailed formats | 94 | 0 / 94 | 0.00% | 94 unassessed |
-
-#### 🧠 ARM64 translation
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| ARM64 guest translation and ABI | 27 | 0 / 27 | 0.00% | 27 unassessed |
-| AArch64 instruction conformance | 211 | 0 / 211 | 0.00% | 211 unassessed |
-
-#### 🧩 Native libraries & POSIX
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Android native ELF loading and dynamic linker | 30 | 0 / 30 | 0.00% | 30 unassessed |
-| ELF and linker detailed conformance | 71 | 0 / 71 | 0.00% | 71 unassessed |
-| Bionic libc and POSIX compatibility | 42 | 0 / 42 | 0.00% | 42 unassessed |
-| Bionic and POSIX exported calls | 314 | 12 / 314 | 3.82% | 11 in progress · 1 not started · 302 unassessed |
-
-#### ⚙️ DEX & Java runtime
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| DEX parser, linking and runtime support | 45 | 0 / 45 | 0.00% | 45 unassessed |
-| DEX opcodes | 224 | 224 / 224 | 100.00% | 9 implemented · 184 in progress · 31 not started |
-| DEX runtime detailed contracts | 67 | 0 / 67 | 0.00% | 67 unassessed |
-| ART-compatible managed semantics | 27 | 0 / 27 | 0.00% | 27 unassessed |
-| ART semantic edge cases | 44 | 0 / 44 | 0.00% | 44 unassessed |
-| Java/Kotlin standard runtime libraries | 33 | 0 / 33 | 0.00% | 33 unassessed |
-| Java core library individual methods | 161 | 0 / 161 | 0.00% | 161 unassessed |
-
-#### 🔗 Java/native bridge (JNI)
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| JNI API | 234 | 230 / 234 | 98.29% | 4 implemented · 117 in progress · 109 not started · 4 unassessed |
-| JNI semantic edge cases | 51 | 0 / 51 | 0.00% | 51 unassessed |
-
-#### 📱 Android framework
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Android framework and app lifecycle | 71 | 0 / 71 | 0.00% | 71 unassessed |
-| Android framework individual methods | 160 | 12 / 160 | 7.50% | 11 in progress · 1 not started · 148 unassessed |
-
-#### 🎨 Screens & graphics
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Android Views and resources | 63 | 0 / 63 | 0.00% | 63 unassessed |
-| Android graphics, UI and resources detailed | 105 | 6 / 105 | 5.71% | 5 in progress · 1 not started · 99 unassessed |
-| EGL, GLES, Vulkan and shader runtime | 48 | 0 / 48 | 0.00% | 48 unassessed |
-| EGL core commands | 44 | 44 / 44 | 100.00% | 20 in progress · 24 not started |
-| OpenGL ES core commands | 358 | 358 / 358 | 100.00% | 34 in progress · 324 not started |
-| GLSL ES shader conformance | 131 | 0 / 131 | 0.00% | 131 unassessed |
-| Graphics formats and textures | 64 | 0 / 64 | 0.00% | 64 unassessed |
-| Vulkan early research surface | 49 | 0 / 49 | 0.00% | 49 unassessed |
-
-#### 🗄️ Files & networking
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Android storage, persistence and data | 40 | 0 / 40 | 0.00% | 40 unassessed |
-| SQLite, files and persistence detailed | 71 | 0 / 71 | 0.00% | 71 unassessed |
-| Networking and TLS | 27 | 0 / 27 | 0.00% | 27 unassessed |
-| Networking and crypto detailed | 60 | 0 / 60 | 0.00% | 60 unassessed |
-
-#### 🎧 Media & devices
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Audio, video, codecs and imaging | 28 | 0 / 28 | 0.00% | 28 unassessed |
-| Audio/video/media detailed | 98 | 0 / 98 | 0.00% | 98 unassessed |
-| Host devices and Android hardware APIs | 30 | 0 / 30 | 0.00% | 30 unassessed |
-| Device and system-services detailed | 80 | 0 / 80 | 0.00% | 80 unassessed |
-
-#### 🎮 App engines
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| App engines and third-party ecosystem | 31 | 0 / 31 | 0.00% | 31 unassessed |
-| Embedded application engines detailed | 97 | 0 / 97 | 0.00% | 97 unassessed |
-
-#### 🔒 Security & permissions
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Windows isolation and Android permission security | 43 | 0 / 43 | 0.00% | 43 unassessed |
-| Permissions and defensive compatibility | 45 | 0 / 45 | 0.00% | 45 unassessed |
-
-#### 🪟 Windows integration
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Windows native install / shell / lifecycle | 35 | 0 / 35 | 0.00% | 35 unassessed |
-| Windows product integration detailed | 30 | 0 / 30 | 0.00% | 30 unassessed |
-
-#### 🧪 Quality & reproducibility
-
-| Area | Entries | Assessed | Review coverage | Recorded labels |
-| :--- | ---: | ---: | ---: | :--- |
-| Reproducibility and test coverage | 30 | 0 / 30 | 0.00% | 30 unassessed |
-| QA and progress evidence systems | 30 | 0 / 30 | 0.00% | 30 unassessed |
+| Area | Entries | Implemented | % |
+| :--- | ---: | ---: | ---: |
+| APK, signing and distribution | 46 | 22 | 47.83% |
+| APK and manifest detailed formats | 94 | 18 | 19.15% |
+| ARM64 guest translation and ABI | 27 | 1 | 3.70% |
+| AArch64 instruction conformance | 211 | 0 | 0.00% |
+| Android native ELF loading and dynamic linker | 30 | 0 | 0.00% |
+| ELF and linker detailed conformance | 71 | 14 | 19.72% |
+| Bionic libc and POSIX compatibility | 42 | 1 | 2.38% |
+| Bionic and POSIX exported calls | 314 | 0 | 0.00% |
+| DEX parser, linking and runtime support | 45 | 1 | 2.22% |
+| DEX opcodes | 224 | 9 | 4.02% |
+| DEX runtime detailed contracts | 67 | 11 | 16.42% |
+| ART-compatible managed semantics | 27 | 0 | 0.00% |
+| ART semantic edge cases | 44 | 0 | 0.00% |
+| Java/Kotlin standard runtime libraries | 33 | 0 | 0.00% |
+| Java core library individual methods | 161 | 3 | 1.86% |
+| JNI API | 234 | 4 | 1.71% |
+| JNI semantic edge cases | 51 | 14 | 27.45% |
+| Android framework and app lifecycle | 71 | 0 | 0.00% |
+| Android framework individual methods | 160 | 0 | 0.00% |
+| Android Views and resources | 63 | 0 | 0.00% |
+| Android graphics, UI and resources detailed | 105 | 0 | 0.00% |
+| EGL, GLES, Vulkan and shader runtime | 48 | 2 | 4.17% |
+| EGL core commands | 44 | 0 | 0.00% |
+| OpenGL ES core commands | 358 | 0 | 0.00% |
+| GLSL ES shader conformance | 131 | 0 | 0.00% |
+| Graphics formats and textures | 64 | 2 | 3.12% |
+| Vulkan early research surface | 49 | 0 | 0.00% |
+| Android storage, persistence and data | 40 | 4 | 10.00% |
+| SQLite, files and persistence detailed | 71 | 2 | 2.82% |
+| Networking and TLS | 27 | 1 | 3.70% |
+| Networking and crypto detailed | 60 | 0 | 0.00% |
+| Audio, video, codecs and imaging | 28 | 0 | 0.00% |
+| Audio/video/media detailed | 98 | 0 | 0.00% |
+| Host devices and Android hardware APIs | 30 | 0 | 0.00% |
+| Device and system-services detailed | 80 | 0 | 0.00% |
+| App engines and third-party ecosystem | 31 | 0 | 0.00% |
+| Embedded application engines detailed | 97 | 0 | 0.00% |
+| Windows isolation and Android permission security | 43 | 14 | 32.56% |
+| Permissions and defensive compatibility | 45 | 12 | 26.67% |
+| Windows native install / shell / lifecycle | 35 | 22 | 62.86% |
+| Windows product integration detailed | 30 | 7 | 23.33% |
+| Reproducibility and test coverage | 30 | 7 | 23.33% |
+| QA and progress evidence systems | 30 | 6 | 20.00% |
 
 </details>
 
@@ -311,9 +221,9 @@ Every entry belongs to one display category. Broader requirements and their refi
 
 <!-- aether:compatibility-progress:end -->
 
-**How this updates:** the local catalogue tool recalculates the graphic, every category/area count and each bar from the authoritative CSV when it is synchronized. GitHub shows the latest committed snapshot. The grouping keeps the original entry IDs, statuses and evidence intact; the CSV, Excel view, sources and historical audit remain local.
+**How this updates:** the catalogue tool recalculates every category and area from the authoritative CSV when synchronized. GitHub shows the latest committed snapshot; the CSV, Excel view and detailed source evidence remain local.
 
-**How to read the percentages:** assessed entries ÷ all entries in that category. Broad requirements overlap their detailed refinements, so these are **review percentages**, not feature-completion percentages or Android app success rates. The expansion entries remain Unassessed until separately reviewed.
+**How to read the percentages:** Implemented entries ? all entries in that category. Partial work contributes zero. All entries now have an implementation disposition, while test verification and real-app outcomes remain separate. Overlapping broad requirements and refinements mean this is a catalogue ratio, not the percentage of Android supported.
 
 ## Which apps have been tried?
 
