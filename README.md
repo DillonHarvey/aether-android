@@ -42,7 +42,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue review** | **25 of 3,589 assessed (0.70%)** · **3,564 still unassessed** |
+| **Catalogue review** | **886 of 3,589 assessed (24.69%)** · **2,703 still unassessed** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -134,26 +134,28 @@ The checklist organizes **future Android and Windows requirements**. Its progres
 
 An **Implemented** label records assessed behaviour within its documented limits; **In progress** records partial work; **Not started** records assessed absence; **Unassessed** means the entry has not been reviewed. These saved labels are not new test results.
 
+The 16 October source reconciliation matched all 3,589 IDs to the supplied 43-area review and added exact opcode, JNI slot, guest graphics command, native symbol and framework-method assessments. **Review coverage includes unsupported operations.** No new full acceptance pass or working app was established; 2,703 entries still need individual assessment. Local records retain the source evidence and unresolved mappings.
+
 <!-- aether:compatibility-progress:start -->
 
 **3,589 planning entries · 13 categories · 43 detailed areas**
 
-**Catalogue review: 25 / 3,589 assessed (0.70%)** · 3,564 awaiting assessment.
+**Catalogue review: 886 / 3,589 assessed (24.69%)** · 2,703 awaiting assessment.
 
-`▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░` **0.70% reviewed**
+`█████████▊░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░` **24.69% reviewed**
 
-Recorded labels: **13 Implemented** · **8 In progress** · **4 Not started** · **3,564 Unassessed**.
+Recorded labels: **13 Implemented** · **382 In progress** · **491 Not started** · **2,703 Unassessed**.
 
 ```mermaid
 flowchart LR
     accTitle: Compatibility catalogue review
     accDescr: Saved assessment labels, not feature completion or app compatibility.
     all["3,589 planning entries"]
-    all --> assessed["25 assessed · 0.70%"]
-    all --> pending["3,564 unassessed"]
+    all --> assessed["886 assessed · 24.69%"]
+    all --> pending["2,703 unassessed"]
     assessed --> status0["13 implemented"]:::implemented
-    assessed --> status1["8 in progress"]:::progress
-    assessed --> status2["4 not started"]:::pending
+    assessed --> status1["382 in progress"]:::progress
+    assessed --> status2["491 not started"]:::pending
     classDef implemented fill:#dcfce7,stroke:#15803d,color:#14532d
     classDef progress fill:#fef3c7,stroke:#b45309,color:#78350f
     classDef pending fill:#f1f5f9,stroke:#64748b,color:#0f172a
@@ -170,18 +172,18 @@ Every entry belongs to one display category. Broader requirements and their refi
 | :--- | ---: | ---: | :--- |
 | 📦 **Packages & signing** | 140 | 0 / 140 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🧠 **ARM64 translation** | 238 | 0 / 238 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🧩 **Native libraries & POSIX** | 457 | 0 / 457 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| ⚙️ **DEX & Java runtime** | 601 | 15 / 601 | `▍░░░░░░░░░░░░░░░` **2.50%** |
-| 🔗 **Java/native bridge (JNI)** | 285 | 10 / 285 | `▌░░░░░░░░░░░░░░░` **3.51%** |
-| 📱 **Android framework** | 231 | 0 / 231 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| 🎨 **Screens & graphics** | 862 | 0 / 862 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🧩 **Native libraries & POSIX** | 457 | 12 / 457 | `▍░░░░░░░░░░░░░░░` **2.63%** |
+| ⚙️ **DEX & Java runtime** | 601 | 224 / 601 | `█████▉░░░░░░░░░░` **37.27%** |
+| 🔗 **Java/native bridge (JNI)** | 285 | 230 / 285 | `████████████▉░░░` **80.70%** |
+| 📱 **Android framework** | 231 | 12 / 231 | `▊░░░░░░░░░░░░░░░` **5.19%** |
+| 🎨 **Screens & graphics** | 862 | 408 / 862 | `███████▌░░░░░░░░` **47.33%** |
 | 🗄️ **Files & networking** | 198 | 0 / 198 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🎧 **Media & devices** | 236 | 0 / 236 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🎮 **App engines** | 128 | 0 / 128 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🔒 **Security & permissions** | 88 | 0 / 88 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🪟 **Windows integration** | 65 | 0 / 65 | `░░░░░░░░░░░░░░░░` **0.00%** |
 | 🧪 **Quality & reproducibility** | 60 | 0 / 60 | `░░░░░░░░░░░░░░░░` **0.00%** |
-| **All categories** | **3,589** | **25 / 3,589** | **0.70% assessed** |
+| **All categories** | **3,589** | **886 / 3,589** | **24.69% assessed** |
 
 **0% means no saved catalogue assessment in that category.** Working subsets can already exist; see the separate implementation summary.
 
@@ -209,14 +211,14 @@ Every entry belongs to one display category. Broader requirements and their refi
 | Android native ELF loading and dynamic linker | 30 | 0 / 30 | 0.00% | 30 unassessed |
 | ELF and linker detailed conformance | 71 | 0 / 71 | 0.00% | 71 unassessed |
 | Bionic libc and POSIX compatibility | 42 | 0 / 42 | 0.00% | 42 unassessed |
-| Bionic and POSIX exported calls | 314 | 0 / 314 | 0.00% | 314 unassessed |
+| Bionic and POSIX exported calls | 314 | 12 / 314 | 3.82% | 11 in progress · 1 not started · 302 unassessed |
 
 #### ⚙️ DEX & Java runtime
 
 | Area | Entries | Assessed | Review coverage | Recorded labels |
 | :--- | ---: | ---: | ---: | :--- |
 | DEX parser, linking and runtime support | 45 | 0 / 45 | 0.00% | 45 unassessed |
-| DEX opcodes | 224 | 15 / 224 | 6.70% | 9 implemented · 3 in progress · 3 not started · 209 unassessed |
+| DEX opcodes | 224 | 224 / 224 | 100.00% | 9 implemented · 184 in progress · 31 not started |
 | DEX runtime detailed contracts | 67 | 0 / 67 | 0.00% | 67 unassessed |
 | ART-compatible managed semantics | 27 | 0 / 27 | 0.00% | 27 unassessed |
 | ART semantic edge cases | 44 | 0 / 44 | 0.00% | 44 unassessed |
@@ -227,7 +229,7 @@ Every entry belongs to one display category. Broader requirements and their refi
 
 | Area | Entries | Assessed | Review coverage | Recorded labels |
 | :--- | ---: | ---: | ---: | :--- |
-| JNI API | 234 | 10 / 234 | 4.27% | 4 implemented · 5 in progress · 1 not started · 224 unassessed |
+| JNI API | 234 | 230 / 234 | 98.29% | 4 implemented · 117 in progress · 109 not started · 4 unassessed |
 | JNI semantic edge cases | 51 | 0 / 51 | 0.00% | 51 unassessed |
 
 #### 📱 Android framework
@@ -235,17 +237,17 @@ Every entry belongs to one display category. Broader requirements and their refi
 | Area | Entries | Assessed | Review coverage | Recorded labels |
 | :--- | ---: | ---: | ---: | :--- |
 | Android framework and app lifecycle | 71 | 0 / 71 | 0.00% | 71 unassessed |
-| Android framework individual methods | 160 | 0 / 160 | 0.00% | 160 unassessed |
+| Android framework individual methods | 160 | 12 / 160 | 7.50% | 11 in progress · 1 not started · 148 unassessed |
 
 #### 🎨 Screens & graphics
 
 | Area | Entries | Assessed | Review coverage | Recorded labels |
 | :--- | ---: | ---: | ---: | :--- |
 | Android Views and resources | 63 | 0 / 63 | 0.00% | 63 unassessed |
-| Android graphics, UI and resources detailed | 105 | 0 / 105 | 0.00% | 105 unassessed |
+| Android graphics, UI and resources detailed | 105 | 6 / 105 | 5.71% | 5 in progress · 1 not started · 99 unassessed |
 | EGL, GLES, Vulkan and shader runtime | 48 | 0 / 48 | 0.00% | 48 unassessed |
-| EGL core commands | 44 | 0 / 44 | 0.00% | 44 unassessed |
-| OpenGL ES core commands | 358 | 0 / 358 | 0.00% | 358 unassessed |
+| EGL core commands | 44 | 44 / 44 | 100.00% | 20 in progress · 24 not started |
+| OpenGL ES core commands | 358 | 358 / 358 | 100.00% | 34 in progress · 324 not started |
 | GLSL ES shader conformance | 131 | 0 / 131 | 0.00% | 131 unassessed |
 | Graphics formats and textures | 64 | 0 / 64 | 0.00% | 64 unassessed |
 | Vulkan early research surface | 49 | 0 / 49 | 0.00% | 49 unassessed |
