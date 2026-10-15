@@ -10,7 +10,7 @@ Aether is a project working towards a simple idea: install an Android app on you
 
 This page explains the project in everyday language. No programming knowledge needed.
 
-**Project snapshot · 11 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
+**Project snapshot · 16 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
 [The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Roadmap](#roadmap) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
@@ -31,7 +31,7 @@ Windows does the underlying work, without needing to start an Android operating 
 
 You can choose Aether to open APK files when you double-click them. Opening an APK brings up installation review; it does not silently run the app.
 
-**This is the intended finished experience.** Much of the underlying installation and launch system exists, while checks of the actual Windows menus, taskbar and Settings screens are still unfinished. The plan uses Windows' familiar controls, with small Aether dialogs when needed.
+**This is the intended finished experience.** The installation and launch system exists, and package icons have been checked in six actual Explorer views. Checks of Start, Search, taskbar pins and Windows Settings remain unfinished. The plan uses Windows' familiar controls, with small Aether dialogs when needed.
 
 ## Where we are
 
@@ -39,36 +39,63 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | :--- | :--- |
 | **Development phases** | **8 complete · 1 in progress**, numbered 0–8 |
 | **Current focus** | **Phase 8:** Windows installation, launch, updates and wider compatibility |
-| **Distinct working test apps** | **2**, towards the Phase 8 minimum of **3** |
-| **Compatibility checklist** | **3,589 planning entries** across **43 areas** |
+| **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
+| **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
+| **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
 | **Catalogue review** | **25 of 3,589 assessed (0.70%)** · **3,564 still unassessed** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
 
-The project progress record (maintained locally) and app compatibility record (maintained locally) contain the evidence behind this snapshot.
+The local progress and app compatibility records contain the evidence behind this snapshot. The three-app milestone is one part of Phase 8; it does not complete the phase.
 
 ## What works today
 
-| Area | What Aether can currently do |
-| :--- | :--- |
-| **Read app files** | Inspect supported APKs and show details such as the app name, version and requested permissions. Report unsupported formats. |
-| **Run our test apps** | Open supported app screens in resizable Windows windows and handle mouse and keyboard input. |
-| **Install and remove apps** | Keep installed packages and app data separately, create Start shortcuts and Windows uninstall entries, and ask for installation and permission choices. |
-| **Limit app access** | Run installed app code with Windows restrictions, check that installed files have not changed before launch, and control access to supported services. |
-| **Check and update apps** | Verify supported app signatures and update eligible apps while keeping their identity, data and permissions. Handle tested interrupted updates. |
-| **Reopen the right app** | Keep an app-specific launch command working after a supported app update. Actual pinned-taskbar behaviour still needs checking. |
-| **Update Aether itself** | Update the shared Aether software at the same location while preserving installed apps and their Windows entries, when the versions are compatible. |
-| **Graphics and sound foundations** | Separate test programs demonstrate graphics through Windows' graphics hardware and audio through Windows' sound system. General Android graphics and media support is unfinished. |
+These are **demonstrated capabilities within a limited scope**, reconciled with the local engineering records on 16 October 2026. They describe implementation progress separately from the checklist's review percentages below.
 
-These features have specific limits. A successful installation or signature check does not establish that an app will run correctly. The graphics and audio demonstrations are separate from the test apps' ordinary screens.
+### 📦 App files, installation and updates
 
-### Recent additions
+| Capability | Recorded working behaviour | Remaining scope |
+| :--- | :--- | :--- |
+| **Package inspection** | Reads supported APKs and XAPK sets; reports app identity, launch screen, permissions, code files, native libraries, resources and signing. All nine supplied files have full inspection checkpoints. | Passing inspection does not establish a successful app launch. |
+| **Split packages** | Verifies supported XAPK member sets and provides bounded installation, resource/asset composition and app-code delivery through the installed path. | General device/configuration selection, APKS installation and expansion-file support remain unfinished. |
+| **Signature checks** | Verifies supported APK v2, v3 and v3.1 companion signatures; keeps and rechecks signing identities. | Unsupported signing is reported explicitly. Verification does not authenticate the publisher or prove that an app is safe. |
+| **App installation and updates** | Reviews the package checksum and permission choices; keeps app data separate; updates eligible apps while preserving identity, data and grants; repairs tested interrupted operations. | Updates that change signing keys and broader failure recovery remain unfinished. |
+| **Shared Aether installation** | Provides a native development installer/uninstaller and compatible upgrades at the existing location, with checks for apps that still depend on Aether. | Fresh-PC acceptance, incompatible migrations and release signing remain open. |
 
-- **App updates with identity checks:** supported updates must retain the installed app's verified signing identity. Data and permission choices are preserved. Details (maintained locally)
-- **More reliable app relaunch:** Windows launch information points back to the right installed app, including after an update. Details (maintained locally)
-- **Compatible Aether upgrades:** the shared software can be updated at its existing location, with an explicit recovery process for supported interrupted upgrades. Details (maintained locally)
-- **Expanded compatibility planning:** all 2,435 v0.2 additions and 134 researched requirements were integrated into the main catalogue, with source links and future goals. Explore the checklist (maintained locally)
+### ⚙️ Android code, screens and saved data
+
+| Capability | Recorded working behaviour | Remaining scope |
+| :--- | :--- | :--- |
+| **Three distinct apps** | HelloAether, PlainAether and Pocket Tally complete their defined scenarios through the installed, isolated Windows runtime. | These are original test apps; no supplied third-party app has a verified functional workflow. |
+| **Managed and ARM64 code** | Executes supported Android bytecode, translates supported ARM64 native code and passes calls both ways through JNI, the bridge between them. | The managed runtime, Java libraries, native loader and Android APIs each support a subset. |
+| **Multiple code files** | Links supported multi-DEX packages and loads needed code files on demand. Focused fixtures exercise cross-file calls and default interface methods. | File, memory and instruction limits apply; admitting a package does not validate every code path. |
+| **More language and resource behaviour** | Supports bounded switch instructions, array cloning, generated class names, compiled resource names, structured resource values and neutral density/API selection. Errors can identify the failing DEX table, record and byte offset. | Full Android themes, locale/device configuration and many language/API features remain unfinished. |
+| **Interactive windows and persistence** | Shows basic app screens in resizable Windows windows with mouse/keyboard input and app lifecycle events. Pocket Tally saves a count through its own ARM64 library and reloads it after reopening. | Saving needs the app's private-file permission; the counter's save is not crash-atomic. |
+
+### 🪟 Windows integration and package artwork
+
+| Capability | Recorded working behaviour | Remaining scope |
+| :--- | :--- | :--- |
+| **Explorer and Open With** | Offers an optional installation action, preserves the user's file-handler choice and opens installation review before execution. | Broader default-handler and clean-machine checks remain open. |
+| **Individual app identities** | Creates Start shortcuts and Installed apps registrations; gives each app its own window identity and stable relaunch command. Supports per-app removal and registration repair. | Actual Start/Search/Settings screens, taskbar grouping and pinned relaunch still need acceptance checks. |
+| **Real package icons** | Shows all nine supplied files' distinct icons in Explorer's Details, List, Small, Medium, Large and Extra large views. Uses bounded PNG/WebP/drawable handling and an isolated metadata worker. | Multiple display scales and fresh-PC acceptance remain open. An icon is not a working-app result. |
+| **Icons across app updates** | Keeps registered icon paths stable and updates supported installed artwork with the app version. | Cached icons on actual taskbar pins remain unverified. |
+
+### 🔒 Isolation, permissions and troubleshooting
+
+| Capability | Recorded working behaviour | Remaining scope |
+| :--- | :--- | :--- |
+| **Isolated execution** | Uses restricted Windows workers, app-specific storage, package-integrity checks and permission-checked host services. Failed isolation refuses execution. | This is the recorded, scoped security model; broader Android services still need implementation. |
+| **Per-app settings** | Native dialogs and CLI controls expose supported clock/private-file permissions. Automatic one-second reads recover after failures and preserve unsaved choices, focus and selection. | Network, camera, microphone and other unsupported grants remain unavailable. |
+| **Diagnostics and reports** | Provides read-only app checks and explicit JSON export, plus optional build details and bounded audit summaries with a preview before saving. | Reports do not certify compatibility or diagnose every crash; nothing is uploaded automatically. |
+| **Offline privacy information** | Includes the privacy and permissions guide in setup, app controls and the CLI. Builds verify the packaged dependency notices and payload identities. | Public licensing, publisher authentication and release review remain open. |
+
+### 🎨 Graphics and sound foundations
+
+Separate native test programs demonstrate **EGL/OpenGL ES graphics through ANGLE and Direct3D 11**, including window input and resize, and **AAudio output through Windows WASAPI**, with permission and cleanup checks. Audio tests use a muted session. The ordinary test-app screens use a separate Windows drawing path; general Android graphics, Java media, video and game-engine compatibility remain unfinished.
+
+The public implementation is in [package handling](src/apk/), [managed execution](src/dex/), [native translation](src/a64/), [installation](src/install/), [Windows integration](src/shell/) and [isolation](src/security/). Detailed test evidence and engineering decisions are retained locally. This README update reuses those records; it does not claim new runtime test passes.
 
 ## Roadmap
 
@@ -90,33 +117,188 @@ Phase 7 is complete under the recorded owner acceptance. Its evidence and verifi
 
 ### What comes next
 
-- **Finish the Windows experience.** Check real File Explorer, Open With, Start, Search, Settings and taskbar pinning, including app icons after updates.
+- **Finish the Windows experience.** Complete Open With, Start, Search, Settings and taskbar-pin acceptance, including icons after updates. Extend the completed six-view Explorer icon checks to other display scales.
 - **Validate installation on a fresh PC.** Complete installer and recovery checks beyond the current development machine.
-- **Run more distinct apps.** Reach at least three compatible apps and expand the Android features they need. Repackaging an existing test app does not count as another app.
+- **Run more real apps.** Build on the three completed original-app scenarios and resolve the supplied apps' actual runtime blockers. Repackaging an existing test app does not count as another app.
 - **Broaden updates and compatibility.** Add more supported package and signature formats, and handle upgrades that require changes to stored data or runtime formats.
-- **Improve user controls and troubleshooting.** Finish the needed per-app settings and diagnostics, alongside usability and performance work.
+- **Validate the existing controls.** Complete broader keyboard/display checks for per-app settings, diagnostics and report export, alongside usability and performance work.
 - **Prepare for release.** Resolve distribution signing, privacy, licensing and the remaining release checks.
 
-Alongside this work, the future compatibility goals (maintained locally) now include every owner v0.2 list plus additional researched requirements. This update prepares the lists; it does not inspect code or test whether features work.
+The compatibility catalogue below organizes future requirements alongside that implementation work. Its saved assessments are maintained independently of phase milestones and app results.
 
 The engineering roadmap and master plan are maintained locally and hold the full requirements. The full project remains unfinished.
 
 ## Progress counts
 
-The compatibility checklist is a list of **future Android and Windows requirements**, including broad requirements and their more detailed refinements.
+The checklist organizes **future Android and Windows requirements**. Its progress bars measure **how much of the catalogue has a saved assessment**. The [working capabilities above](#what-works-today), [development phases](#roadmap) and [app results below](#which-apps-have-been-tried) answer different questions.
+
+An **Implemented** label records assessed behaviour within its documented limits; **In progress** records partial work; **Not started** records assessed absence; **Unassessed** means the entry has not been reviewed. These saved labels are not new test results.
 
 <!-- aether:compatibility-progress:start -->
 
-**3,589 planning entries** across **43 areas**.
+**3,589 planning entries · 13 categories · 43 detailed areas**
 
-```text
-CATALOGUE REVIEW
-▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  0.70%
+**Catalogue review: 25 / 3,589 assessed (0.70%)** · 3,564 awaiting assessment.
 
-25 / 3,589 entries assessed  |  3,564 unassessed
-```
+`▎░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░` **0.70% reviewed**
 
 Recorded labels: **13 Implemented** · **8 In progress** · **4 Not started** · **3,564 Unassessed**.
+
+```mermaid
+flowchart LR
+    accTitle: Compatibility catalogue review
+    accDescr: Saved assessment labels, not feature completion or app compatibility.
+    all["3,589 planning entries"]
+    all --> assessed["25 assessed · 0.70%"]
+    all --> pending["3,564 unassessed"]
+    assessed --> status0["13 implemented"]:::implemented
+    assessed --> status1["8 in progress"]:::progress
+    assessed --> status2["4 not started"]:::pending
+    classDef implemented fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef progress fill:#fef3c7,stroke:#b45309,color:#78350f
+    classDef pending fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    classDef blocked fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    class all,assessed progress
+    class pending pending
+```
+
+### Review progress by category
+
+Every entry belongs to one display category. Broader requirements and their refinements remain separate planning records.
+
+| Category | Planning entries | Assessed | Review coverage |
+| :--- | ---: | ---: | :--- |
+| 📦 **Packages & signing** | 140 | 0 / 140 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🧠 **ARM64 translation** | 238 | 0 / 238 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🧩 **Native libraries & POSIX** | 457 | 0 / 457 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| ⚙️ **DEX & Java runtime** | 601 | 15 / 601 | `▍░░░░░░░░░░░░░░░` **2.50%** |
+| 🔗 **Java/native bridge (JNI)** | 285 | 10 / 285 | `▌░░░░░░░░░░░░░░░` **3.51%** |
+| 📱 **Android framework** | 231 | 0 / 231 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🎨 **Screens & graphics** | 862 | 0 / 862 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🗄️ **Files & networking** | 198 | 0 / 198 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🎧 **Media & devices** | 236 | 0 / 236 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🎮 **App engines** | 128 | 0 / 128 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🔒 **Security & permissions** | 88 | 0 / 88 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🪟 **Windows integration** | 65 | 0 / 65 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| 🧪 **Quality & reproducibility** | 60 | 0 / 60 | `░░░░░░░░░░░░░░░░` **0.00%** |
+| **All categories** | **3,589** | **25 / 3,589** | **0.70% assessed** |
+
+**0% means no saved catalogue assessment in that category.** Working subsets can already exist; see the separate implementation summary.
+
+<details>
+<summary>All 43 areas: review progress and recorded labels</summary>
+
+#### 📦 Packages & signing
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| APK, signing and distribution | 46 | 0 / 46 | 0.00% | 46 unassessed |
+| APK and manifest detailed formats | 94 | 0 / 94 | 0.00% | 94 unassessed |
+
+#### 🧠 ARM64 translation
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| ARM64 guest translation and ABI | 27 | 0 / 27 | 0.00% | 27 unassessed |
+| AArch64 instruction conformance | 211 | 0 / 211 | 0.00% | 211 unassessed |
+
+#### 🧩 Native libraries & POSIX
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Android native ELF loading and dynamic linker | 30 | 0 / 30 | 0.00% | 30 unassessed |
+| ELF and linker detailed conformance | 71 | 0 / 71 | 0.00% | 71 unassessed |
+| Bionic libc and POSIX compatibility | 42 | 0 / 42 | 0.00% | 42 unassessed |
+| Bionic and POSIX exported calls | 314 | 0 / 314 | 0.00% | 314 unassessed |
+
+#### ⚙️ DEX & Java runtime
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| DEX parser, linking and runtime support | 45 | 0 / 45 | 0.00% | 45 unassessed |
+| DEX opcodes | 224 | 15 / 224 | 6.70% | 9 implemented · 3 in progress · 3 not started · 209 unassessed |
+| DEX runtime detailed contracts | 67 | 0 / 67 | 0.00% | 67 unassessed |
+| ART-compatible managed semantics | 27 | 0 / 27 | 0.00% | 27 unassessed |
+| ART semantic edge cases | 44 | 0 / 44 | 0.00% | 44 unassessed |
+| Java/Kotlin standard runtime libraries | 33 | 0 / 33 | 0.00% | 33 unassessed |
+| Java core library individual methods | 161 | 0 / 161 | 0.00% | 161 unassessed |
+
+#### 🔗 Java/native bridge (JNI)
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| JNI API | 234 | 10 / 234 | 4.27% | 4 implemented · 5 in progress · 1 not started · 224 unassessed |
+| JNI semantic edge cases | 51 | 0 / 51 | 0.00% | 51 unassessed |
+
+#### 📱 Android framework
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Android framework and app lifecycle | 71 | 0 / 71 | 0.00% | 71 unassessed |
+| Android framework individual methods | 160 | 0 / 160 | 0.00% | 160 unassessed |
+
+#### 🎨 Screens & graphics
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Android Views and resources | 63 | 0 / 63 | 0.00% | 63 unassessed |
+| Android graphics, UI and resources detailed | 105 | 0 / 105 | 0.00% | 105 unassessed |
+| EGL, GLES, Vulkan and shader runtime | 48 | 0 / 48 | 0.00% | 48 unassessed |
+| EGL core commands | 44 | 0 / 44 | 0.00% | 44 unassessed |
+| OpenGL ES core commands | 358 | 0 / 358 | 0.00% | 358 unassessed |
+| GLSL ES shader conformance | 131 | 0 / 131 | 0.00% | 131 unassessed |
+| Graphics formats and textures | 64 | 0 / 64 | 0.00% | 64 unassessed |
+| Vulkan early research surface | 49 | 0 / 49 | 0.00% | 49 unassessed |
+
+#### 🗄️ Files & networking
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Android storage, persistence and data | 40 | 0 / 40 | 0.00% | 40 unassessed |
+| SQLite, files and persistence detailed | 71 | 0 / 71 | 0.00% | 71 unassessed |
+| Networking and TLS | 27 | 0 / 27 | 0.00% | 27 unassessed |
+| Networking and crypto detailed | 60 | 0 / 60 | 0.00% | 60 unassessed |
+
+#### 🎧 Media & devices
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Audio, video, codecs and imaging | 28 | 0 / 28 | 0.00% | 28 unassessed |
+| Audio/video/media detailed | 98 | 0 / 98 | 0.00% | 98 unassessed |
+| Host devices and Android hardware APIs | 30 | 0 / 30 | 0.00% | 30 unassessed |
+| Device and system-services detailed | 80 | 0 / 80 | 0.00% | 80 unassessed |
+
+#### 🎮 App engines
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| App engines and third-party ecosystem | 31 | 0 / 31 | 0.00% | 31 unassessed |
+| Embedded application engines detailed | 97 | 0 / 97 | 0.00% | 97 unassessed |
+
+#### 🔒 Security & permissions
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Windows isolation and Android permission security | 43 | 0 / 43 | 0.00% | 43 unassessed |
+| Permissions and defensive compatibility | 45 | 0 / 45 | 0.00% | 45 unassessed |
+
+#### 🪟 Windows integration
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Windows native install / shell / lifecycle | 35 | 0 / 35 | 0.00% | 35 unassessed |
+| Windows product integration detailed | 30 | 0 / 30 | 0.00% | 30 unassessed |
+
+#### 🧪 Quality & reproducibility
+
+| Area | Entries | Assessed | Review coverage | Recorded labels |
+| :--- | ---: | ---: | ---: | :--- |
+| Reproducibility and test coverage | 30 | 0 / 30 | 0.00% | 30 unassessed |
+| QA and progress evidence systems | 30 | 0 / 30 | 0.00% | 30 unassessed |
+
+</details>
+
+### Where the entries came from
 
 | Inventory source | Entries |
 | :--- | ---: |
@@ -127,13 +309,9 @@ Recorded labels: **13 Implemented** · **8 In progress** · **4 Not started** ·
 
 <!-- aether:compatibility-progress:end -->
 
-The bar shows **recorded catalogue review coverage**: entries with an existing assessment rather than an Unassessed label. Code recalculates its fill, percentage and totals from the CSV whenever the catalogue is synchronized. How the counts update (maintained locally).
+**How this updates:** the local catalogue tool recalculates the graphic, every category/area count and each bar from the authoritative CSV when it is synchronized. GitHub shows the latest committed snapshot. The grouping keeps the original entry IDs, statuses and evidence intact; the CSV, Excel view, sources and historical audit remain local.
 
-The new requirements cover areas such as accessibility, text input, credentials/autofill, background work, Binder communication, WebView, native graphics buffers and newer Android behavior rules. Read the future goals and sources (maintained locally).
-
-All new entries were added as **Unassessed**. Existing recorded statuses and evidence are retained without rechecking them. **No builds, tests or implementation checks were run for this list update.** A planning entry does not mean a feature is missing or working. Review coverage describes catalogue records. Overlapping requirements mean it cannot be used as a feature-completion percentage or an Android app success rate.
-
-Browse the detailed inventory counts (maintained locally), main CSV (maintained locally) or Excel checklist (maintained locally). The earlier audit report (maintained locally) remains a historical record.
+**How to read the percentages:** assessed entries ÷ all entries in that category. Broad requirements overlap their detailed refinements, so these are **review percentages**, not feature-completion percentages or Android app success rates. The expansion entries remain Unassessed until separately reviewed.
 
 ## Which apps have been tried?
 
@@ -141,13 +319,24 @@ Browse the detailed inventory counts (maintained locally), main CSV (maintained 
 | :--- | :--- |
 | **HelloAether** — our own test app | Opens a Windows window. Its button runs Android app code and translated ARM64 code, then displays **ARM64 result: 42**. |
 | **PlainAether** — our second test app | Runs a separate, simpler Android app through the installed-app system. Its versions are also used to check updates and preserved app data. |
-| **TikTok** — an owner-supplied APK | Inspection reaches unsupported package details. It has **not been executed or shown to work**. |
+| **Pocket Tally** — our third test app | Counts, saves through its own ARM64 library and reloads the saved value after reopening. Recorded scenarios include permission denial/revocation, damaged records and another app remaining usable after removal. |
 
-That is **two distinct working test apps**. Signed versions and modified copies of those apps do not increase the count. No downloaded third-party app is currently claimed compatible.
+That is **three distinct working test apps**, with bounded installed-path scenarios recorded in Debug and Release. Signed versions, multi-DEX probes and modified copies do not increase that count.
 
-Installation of other APKs is enabled experimentally, with app isolation and explicit consent. Many will be refused or encounter missing features. The current execution path supports a limited standalone APK format with one app-code file and one main screen; many larger apps need more.
+### Owner-supplied apps
 
-Support for Google Play Services, protected streaming, banking apps, games with anti-cheat, and universal Android compatibility is not promised. The app compatibility record (maintained locally) and known limitations (maintained locally) give the exact boundaries.
+| Checkpoint for the nine supplied APK/XAPK files | Recorded result |
+| :--- | :--- |
+| Full metadata-inspection checkpoint | **9 / 9** |
+| Distinct icons visible in six Explorer views | **9 / 9** |
+| Currently installed owner apps | **0 / 9** |
+| Verified functional app workflows | **0 / 9** |
+
+TikTok now passes full inspection and a supported-signature installation preview; it has not been executed or shown to work. Two other supplied packages previously reached failed startup attempts, retained in the local record. Those historical attempts are not current installations or working-app results.
+
+Experimental installation supports eligible standalone APKs and a bounded XAPK split path, with supported multi-DEX loading, explicit consent and Windows isolation. Many apps still encounter missing Android APIs, native-library or memory limits. A package inspection, installation preview or icon does not establish successful execution.
+
+No supplied third-party app is currently claimed compatible. Google Play Services, protected streaming, banking apps, anti-cheat games and universal Android support are not promised. The local per-app tracker preserves each input's identity, results and remaining requirements.
 
 ## Can I try it?
 
