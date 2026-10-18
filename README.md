@@ -216,12 +216,20 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 
 ### Where the entries came from
 
-| Inventory source | Entries |
+Entries are grouped by the technical reference recorded in each catalogue row. These are requirement sources, not claims that their implementation code was copied.
+
+| Specification or documentation source | Entries |
 | :--- | ---: |
-| Original catalogue, preserved | 1,020 |
-| Owner's v0.2 additions, integrated | 2,435 |
-| Further researched requirements | 134 |
+| [Android Developers: API, NDK and app guides](https://developer.android.com/) | 1,697 |
+| [Android Open Source Project: DEX, bytecode, ART and CTS](https://source.android.com/) | 470 |
+| [Khronos: OpenGL ES, EGL and Vulkan specifications / headers](https://registry.khronos.org/) | 687 |
+| [Arm: AArch64 instruction reference and ELF ABI](https://support.arm.com/documentation/ddi0602/2026-06) | 282 |
+| [Oracle: JNI function specification](https://docs.oracle.com/javase/8/docs/technotes/guides/jni/spec/functions.html) | 234 |
+| [Microsoft Learn: Windows shell, AppContainer and UI Automation](https://learn.microsoft.com/en-us/windows/win32/) | 65 |
+| Aether project requirements: Windows integration, security and quality goals | 154 |
 | **Total planning entries** | **3,589** |
+
+Each entry is counted once by its recorded source. Project-specific requirements remain attributed to Aether's plan; overlapping requirements remain in the catalogue.
 
 <!-- aether:compatibility-progress:end -->
 
