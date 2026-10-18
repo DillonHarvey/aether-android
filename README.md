@@ -10,7 +10,7 @@ Aether is a project working towards a simple idea: install an Android app on you
 
 This page explains the project in everyday language. No programming knowledge needed.
 
-**Project snapshot · 16 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
+**Project snapshot · 18 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
 [The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Roadmap](#roadmap) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
@@ -42,7 +42,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue implementation** | **177 of 3,589 implemented (4.93%)** |
+| **Catalogue implementation** | **479 of 3,589 implemented (13.35%)** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -130,11 +130,15 @@ The engineering roadmap and master plan are maintained locally and hold the full
 
 ## Progress counts
 
+The tables show the **18 October 2026 source implementation assessment of all 3,589 entries**. The review corrected 385 saved implementation states. It changed no runtime code and established no new acceptance-test pass.
+
+Source checkpoint: **18 October 2026, 12:48:55 Sydney (01:48:55 UTC)**. Concurrent development after that checkpoint requires affected-entry reassessment; these counts describe the reviewed source versions.
+
 The tables count **implemented catalogue requirements**. Partial work and unsupported requirements do not increase the percentage. Implementation and complete test verification remain separate, and successful real-app workflows are reported separately below.
 
 <!-- aether:compatibility-progress:start -->
 
-**177 / 3,589 entries implemented (4.93%)**
+**479 / 3,589 entries implemented (13.35%)**
 
 Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
@@ -144,18 +148,18 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | :--- | ---: | ---: | ---: |
 | Packages & signing | 140 | 40 | 28.57% |
 | ARM64 translation | 238 | 1 | 0.42% |
-| Native libraries & POSIX | 457 | 15 | 3.28% |
-| DEX & Java runtime | 601 | 24 | 3.99% |
-| Java/native bridge (JNI) | 285 | 18 | 6.32% |
-| Android framework | 231 | 0 | 0.00% |
-| Screens & graphics | 862 | 4 | 0.46% |
-| Files & networking | 198 | 7 | 3.54% |
+| Native libraries & POSIX | 457 | 17 | 3.72% |
+| DEX & Java runtime | 601 | 218 | 36.27% |
+| Java/native bridge (JNI) | 285 | 121 | 42.46% |
+| Android framework | 231 | 7 | 3.03% |
+| Screens & graphics | 862 | 3 | 0.35% |
+| Files & networking | 198 | 6 | 3.03% |
 | Media & devices | 236 | 0 | 0.00% |
 | App engines | 128 | 0 | 0.00% |
 | Security & permissions | 88 | 26 | 29.55% |
 | Windows integration | 65 | 29 | 44.62% |
-| Quality & reproducibility | 60 | 13 | 21.67% |
-| **Total** | **3,589** | **177** | **4.93%** |
+| Quality & reproducibility | 60 | 11 | 18.33% |
+| **Total** | **3,589** | **479** | **13.35%** |
 
 Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
@@ -169,29 +173,29 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | ARM64 guest translation and ABI | 27 | 1 | 3.70% |
 | AArch64 instruction conformance | 211 | 0 | 0.00% |
 | Android native ELF loading and dynamic linker | 30 | 0 | 0.00% |
-| ELF and linker detailed conformance | 71 | 14 | 19.72% |
+| ELF and linker detailed conformance | 71 | 16 | 22.54% |
 | Bionic libc and POSIX compatibility | 42 | 1 | 2.38% |
 | Bionic and POSIX exported calls | 314 | 0 | 0.00% |
-| DEX parser, linking and runtime support | 45 | 1 | 2.22% |
-| DEX opcodes | 224 | 9 | 4.02% |
-| DEX runtime detailed contracts | 67 | 11 | 16.42% |
-| ART-compatible managed semantics | 27 | 0 | 0.00% |
-| ART semantic edge cases | 44 | 0 | 0.00% |
+| DEX parser, linking and runtime support | 45 | 12 | 26.67% |
+| DEX opcodes | 224 | 156 | 69.64% |
+| DEX runtime detailed contracts | 67 | 27 | 40.30% |
+| ART-compatible managed semantics | 27 | 2 | 7.41% |
+| ART semantic edge cases | 44 | 2 | 4.55% |
 | Java/Kotlin standard runtime libraries | 33 | 0 | 0.00% |
-| Java core library individual methods | 161 | 3 | 1.86% |
-| JNI API | 234 | 4 | 1.71% |
-| JNI semantic edge cases | 51 | 14 | 27.45% |
+| Java core library individual methods | 161 | 19 | 11.80% |
+| JNI API | 234 | 96 | 41.03% |
+| JNI semantic edge cases | 51 | 25 | 49.02% |
 | Android framework and app lifecycle | 71 | 0 | 0.00% |
-| Android framework individual methods | 160 | 0 | 0.00% |
+| Android framework individual methods | 160 | 7 | 4.38% |
 | Android Views and resources | 63 | 0 | 0.00% |
 | Android graphics, UI and resources detailed | 105 | 0 | 0.00% |
 | EGL, GLES, Vulkan and shader runtime | 48 | 2 | 4.17% |
 | EGL core commands | 44 | 0 | 0.00% |
 | OpenGL ES core commands | 358 | 0 | 0.00% |
 | GLSL ES shader conformance | 131 | 0 | 0.00% |
-| Graphics formats and textures | 64 | 2 | 3.12% |
+| Graphics formats and textures | 64 | 1 | 1.56% |
 | Vulkan early research surface | 49 | 0 | 0.00% |
-| Android storage, persistence and data | 40 | 4 | 10.00% |
+| Android storage, persistence and data | 40 | 3 | 7.50% |
 | SQLite, files and persistence detailed | 71 | 2 | 2.82% |
 | Networking and TLS | 27 | 1 | 3.70% |
 | Networking and crypto detailed | 60 | 0 | 0.00% |
@@ -205,7 +209,7 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | Permissions and defensive compatibility | 45 | 12 | 26.67% |
 | Windows native install / shell / lifecycle | 35 | 22 | 62.86% |
 | Windows product integration detailed | 30 | 7 | 23.33% |
-| Reproducibility and test coverage | 30 | 7 | 23.33% |
+| Reproducibility and test coverage | 30 | 5 | 16.67% |
 | QA and progress evidence systems | 30 | 6 | 20.00% |
 
 </details>
@@ -223,7 +227,7 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 
 **How this updates:** the catalogue tool recalculates every category and area from the authoritative CSV when synchronized. GitHub shows the latest committed snapshot; the CSV, Excel view and detailed source evidence remain local.
 
-**How to read the percentages:** Implemented entries ? all entries in that category. Partial work contributes zero. All entries now have an implementation disposition, while test verification and real-app outcomes remain separate. Overlapping broad requirements and refinements mean this is a catalogue ratio, not the percentage of Android supported.
+**How to read the percentages:** Implemented entries divided by all entries in that category. Partial work contributes zero. All entries now have an implementation disposition, while test verification and real-app outcomes remain separate. Overlapping broad requirements and refinements mean this is a catalogue ratio, not the percentage of Android supported.
 
 ## Which apps have been tried?
 
@@ -241,10 +245,10 @@ That is **three distinct working test apps**, with bounded installed-path scenar
 | :--- | :--- |
 | Full metadata-inspection checkpoint | **9 / 9** |
 | Distinct icons visible in six Explorer views | **9 / 9** |
-| Currently installed owner apps | **0 / 9** |
+| Currently installed owner apps (read-only check, 18 October 2026) | **2 / 9** |
 | Verified functional app workflows | **0 / 9** |
 
-TikTok now passes full inspection and a supported-signature installation preview; it has not been executed or shown to work. Two other supplied packages previously reached failed startup attempts, retained in the local record. Those historical attempts are not current installations or working-app results.
+TikTok and the input labelled "The Sims 4" (package `com.am.obby.runner.world.game`) are currently installed, with package integrity and Windows registrations checked. TikTok has reached failed isolated startup attempts; the latest inspected record stops at unsupported `Runtime.getRuntime()` before a usable Activity. Alchemia retains data after removal. None has a verified functional workflow. This read-only check did not launch or install any app.
 
 Experimental installation supports eligible standalone APKs and a bounded XAPK split path, with supported multi-DEX loading, explicit consent and Windows isolation. Many apps still encounter missing Android APIs, native-library or memory limits. A package inspection, installation preview or icon does not establish successful execution.
 
