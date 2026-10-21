@@ -12,7 +12,7 @@ This page explains the project in everyday language. No programming knowledge ne
 
 **Project snapshot · 21 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
-[The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Roadmap](#roadmap) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
+[The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
 > **Currently in development.** Eight development phases are complete. Phase 8, Windows integration and wider app support, is in progress. Aether can run its own test apps, but everyday Android app compatibility is still limited.
 
@@ -102,37 +102,6 @@ The latest retained native-locking results record **Release 9/9 selected cross-l
 Separate native test programs demonstrate **EGL/OpenGL ES graphics through ANGLE and Direct3D 11**, including window input and resize, and **AAudio output through Windows WASAPI**, with permission and cleanup checks. Audio tests use a muted session. The ordinary test-app screens use a separate Windows drawing path; general Android graphics, Java media, video and game-engine compatibility remain unfinished.
 
 The public implementation is in [package handling](src/apk/), [managed execution](src/dex/), [native translation](src/a64/), [installation](src/install/), [Windows integration](src/shell/) and [isolation](src/security/). Detailed test evidence and engineering decisions are retained locally. This README update reuses those records; it does not claim new runtime test passes.
-
-## Roadmap
-
-The plan starts at **Phase 0**, so there are **nine phases** in total. “Complete” means the phase's recorded milestone has been accepted within its documented scope; support continues to grow afterwards.
-
-| Phase | In everyday language | Status |
-| :---: | :--- | :--- |
-| **0** | Set up the project, build tools and tests | ✅ Complete |
-| **1** | Read and inspect Android installation files | ✅ Complete |
-| **2** | Translate supported instructions used by phone processors for a PC | ✅ Complete |
-| **3** | Load and run the extra code packaged inside supported apps | ✅ Complete |
-| **4** | Run Android app logic and connect its different code parts | ✅ Complete |
-| **5** | Support basic screens and opening, using and closing an app | ✅ Complete |
-| **6** | Connect windows, input, graphics and audio to Windows | ✅ Complete |
-| **7** | Establish app isolation and security controls | ✅ Complete |
-| **8** | Make installation, updates and everyday Windows use work with more apps | 🔨 In progress |
-
-Phase 7 is complete under the recorded owner acceptance. Its evidence and verification exceptions remain documented in the security record (maintained locally).
-
-### What comes next
-
-- **Finish the Windows experience.** Complete Open With, Start, Search, Settings and taskbar-pin acceptance, including icons after updates. Extend the completed six-view Explorer icon checks to other display scales.
-- **Validate installation on a fresh PC.** Complete installer and recovery checks beyond the current development machine.
-- **Run more real apps.** Build on the three completed original-app scenarios and resolve the supplied apps' actual runtime blockers. Repackaging an existing test app does not count as another app.
-- **Broaden updates and compatibility.** Add more supported package and signature formats, and handle upgrades that require changes to stored data or runtime formats.
-- **Validate the existing controls.** Complete broader keyboard/display checks for per-app settings, diagnostics and report export, alongside usability and performance work.
-- **Prepare for release.** Resolve distribution signing, privacy, licensing and the remaining release checks.
-
-The compatibility catalogue below organizes future requirements alongside that implementation work. Its saved assessments are maintained independently of phase milestones and app results.
-
-The engineering roadmap and master plan are maintained locally and hold the full requirements. The full project remains unfinished.
 
 ## Progress counts
 
@@ -278,7 +247,7 @@ No supplied third-party app is currently claimed compatible. Google Play Service
 
 The current target is **Windows 11 on a 64-bit Intel or AMD PC**. Windows on ARM, macOS and Linux are outside the current target.
 
-To follow the project, start with the roadmap and counts above. To build the published source, use the instructions below. Building currently requires developer tools.
+To follow the project, start with the current capabilities and progress counts above. To build the published source, use the instructions below. Building currently requires developer tools.
 
 ### A few useful words
 
