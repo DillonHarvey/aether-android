@@ -10,7 +10,7 @@ Aether is a project working towards a simple idea: install an Android app on you
 
 This page explains the project in everyday language. No programming knowledge needed.
 
-**Project snapshot · 18 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
+**Project snapshot · 21 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
 [The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Roadmap](#roadmap) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
@@ -42,7 +42,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue implementation** | **479 of 3,589 implemented (13.35%)** |
+| **Catalogue implementation** | **724 of 3,589 implemented (20.17%)** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -51,7 +51,7 @@ The local progress and app compatibility records contain the evidence behind thi
 
 ## What works today
 
-These are **demonstrated capabilities within a limited scope**, reconciled with the local engineering records on 16 October 2026. They describe implementation progress separately from the checklist's review percentages below.
+These are **demonstrated capabilities within a limited scope**, updated from local engineering records through 21 October 2026. They describe implementation progress separately from the checklist's review percentages below.
 
 ### 📦 App files, installation and updates
 
@@ -73,6 +73,12 @@ These are **demonstrated capabilities within a limited scope**, reconciled with 
 | **More language and resource behaviour** | Supports bounded switch instructions, array cloning, generated class names, compiled resource names, structured resource values and neutral density/API selection. Errors can identify the failing DEX table, record and byte offset. | Full Android themes, locale/device configuration and many language/API features remain unfinished. |
 | **Interactive windows and persistence** | Shows basic app screens in resizable Windows windows with mouse/keyboard input and app lifecycle events. Pocket Tally saves a count through its own ARM64 library and reloads it after reopening. | Saving needs the app's private-file permission; the counter's save is not crash-atomic. |
 
+### Recent runtime progress · 21 October 2026
+
+Recent native work adds scoped local/UTC time queries, shared file-descriptor aliases, saved native contexts, checked formatting and provider-owned advisory file locks. Managed and framework work also adds cooperative threads/tasks, further Java library methods, Application startup and persistent preferences. Each remains bounded by its recorded contract; the catalogue audit below separates exact completed operations from partial wider APIs.
+
+The latest retained native-locking results record **Release 9/9 selected cross-layer tests** and **Debug 2/2 focused ELF/security tests**, with zero failures or skips. The Release distribution and all 31 payload identities were checked. These are prior results inspected for this update; no runtime test was rerun. The retained broad catalogue-migration regression remains **Debug 77/83 and Release 76/83 passed**. Later focused passes do not close that broader gate.
+
 ### 🪟 Windows integration and package artwork
 
 | Capability | Recorded working behaviour | Remaining scope |
@@ -87,7 +93,7 @@ These are **demonstrated capabilities within a limited scope**, reconciled with 
 | Capability | Recorded working behaviour | Remaining scope |
 | :--- | :--- | :--- |
 | **Isolated execution** | Uses restricted Windows workers, app-specific storage, package-integrity checks and permission-checked host services. Failed isolation refuses execution. | This is the recorded, scoped security model; broader Android services still need implementation. |
-| **Per-app settings** | Native dialogs and CLI controls expose supported clock/private-file permissions. Automatic one-second reads recover after failures and preserve unsaved choices, focus and selection. | Network, camera, microphone and other unsupported grants remain unavailable. |
+| **Per-app settings** | Native dialogs and CLI controls expose basic time, private-file and separately consented wall-clock permissions. Automatic one-second reads recover after failures and preserve unsaved choices, focus and selection. | Network, camera, microphone and other unsupported grants remain unavailable. |
 | **Diagnostics and reports** | Provides read-only app checks and explicit JSON export, plus optional build details and bounded audit summaries with a preview before saving. | Reports do not certify compatibility or diagnose every crash; nothing is uploaded automatically. |
 | **Offline privacy information** | Includes the privacy and permissions guide in setup, app controls and the CLI. Builds verify the packaged dependency notices and payload identities. | Public licensing, publisher authentication and release review remain open. |
 
@@ -130,15 +136,17 @@ The engineering roadmap and master plan are maintained locally and hold the full
 
 ## Progress counts
 
-The tables show the **18 October 2026 source implementation assessment of all 3,589 entries**. The review corrected 385 saved implementation states. It changed no runtime code and established no new acceptance-test pass.
+The **21 October 2026 source audit of all 3,589 entries** records **724 implemented, 694 in progress and 2,171 not started**, with none unassessed. This replaces the saved 18 October total of 483 implemented (13.46%).
 
-Source checkpoint: **18 October 2026, 12:48:55 Sydney (01:48:55 UTC)**. Concurrent development after that checkpoint requires affected-entry reassessment; these counts describe the reviewed source versions.
+That is **241 additional counted requirements**, including newer source work and corrections to older undercounting. Missing tests were previously treated as missing implementation in some entries. The audit keeps test verification separate and retains concrete semantic gaps as partial work. It adds no runtime functionality or acceptance-test pass.
+
+Source checkpoint: **21 October 2026, 22:40:18 Sydney (11:40:18 UTC)**. Per-entry reasons and source hashes are retained locally; later development requires affected-entry reassessment.
 
 The tables count **implemented catalogue requirements**. Partial work and unsupported requirements do not increase the percentage. Implementation and complete test verification remain separate, and successful real-app workflows are reported separately below.
 
 <!-- aether:compatibility-progress:start -->
 
-**479 / 3,589 entries implemented (13.35%)**
+**724 / 3,589 entries implemented (20.17%)**
 
 Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
@@ -147,19 +155,19 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | Category | Entries | Implemented | % |
 | :--- | ---: | ---: | ---: |
 | Packages & signing | 140 | 40 | 28.57% |
-| ARM64 translation | 238 | 1 | 0.42% |
-| Native libraries & POSIX | 457 | 17 | 3.72% |
-| DEX & Java runtime | 601 | 218 | 36.27% |
-| Java/native bridge (JNI) | 285 | 121 | 42.46% |
-| Android framework | 231 | 7 | 3.03% |
-| Screens & graphics | 862 | 3 | 0.35% |
-| Files & networking | 198 | 6 | 3.03% |
+| ARM64 translation | 238 | 105 | 44.12% |
+| Native libraries & POSIX | 457 | 60 | 13.13% |
+| DEX & Java runtime | 601 | 244 | 40.60% |
+| Java/native bridge (JNI) | 285 | 125 | 43.86% |
+| Android framework | 231 | 11 | 4.76% |
+| Screens & graphics | 862 | 54 | 6.26% |
+| Files & networking | 198 | 14 | 7.07% |
 | Media & devices | 236 | 0 | 0.00% |
 | App engines | 128 | 0 | 0.00% |
-| Security & permissions | 88 | 26 | 29.55% |
+| Security & permissions | 88 | 31 | 35.23% |
 | Windows integration | 65 | 29 | 44.62% |
 | Quality & reproducibility | 60 | 11 | 18.33% |
-| **Total** | **3,589** | **479** | **13.35%** |
+| **Total** | **3,589** | **724** | **20.17%** |
 
 Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
@@ -170,33 +178,33 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | :--- | ---: | ---: | ---: |
 | APK, signing and distribution | 46 | 22 | 47.83% |
 | APK and manifest detailed formats | 94 | 18 | 19.15% |
-| ARM64 guest translation and ABI | 27 | 1 | 3.70% |
-| AArch64 instruction conformance | 211 | 0 | 0.00% |
+| ARM64 guest translation and ABI | 27 | 10 | 37.04% |
+| AArch64 instruction conformance | 211 | 95 | 45.02% |
 | Android native ELF loading and dynamic linker | 30 | 0 | 0.00% |
 | ELF and linker detailed conformance | 71 | 16 | 22.54% |
-| Bionic libc and POSIX compatibility | 42 | 1 | 2.38% |
-| Bionic and POSIX exported calls | 314 | 0 | 0.00% |
+| Bionic libc and POSIX compatibility | 42 | 3 | 7.14% |
+| Bionic and POSIX exported calls | 314 | 41 | 13.06% |
 | DEX parser, linking and runtime support | 45 | 12 | 26.67% |
-| DEX opcodes | 224 | 156 | 69.64% |
-| DEX runtime detailed contracts | 67 | 27 | 40.30% |
-| ART-compatible managed semantics | 27 | 2 | 7.41% |
-| ART semantic edge cases | 44 | 2 | 4.55% |
+| DEX opcodes | 224 | 162 | 72.32% |
+| DEX runtime detailed contracts | 67 | 28 | 41.79% |
+| ART-compatible managed semantics | 27 | 3 | 11.11% |
+| ART semantic edge cases | 44 | 5 | 11.36% |
 | Java/Kotlin standard runtime libraries | 33 | 0 | 0.00% |
-| Java core library individual methods | 161 | 19 | 11.80% |
+| Java core library individual methods | 161 | 34 | 21.12% |
 | JNI API | 234 | 96 | 41.03% |
-| JNI semantic edge cases | 51 | 25 | 49.02% |
+| JNI semantic edge cases | 51 | 29 | 56.86% |
 | Android framework and app lifecycle | 71 | 0 | 0.00% |
-| Android framework individual methods | 160 | 7 | 4.38% |
+| Android framework individual methods | 160 | 11 | 6.88% |
 | Android Views and resources | 63 | 0 | 0.00% |
-| Android graphics, UI and resources detailed | 105 | 0 | 0.00% |
+| Android graphics, UI and resources detailed | 105 | 1 | 0.95% |
 | EGL, GLES, Vulkan and shader runtime | 48 | 2 | 4.17% |
-| EGL core commands | 44 | 0 | 0.00% |
-| OpenGL ES core commands | 358 | 0 | 0.00% |
-| GLSL ES shader conformance | 131 | 0 | 0.00% |
+| EGL core commands | 44 | 6 | 13.64% |
+| OpenGL ES core commands | 358 | 28 | 7.82% |
+| GLSL ES shader conformance | 131 | 16 | 12.21% |
 | Graphics formats and textures | 64 | 1 | 1.56% |
 | Vulkan early research surface | 49 | 0 | 0.00% |
 | Android storage, persistence and data | 40 | 3 | 7.50% |
-| SQLite, files and persistence detailed | 71 | 2 | 2.82% |
+| SQLite, files and persistence detailed | 71 | 10 | 14.08% |
 | Networking and TLS | 27 | 1 | 3.70% |
 | Networking and crypto detailed | 60 | 0 | 0.00% |
 | Audio, video, codecs and imaging | 28 | 0 | 0.00% |
@@ -205,8 +213,8 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | Device and system-services detailed | 80 | 0 | 0.00% |
 | App engines and third-party ecosystem | 31 | 0 | 0.00% |
 | Embedded application engines detailed | 97 | 0 | 0.00% |
-| Windows isolation and Android permission security | 43 | 14 | 32.56% |
-| Permissions and defensive compatibility | 45 | 12 | 26.67% |
+| Windows isolation and Android permission security | 43 | 15 | 34.88% |
+| Permissions and defensive compatibility | 45 | 16 | 35.56% |
 | Windows native install / shell / lifecycle | 35 | 22 | 62.86% |
 | Windows product integration detailed | 30 | 7 | 23.33% |
 | Reproducibility and test coverage | 30 | 5 | 16.67% |
@@ -253,10 +261,12 @@ That is **three distinct working test apps**, with bounded installed-path scenar
 | :--- | :--- |
 | Full metadata-inspection checkpoint | **9 / 9** |
 | Distinct icons visible in six Explorer views | **9 / 9** |
-| Currently installed owner apps (read-only check, 18 October 2026) | **2 / 9** |
+| Installed owner apps in the 18 October reconciled store record | **1 / 9** |
 | Verified functional app workflows | **0 / 9** |
 
-TikTok and the input labelled "The Sims 4" (package `com.am.obby.runner.world.game`) are currently installed, with package integrity and Windows registrations checked. TikTok has reached failed isolated startup attempts; the latest inspected record stops at unsupported `Runtime.getRuntime()` before a usable Activity. Alchemia retains data after removal. None has a verified functional workflow. This read-only check did not launch or install any app.
+The frozen intake contains **4 APKs and 5 XAPK sets**. The latest reconciled store record lists **TikTok installed**, **Alchemia with data retained after removal**, and no current store record for the other seven inputs, including the file labelled "The Sims 4" (package `com.am.obby.runner.world.game`). Earlier installation results remain historical.
+
+TikTok's latest retained isolated startup attempt inspected for this audit on **21 October 2026** ran for **15.453 seconds** and stopped at unsupported native `access` file-permission/existence checks during application initialization. All **31 installed runtime payload hashes** matched the recorded bundle. This is startup progress; no usable Activity, video playback or functional workflow is verified. Source review includes newer scoped `access` support; the earlier launch result remains a failure. This audit did not launch or install an app.
 
 Experimental installation supports eligible standalone APKs and a bounded XAPK split path, with supported multi-DEX loading, explicit consent and Windows isolation. Many apps still encounter missing Android APIs, native-library or memory limits. A package inspection, installation preview or icon does not establish successful execution.
 
