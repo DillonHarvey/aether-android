@@ -1,5 +1,6 @@
 #include "aether/a64/guest_cpu.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <dynarmic/interface/A64/a64.h>
@@ -9,6 +10,14 @@
 #include <windows.h>
 
 namespace aether::a64 {
+namespace {
+std::atomic<std::uint64_t> invocation_sequence{1};
+std::uint64_t next_invocation() noexcept {
+    auto value=invocation_sequence.load(std::memory_order_relaxed);
+    while(value!=UINT64_MAX){if(invocation_sequence.compare_exchange_weak(value,value+1,std::memory_order_relaxed))return value;}
+    return 0;
+}
+}
 std::string_view fault_name(Fault fault) noexcept {
     switch (fault) {
     case Fault::none:
@@ -35,6 +44,10 @@ std::string_view fault_name(Fault fault) noexcept {
         return "AETHER_JIT_PROTECTION_FAILED";
     case Fault::nesting_limit:
         return "AETHER_GUEST_CALL_DEPTH";
+    case Fault::process_exit:
+        return "AETHER_GUEST_PROCESS_EXIT";
+    case Fault::thread_exit:
+        return "AETHER_GUEST_THREAD_EXIT";
     }
     return "AETHER_GUEST_UNKNOWN_FAULT";
 }
@@ -47,14 +60,16 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
     Dynarmic::ExclusiveMonitor monitor{1};
     std::unique_ptr<Dynarmic::A64::Jit> jit;
     std::uint64_t remaining = 0, memory_generation = 0, frequency = 0;
-    std::uint64_t tpidr = 0, tpidr_read_only = 0;
+    std::uint64_t tpidr = 0, tpidr_read_only = 0, default_tpidr = 0;
     const DWORD owner_thread = GetCurrentThreadId();
     bool service_pending = false, dispatching_service = false;
     std::uint32_t pending_service = 0, call_depth = 0;
     Address service_instruction = 0;
+    std::uint64_t active_invocation = 0;
 
     Impl(GuestMemory &memory_, const AppContext &app_, GuestServices *services_)
         : memory(memory_), app(app_), services(services_) {
+        if(!app.process_state)throw GuestError("AETHER_GUEST_CONTEXT","Guest process state is required");
         LARGE_INTEGER f{};
         if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0 ||
             f.QuadPart > std::numeric_limits<std::uint32_t>::max())
@@ -87,7 +102,7 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
             result.fault = fault;
             result.fault_address = address;
             result.detail = detail;
-            ++stats.faults;
+            if(fault!=Fault::process_exit && fault!=Fault::thread_exit)++stats.faults;
         }
         jit->HaltExecution();
     }
@@ -239,13 +254,22 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
 GuestCpu::GuestCpu(GuestMemory &memory, const AppContext &app, GuestServices *services)
     : impl_(std::make_unique<Impl>(memory, app, services)) {}
 GuestCpu::~GuestCpu() = default;
+void GuestCpu::set_thread_pointer(Address address) {
+    auto &p=*impl_;
+    if(GetCurrentThreadId()!=p.owner_thread || p.call_depth || p.jit->IsExecuting())throw GuestError("AETHER_GUEST_CPU_OWNERSHIP","TLS binding requires idle CPU owner");
+    if(address && !p.memory.accessible(address,48,Permission::read))throw GuestError("AETHER_GUEST_TLS","TLS block is not guest readable");
+    p.default_tpidr=p.tpidr=address;
+}
 ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arguments, Address stack_top,
-                               std::uint64_t instruction_budget, std::span<const Vector> floating_arguments) {
+                               std::uint64_t instruction_budget, std::span<const Vector> floating_arguments, std::optional<Address> thread_pointer) {
     auto &p = *impl_;
     if (GetCurrentThreadId() != p.owner_thread || p.jit->IsExecuting() ||
         (p.call_depth && !p.dispatching_service))
         throw GuestError("AETHER_GUEST_CPU_OWNERSHIP",
                          "Nested calls require a suspended service on the CPU owner thread");
+    if(const auto status=p.app.process_state->exit_status()){ExecutionResult exited;exited.fault=Fault::process_exit;exited.detail=*status;return exited;}
+    const auto logical_tls=thread_pointer.value_or(p.default_tpidr);
+    if(p.services)if(const auto value=p.services->thread_exit_value(logical_tls)){ExecutionResult exited;exited.fault=Fault::thread_exit;exited.registers[0]=*value;return exited;}
     if (p.call_depth >= 32) {
         ++p.stats.faults;
         ExecutionResult limit;
@@ -260,6 +284,8 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         ++p.stats.faults;
         return invalid;
     }
+    const auto invocation=next_invocation();
+    if(!invocation){ExecutionResult invalid;invalid.fault=Fault::invalid_call;++p.stats.faults;return invalid;}
     struct SavedFrame {
         Impl &p;
         ExecutionResult result;
@@ -267,12 +293,13 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         std::array<Vector, 32> vectors;
         Address pc, sp;
         std::uint32_t pstate, fpsr, fpcr;
-        std::uint64_t remaining, ticks;
+        std::uint64_t remaining, ticks, tpidr, tpidr_read_only, invocation;
         bool dispatching, nested;
         ~SavedFrame() {
             --p.call_depth;
             p.dispatching_service = dispatching;
             p.service_pending = false;
+            p.tpidr=tpidr;p.tpidr_read_only=tpidr_read_only;p.active_invocation=invocation;
             if (!nested)
                 return;
             p.jit->Reset();
@@ -300,8 +327,10 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
             p.jit->GetFpcr(),
             p.remaining,
             p.stats.guest_ticks,
+            p.tpidr,p.tpidr_read_only,p.active_invocation,
             p.dispatching_service,
             p.call_depth != 0};
+    p.active_invocation=invocation;
     ++p.call_depth;
     p.stats.maximum_call_depth = std::max<std::uint64_t>(p.stats.maximum_call_depth, p.call_depth);
     if (saved.nested)
@@ -312,6 +341,7 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     p.jit->Reset();
     p.monitor.Clear();
     p.remaining = saved.nested ? std::min(instruction_budget, saved.remaining) : instruction_budget;
+    p.tpidr=thread_pointer.value_or(p.default_tpidr);
     p.jit->SetPC(entry);
     p.jit->SetSP(stack_top);
     p.jit->SetRegister(30, return_trampoline);
@@ -320,6 +350,8 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     for (std::size_t i = 0; i < floating_arguments.size(); ++i)
         p.jit->SetVector(i, floating_arguments[i]);
     for (;;) {
+        if(p.app.process_state->exit_status()){p.stop(Fault::process_exit,p.jit->GetPC());break;}
+        if(p.services && p.services->thread_exit_value(logical_tls)){p.stop(Fault::thread_exit,p.jit->GetPC());break;}
         if (!p.remaining) {
             p.stop(Fault::budget, p.jit->GetPC());
             break;
@@ -340,18 +372,25 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         const auto service = p.pending_service;
         const auto instruction = p.service_instruction;
         p.service_pending = false;
-        ServiceState state{p.jit->GetRegisters(), p.jit->GetVectors(), p.jit->GetSP()};
+        ServiceState state{p.jit->GetRegisters(), p.jit->GetVectors(), p.jit->GetSP(),p.active_invocation,stack_top};
         p.dispatching_service = true;
         ++p.stats.host_calls;
         ++p.stats.deferred_services;
         const auto fault = p.services->invoke_frame(service, instruction, state);
         p.dispatching_service = false;
+        if(p.app.process_state->exit_status()){p.stop(Fault::process_exit,instruction);break;}
+        if(p.services && p.services->thread_exit_value(logical_tls)){p.stop(Fault::thread_exit,instruction);break;}
         if (fault != Fault::none) {
             p.stop(fault, instruction, service);
             break;
         }
+        if(state.stack_pointer!=p.jit->GetSP() && (state.stack_pointer<16 || state.stack_pointer%16 ||
+           state.stack_pointer>stack_top || !p.memory.accessible(state.stack_pointer-16,16,Permission::write))){
+            p.stop(Fault::write,instruction,service);break;
+        }
         p.jit->SetRegisters(state.registers);
         p.jit->SetVectors(state.vectors);
+        p.jit->SetSP(state.stack_pointer);
         // Host transitions may break an exclusive reservation; a spurious failure is allowed.
         p.jit->ClearExclusiveState();
         p.monitor.Clear();
@@ -365,6 +404,8 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     p.result.pstate = p.jit->GetPstate();
     p.result.fpsr = p.jit->GetFpsr();
     p.result.fpcr = p.jit->GetFpcr();
+    if(p.services)if(const auto value=p.services->thread_exit_value(logical_tls)){p.result.fault=Fault::thread_exit;p.result.registers[0]=*value;p.result.returned=false;}
+    if(const auto status=p.app.process_state->exit_status()){p.result.fault=Fault::process_exit;p.result.detail=*status;p.result.returned=false;}
     p.result.returned = p.result.returned && p.result.fault == Fault::none;
     return p.result;
 }

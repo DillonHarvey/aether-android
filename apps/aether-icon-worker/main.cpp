@@ -27,7 +27,7 @@ int run(HANDLE reader, HANDLE writer) {
     const auto grant = read_pipe_frame(reader);
     require(grant.header.operation == Operation::boot && grant.header.sequence == 0 && grant.header.session &&
                 grant.header.status == Status::ok && grant.payload.size() == 40 &&
-                read_u64(grant.payload, 0) == 2 && read_u64(grant.payload, 8) &&
+                read_u64(grant.payload, 0) == 3 && read_u64(grant.payload, 8) &&
                 read_u64(grant.payload, 16) && read_u64(grant.payload, 24) == 256 &&
                 read_u64(grant.payload, 32) == 96,
             "Invalid preview grant");
@@ -48,6 +48,23 @@ int run(HANDLE reader, HANDLE writer) {
             writer, {{operation, sequence++, grant.header.session, size, Status::ok}, std::move(payload)});
     };
     send(Operation::icon_result, encode_icon_description(preview));
+    std::vector<std::uint8_t> permission_count;
+    require(preview.declared_permissions.size() <= 1024, "Too many declared permissions");
+    append_u64(permission_count, preview.declared_permissions.size());
+    send(Operation::icon_permissions, std::move(permission_count));
+    std::size_t permission_bytes = 0;
+    std::vector<std::uint8_t> permission_frame;
+    for (const auto &permission : preview.declared_permissions) {
+        permission_bytes += permission.size();
+        require(permission.size() <= 512 && permission_bytes <= 64 * 1024, "Permission metadata limit");
+        if (permission_frame.size() + 8 + permission.size() > maximum_payload) {
+            send(Operation::icon_permissions, std::move(permission_frame));
+            permission_frame.clear();
+        }
+        append_text(permission_frame, permission);
+    }
+    if (!permission_frame.empty())
+        send(Operation::icon_permissions, std::move(permission_frame));
     const auto &pixels = preview.presentation.bitmap.rgba;
     require(pixels.size() ==
                     std::size_t(preview.presentation.bitmap.width) * preview.presentation.bitmap.height * 4 &&

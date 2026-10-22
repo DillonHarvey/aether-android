@@ -2,7 +2,7 @@
 #include "app_dialog_ids.h"
 #include "privacy_ids.h"
 
-IDD_APP_SETTINGS DIALOGEX 0, 0, 420, 352
+IDD_APP_SETTINGS DIALOGEX 0, 0, 420, 372
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "Aether - App settings"
@@ -11,18 +11,20 @@ BEGIN
     LTEXT "Reading this app...", IDC_APP_NAME, 12, 10, 396, 20, SS_NOPREFIX
     CONTROL "Allow &timekeeping (required to run)", IDC_APP_CLOCK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 34, 396, 14
     CONTROL "Allow access to this app's &private files", IDC_APP_FILES, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 54, 396, 14
-    LTEXT "Other host capabilities are unavailable. Apply saves only these permission choices.", -1, 12, 76, 396, 22
-    LTEXT "&Diagnostics for this app:", -1, 12, 100, 396, 12
-    EDITTEXT IDC_APP_REPORT, 12, 114, 396, 114, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
-    LTEXT "Checking automatically...", IDC_APP_READ_STATUS, 12, 234, 396, 24, SS_NOPREFIX
-    LTEXT "", IDC_APP_ACTION_STATUS, 12, 262, 396, 24, SS_NOPREFIX
-    PUSHBUTTON "&Save report...", IDC_APP_SAVE, 12, 296, 84, 18
-    PUSHBUTTON "T&roubleshoot...", IDC_APP_TROUBLESHOOT, 104, 296, 104, 18
-    PUSHBUTTON "Pri&vacy...", IDC_PRIVACY_OPEN, 216, 296, 96, 18
-    PUSHBUTTON "&Discard edits", IDC_APP_DISCARD, 104, 324, 84, 18
-    PUSHBUTTON "&Apply permissions", IDC_APP_APPLY, 214, 324, 102, 18
-    DEFPUSHBUTTON "Close", IDCANCEL, 324, 324, 84, 18
+    CONTROL "Allow &wall-clock date and time", IDC_APP_WALL_CLOCK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 12, 74, 396, 14
+    LTEXT "Other host capabilities are unavailable. Apply saves only these permission choices.", -1, 12, 96, 396, 22
+    LTEXT "&Diagnostics for this app:", -1, 12, 120, 396, 12
+    EDITTEXT IDC_APP_REPORT, 12, 134, 396, 114, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT "Checking automatically...", IDC_APP_READ_STATUS, 12, 254, 396, 24, SS_NOPREFIX
+    LTEXT "", IDC_APP_ACTION_STATUS, 12, 282, 396, 24, SS_NOPREFIX
+    PUSHBUTTON "&Save report...", IDC_APP_SAVE, 12, 316, 84, 18
+    PUSHBUTTON "T&roubleshoot...", IDC_APP_TROUBLESHOOT, 104, 316, 104, 18
+    PUSHBUTTON "Pri&vacy...", IDC_PRIVACY_OPEN, 216, 316, 96, 18
+    PUSHBUTTON "&Discard edits", IDC_APP_DISCARD, 104, 344, 84, 18
+    PUSHBUTTON "&Apply permissions", IDC_APP_APPLY, 214, 344, 102, 18
+    DEFPUSHBUTTON "Close", IDCANCEL, 324, 344, 84, 18
 END
+
 
 IDD_APP_DIAGNOSTICS DIALOGEX 0, 0, 420, 286
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX

@@ -5,6 +5,7 @@
 #include "aether/common/text.hpp"
 #include <algorithm>
 #include <set>
+#include <tuple>
 
 namespace aether::apk {
 namespace {
@@ -53,29 +54,34 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                                    const ResourceConfiguration *configuration, ResourceParseOptions options) {
     const bool runtime_selection =
         configuration && configuration->policy == ResourceSelectionPolicy::neutral_runtime;
+    const bool optimized = options.names == ResourceNamePolicy::optimized;
+    if (optimized && (!runtime_selection || options.metadata_preview))
+        bad("Optimized tables require the explicit neutral runtime policy", "UNSUPPORTED");
+    const bool extended = options.metadata_preview || optimized;
     if (runtime_selection &&
         (!configuration->density || configuration->density >= 0xfffe || !configuration->sdk))
         bad("A neutral runtime target requires an explicit numeric density and resource SDK", "UNSUPPORTED");
-    const std::size_t encoded_limit = (options.metadata_preview ? 64u : 16u) * 1024 * 1024;
+    const std::size_t encoded_limit = (extended ? 64u : 16u) * 1024 * 1024;
     if (bytes.size() > encoded_limit)
-        bad(options.metadata_preview ? "Preview resource table exceeds 64 MiB limit"
-                                     : "Resource table exceeds 16 MiB limit",
+        bad(extended ? "Extended resource table exceeds 64 MiB limit" : "Resource table exceeds 16 MiB limit",
             "LIMIT");
     const View document(bytes, "resources");
     const auto top = chunk(document, 0);
     if (top.type != 2 || top.header != 12 || top.size != bytes.size())
         bad("Expected a complete Android resource table");
     const auto package_count = document.u32(8);
-    if (!package_count || package_count > (options.metadata_preview ? 256u : 1u))
-        bad("Only a single application resource package is supported", "UNSUPPORTED");
+    if (!package_count || package_count > (extended ? 256u : 1u))
+        bad("Resource package count exceeds the selected table policy", "UNSUPPORTED");
     ResourceTable result;
     result.metadata_preview_ = options.metadata_preview;
+    result.optimized_runtime_ = optimized;
     if (configuration)
         result.configuration_ = *configuration;
     result.encoded_bytes_ = bytes.size();
     bool have_strings = false, have_package = false;
     std::set<std::uint32_t> package_ids;
     std::size_t chunks = 0;
+    std::size_t entry_count = 0;
     for (std::size_t offset = top.header; offset < bytes.size();) {
         if (++chunks > 8192)
             bad("Resource chunk quota exceeded", "LIMIT");
@@ -94,16 +100,19 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
             }
         }
         if (current.type == 1 && !have_strings && !have_package) {
+            std::vector<std::uint32_t> styled;
             result.strings_ = parse_string_pool(document.slice(offset, current.size), "resources",
-                                                "RESOURCES", options.metadata_preview);
+                                                "RESOURCES", extended, optimized ? &styled : nullptr);
+            result.styled_strings_.insert(styled.begin(), styled.end());
             for (const auto &text : result.strings_)
                 result.decoded_bytes_ += text.size();
             have_strings = true;
-        } else if (current.type == 0x200 && have_strings && !have_package) {
+        } else if (current.type == 0x200 && have_strings && (!have_package || optimized)) {
             have_package = true;
-            if (current.header != 288 || view.u32(8) != 0x7f || view.u32(284))
-                bad("Only the standard application package ID with no type offset is supported",
-                    "UNSUPPORTED");
+            const auto package_id = view.u32(8);
+            if (current.header != 288 || view.u32(284) ||
+                (optimized ? package_id < 2 || package_id > 255 : package_id != 0x7f))
+                bad("Resource package requires a fixed application ID and no type offset", "UNSUPPORTED");
             std::wstring name;
             bool ended = false;
             for (std::size_t i = 0; i < 128; ++i) {
@@ -117,11 +126,18 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
             }
             if (!ended || name.empty())
                 bad("Unterminated or empty resource package name");
+            std::string package_name;
             try {
-                result.package_ = utf8(name);
+                package_name = utf8(name);
             } catch (const std::invalid_argument &) {
                 bad("Invalid Unicode package name");
             }
+            if (!result.packages_.emplace(package_id, package_name).second ||
+                std::count_if(result.packages_.begin(), result.packages_.end(),
+                              [&](const auto &item) { return item.second == package_name; }) != 1)
+                bad("Duplicate resource package ID or name");
+            if (package_id == 0x7f)
+                result.package_ = package_name;
             const auto types_at = view.u32(268), keys_at = view.u32(276);
             if (types_at < current.header || keys_at <= types_at)
                 bad("Invalid resource name-pool offsets");
@@ -143,9 +159,9 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                                                    : "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
                                                      "0123456789_.") == std::string::npos;
             };
-            const bool compiled_names = options.names == ResourceNamePolicy::compiled;
+            const bool compiled_names = options.names != ResourceNamePolicy::legacy;
             const auto key_valid = [&](const std::string &value) {
-                if (!options.metadata_preview)
+                if (!extended)
                     return name_valid(value, 256, compiled_names);
                 // Compiled keys may be Unicode or obfuscator labels such as
                 // "(name removed)". They are bounded identities, never paths.
@@ -154,7 +170,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                        std::none_of(value.begin(), value.end(),
                                     [](unsigned char c) { return c < 32 || c == 127; });
             };
-            if (!name_valid(result.package_, 255) ||
+            if (!name_valid(package_name, 255) ||
                 std::any_of(keys.begin(), keys.end(), [&](const auto &value) { return !key_valid(value); }))
                 bad("Resource package/type/key names exceed the supported identifier subset", "UNSUPPORTED");
             for (std::size_t i = 0; i < types.size(); ++i) {
@@ -169,7 +185,6 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
             std::set<unsigned> definitions;
             std::set<std::pair<unsigned, std::vector<std::uint8_t>>> configurations;
             std::map<std::uint32_t, std::uint32_t> resource_keys;
-            std::size_t entry_count = 0;
             bool saw_types = false, saw_keys = false, saw_libraries = false;
             for (std::size_t at = current.header; at < current.size;) {
                 if (++chunks > 8192)
@@ -250,7 +265,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         auto relative = flags & 1    ? item.u16(table_at + 2)
                                         : width == 2 ? item.u16(table_at)
                                                      : item.u32(table_at);
-                        if (++entry_count > (options.metadata_preview ? 8388608u : 262144u))
+                        if (++entry_count > (extended ? 8388608u : 262144u))
                             bad("Resource variant quota exceeded", "LIMIT");
                         if (flags & 1)
                             relative *= 4;
@@ -297,12 +312,15 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                                         {item.u32(map), {item.u32(map + 8), item.u8(map + 7)}});
                             }
                             if (bag) {
-                                std::sort(bag->items.begin(), bag->items.end(),
-                                          [](const auto &a, const auto &b) { return a.key < b.key; });
-                                if (std::adjacent_find(bag->items.begin(), bag->items.end(),
-                                                       [](const auto &a, const auto &b) {
-                                                           return a.key == b.key;
-                                                       }) != bag->items.end())
+                                std::stable_sort(bag->items.begin(), bag->items.end(),
+                                                 [](const auto &a, const auto &b) { return a.key < b.key; });
+                                bag->duplicate_keys = std::adjacent_find(bag->items.begin(), bag->items.end(),
+                                                                         [](const auto &a, const auto &b) {
+                                                                             return a.key == b.key;
+                                                                         }) != bag->items.end();
+                                // Android retains repeated attributes. Preserve their values/order,
+                                // but do not guess a theme consumer's duplicate precedence.
+                                if (bag->duplicate_keys && !optimized)
                                     bad("Duplicate complex resource map key");
                             }
                             // Frozen icon callers retain only identity. Runtime
@@ -327,21 +345,21 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         }
                         (void)item.slice(value_at, size);
                         const auto next = ranges.lower_bound(value_at);
-                        const bool shared = options.metadata_preview && next != ranges.end() &&
-                                            next->first == value_at && next->second == value_at + size;
+                        const bool shared = extended && next != ranges.end() && next->first == value_at &&
+                                            next->second == value_at + size;
                         if (!shared && ((next != ranges.end() && value_at + size > next->first) ||
                                         (next != ranges.begin() && std::prev(next)->second > value_at)))
                             bad("Resource entries overlap");
                         ranges.emplace(value_at, value_at + size);
-                        if (key >= keys.size() ||
-                            (!options.metadata_preview && !entry_keys.insert(key).second) ||
+                        if (key >= keys.size() || (!extended && !entry_keys.insert(key).second) ||
                             keys[key].empty() || types[id - 1].empty())
                             bad("Invalid or duplicate resource name");
                         if (value_type == 3 && data >= result.strings_.size())
                             bad("Resource string index is out of bounds");
-                        if (result.entries_.size() >= (options.metadata_preview ? 131072u : 65536u))
+                        const auto resource_id = (package_id << 24) | (std::uint32_t(id) << 16) | entry_id;
+                        if (result.entries_.size() >= (extended ? 131072u : 65536u) &&
+                            !result.entries_.contains(resource_id))
                             bad("Resource entry quota exceeded", "LIMIT");
-                        const auto resource_id = 0x7f000000u | (std::uint32_t(id) << 16) | entry_id;
                         const auto [identity, inserted] = resource_keys.emplace(resource_id, key);
                         if (!inserted && identity->second != key)
                             bad("Resource name changes across configurations");
@@ -367,7 +385,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                             }
                         }
                     }
-                } else if (part.type == 0x203 && options.metadata_preview) {
+                } else if (part.type == 0x203 && extended) {
                     if (saw_libraries || part.header != 12 || item.u32(8) > 256 ||
                         part.size != 12ull + std::uint64_t(item.u32(8)) * 260)
                         bad("Invalid resource library metadata");
@@ -406,7 +424,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                     bad("Unsupported resource package chunk " + std::to_string(part.type), "UNSUPPORTED");
                 at += part.size;
             }
-            if (!saw_types || !saw_keys || (!options.metadata_preview && specs.size() != definitions.size()))
+            if (!saw_types || !saw_keys || (!extended && specs.size() != definitions.size()))
                 bad("Missing resource name pools or type definitions");
             for (const auto &[id, declared] : declared_configurations)
                 if (declared && declared != actual_configurations[id])
@@ -419,6 +437,8 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
         bad("Missing resource string pool or package");
     if (options.metadata_preview && package_ids.size() != package_count)
         bad("Resource package count disagrees with table header");
+    if (optimized && (result.packages_.size() != package_count || result.package_.empty()))
+        bad("Resource packages disagree with the header or omit the base application");
     result.chunks_ = chunks;
     return result;
 }
@@ -427,7 +447,9 @@ ResourceTable ResourceTable::compose(const PackageView &package, std::string_vie
                                      ResourceParseOptions options) {
     ResourceTable result;
     result.metadata_preview_ = options.metadata_preview;
-    const std::size_t encoded_limit = (options.metadata_preview ? 64u : 16u) * 1024 * 1024;
+    result.optimized_runtime_ = options.names == ResourceNamePolicy::optimized;
+    const bool extended = result.metadata_preview_ || result.optimized_runtime_;
+    const std::size_t encoded_limit = (extended ? 64u : 16u) * 1024 * 1024;
     if (configuration)
         result.configuration_ = *configuration;
     for (const auto &part : package.parts) {
@@ -437,8 +459,8 @@ ResourceTable ResourceTable::compose(const PackageView &package, std::string_vie
         if (found == entries.end())
             continue;
         if (found->directory || found->bytes > encoded_limit - result.encoded_bytes_)
-            bad(options.metadata_preview ? "Combined preview resource tables exceed 64 MiB"
-                                         : "Combined resource tables exceed 16 MiB",
+            bad(extended ? "Combined extended resource tables exceed 64 MiB"
+                         : "Combined resource tables exceed 16 MiB",
                 "LIMIT");
         auto table = parse(part.archive->read(static_cast<std::size_t>(found - entries.begin())), part.path,
                            configuration, options);
@@ -451,8 +473,11 @@ ResourceTable ResourceTable::compose(const PackageView &package, std::string_vie
 void ResourceTable::merge(ResourceTable other) {
     if (metadata_preview_ != other.metadata_preview_)
         bad("Cannot compose preview and runtime resource policies", "UNSUPPORTED");
-    const std::size_t encoded_limit = (metadata_preview_ ? 64u : 16u) * 1024 * 1024;
-    const std::size_t string_limit = metadata_preview_ ? 262144u : 65536u;
+    if (optimized_runtime_ != other.optimized_runtime_ && encoded_bytes_)
+        bad("Cannot compose different compiled resource policies", "UNSUPPORTED");
+    const bool extended = metadata_preview_ || optimized_runtime_ || other.optimized_runtime_;
+    const std::size_t encoded_limit = (extended ? 64u : 16u) * 1024 * 1024;
+    const std::size_t string_limit = extended ? 262144u : 65536u;
     const bool runtime_selection =
         (configuration_ && configuration_->policy == ResourceSelectionPolicy::neutral_runtime) ||
         (other.configuration_ && other.configuration_->policy == ResourceSelectionPolicy::neutral_runtime);
@@ -462,14 +487,21 @@ void ResourceTable::merge(ResourceTable other) {
         bad("Resource packages disagree across APK members");
     if (other.encoded_bytes_ > encoded_limit - encoded_bytes_ ||
         other.decoded_bytes_ > 16 * 1024 * 1024 - decoded_bytes_ || other.chunks_ > 8192 - chunks_ ||
-        other.entries_.size() > (metadata_preview_ ? 131072u : 65536u) - entries_.size() ||
+        other.entries_.size() > (extended ? 131072u : 65536u) - entries_.size() ||
         other.strings_.size() > string_limit - strings_.size() ||
         other.metadata_bytes_ > 64 * 1024 * 1024 - metadata_bytes_ || other.bag_items_ > 262144 - bag_items_)
         bad("Combined resource tables exceed package-wide quotas", "LIMIT");
-    std::set<std::pair<std::string, std::string>> names;
-    if (!metadata_preview_)
+    for (const auto &[id, name] : other.packages_) {
+        const auto found = packages_.find(id);
+        if ((found != packages_.end() && found->second != name) ||
+            std::any_of(packages_.begin(), packages_.end(),
+                        [&](const auto &old) { return old.first != id && old.second == name; }))
+            bad("Resource package identity changes across APK members");
+    }
+    std::set<std::tuple<std::uint32_t, std::string, std::string>> names;
+    if (!extended)
         for (const auto &[id, entry] : entries_)
-            names.emplace(entry.type, entry.name);
+            names.emplace(id >> 24, entry.type, entry.name);
     // Validate every identity before rebasing strings or replacing an existing
     // selection; a later conflicting split must not leave dangling string IDs.
     for (const auto &[id, entry] : other.entries_) {
@@ -480,7 +512,7 @@ void ResourceTable::merge(ResourceTable other) {
                 (old.density == entry.density && old.sdk == entry.sdk))
                 bad("Resource identity/configuration is ambiguous across APK members", "UNSUPPORTED");
         } else if (found != entries_.end() ||
-                   (!metadata_preview_ && !names.emplace(entry.type, entry.name).second))
+                   (!extended && !names.emplace(id >> 24, entry.type, entry.name).second))
             bad("Default resource identity is ambiguous across APK members", "UNSUPPORTED");
     }
     for (auto &[id, entry] : other.entries_) {
@@ -512,6 +544,10 @@ void ResourceTable::merge(ResourceTable other) {
         package_ = std::move(other.package_);
     if (runtime_selection && !configuration_)
         configuration_ = other.configuration_;
+    optimized_runtime_ = other.optimized_runtime_;
+    packages_.merge(other.packages_);
+    for (const auto index : other.styled_strings_)
+        styled_strings_.insert(static_cast<std::uint32_t>(strings_.size()) + index);
     strings_.insert(strings_.end(), std::make_move_iterator(other.strings_.begin()),
                     std::make_move_iterator(other.strings_.end()));
     entries_.merge(other.entries_);
@@ -532,14 +568,16 @@ std::uint32_t ResourceTable::identifier(std::string_view name, std::string_view 
         type = name.substr(0, slash);
         name.remove_prefix(slash + 1);
     }
-    if (package != package_)
+    const auto owner = std::find_if(packages_.begin(), packages_.end(),
+                                    [&](const auto &item) { return item.second == package; });
+    if (owner == packages_.end())
         return 0;
     std::uint32_t match = 0;
     for (const auto &[id, entry] : entries_)
-        if (entry.type == type && entry.name == name) {
+        if ((id >> 24) == owner->first && entry.type == type && entry.name == name) {
             if (match)
                 bad("Symbolic resource name is ambiguous; use its encoded ID", "UNSUPPORTED");
-            if (!metadata_preview_)
+            if (!metadata_preview_ && !optimized_runtime_)
                 return id;
             match = id;
         }
@@ -575,14 +613,23 @@ const ResourceEntry &ResourceTable::value(std::uint32_t id) const {
 std::string_view ResourceTable::string_value(const ResourceEntry &entry) const {
     if (entry.value_type != 3 || entry.data >= strings_.size())
         bad("Resource is not a string", "UNSUPPORTED");
+    if (styled_strings_.contains(entry.data))
+        bad("Styled resource text requires an implemented span consumer", "UNSUPPORTED");
     return strings_[entry.data];
 }
-std::u16string ResourceTable::text(std::uint32_t id) const { return unicode(strings_.at(resolve(id).data)); }
-std::u16string ResourceTable::text(ResourceValue value) const {
+std::u16string ResourceTable::text(std::uint32_t id, bool strip_styles) const {
+    const auto index = resolve(id).data;
+    if (!strip_styles && styled_strings_.contains(index))
+        bad("Styled resource text requires an implemented span consumer", "UNSUPPORTED");
+    return unicode(strings_.at(index));
+}
+std::u16string ResourceTable::text(ResourceValue value, bool strip_styles) const {
     if (value.type == 1)
-        return text(value.data);
+        return text(value.data, strip_styles);
     if (value.type != 3 || value.data >= strings_.size())
         bad("Resource bag value is not a supported string or reference", "UNSUPPORTED");
+    if (!strip_styles && styled_strings_.contains(value.data))
+        bad("Styled resource text requires an implemented span consumer", "UNSUPPORTED");
     return unicode(strings_[value.data]);
 }
 std::vector<ResourceBagItem> ResourceTable::bag(std::uint32_t id) const {
@@ -595,6 +642,9 @@ std::vector<ResourceBagItem> ResourceTable::bag(std::uint32_t id) const {
         const auto found = bags_.find(entry.id);
         if (found == bags_.end())
             bad("Resource is not a retained complex value", "UNSUPPORTED");
+        if (found->second.duplicate_keys)
+            bad("Resource bag requires a duplicate-attribute consumer: " + std::to_string(entry.id),
+                "UNSUPPORTED");
         for (const auto &item : found->second.items) {
             // Visit children first: an existing child value overrides its parent.
             resolved.try_emplace(item.key, item.value);

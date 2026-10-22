@@ -1,10 +1,13 @@
 #include "aether/jni/bridge.hpp"
+#include "aether/common/thread_exit.hpp"
+#include "aether/host/process_info.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <map>
 #include <set>
 #include <thread>
+#include <utility>
 
 namespace aether::jni {
 namespace {
@@ -98,11 +101,13 @@ struct Bridge::Impl {
     Bridge &bridge;
     dex::ManagedRuntime &runtime;
     a64::GuestMemory &memory;
+    std::shared_ptr<ProcessState> process;
     bionic::GuestPosixServices posix;
     elf::GuestLoader loader;
     a64::GuestCpu cpu;
     std::string root, error;
     Metrics metrics;
+    std::vector<std::string> loaded_roots;
     unsigned load_state = 0;
     bool on_load_active = false;
     const std::thread::id owner_thread = std::this_thread::get_id();
@@ -113,6 +118,7 @@ struct Bridge::Impl {
         ObjectId object;
         std::size_t frame;
         bool global;
+        Address context;
     };
     struct LocalFrame {
         std::set<Handle> handles;
@@ -127,6 +133,7 @@ struct Bridge::Impl {
         ObjectId string;
         bool utf8;
         std::size_t bytes;
+        Address context;
     };
     std::map<Handle, Ref> refs;
     std::vector<LocalFrame> frames;
@@ -137,13 +144,27 @@ struct Bridge::Impl {
     Address buffer_next = 0x50000000;
     std::size_t buffer_bytes = 0;
     ObjectId pending = 0;
+    Address context=0,current_environment=Bridge::environment;
+    bool attached=true;
+    struct ManagedBinding {ObjectId thread=0;Address tls=0;bool mapped=false;std::uint32_t tid=0;};
+    std::array<ManagedBinding,16> managed_bindings{};
+    std::uint32_t next_managed_tid=0x40000000;
+    ObjectId active_managed_thread=0;
+    std::uint64_t active_execution_token=0;
     Impl(Bridge &bridge, dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
          const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
-         host::FileService *files, bool attach_interface)
-        : bridge(bridge), runtime(runtime), memory(memory), posix(memory, app, time, 1, files),
+         host::FileService *files, bool attach_interface,std::string_view package)
+        : bridge(bridge), runtime(runtime), memory(memory), process(app.process_state), posix(memory, app, time, 1, files,nullptr,package),
           loader(memory, posix), cpu(memory, app, &bridge), root(std::move(root)),
           attach_interface(attach_interface) {
         try {
+            runtime.bind_process_state(process);process->checkpoint();
+            posix.set_managed_priority_service(runtime.thread_priority_baseline(),[this](std::optional<std::int32_t> nice){return this->runtime.thread_priority(nice);});
+            cpu.set_thread_pointer(posix.thread_pointer());
+            posix.set_signal_runner([this](Address entry,std::uint32_t signal,Address stack,Address tls){return cpu.call(entry,std::array<std::uint64_t,1>{signal},stack,1'000'000,{},tls);});
+        posix.set_thread_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
+                return run_worker(entry,argument,stack,tls,budget);
+            });
             loader.load(modules, this->root);
             map(tables, 8192);
             map(trampolines, 4096);
@@ -197,6 +218,7 @@ struct Bridge::Impl {
             }
             buffers.clear();
             metrics.string_buffers = 0;
+            for(auto &binding:managed_bindings)release_managed_binding(binding);
             for (auto it = mappings.rbegin(); it != mappings.rend(); ++it)
                 memory.unmap(*it);
             mappings.clear();
@@ -239,7 +261,7 @@ struct Bridge::Impl {
         if (!handle)
             return 0;
         const auto it = refs.find(handle);
-        if (it == refs.end())
+        if (it == refs.end() || (!it->second.global && it->second.context!=context))
             bad("REFERENCE", "Invalid, deleted or foreign JNI reference");
         return it->second.object;
     }
@@ -251,7 +273,7 @@ struct Bridge::Impl {
         const auto handle = identity();
         runtime.retain(object);
         try {
-            refs.emplace(handle, Ref{object, frames.size(), global});
+            refs.emplace(handle, Ref{object, frames.size(), global,context});
             if (!global)
                 frames.back().handles.insert(handle);
         } catch (...) {
@@ -270,7 +292,7 @@ struct Bridge::Impl {
         if (!handle)
             return;
         const auto it = refs.find(handle);
-        if (it == refs.end() || it->second.global != global)
+        if (it == refs.end() || it->second.global != global || (!global && it->second.context!=context))
             bad("REFERENCE", "Reference deletion has wrong kind or stale handle");
         runtime.release(it->second.object);
         if (global)
@@ -290,6 +312,60 @@ struct Bridge::Impl {
         }
         frames.pop_back();
     }
+    void release_managed_binding(ManagedBinding &binding) {
+        if(!binding.thread)return;
+        for(auto it=buffers.begin();it!=buffers.end();) {
+            if(it->second.context!=binding.tls){++it;continue;}
+            memory.unmap(it->first);runtime.release(it->second.string);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
+        }
+        metrics.string_buffers=buffers.size();
+        if(binding.mapped)memory.unmap(binding.tls);
+        runtime.release(binding.thread);binding={};
+    }
+    bionic::GuestPosixServices::ThreadBinding managed_binding(ObjectId thread) {
+        std::size_t slot=0;
+        for(;slot<managed_bindings.size();++slot)if(managed_bindings[slot].thread==thread)break;
+        if(slot==managed_bindings.size()) {
+            for(slot=0;slot<managed_bindings.size();++slot)if(!managed_bindings[slot].thread || !runtime.thread_alive(managed_bindings[slot].thread))break;
+            if(slot==managed_bindings.size())bad("THREAD_LIMIT","Sixteen live managed native bindings exhausted");
+            if(next_managed_tid==0x7fffffffU)bad("THREAD_LIMIT","Managed native thread ID lifetime range exhausted");
+            auto id=next_managed_tid+1;if(id==host::current_process_id())++id;
+            if(id>0x7fffffffU)bad("THREAD_LIMIT","Managed native thread ID lifetime range exhausted");
+            auto &binding=managed_bindings[slot];release_managed_binding(binding);
+            const auto tls=Address{0x36000000}+slot*0x2000;runtime.retain(thread);bool mapped=false;
+            try {
+                memory.map(tls,4096,a64::read_write);mapped=true;
+                write(tls,tls,8);write(tls+8,id,8);write(tls+40,read(0x25028,8),8);write(tls+0x200,function_table,8);
+                binding={thread,tls,true,id};next_managed_tid=id;
+            }catch(...){if(mapped)memory.unmap(tls);runtime.release(thread);throw;}
+        }
+        const auto tls=managed_bindings[slot].tls;return {managed_bindings[slot].tid,tls,tls+0x100,runtime.thread_initial_signal_mask(thread)};
+    }
+    struct LogicalScope {
+        Impl &p;ObjectId owner;std::uint64_t token;bool switched=false;
+        std::vector<LocalFrame> frames;ObjectId pending=0;Address context=0,environment=0,tls=0;bool attached=false;
+        std::optional<bionic::GuestPosixServices::ThreadBinding> binding;
+        explicit LogicalScope(Impl &p):p(p),owner(p.active_managed_thread),token(p.active_execution_token) {
+            const auto thread=p.runtime.current_thread(),execution=dex::Scheduler::execution_token();
+            if(p.native_depth && (owner!=thread || token!=execution))bad("THREAD","Native CPU belongs to another logical thread");
+            const bool main=p.runtime.is_main_thread();
+            if(!main) {
+                const auto selected=p.managed_binding(thread);
+                if(p.context!=selected.tls) {
+                    if(p.native_depth)bad("THREAD","Cannot switch a live native attachment");
+                    tls=p.posix.thread_pointer();p.cpu.set_thread_pointer(selected.tls);
+                    try{binding=p.posix.exchange_thread_binding(selected);}catch(...){p.cpu.set_thread_pointer(tls);throw;}
+                    frames=std::move(p.frames);pending=std::exchange(p.pending,0);context=p.context;environment=p.current_environment;attached=p.attached;
+                    p.context=selected.tls;p.current_environment=selected.tls+0x200;p.attached=true;p.frames.clear();switched=true;
+                }
+            } else if(p.context)bad("THREAD","Main entry cannot borrow a background attachment");
+            p.active_managed_thread=thread;p.active_execution_token=execution;
+        }
+        ~LogicalScope(){
+            if(switched){while(!p.frames.empty())p.pop();p.pending_exception(0);p.frames=std::move(frames);p.pending=pending;p.context=context;p.current_environment=environment;p.attached=attached;p.posix.exchange_thread_binding(binding);p.cpu.set_thread_pointer(tls);}
+            p.active_managed_thread=owner;p.active_execution_token=token;
+        }
+    };
     struct Scope {
         Impl &p;
         std::size_t base;
@@ -306,6 +382,31 @@ struct Bridge::Impl {
         }
         Address stack() const { return stacks + (p.native_depth - 1) * stride + stack_size - 4096; }
     };
+    void clear_attachment() {
+        while(!frames.empty())pop();
+        pending_exception(0);
+        for(auto it=buffers.begin();it!=buffers.end();) {
+            if(it->second.context!=context){++it;continue;}
+            memory.unmap(it->first);runtime.release(it->second.string);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
+        }
+        metrics.string_buffers=buffers.size();attached=false;
+    }
+    bionic::GuestPosixServices::ThreadExecution run_worker(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
+        const auto before=cpu.metrics().guest_ticks;a64::ExecutionResult result;
+        try {runtime.run_native_thread([&]{
+            auto parent_frames=std::move(frames);const auto parent_pending=std::exchange(pending,0);
+            const auto parent_context=context,parent_environment=current_environment;const auto parent_attached=attached;
+            context=tls;current_environment=tls+0x200;attached=false;frames.clear();
+            struct Restore {
+                Impl &p;std::vector<LocalFrame> frames;ObjectId pending;Address context,environment;bool attached;
+                ~Restore(){p.clear_attachment();p.frames=std::move(frames);p.pending=pending;p.context=context;p.current_environment=environment;p.attached=attached;}
+            } restore{*this,std::move(parent_frames),parent_pending,parent_context,parent_environment,parent_attached};
+            write(current_environment,function_table,8);
+            result=cpu.call(entry,std::array{argument},stack,budget,{},tls);
+        },[this](std::optional<std::int32_t> nice){return posix.current_thread_priority(nice);});}
+        catch(const ThreadExit &exit){process->checkpoint();posix.request_thread_exit(exit.value);result.fault=a64::Fault::thread_exit;result.registers[0]=exit.value;}
+        return {result,cpu.metrics().guest_ticks-before};
+    }
     void pending_exception(ObjectId object) {
         if (object)
             runtime.retain(object);
@@ -329,10 +430,18 @@ struct Bridge::Impl {
     }
     a64::ExecutionResult call(Address address, std::span<const std::uint64_t> args, Address stack,
                               std::span<const a64::Vector> floats = {}) {
-        const auto result = cpu.call(address, args, stack, 1'000'000, floats);
+        process->checkpoint();
+        const auto before=cpu.metrics().guest_ticks;
+        const auto result = cpu.call(address, args, stack, 1'000'000, floats,posix.thread_pointer());
+        if(result.fault==a64::Fault::process_exit){process->request_exit(result.detail);process->checkpoint();}
+        if(result.fault==a64::Fault::thread_exit)runtime.exit_current_thread(result.registers[0]);
         if (!result.returned)
             bad("NATIVE_EXECUTION", std::string(a64::fault_name(result.fault)) + ": " + error + "; " +
                                         std::string(posix.last_rejection()));
+        const auto spent=cpu.metrics().guest_ticks-before;
+        const auto thread_fault=posix.run_pending_threads(spent>=1000000?0:1000000-spent);
+        if(thread_fault==a64::Fault::process_exit)process->checkpoint();
+        if(thread_fault!=a64::Fault::none)bad("NATIVE_EXECUTION",std::string(a64::fault_name(thread_fault))+": "+error+"; "+std::string(posix.last_rejection()));
         return result;
     }
     Value decode(std::uint64_t bits, std::string_view type) {
@@ -473,7 +582,7 @@ struct Bridge::Impl {
             memory.protect(address, a64::Permission::read);
             runtime.retain(id);
             retained = true;
-            buffers.emplace(address, Buffer{id, utf8, size});
+            buffers.emplace(address, Buffer{id, utf8, size,context});
         } catch (...) {
             if (retained)
                 runtime.release(id);
@@ -486,7 +595,7 @@ struct Bridge::Impl {
     }
     void release_string(ObjectId id, Address address, bool utf8) {
         const auto it = buffers.find(address);
-        if (it == buffers.end() || it->second.string != id || it->second.utf8 != utf8)
+        if (it == buffers.end() || it->second.string != id || it->second.utf8 != utf8 || it->second.context!=context)
             bad("BUFFER", "Mismatched or double JNI string release");
         memory.unmap(address);
         runtime.release(id);
@@ -522,7 +631,7 @@ struct Bridge::Impl {
     }
     void dispatch(unsigned slot, a64::ServiceState &state) {
         auto &r = state.registers;
-        if (r[0] != Bridge::environment)
+        if (!attached || r[0] != current_environment)
             bad("ENVIRONMENT", "JNIEnv does not belong to this app/thread");
         if (pending && slot != 15 && slot != 17 && slot != 228 && slot != 22 && slot != 23 && slot != 20 &&
             slot != 166 && slot != 170)
@@ -763,21 +872,39 @@ struct Bridge::Impl {
 };
 Bridge::Bridge(dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
                const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
-               host::FileService *files, bool attach_interface)
+               host::FileService *files, bool attach_interface,std::string_view package)
     : impl_(std::make_unique<Impl>(*this, runtime, memory, app, time, modules, std::move(root), files,
-                                   attach_interface)) {}
+                                   attach_interface,package)) {}
 Bridge::~Bridge() {
     if (impl_ && impl_->attach_interface)
         impl_->runtime.set_native_interface(nullptr);
 }
+bool Bridge::has_library(std::string_view root) const noexcept {
+    return impl_->root == root || std::find(impl_->loaded_roots.begin(), impl_->loaded_roots.end(), root) != impl_->loaded_roots.end();
+}
+void Bridge::add_library(std::span<const elf::ModuleInput> modules, std::string root) {
+    auto &p = *impl_;p.process->checkpoint();
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_depth || p.load_state != 2)
+        bad("LOAD_STATE", "Additional native graphs require an idle initialized bridge");
+    Impl::LogicalScope logical_scope(p);
+    if (has_library(root)) return;
+    p.loaded_roots.reserve(p.loaded_roots.size() + 1);
+    p.loader.extend(modules, root);
+    p.root = std::move(root);
+    p.load_state = 0;
+}
 void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name) {
-    auto &p = *impl_;
+    auto &p = *impl_;p.process->checkpoint();
     if (std::this_thread::get_id() != p.owner_thread)
         bad("THREAD", "Native library belongs to another runtime thread");
     if (&runtime != &p.runtime || p.closed)
         bad("STATE", "Wrong or closed runtime");
-    if ("lib" + ascii(name) + ".so" != p.root)
-        bad("LIBRARY_UNSUPPORTED", "Library is not in this app's explicit native registry");
+    Impl::LogicalScope logical_scope(p);
+    const auto requested = "lib" + ascii(name) + ".so";
+    if (p.load_state == 3) bad("LOAD_STATE", "Previously failed JNI library load");
+    if (std::find(p.loaded_roots.begin(), p.loaded_roots.end(), requested) != p.loaded_roots.end()) return;
+    if (requested != p.root)
+        bad("LIBRARY_UNSUPPORTED", "Additional native root lib"+ascii(name)+".so requires another dependency graph; active root is "+p.root);
     if (p.load_state == 2)
         return;
     // FindClass in JNI_OnLoad can initialize another class that loads this library.
@@ -790,6 +917,7 @@ void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name
     Impl::Scope scope(p);
     try {
         p.loader.initialize(p.cpu, scope.stack());
+        if(const auto fault=p.posix.run_pending_threads();fault!=a64::Fault::none){p.process->checkpoint();bad("NATIVE_EXECUTION",std::string(a64::fault_name(fault))+": "+std::string(p.posix.last_rejection()));}
         std::optional<Address> on_load;
         try {
             on_load = p.loader.symbol(p.root, "JNI_OnLoad").address;
@@ -810,7 +938,10 @@ void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name
             if (result.registers[0] != 0x10006)
                 bad("VERSION", "JNI_OnLoad must return the supported JNI 1.6 version");
         }
+        p.loaded_roots.push_back(p.root);
         p.load_state = 2;
+    } catch(const ThreadExit &exit){
+        p.load_state=3;p.pending_exception(0);p.process->checkpoint();p.runtime.exit_current_thread(exit.value);
     } catch (...) {
         p.load_state = 3;
         p.pending_exception(0);
@@ -818,11 +949,12 @@ void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name
     }
 }
 Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<const Value> arguments) {
-    auto &p = *impl_;
+    auto &p = *impl_;p.process->checkpoint();
     if (std::this_thread::get_id() != p.owner_thread)
         bad("THREAD", "Native library belongs to another runtime thread");
     if (&runtime != &p.runtime || p.closed || (p.load_state != 2 && !p.on_load_active))
         bad("STATE", "Native library is not initialized in this runtime");
+    Impl::LogicalScope logical_scope(p);
     p.check_pending();
     p.error.clear();
     Impl::Scope scope(p);
@@ -835,16 +967,24 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
     else {
         const auto short_name = "Java_" + mangled(std::string_view(owner).substr(1, owner.size() - 2)) + "_" +
                                 mangled(method.name);
-        try {
-            address = p.loader.symbol(p.root, short_name).address;
-        } catch (const elf::ElfError &) {
-            const auto parameters =
-                std::string_view(prototype.descriptor).substr(1, prototype.descriptor.find(')') - 1);
-            address = p.loader.symbol(p.root, short_name + "__" + mangled(parameters)).address;
+        const auto parameters =
+            std::string_view(prototype.descriptor).substr(1, prototype.descriptor.find(')') - 1);
+        std::vector<std::string_view> roots;
+        for (const auto &root : p.loaded_roots) roots.push_back(root);
+        if (p.on_load_active) roots.push_back(p.root);
+        for (const auto root : roots) {
+            for (const auto &symbol : {short_name, short_name + "__" + mangled(parameters)}) {
+                try { address = p.loader.symbol(root, symbol).address; break; }
+                catch (const elf::ElfError &error) {
+                    if (error.code != "AETHER_ELF_SYMBOL_UNRESOLVED") throw;
+                }
+            }
+            if (address) break;
         }
+        if (!address) bad("METHOD_UNSUPPORTED", "No loaded native root exports " + short_name);
     }
     const auto stat = bool(method.flags & 8);
-    std::vector<std::uint64_t> integers{environment,
+    std::vector<std::uint64_t> integers{p.current_environment,
                                         p.reference(stat ? runtime.class_object(owner) : arguments[0].bits)};
     std::vector<a64::Vector> floating;
     std::vector<std::uint64_t> spilled;
@@ -881,6 +1021,8 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
         return Value::nothing();
     return p.decode(type == "F" || type == "D" ? result.vectors[0][0] : result.registers[0], type);
 }
+std::optional<std::uint64_t> Bridge::thread_exit_value(Address tls) const noexcept {return impl_->posix.thread_exit_value(tls);}
+
 a64::Fault Bridge::invoke(std::uint32_t service, Address instruction,
                           std::array<std::uint64_t, 31> &registers) noexcept {
     a64::ServiceState state;
@@ -892,33 +1034,49 @@ a64::Fault Bridge::invoke(std::uint32_t service, Address instruction,
 a64::Fault Bridge::invoke_frame(std::uint32_t service, Address instruction,
                                 a64::ServiceState &state) noexcept {
     auto &p = *impl_;
+    if(p.process->exit_status())return a64::Fault::process_exit;
     if (service < first_service)
         return p.posix.invoke_frame(service, instruction, state);
     try {
         ++p.metrics.calls;
-        if (p.closed || p.frames.empty())
-            bad("STATE", "JNI service outside native frame");
+        if (p.closed)bad("STATE","JNI service in closed bridge");
         if (service >= first_service && service < first_service + function_count) {
             const auto slot = service - first_service;
             if (instruction != trampolines + slot * 8)
                 bad("TRAMPOLINE", "JNI service called from an unregistered PC");
+            if(!p.attached || p.frames.empty())bad("THREAD_UNSUPPORTED","Native thread has no JNI attachment");
             p.dispatch(slot, state);
         } else if (service >= first_vm_service + 3 && service <= first_vm_service + 7) {
             const auto slot = service - first_vm_service;
             if (instruction != trampolines + 0x800 + slot * 8 || state.registers[0] != java_vm)
                 bad("VM", "Invalid JavaVM service identity");
-            if (slot != 6)
-                bad("THREAD_UNSUPPORTED", "Attach/detach/destroy VM are not supported");
-            if (state.registers[2] != 0x10006) {
-                p.write(state.registers[1], 0, 8);
-                state.registers[0] = static_cast<std::uint32_t>(-3);
+            if(slot==3)bad("THREAD_UNSUPPORTED","DestroyJavaVM is not supported");
+            if(slot==7)bad("THREAD_ATTRIBUTES_UNSUPPORTED","Daemon attachment is not implemented");
+            if(slot==5) {
+                if(p.posix.is_main_native_thread() || !p.runtime.detach_native_thread()){state.registers[0]=static_cast<std::uint32_t>(-1);return a64::Fault::none;}
+                p.clear_attachment();state.registers[0]=0;return a64::Fault::none;
+            }
+            if(!p.memory.accessible(state.registers[1],8,a64::Permission::write))bad("MEMORY","JavaVM output is not writable");
+            if(slot==4 || slot==7) {
+                if(!p.attached) {
+                    if(state.registers[2])bad("THREAD_ATTRIBUTES_UNSUPPORTED","Custom native attachment arguments are not implemented");
+                    p.runtime.current_thread();p.frames.push_back({});p.attached=true;
+                }
+                p.write(state.registers[1],p.current_environment,8);state.registers[0]=0;
+            } else if(state.registers[2]!=0x10006) {
+                p.write(state.registers[1],0,8);state.registers[0]=static_cast<std::uint32_t>(-3);
             } else {
-                p.write(state.registers[1], environment, 8);
-                state.registers[0] = 0;
+                p.write(state.registers[1],p.attached?p.current_environment:0,8);
+                state.registers[0]=p.attached?0:static_cast<std::uint32_t>(-2);
             }
         } else
             bad("FUNCTION_UNSUPPORTED", "Unknown JNI service ID");
         return a64::Fault::none;
+    } catch(const ThreadExit &exit){
+        if(p.process->exit_status())return a64::Fault::process_exit;
+        p.posix.request_thread_exit(exit.value);return a64::Fault::thread_exit;
+    } catch(const ProcessExit &exit){
+        p.process->request_exit(exit.status);return a64::Fault::process_exit;
     } catch (const dex::JavaException &e) {
         try {
             p.pending_exception(e.object);
@@ -938,6 +1096,14 @@ a64::Fault Bridge::invoke_frame(std::uint32_t service, Address instruction,
     ++p.metrics.rejected_calls;
     return a64::Fault::unsupported_service;
 }
+std::uint64_t Bridge::capture_signal_mask(dex::ManagedRuntime &runtime) {
+    auto &p=*impl_;
+    if(&runtime!=&p.runtime)throw a64::GuestError("AETHER_JNI_THREAD","Signal-mask capture from another runtime refused");
+    if(p.native_depth || runtime.is_main_thread())return p.posix.signal_mask();
+    const auto thread=runtime.current_thread();
+    for(const auto &binding:p.managed_bindings)if(binding.thread==thread)return p.posix.binding_signal_mask({binding.tid,binding.tls,binding.tls+0x100,runtime.thread_initial_signal_mask(thread)});
+    return runtime.thread_initial_signal_mask(thread);
+}
 const Metrics &Bridge::metrics() const noexcept { return impl_->metrics; }
 const a64::Metrics &Bridge::cpu_metrics() const noexcept { return impl_->cpu.metrics(); }
 std::string_view Bridge::last_error() const noexcept { return impl_->error; }
@@ -945,11 +1111,14 @@ void Bridge::shutdown() {
     auto &p = *impl_;
     if (p.closed)
         return;
+    if(p.process->exit_status()){p.closed=true;if(p.attach_interface)p.runtime.set_native_interface(nullptr);p.cleanup();return;}
+    Impl::LogicalScope logical_scope(p);
     if (p.native_depth)
         bad("STATE", "Cannot shut down an active native call");
     if (p.load_state == 2) {
         Impl::Scope scope(p);
-        p.loader.finalize(p.cpu, scope.stack());
+        try{p.loader.finalize(p.cpu, scope.stack());}
+        catch(const ThreadExit &exit){p.process->checkpoint();p.runtime.exit_current_thread(exit.value);}
     }
     p.closed = true;
     if (p.attach_interface)

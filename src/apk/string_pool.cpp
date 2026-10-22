@@ -4,7 +4,7 @@
 
 namespace aether::apk {
 std::vector<std::string> parse_string_pool(Bytes bytes, std::string_view phase, std::string_view kind,
-                                           bool metadata_preview) {
+                                           bool extended_table, std::vector<std::uint32_t> *styled_strings) {
     const auto bad = [&](std::string message) {
         throw InspectError("AETHER_" + std::string(kind) + "_INVALID", std::string(phase),
                            std::move(message));
@@ -19,9 +19,9 @@ std::vector<std::string> parse_string_pool(Bytes bytes, std::string_view phase, 
     const std::size_t start = view.u32(20);
     const std::size_t style_start = view.u32(24);
     const std::size_t offsets = view.u16(2);
-    if (count > (metadata_preview ? 262144u : 65536u) || styles > count || (flags & ~0x101U) != 0)
+    if (count > (extended_table ? 262144u : 65536u) || styles > count || (flags & ~0x101U) != 0)
         bad("String-pool count or flags are invalid");
-    if (styles != 0 && !metadata_preview)
+    if (styles != 0 && !extended_table)
         throw InspectError("AETHER_" + std::string(kind) + "_UNSUPPORTED", std::string(phase),
                            "Styled strings are unsupported");
     const std::size_t string_end = styles ? style_start : view.size();
@@ -135,8 +135,7 @@ std::vector<std::string> parse_string_pool(Bytes bytes, std::string_view phase, 
         if (decoded_bytes > 16 * 1024 * 1024)
             bad("String pool decoded size limit exceeded");
     }
-    // Preview consumes plain text, but validates every referenced style span
-    // instead of treating the style section as unchecked string bytes.
+    // Validate every span even if its string is not selected by a resource.
     std::size_t span_work = 0;
     for (std::uint32_t i = 0; i < styles; ++i) {
         const auto relative = view.u32(offsets + (std::size_t(count) + i) * 4);
@@ -144,6 +143,7 @@ std::vector<std::string> parse_string_pool(Bytes bytes, std::string_view phase, 
             continue;
         if ((relative & 3) || relative >= view.size() - style_start)
             bad("Style offset exceeds its pool");
+        bool styled = false;
         for (std::size_t at = style_start + relative;; at += 12) {
             if (++span_work > 262144)
                 bad("String style work limit exceeded");
@@ -153,7 +153,10 @@ std::vector<std::string> parse_string_pool(Bytes bytes, std::string_view phase, 
             const auto first = view.u32(at + 4), last = view.u32(at + 8);
             if (name >= count || first > last || last >= utf16_lengths[i])
                 bad("Invalid string style name or UTF-16 range");
+            styled = true;
         }
+        if (styled && styled_strings)
+            styled_strings->push_back(i);
     }
     return strings;
 }

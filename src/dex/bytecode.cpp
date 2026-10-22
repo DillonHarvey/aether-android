@@ -36,6 +36,8 @@ const std::array<Opcode, 256> &opcode_registry() noexcept {
         one(0x1a, "const-string", Format::f21c, 2);
         one(0x1b, "const-string/jumbo", Format::f31c, 3);
         one(0x1c, "const-class", Format::f21c, 2);
+        one(0x1d, "monitor-enter", Format::f11x, 1);
+        one(0x1e, "monitor-exit", Format::f11x, 1);
         one(0x1f, "check-cast", Format::f21c, 2);
         one(0x20, "instance-of", Format::f22c, 2);
         one(0x21, "array-length", Format::f12x, 1);
@@ -48,6 +50,7 @@ const std::array<Opcode, 256> &opcode_registry() noexcept {
         one(0x29, "goto/16", Format::f20t, 2);
         one(0x2a, "goto/32", Format::f30t, 3);
         one(0x2b, "packed-switch", Format::f31t, 3);
+        one(0x2c, "sparse-switch", Format::f31t, 3);
         group(0x2d, 0x31, "compare", Format::f23x, 2);
         group(0x32, 0x37, "if", Format::f22t, 2);
         group(0x38, 0x3d, "if-zero", Format::f21t, 2);
@@ -64,6 +67,13 @@ const std::array<Opcode, 256> &opcode_registry() noexcept {
         one(0x76, "invoke-direct/range", Format::f3rc, 3);
         one(0x77, "invoke-static/range", Format::f3rc, 3);
         one(0x78, "invoke-interface/range", Format::f3rc, 3);
+        one(0x81, "int-to-long", Format::f12x, 1);
+        one(0x82, "int-to-float", Format::f12x, 1);
+        one(0x84, "long-to-int", Format::f12x, 1);
+        one(0x87, "float-to-int", Format::f12x, 1);
+        one(0x8d, "int-to-byte", Format::f12x, 1);
+        one(0x8e, "int-to-char", Format::f12x, 1);
+        one(0x8f, "int-to-short", Format::f12x, 1);
         group(0x90, 0xaf, "binary", Format::f23x, 2);
         group(0xb0, 0xcf, "binary/2addr", Format::f12x, 1);
         group(0xd0, 0xd7, "binary/lit16", Format::f22s, 2);
@@ -104,7 +114,8 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
     };
     for (std::uint32_t pc = 0; pc < units.size();) {
         const auto first = units[pc];
-        if (!first && (pc & 1) && pc + 1 < units.size() && units[pc + 1] == 0x0100) {
+        if (!first && (pc & 1) && pc + 1 < units.size() &&
+            (units[pc + 1] == 0x0100 || units[pc + 1] == 0x0200)) {
             // D8 aligns non-executable payloads with an unreachable nop.
             data_width[pc] = data_prefix[pc + 1] = 1;
             ++pc;
@@ -119,6 +130,20 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             if (count &&
                 std::int64_t(signed32(pc + 2)) + count - 1 > std::numeric_limits<std::int32_t>::max())
                 invalid(method_index, pc, "Packed-switch key range overflows int32");
+            data_width[pc] = width;
+            std::fill(data_prefix.begin() + pc + 1, data_prefix.begin() + pc + width + 1, 1);
+            pc += width;
+            continue;
+        }
+        if (first == 0x0200) {
+            if ((pc & 1) || units.size() - pc < 2)
+                invalid(method_index, pc, "Misaligned or truncated sparse-switch payload");
+            const auto count = std::uint32_t(units[pc + 1]), width = 2 + count * 4;
+            if (width > units.size() - pc)
+                invalid(method_index, pc, "Truncated sparse-switch keys or targets");
+            for (std::uint32_t n = 1; n < count; ++n)
+                if (signed32(pc + 2 + (n - 1) * 2) >= signed32(pc + 2 + n * 2))
+                    invalid(method_index, pc, "Sparse-switch keys must be strictly increasing");
             data_width[pc] = width;
             std::fill(data_prefix.begin() + pc + 1, data_prefix.begin() + pc + width + 1, 1);
             pc += width;
@@ -275,7 +300,7 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
         } else if (op == 0x20 || op == 0x21 || op == 0x23) {
             reg(pc, ins.a);
             reg(pc, ins.b);
-        } else if (op == 0x22 || op == 0x27 || op == 0x2b || (op >= 0x38 && op <= 0x3d)) {
+        } else if (op == 0x22 || op == 0x27 || op == 0x2b || op == 0x2c || (op >= 0x38 && op <= 0x3d)) {
             reg(pc, ins.a);
         } else if (op >= 0x2d && op <= 0x31) {
             reg(pc, ins.a);
@@ -292,6 +317,9 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             reg(pc, ins.a, (op - 0x52) % 7 == 1 ? 2 : 1);
             if (op < 0x60)
                 reg(pc, ins.b);
+        } else if (op == 0x81 || op == 0x82 || op == 0x84 || op == 0x87 || (op >= 0x8d && op <= 0x8f)) {
+            reg(pc, ins.a, op == 0x81 ? 2 : 1);
+            reg(pc, ins.b, op == 0x84 ? 2 : 1);
         } else if (op >= 0x90 && op <= 0xcf) {
             const auto binary = op >= 0xb0 ? op - 0x20u : op;
             const auto width = wide_binary(binary) ? 2u : 1u;
@@ -353,8 +381,8 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             const auto &type = image.types[ins.index];
             if (type.size() < 2 || type[0] != '[' || type_words(std::string_view(type).substr(1)) == 2)
                 invalid(method_index, pc, "filled-new-array requires one-word elements");
-            if (ins.arguments.size() > code.outgoing)
-                invalid(method_index, pc, "Array arguments exceed outgoing frame");
+            // outs_size describes method calls, not array elements. Their
+            // source registers were checked against registers_size above.
         }
         if (op >= 0x0e && op <= 0x11) {
             const auto &type = image.types[image.prototypes[method.prototype].return_type];
@@ -408,20 +436,28 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
                 invalid(method_index, ins.pc, "Branch target is not a valid instruction boundary");
             (void)branch_target(ins.pc, ins.branch);
         }
-        if (op == 0x2b) {
+        if (op == 0x2b || op == 0x2c) {
+            const bool sparse = op == 0x2c;
             const auto location = std::int64_t(ins.pc) + ins.branch;
             if (location < 0 || location >= static_cast<std::int64_t>(units.size()) ||
-                data_width[static_cast<std::size_t>(location)] < 4)
-                invalid(method_index, ins.pc, "Packed-switch does not reference a complete payload");
+                data_width[static_cast<std::size_t>(location)] < (sparse ? 2u : 4u) ||
+                units[static_cast<std::size_t>(location)] != (sparse ? 0x0200 : 0x0100))
+                invalid(method_index, ins.pc, "Switch does not reference a complete matching payload");
             const auto payload = static_cast<std::uint32_t>(location);
             const auto count = std::uint32_t(units[payload + 1]);
             if (count > 65536 - switch_edges)
-                invalid(method_index, ins.pc, "Packed-switch case edge budget exceeded", "VERIFY_LIMIT");
+                invalid(method_index, ins.pc, "Switch case edge budget exceeded", "VERIFY_LIMIT");
             switch_edges += count;
-            ins.switch_first = signed32(payload + 2);
+            if (sparse) {
+                ins.switch_keys.reserve(count);
+                for (std::uint32_t i = 0; i < count; ++i)
+                    ins.switch_keys.push_back(signed32(payload + 2 + i * 2));
+            } else
+                ins.switch_first = signed32(payload + 2);
             ins.switch_targets.reserve(count);
+            const auto targets = payload + (sparse ? 2 + count * 2 : 4);
             for (std::uint32_t i = 0; i < count; ++i)
-                ins.switch_targets.push_back(branch_target(ins.pc, signed32(payload + 4 + i * 2)));
+                ins.switch_targets.push_back(branch_target(ins.pc, signed32(targets + i * 2)));
         }
         if (op >= 0x0a && op <= 0x0c) {
             if (!n)

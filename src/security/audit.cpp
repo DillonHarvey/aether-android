@@ -62,10 +62,10 @@ void validate(const AuditRecord &record) {
     const auto &entry = record.entry;
     require(record.index && record.index <= 2 * audit_request_limit + 2 && record.utc_100ns &&
                 record.context.app_id && record.context.session && record.context.parent_process &&
-                record.context.capabilities <= 31 && entry.app_id == record.context.app_id &&
+                (record.context.capabilities & ~audit_known_capabilities) == 0 && entry.app_id == record.context.app_id &&
                 static_cast<std::uint32_t>(entry.operation) <= UINT16_MAX,
             "Invalid record identity or bounds");
-    require(static_cast<unsigned>(entry.file_error) <= static_cast<unsigned>(host::FileError::io) &&
+    require(static_cast<unsigned>(entry.file_error) <= static_cast<unsigned>(host::FileError::would_block) &&
                 entry.audio_error <= 8 &&
                 (entry.graphics_operation == UINT32_MAX || entry.graphics_operation < 54),
             "Invalid typed service metadata");
@@ -250,7 +250,7 @@ AuditTrail::~AuditTrail() = default;
 void AuditTrail::configure(std::uint64_t app_id, std::uint64_t session, std::uint32_t capabilities) {
     auto &p = *impl_;
     std::lock_guard lock(p.mutex);
-    require(!p.configured && app_id && session && capabilities <= 31,
+    require(!p.configured && app_id && session && (capabilities & ~audit_known_capabilities) == 0,
             "Audit context already bound or invalid");
     p.context = {app_id, session, capabilities, GetCurrentProcessId(), 0};
     p.configured = true;

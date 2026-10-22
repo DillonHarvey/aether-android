@@ -80,7 +80,11 @@ struct PrivateStorage::Impl {
     UniqueHandle directory;
     DirectoryLease lease;
     std::unique_ptr<host::HostFileService> files;
-    explicit Impl(const std::filesystem::path &root) : path(root) {
+    const std::size_t name_limit;
+    explicit Impl(const std::filesystem::path &root, StoragePurpose purpose)
+        : path(root), name_limit(purpose == StoragePurpose::audit ? maximum_audit_names : maximum_names) {
+        require(purpose == StoragePurpose::private_files || purpose == StoragePurpose::audit,
+                "Unknown protected storage purpose");
         const auto parent = path.parent_path();
         require(path.is_absolute() && !path.filename().empty() && path.filename() != L"." &&
                     path.filename() != L"..",
@@ -134,12 +138,15 @@ struct PrivateStorage::Impl {
                 "Private storage already has a live broker owner");
         lease.owned = true;
         verify_acl(directory.get(), owner, true);
-        files = std::make_unique<host::HostFileService>(path);
-        require(count_names() <= maximum_names, "Private storage already exceeds its file quota");
+        if (purpose == StoragePurpose::private_files)
+            files = std::make_unique<host::HostFileService>(path);
+        require(count_names() <= name_limit, "Protected storage already exceeds its file quota");
         // Existing files can have explicit ACLs that do not inherit the protected root policy.
         // Inspect every bounded child before permitting any worker to use this storage.
         for (const auto &entry : std::filesystem::directory_iterator(path)) {
-            require(safe_name(entry.path().filename().string()), "Private storage has an unsupported name");
+            const auto name = entry.path().filename().string();
+            require(safe_name(name) || (purpose == StoragePurpose::private_files && name.starts_with('@') &&
+                        safe_name(std::string_view(name).substr(1))), "Private storage has an unsupported name");
             UniqueHandle file(CreateFileW(
                 entry.path().c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
                 nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
@@ -159,22 +166,32 @@ struct PrivateStorage::Impl {
         std::size_t count = 0;
         for (const auto &entry : std::filesystem::directory_iterator(path)) {
             (void)entry;
-            if (++count > maximum_names)
+            if (++count > name_limit)
                 break;
         }
         return count;
     }
 };
-PrivateStorage::PrivateStorage(const std::filesystem::path &parent, std::uint64_t app_id)
-    : PrivateStorage([&] {
-          require(app_id != 0, "Invalid trusted app identity");
-          return parent / (L"app_" + std::to_wstring(app_id));
-      }()) {}
-PrivateStorage::PrivateStorage(const std::filesystem::path &root) : impl_(std::make_unique<Impl>(root)) {}
+PrivateStorage::PrivateStorage(const std::filesystem::path &parent, std::uint64_t app_id,
+                               StoragePurpose purpose)
+    : PrivateStorage(
+          [&] {
+              require(app_id != 0, "Invalid trusted app identity");
+              return parent / (L"app_" + std::to_wstring(app_id));
+          }(),
+          purpose) {}
+PrivateStorage::PrivateStorage(const std::filesystem::path &root, StoragePurpose purpose)
+    : impl_(std::make_unique<Impl>(root, purpose)) {}
 PrivateStorage::~PrivateStorage() = default;
 const std::filesystem::path &PrivateStorage::root() const noexcept { return impl_->path; }
+host::FileResult PrivateStorage::private_root() noexcept {
+    return impl_->files ? impl_->files->private_root() : host::FileResult{-1, host::FileError::denied};
+}
+host::FileResult PrivateStorage::list_directory(std::vector<host::DirectoryEntry> &entries) {
+    return impl_->files ? impl_->files->list_directory(entries) : host::FileResult{-1,host::FileError::denied};
+}
 host::FileResult PrivateStorage::open(std::string_view name, host::FileOpen options) {
-    if (!safe_name(name))
+    if (!impl_->files || !safe_name(name))
         return {-1, host::FileError::denied};
     try {
         if (options.create && !std::filesystem::exists(impl_->path / std::string(name)) &&
@@ -185,11 +202,30 @@ host::FileResult PrivateStorage::open(std::string_view name, host::FileOpen opti
         return {-1, host::FileError::io};
     }
 }
+host::FileResult PrivateStorage::observe_data_file(std::string_view name) {
+    if (!impl_->files || !safe_name(name)) return {-1, host::FileError::denied};
+    return impl_->files->observe_data_file(name);
+}
 host::FileResult PrivateStorage::read(int descriptor, std::span<std::uint8_t> output) noexcept {
+    if (!impl_->files)
+        return {-1, host::FileError::denied};
     return impl_->files->read(descriptor, output);
 }
 host::FileResult PrivateStorage::write(int descriptor, std::span<const std::uint8_t> input) noexcept {
+    if (!impl_->files)
+        return {-1, host::FileError::denied};
     return impl_->files->write(descriptor, input);
 }
-host::FileResult PrivateStorage::close(int descriptor) noexcept { return impl_->files->close(descriptor); }
+host::FileResult PrivateStorage::flush(int descriptor) noexcept {
+    return impl_->files ? impl_->files->flush(descriptor) : host::FileResult{-1, host::FileError::denied};
+}
+host::FileResult PrivateStorage::lock(int descriptor,std::uint32_t operation) noexcept {
+    return impl_->files?impl_->files->lock(descriptor,operation):host::FileResult{-1,host::FileError::denied};
+}
+host::FileResult PrivateStorage::access(host::FileAccessScope scope,std::string_view name,std::uint32_t mode) noexcept {
+    return impl_->files?impl_->files->access(scope,name,mode):host::FileResult{-1,host::FileError::denied};
+}
+host::FileResult PrivateStorage::close(int descriptor) noexcept {
+    return impl_->files ? impl_->files->close(descriptor) : host::FileResult{-1, host::FileError::denied};
+}
 } // namespace aether::security

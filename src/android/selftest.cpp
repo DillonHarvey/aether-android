@@ -73,7 +73,8 @@ FrameworkSelftestReport framework_selftest(apk::Bytes bytes, const host::TimeSer
     const std::array inputs{elf::ModuleInput{"libaether_fixture.so", root},
                             elf::ModuleInput{"libaether_support.so", support}};
     jni::Bridge bridge(runtime, memory, app, time, inputs, "libaether_fixture.so", files);
-    ActivitySession session(runtime, report.package, apk::ResourceTable::parse(resource_bytes));
+    ActivitySession session(runtime, report.package, apk::ResourceTable::parse(resource_bytes),
+                            app.monotonic_time_allowed ? &time : nullptr, storage_allowed ? files : nullptr);
     const auto check = [&](std::string name, bool passed) {
         report.checks.push_back({std::move(name), passed, {}});
     };

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <string_view>
 #include <tuple>
 
 namespace aether::dex {
@@ -26,9 +27,12 @@ struct Linker::Impl {
     DexImage &image;
     bool failed = false, finished = false;
     std::uint64_t accounted = 0;
-    std::map<std::u16string, Index> strings;
-    std::map<std::string, Index> types, prototypes;
-    using Member = std::tuple<Index, std::string, Index>;
+    // Keys borrow immutable identities in the append-only target deques, never
+    // the consumed input. Declaration upgrades preserve these identity fields.
+    // These indexes are destroyed before owned_image (or the caller's target).
+    std::map<std::u16string_view, Index> strings;
+    std::map<std::string_view, Index> types, prototypes;
+    using Member = std::tuple<Index, std::string_view, Index>;
     std::map<Member, Index> fields, methods;
     std::map<Index, std::size_t> classes;
     std::set<std::string> names;
@@ -106,64 +110,75 @@ struct Linker::Impl {
         map->types.reserve(input.types.size());
         map->fields.reserve(input.fields.size());
         map->methods.reserve(input.methods.size());
-        for (const auto &value : input.strings) {
-            auto [it, inserted] = strings.try_emplace(value, static_cast<Index>(image.strings.size()));
-            if (inserted) {
-                (void)next(image.strings);
-                image.strings.push_back(value);
+        for (auto &value : input.strings) {
+            auto it = strings.find(value);
+            if (it == strings.end()) {
+                const auto index = next(image.strings);
+                image.strings.push_back(std::move(value));
+                it = strings.emplace(image.strings.back(), index).first;
             }
             map->strings.push_back(it->second);
         }
-        for (const auto &value : input.types) {
-            auto [it, inserted] = types.try_emplace(value, static_cast<Index>(image.types.size()));
-            if (inserted) {
-                (void)next(image.types);
-                image.types.push_back(value);
+        input.strings.clear();
+        for (auto &value : input.types) {
+            auto it = types.find(value);
+            if (it == types.end()) {
+                const auto index = next(image.types);
+                image.types.push_back(std::move(value));
+                it = types.emplace(image.types.back(), index).first;
             }
             map->types.push_back(it->second);
         }
+        input.types.clear();
         std::vector<Index> proto_map;
+        proto_map.reserve(input.prototypes.size());
         for (auto &value : input.prototypes) {
             value.return_type = mapped(map->types, value.return_type);
             for (auto &type : value.parameters)
                 type = mapped(map->types, type);
-            auto [it, inserted] =
-                prototypes.try_emplace(value.descriptor, static_cast<Index>(image.prototypes.size()));
-            if (inserted) {
-                (void)next(image.prototypes);
+            auto it = prototypes.find(value.descriptor);
+            if (it == prototypes.end()) {
+                const auto index = next(image.prototypes);
                 image.prototypes.push_back(std::move(value));
+                it = prototypes.emplace(image.prototypes.back().descriptor, index).first;
             }
             proto_map.push_back(it->second);
         }
+        input.prototypes.clear();
         for (auto &value : input.fields) {
             value.owner = mapped(map->types, value.owner);
             value.type = mapped(map->types, value.type);
-            auto [it, inserted] = fields.try_emplace(Member{value.owner, value.name, value.type},
-                                                     static_cast<Index>(image.fields.size()));
-            if (inserted) {
-                (void)next(image.fields);
+            auto it = fields.find(Member{value.owner, value.name, value.type});
+            if (it == fields.end()) {
+                const auto index = next(image.fields);
                 image.fields.push_back(std::move(value));
+                const auto &target = image.fields.back();
+                it = fields.emplace(Member{target.owner, target.name, target.type}, index).first;
             } else if (value.declared) {
                 if (image.fields[it->second].declared)
                     bad("DUPLICATE", "Duplicate field definition across DEX files");
-                image.fields[it->second] = std::move(value);
+                auto &target = image.fields[it->second];
+                target.flags = value.flags;
+                target.declared = true;
             }
             map->fields.push_back(it->second);
         }
+        input.fields.clear();
         // Publish every method mapping before moving a code body: recursive and
         // forward references retain file-local operands until verification.
         for (auto &value : input.methods) {
             value.owner = mapped(map->types, value.owner);
             value.prototype = mapped(proto_map, value.prototype);
-            auto [it, inserted] = methods.try_emplace(Member{value.owner, value.name, value.prototype},
-                                                      static_cast<Index>(image.methods.size()));
-            if (inserted) {
-                (void)next(image.methods);
+            auto it = methods.find(Member{value.owner, value.name, value.prototype});
+            if (it == methods.end()) {
+                const auto index = next(image.methods);
                 Method reference;
                 reference.owner = value.owner;
                 reference.prototype = value.prototype;
-                reference.name = value.name;
+                reference.name = std::move(value.name);
                 image.methods.push_back(std::move(reference));
+                const auto &target = image.methods.back();
+                it = methods.emplace(Member{target.owner, target.name, target.prototype}, index).first;
             }
             map->methods.push_back(it->second);
         }
@@ -183,8 +198,12 @@ struct Linker::Impl {
                         if (handler.type != no_index)
                             handler.type = mapped(map->types, handler.type);
             }
-            target = std::move(value);
+            target.flags = value.flags;
+            target.declared = true;
+            target.direct = value.direct;
+            target.code = std::move(value.code);
         }
+        input.methods.clear();
         for (auto &value : input.classes) {
             value.type = mapped(map->types, value.type);
             if (image.classes.size() >= 65536)

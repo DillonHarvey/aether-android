@@ -148,8 +148,9 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
                 continue;
             }
             if (arg == "--allow-clock" || arg == "--deny-clock" || arg == "--allow-private-files" ||
-                arg == "--deny-private-files") {
+                arg == "--deny-private-files" || arg == "--allow-wall-clock" || arg == "--deny-wall-clock") {
                 const auto bit =
+                    arg.ends_with("wall-clock") ? security::installed_wall_clock :
                     arg.ends_with("clock") ? security::installed_clock : security::installed_files;
                 (arg.starts_with("--allow-") ? allow : deny) |= bit;
                 continue;
@@ -197,16 +198,22 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
     std::optional<PermissionReview> permission_review;
     if (!expected_permissions.empty()) {
         std::uint32_t mask = 0;
-        if (expected_permissions == "monotonic-clock")
-            mask = security::installed_clock;
-        else if (expected_permissions == "private-files")
-            mask = security::installed_files;
-        else if (expected_permissions == "monotonic-clock,private-files")
-            mask = security::installed_clock | security::installed_files;
-        else
-            usage(expected_permissions == "none",
-                  "Expected permissions must be none, monotonic-clock, private-files, or "
-                  "monotonic-clock,private-files");
+        if (expected_permissions != "none") {
+            std::string_view remaining = expected_permissions;
+            while (!remaining.empty()) {
+                const auto comma = remaining.find(',');
+                const auto name = remaining.substr(0, comma);
+                const auto bit = name == "monotonic-clock" ? security::installed_clock
+                               : name == "private-files" ? security::installed_files
+                               : name == "wall-clock" ? security::installed_wall_clock : 0;
+                usage(bit && !(mask & bit), "Expected permissions contain an unknown or duplicate grant");
+                mask |= bit;
+                if (comma == std::string_view::npos)
+                    break;
+                remaining.remove_prefix(comma + 1);
+                usage(!remaining.empty(), "Expected permissions contain an empty grant");
+            }
+        }
         permission_review = PermissionReview{expected_current_sha256, mask};
     }
     usage(!(allow || deny) || command == "settings" || windows,

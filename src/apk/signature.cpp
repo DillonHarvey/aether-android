@@ -2,11 +2,14 @@
 #include <Windows.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bcrypt.h>
 #include <cstring>
+#include <future>
 #include <map>
 #include <optional>
 #include <set>
+#include <thread>
 #include <wincrypt.h>
 
 namespace aether::apk {
@@ -182,17 +185,35 @@ std::vector<std::uint8_t> content_digest(Bytes bytes, const Layout &layout, bool
     std::uint32_t count = 0;
     for (const auto section : sections)
         count += static_cast<std::uint32_t>((section.size() + chunk - 1) / chunk);
+    std::vector<Bytes> parts;
+    parts.reserve(count);
+    for (const auto section : sections)
+        for (std::size_t offset = 0; offset < section.size(); offset += chunk)
+            parts.push_back(section.subspan(offset, (std::min)(chunk, section.size() - offset)));
+    std::vector<std::vector<std::uint8_t>> digests(parts.size());
+    std::atomic<std::size_t> next{0};
+    const auto compute = [&] {
+        for (auto index = next.fetch_add(1); index < parts.size(); index = next.fetch_add(1)) {
+            Hash hash(wide);
+            hash.add(prefix(0xa5, static_cast<std::uint32_t>(parts[index].size())));
+            hash.add(parts[index]);
+            digests[index] = hash.finish();
+        }
+    };
+    // Small APKs avoid thread startup; large inputs use available cores without
+    // allocating package-sized copies or unbounded queues.
+    const auto workers = (std::min)({std::size_t(std::max(1u, std::thread::hardware_concurrency())),
+                                     std::size_t(32), std::max(std::size_t(1), parts.size() / 4)});
+    std::vector<std::future<void>> work;
+    for (std::size_t n = 1; n < workers; ++n)
+        work.push_back(std::async(std::launch::async, compute));
+    compute();
+    for (auto &task : work)
+        task.get();
     Hash whole(wide);
     whole.add(prefix(0x5a, count));
-    for (const auto section : sections) {
-        for (std::size_t offset = 0; offset < section.size(); offset += chunk) {
-            const auto part = section.subspan(offset, (std::min)(chunk, section.size() - offset));
-            Hash hash(wide);
-            hash.add(prefix(0xa5, static_cast<std::uint32_t>(part.size())));
-            hash.add(part);
-            whole.add(hash.finish());
-        }
-    }
+    for (const auto &value : digests)
+        whole.add(value);
     return whole.finish();
 }
 // Minimal definite-length DER framing; Windows decodes the bounded public key

@@ -1,4 +1,5 @@
 #include "aether/security/metadata_process.hpp"
+#include "aether/common/text.hpp"
 #include <bcrypt.h>
 
 namespace aether::security {
@@ -26,7 +27,7 @@ MetadataResult MetadataProcess::inspect(const shell::IconSource &source) {
             CreateFileMappingW(source.handle(), nullptr, PAGE_READONLY, 0, 0, nullptr));
         require(static_cast<bool>(mapping), "Cannot map the stable read-only package");
         std::vector<std::uint8_t> grant;
-        append_u64(grant, 2);
+        append_u64(grant, 3);
         append_u64(grant, worker_.duplicate_metadata_mapping(mapping.get()));
         append_u64(grant, source.size());
         append_u64(grant, 256);
@@ -42,6 +43,25 @@ MetadataResult MetadataProcess::inspect(const shell::IconSource &source) {
             return frame;
         };
         result.preview = decode_icon_description(receive(Operation::icon_result).payload);
+        const auto permissions = receive(Operation::icon_permissions);
+        require(permissions.payload.size() == 8, "Invalid permission count frame");
+        const auto count = read_u64(permissions.payload, 0);
+        require(count <= 1024, "Too many declared permissions");
+        std::size_t permission_bytes = 0;
+        while (result.preview.declared_permissions.size() < count) {
+            const auto frame = receive(Operation::icon_permissions);
+            require(!frame.payload.empty(), "Empty permission frame");
+            std::size_t offset = 0;
+            while (offset < frame.payload.size()) {
+                auto value = read_text(frame.payload, offset, 512);
+                permission_bytes += value.size();
+                require(permission_bytes <= 64 * 1024 && value.find('\0') == value.npos &&
+                            result.preview.declared_permissions.size() < count,
+                        "Invalid declared permission");
+                (void)utf16(value);
+                result.preview.declared_permissions.push_back(std::move(value));
+            }
+        }
         auto &bitmap = result.preview.presentation.bitmap;
         const auto total = std::size_t(bitmap.width) * bitmap.height * 4;
         bitmap.rgba.reserve(total);

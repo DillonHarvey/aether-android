@@ -105,16 +105,18 @@ PackageView open_package(Bytes bytes, const InspectLimits &limits) {
              std::make_shared<Archive>(member.bytes, limits, ArchiveNames::case_sensitive)});
     return result;
 }
-InspectResult inspect_package(Bytes bytes, const InspectLimits &limits, const ArtworkOptions &options) {
+InspectResult inspect_package(Bytes bytes, const InspectLimits &limits, const ArtworkOptions &options,
+                              ScanScope scope) {
     const auto package = open_package(bytes, limits);
     if (package.format == PackageFormat::apk) {
-        auto result = inspect(bytes, limits);
+        auto result = inspect(bytes, limits, scope);
         if (options.modern)
             result.presentation = std::make_shared<Artwork>(artwork(package, result.manifest, {}, options));
         presentation_limits(result, options);
         return result;
     }
     InspectResult result;
+    result.scope = scope;
     result.format = PackageFormat::xapk;
     result.sha256 = sha256(bytes);
     result.archive_bytes = bytes.size();
@@ -124,7 +126,7 @@ InspectResult inspect_package(Bytes bytes, const InspectLimits &limits, const Ar
     for (const auto &part : package.parts) {
         auto bounded = limits;
         bounded.total_bytes -= result.expanded_bytes;
-        auto report = inspect(part.bytes, bounded);
+        auto report = inspect(part.bytes, bounded, scope);
         for (const auto &activity : report.manifest.activities)
             if (!activity_containers.emplace(activity.name, part.path).second)
                 bad("Activity identity is repeated across APK members: " + activity.name);

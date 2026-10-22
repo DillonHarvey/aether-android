@@ -61,7 +61,9 @@ struct ShellLease {
         const auto name = L"Local\\Aether.ShellRegistration." + policy.substr(2, end - 2);
         mutex.reset(CreateMutexW(nullptr, FALSE, name.c_str()));
         require(static_cast<bool>(mutex), "AETHER_SHELL_IO", "Cannot create the registration lease");
-        const auto wait = WaitForSingleObject(mutex.get(), 0);
+        // Independent app operations may briefly overlap a registration read.
+        // Wait once for ownership before proceeding; never replay a write.
+        const auto wait = WaitForSingleObject(mutex.get(), 1000);
         require(wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED, "AETHER_SHELL_BUSY",
                 "Another Windows registration operation is in progress");
     }
@@ -139,7 +141,9 @@ apk::Artwork package_artwork(const InstalledApp &app, const std::filesystem::pat
     const auto bytes = detail::read_contents(package.get());
     require(bytes.size() == app.package_bytes && apk::sha256(bytes) == app.sha256, "AETHER_INSTALL_INTEGRITY",
             "Installed package changed before deriving Windows artwork");
-    return *apk::inspect_package(bytes, {}, {.modern = app.icon_renderer == 2}).presentation;
+    return *apk::inspect_package(bytes, {}, {.modern = app.icon_renderer >= 2,
+                                  .metadata_preview = app.icon_renderer >= 3}, apk::ScanScope::installation)
+                .presentation;
 }
 bool icon_matches(const InstalledApp &app, const std::filesystem::path &store) {
     if (app.icon_sha256.empty())
@@ -175,10 +179,11 @@ void validate_icon_ownership(const InstalledApp &app, const std::filesystem::pat
     const auto bytes = detail::read_contents(file.get());
     validate_icon_content(app, store, bytes);
 }
-void apply_icon(const InstalledApp &app, const std::filesystem::path &store) {
+void apply_icon(const InstalledApp &app, const std::filesystem::path &store,
+                const apk::Artwork *prepared = nullptr) {
     if (app.icon_sha256.empty() || icon_matches(app, store))
         return;
-    const auto artwork = package_artwork(app, store);
+    const auto artwork = prepared ? *prepared : package_artwork(app, store);
     const auto bytes = apk::icon_file(artwork.bitmap, app.icon_renderer);
     require(apk::sha256(bytes) == app.icon_sha256 && artwork.label == app.display_name,
             "AETHER_SHELL_INTEGRITY", "Current artwork does not match the recorded registration intent");
@@ -509,7 +514,7 @@ bool valid_shell_record(const InstalledApp &app) {
             return false;
     }
     return !app.display_name.empty() && app.display_name.size() <= 128 && safe_leaf(app.shortcut_name) &&
-           (app.icon_renderer == 1 || app.icon_renderer == 2) &&
+           (app.icon_renderer == 1 || app.icon_renderer == 2 || app.icon_renderer == 3) &&
            (!app.icon_sha256.empty() || app.icon_renderer == 1) &&
            app.icon_generation <= app.package_generation &&
            (!app.icon_sha256.empty() || app.icon_generation == 0) &&
@@ -570,7 +575,8 @@ security::InstalledActivity prepare_shell_relaunch(std::string_view id) {
             "AETHER_SHELL_INTEGRITY", "Windows registration needs explicit repair before taskbar relaunch");
     return store.prepare_launch(id);
 }
-void plan_shell_registration(InstalledApp &app, const std::filesystem::path &store) {
+void plan_shell_registration(InstalledApp &app, const std::filesystem::path &store,
+                             const apk::Artwork *prepared) {
     require(app.shell == ShellState::none, "AETHER_SHELL_STATE",
             "Registration is already recorded; use repair");
     Programs programs(false);
@@ -583,8 +589,8 @@ void plan_shell_registration(InstalledApp &app, const std::filesystem::path &sto
             "AETHER_SHELL_RUNTIME_MISSING",
             "Build or install the shared aether-shell.exe before registering apps");
     app.launcher = utf8(launcher.wstring());
-    app.icon_renderer = 2;
-    const auto artwork = package_artwork(app, store);
+    app.icon_renderer = 3;
+    const auto artwork = prepared ? *prepared : package_artwork(app, store);
     app.display_name = artwork.label;
     app.icon_sha256 = apk::sha256(apk::icon_file(artwork.bitmap, app.icon_renderer));
     app.icon_generation = app.package_generation;
@@ -612,7 +618,7 @@ void plan_shell_update(const InstalledApp &previous, InstalledApp &candidate, co
     require(inspect_shell_registration(previous, store), "AETHER_UPDATE_STATE",
             "Repair the existing Windows registration before updating");
     candidate.launcher = previous.launcher;
-    require(artwork.renderer_version == 2, "AETHER_UPDATE_STATE",
+    require(artwork.renderer_version == 3, "AETHER_UPDATE_STATE",
             "New Windows artwork requires the current recorded renderer");
     candidate.icon_renderer = artwork.renderer_version;
     candidate.display_name = artwork.label;
@@ -679,14 +685,15 @@ void retire_shell_update(const InstalledApp &retired, const InstalledApp &curren
                 "AETHER_SHELL_IO", "Cannot retire the obsolete update icon");
     }
 }
-void apply_shell_registration(const InstalledApp &app, const std::filesystem::path &store) {
+void apply_shell_registration(const InstalledApp &app, const std::filesystem::path &store,
+                              const apk::Artwork *prepared) {
     require(valid_shell_record(app) && app.shell != ShellState::none, "AETHER_SHELL_STATE",
             "No registration intent exists");
     // Recheck before touching either projection, including resumed pending intents.
     validate_shell_ownership(app, store);
     if (inspect_shell_registration(app, store))
         return;
-    apply_icon(app, store);
+    apply_icon(app, store, prepared);
     Programs programs(true);
     const auto path = programs.root / utf16(app.shortcut_name);
     if (!link_matches(path, app, store)) {
@@ -733,7 +740,8 @@ void apply_shell_registration(const InstalledApp &app, const std::filesystem::pa
     check(HRESULT_FROM_WIN32(RegFlushKey(key.value)), "Flush Windows application registration");
     require(inspect_shell_registration(app, store), "AETHER_SHELL_INTEGRITY",
             "Windows registrations failed readback");
-    SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, path.c_str(), nullptr);
+    SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW | SHCNF_FLUSH, path.c_str(), nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, programs.root.c_str(), nullptr);
 }
 void validate_shell_ownership(const InstalledApp &app, const std::filesystem::path &store) {
     if (app.shell == ShellState::none)

@@ -1,4 +1,6 @@
 #include "aether/elf/guest_loader.hpp"
+#include "aether/common/thread_exit.hpp"
+#include "aether/apk/hash.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -31,11 +33,15 @@ struct GuestLoader::Impl {
     std::vector<GuestModule> modules;
     std::vector<std::size_t> scope, init_order;
     std::vector<Address> mappings;
-    // Names refer to immutable parsed images after the complete graph is built.
+    // Owned names survive resident module vector growth across appended graphs.
     // Each list retains breadth-first module order and dynamic symbol order.
-    std::map<std::string_view, std::vector<std::pair<std::size_t, std::size_t>>, std::less<>> exports;
+    std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>, std::less<>> exports;
     std::size_t resolution_steps = 0;
     std::size_t relocations = 0;
+    std::vector<std::string> hashes;
+    Address next = 0x10000000;
+    std::uint64_t input_bytes = 0, mapped_bytes = 0;
+    bool finalized = false;
     bool loaded = false, initialization_started = false, initialization_failed = false;
     Impl(a64::GuestMemory &m, const ImportResolver &i) : memory(m), imports(i) {}
     ~Impl() { clear(); }
@@ -62,17 +68,19 @@ struct GuestLoader::Impl {
                 return i;
         return std::nullopt;
     }
-    void dependencies(std::size_t root) {
+    void dependencies(std::size_t root, std::size_t first_new) {
         scope.push_back(root);
         for (std::size_t i = 0; i < scope.size(); ++i)
             for (const auto &name : modules[scope[i]].image.needed) {
                 const auto dep = index(name);
                 if (!dep && !imports.has_library(name))
-                    throw ElfError("AETHER_ELF_DEPENDENCY_MISSING", "No registered dependency: " + name);
+                    throw ElfError("AETHER_ELF_DEPENDENCY_MISSING", "No registered dependency: " + name + " required by " + modules[scope[i]].image.soname);
                 if (dep && std::find(scope.begin(), scope.end(), *dep) == scope.end())
                     scope.push_back(*dep);
             }
-        if (scope.size() != modules.size())
+        if (std::any_of(modules.begin() + first_new, modules.end(), [&](const auto &m) {
+                return std::find(scope.begin(), scope.end(), static_cast<std::size_t>(&m - modules.data())) == scope.end();
+            }))
             throw ElfError("AETHER_ELF_DEPENDENCY_UNUSED",
                            "Input contains a module outside the dependency closure");
         std::vector<unsigned> state(modules.size());
@@ -87,7 +95,7 @@ struct GuestLoader::Impl {
                 if (const auto dep = index(name))
                     self(self, *dep);
             state[at] = 2;
-            init_order.push_back(at);
+            if (at >= first_new) init_order.push_back(at);
         };
         visit(visit, root);
         for (const auto at : scope)
@@ -136,6 +144,8 @@ struct GuestLoader::Impl {
             throw ElfError("AETHER_ELF_INITIALIZER", "Initializer/finalizer target is not guest executable");
         constexpr std::array<std::uint64_t, 3> arguments{}; // argc, argv, envp for Android constructors.
         const auto result = cpu.call(address, arguments, stack_top);
+        if(result.fault==a64::Fault::process_exit)throw ProcessExit{static_cast<std::uint8_t>(result.detail)};
+        if(result.fault==a64::Fault::thread_exit)throw ThreadExit{result.registers[0]};
         if (!result.returned)
             throw ElfError("AETHER_ELF_INITIALIZER_FAILED", "Guest initializer/finalizer failed: " +
                                                                 std::string(a64::fault_name(result.fault)));
@@ -154,31 +164,70 @@ GuestLoader::GuestLoader(a64::GuestMemory &memory, const ImportResolver &imports
     : impl_(std::make_unique<Impl>(memory, imports)) {}
 GuestLoader::~GuestLoader() = default;
 void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view root) {
+    load_graph(inputs, root, false);
+}
+void GuestLoader::extend(std::span<const ModuleInput> inputs, std::string_view root) {
+    load_graph(inputs, root, true);
+}
+void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_view root, bool additional) {
     auto &p = *impl_;
-    if (p.loaded || inputs.empty() || inputs.size() > native_graph_modules)
-        throw ElfError("AETHER_ELF_LOAD_STATE",
-                       "One dependency graph of 1..16 modules is supported per loader");
+    if (inputs.empty() || inputs.size() > native_graph_modules ||
+        (!additional && p.loaded) ||
+        (additional && (!p.loaded || !p.initialization_started || p.initialization_failed || p.finalized ||
+                       std::any_of(p.modules.begin(), p.modules.end(), [](const auto &m) { return !m.initialized; }))))
+        throw ElfError("AETHER_ELF_LOAD_STATE", "Native graph requires a fresh loader or successfully initialized resident modules");
+    const auto old_modules = p.modules.size(), old_mappings = p.mappings.size(), old_init = p.init_order.size();
+    const auto old_steps = p.resolution_steps;
+    auto old_scope = std::move(p.scope);
+    auto old_exports = std::move(p.exports);
+    Address next = p.next;
+    std::uint64_t total_bytes = p.input_bytes, total_relocations = p.relocations, mapped_bytes = p.mapped_bytes;
     try {
-        Address next = 0x10000000;
-        std::uint64_t total_bytes = 0, total_relocations = 0, mapped_bytes = 0;
         std::vector<std::shared_ptr<ModuleSource>> sources;
+        std::set<std::string> supplied;
         const bool streaming =
             std::any_of(inputs.begin(), inputs.end(), [](const auto &input) { return bool(input.source); });
         for (const auto &input : inputs) {
             if (input.source && !input.bytes.empty())
                 throw ElfError("AETHER_ELF_SOURCE", "Native input has two competing byte representations");
+            if (!supplied.insert(input.name).second)
+                throw ElfError("AETHER_ELF_SONAME", "Repeated input SONAME");
             const auto size = input.source ? input.source->size() : input.bytes.size();
+            if (size > streamed_native_bytes)
+                throw ElfError("AETHER_ELF_LIMIT", "Native input exceeds 128 MiB");
+            if (const auto resident = p.index(input.name)) {
+                apk::Sha256 hash;
+                if (input.source) {
+                    std::uint64_t consumed = 0;
+                    input.source->stream([&](std::uint64_t offset, Bytes bytes) {
+                        if (offset != consumed || bytes.empty() || bytes.size() > 65536 || offset > size || bytes.size() > size-offset)
+                            throw ElfError("AETHER_ELF_SOURCE", "Invalid resident identity stream");
+                        hash.update(bytes); consumed += bytes.size();
+                    });
+                    if (consumed != size) throw ElfError("AETHER_ELF_SOURCE", "Incomplete resident identity stream");
+                } else hash.update(input.bytes);
+                if (hash.finish() != p.hashes[*resident])
+                    throw ElfError("AETHER_ELF_SONAME", "Resident SONAME has different content: " + input.name);
+                continue;
+            }
+            if (p.modules.size() == native_graph_modules)
+                throw ElfError("AETHER_ELF_LIMIT", "Resident native modules exceed 16");
             if (size > streamed_native_bytes - total_bytes)
                 throw ElfError("AETHER_ELF_LIMIT", "Dependency graph exceeds 128 MiB of ELF input");
             total_bytes += size;
-            auto image = input.source ? parse(*input.source) : parse(input.bytes);
+            auto image = [&] {
+                try { return input.source ? parse(*input.source) : parse(input.bytes); }
+                catch (const ElfError &error) {
+                    throw ElfError(error.code, "ELF module " + input.name + ": " + error.what());
+                }
+            }();
             if (image.relocations.size() > 1'048'576 - total_relocations)
                 throw ElfError("AETHER_ELF_LIMIT", "Dependency graph exceeds 1048576 relocations");
             total_relocations += image.relocations.size();
             for (const auto &s : image.segments) {
                 const auto bytes = up(s.address + s.memory_size) - down(s.address);
                 const auto limit = streaming ? streamed_native_bytes : a64::GuestMemory::maximum_bytes;
-                if (bytes > limit - mapped_bytes)
+                if (mapped_bytes > limit || bytes > limit - mapped_bytes)
                     throw ElfError("AETHER_ELF_LIMIT",
                                    "Native dependency graph exceeds its mapped-image budget");
                 mapped_bytes += bytes;
@@ -187,6 +236,10 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
                 throw ElfError("AETHER_ELF_SONAME",
                                "Input identity differs from SONAME or shadows a registered module");
             const auto span = image.span;
+            const auto advance = (span + 0xffff) & ~Address{0xffff};
+            if (advance > 0x20000000 - next)
+                throw ElfError("AETHER_ELF_LIMIT", "Native module addresses exceed reserved image range");
+            p.hashes.push_back(input.source ? std::string{} : apk::sha256(input.bytes));
             p.modules.push_back({std::move(image), next});
             sources.push_back(input.source);
             next += (span + 0xffff) & ~Address{0xffff};
@@ -194,15 +247,16 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
         const auto root_index = p.index(root);
         if (!root_index)
             throw ElfError("AETHER_ELF_DEPENDENCY_MISSING", "Root module was not supplied");
-        p.dependencies(*root_index);
+        p.dependencies(*root_index, old_modules);
         struct Write {
             Address address, value;
         };
         std::vector<Write> writes;
         writes.reserve(static_cast<std::size_t>(total_relocations));
         // All symbols/relocations resolve before the first guest mapping is made.
-        for (const auto &m : p.modules)
-            for (const auto &r : m.image.relocations) {
+        for (std::size_t at = old_modules; at < p.modules.size(); ++at)
+            for (const auto &r : p.modules[at].image.relocations) {
+                const auto &m = p.modules[at];
                 Address value = m.base;
                 if (r.type == 1027) {
                     if (r.addend < 0 || static_cast<std::uint64_t>(r.addend) >= m.image.span)
@@ -228,7 +282,7 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
             a64::Permission permissions;
         };
         std::vector<Protection> protections;
-        for (std::size_t module = 0; module < p.modules.size(); ++module) {
+        for (std::size_t module = old_modules; module < p.modules.size(); ++module) {
             const auto &m = p.modules[module];
             for (const auto &s : m.image.segments) {
                 const auto begin = down(s.address), end = up(s.address + s.memory_size);
@@ -249,20 +303,22 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
                     p.mappings.push_back(address);
                     protections.push_back({address, permissions});
                 }
-                if (!sources[module] && s.file_size &&
+                if (!sources[module - old_modules] && s.file_size &&
                     !p.memory.write(m.base + s.address,
                                     Bytes{m.image.bytes}.subspan(static_cast<std::size_t>(s.offset),
                                                                  static_cast<std::size_t>(s.file_size))))
                     throw ElfError("AETHER_ELF_MAPPING", "Could not populate guest load segment");
             }
-            if (sources[module]) {
+            if (sources[module - old_modules]) {
+                apk::Sha256 hash;
                 std::uint64_t consumed = 0;
-                const auto size = sources[module]->size();
-                sources[module]->stream([&](std::uint64_t offset, Bytes bytes) {
+                const auto size = sources[module - old_modules]->size();
+                sources[module - old_modules]->stream([&](std::uint64_t offset, Bytes bytes) {
                     if (offset != consumed || bytes.empty() || bytes.size() > 65536 || offset > size ||
                         bytes.size() > size - offset)
                         throw ElfError("AETHER_ELF_SOURCE",
                                        "Native stream has a gap, overlap or invalid chunk");
+                    hash.update(bytes);
                     for (const auto &s : m.image.segments) {
                         const auto begin = (std::max)(offset, s.offset);
                         const auto end = (std::min)(offset + bytes.size(), s.offset + s.file_size);
@@ -277,6 +333,7 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
                 if (consumed != size)
                     throw ElfError("AETHER_ELF_SOURCE",
                                    "Native stream ended before the declared file extent");
+                p.hashes[module] = hash.finish();
             }
         }
         for (const auto &w : writes) {
@@ -288,10 +345,16 @@ void GuestLoader::load(std::span<const ModuleInput> inputs, std::string_view roo
         }
         for (const auto &protection : protections)
             p.memory.protect(protection.address, protection.permissions);
-        p.relocations = writes.size();
+        p.relocations = static_cast<std::size_t>(total_relocations);
+        p.input_bytes = total_bytes; p.mapped_bytes = mapped_bytes; p.next = next;
         p.loaded = true;
+        p.initialization_started = false;
     } catch (...) {
-        p.clear();
+        while (p.mappings.size() > old_mappings) {
+            p.memory.unmap(p.mappings.back()); p.mappings.pop_back();
+        }
+        p.modules.resize(old_modules); p.hashes.resize(old_modules); p.init_order.resize(old_init);
+        p.scope = std::move(old_scope); p.exports = std::move(old_exports); p.resolution_steps = old_steps;
         throw;
     }
 }
@@ -315,6 +378,7 @@ void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top) {
     try {
         for (const auto at : p.init_order) {
             auto &m = p.modules[at];
+            if (m.initialized) continue;
             if (m.image.init)
                 p.call(cpu, m.base + m.image.init, stack_top);
             for (std::uint64_t i = 0; i < m.image.init_count; ++i)
@@ -330,6 +394,7 @@ void GuestLoader::finalize(a64::GuestCpu &cpu, Address stack_top) {
     auto &p = *impl_;
     if (!p.loaded || !p.initialization_started || p.initialization_failed)
         throw ElfError("AETHER_ELF_LOAD_STATE", "Finalization requires successful initialization");
+    p.finalized = true;
     for (auto i = p.init_order.rbegin(); i != p.init_order.rend(); ++i) {
         auto &m = p.modules[*i];
         if (m.finalized)

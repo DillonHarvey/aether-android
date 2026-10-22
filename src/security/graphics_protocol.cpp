@@ -153,7 +153,7 @@ graphics::GraphicsReply decode_graphics_reply(std::span<const std::uint8_t> byte
     graphics::GraphicsReply reply;
     reply.value = r.n();
     const auto fault = r.n();
-    require(fault <= static_cast<unsigned>(a64::Fault::nesting_limit));
+    require(fault <= static_cast<unsigned>(a64::Fault::thread_exit));
     reply.fault = static_cast<a64::Fault>(fault);
     reply.string_result = r.flag();
     reply.pack_alignment = r.u();

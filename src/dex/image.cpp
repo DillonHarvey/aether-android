@@ -123,10 +123,10 @@ struct Parser {
             const auto p = std::size_t{at} + 4 + std::size_t{i} * 12;
             const auto type = view.u16(p);
             if (type == 0x0007 || type == 0x0008)
-                bad("FEATURE_UNSUPPORTED",
-                    std::string(type == 0x0007 ? "call_site_id" : "method_handle") + " map[" +
-                        std::to_string(i) + "] offset=" + std::to_string(view.u32(p + 8)) +
-                        ": Dynamic calls and method handles are not implemented");
+                bad("FEATURE_UNSUPPORTED", std::string(type == 0x0007 ? "call_site_id" : "method_handle") +
+                                               " map[" + std::to_string(i) +
+                                               "] offset=" + std::to_string(view.u32(p + 8)) +
+                                               ": Dynamic calls and method handles are not implemented");
             const auto begin = view.u32(p + 8),
                        end = i + 1 == count ? static_cast<std::uint32_t>(view.size()) : view.u32(p + 20);
             sections.emplace(type, std::pair{begin, end});
@@ -324,9 +324,12 @@ struct Parser {
         result.outgoing = view.u16(start + 4);
         const auto tries = view.u16(start + 6);
         const auto debug = view.u32(start + 8), count = view.u32(start + 12);
-        if (result.registers > 256 || result.incoming > result.registers || result.outgoing > 256 || !count ||
-            count > 65536 || tries > 256 || count > 4 * 1024 * 1024 - code_units)
-            bad("LIMIT", "Code item exceeds register, instruction or exception limits");
+        if (result.registers > 256 || result.incoming > result.registers || result.outgoing > 256)
+            bad("LIMIT", "Code item exceeds the 256-register frame/call bound");
+        if (!count || count > 65536 || count > 4 * 1024 * 1024 - code_units)
+            bad("LIMIT", "Code item exceeds the 65536-unit method or 4 Mi-unit file bound");
+        if (tries > 4096)
+            bad("LIMIT", "Code item exceeds 4096 exception regions");
         code_units += count;
         charge(std::uint64_t{count} * sizeof(std::uint16_t) + std::uint64_t{tries} * sizeof(TryBlock));
         if (result.incoming !=
@@ -335,6 +338,7 @@ struct Parser {
         if (debug)
             range(debug, 1, 0x2003); // Debug metadata is not executed.
         range(start, 16 + std::size_t{count} * 2, 0x2001);
+        result.units.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i)
             result.units.push_back(view.u16(start + 16 + i * 2));
         if (!tries)
@@ -350,16 +354,22 @@ struct Parser {
         const auto try_start = at, handlers_start = at + std::uint32_t{tries} * 8;
         at = handlers_start;
         const auto handlers_count = leb(at, 0x2001);
-        if (!handlers_count || handlers_count > 256)
-            bad("LIMIT", "Invalid catch-handler count");
+        if (!handlers_count || handlers_count > 4096)
+            bad("LIMIT", "Code item requires 1 through 4096 catch-handler lists");
         std::map<std::uint32_t, std::vector<CatchHandler>> handlers;
+        std::uint32_t handler_items = 0;
         for (std::uint32_t i = 0; i < handlers_count; ++i) {
             const auto offset = at - handlers_start;
             const auto signed_count = sleb(at, 0x2001);
             if (signed_count < -256 || signed_count > 256)
                 bad("LIMIT", "Oversized catch handler");
             const auto typed = static_cast<std::uint32_t>(signed_count < 0 ? -signed_count : signed_count);
+            const auto items = typed + (signed_count <= 0 ? 1u : 0u);
+            if (items > 65536 - handler_items)
+                bad("LIMIT", "Code item exceeds 65536 temporary catch-handler entries");
+            handler_items += items;
             std::vector<CatchHandler> list;
+            list.reserve(items);
             std::set<Index> catch_types;
             for (std::uint32_t j = 0; j < typed; ++j) {
                 const auto index = leb(at, 0x2001), target = leb(at, 0x2001);
@@ -376,6 +386,7 @@ struct Parser {
             handlers.emplace(offset, std::move(list));
         }
         std::uint32_t previous_end = 0;
+        result.tries.reserve(tries);
         for (std::uint32_t i = 0; i < tries; ++i) {
             const auto p = try_start + i * 8;
             const auto begin = view.u32(p);
@@ -497,8 +508,11 @@ struct Parser {
                         m.declared = true;
                         m.direct = is_direct;
                         m.flags = flags;
-                        if (code_offset)
+                        if (code_offset) {
+                            record("code_item", index, code_offset);
                             m.code = code(code_offset, m);
+                            record_kind = {};
+                        }
                         out.push_back(index);
                     }
                 };

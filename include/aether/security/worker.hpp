@@ -3,11 +3,13 @@
 #include "aether/security/worker_image.hpp"
 #include <Windows.h>
 #include <filesystem>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
 
 namespace aether::security {
+class WorkerProgress;
 enum class WorkerRole { guest, graphics, metadata };
 struct WorkerOptions {
     std::filesystem::path executable;
@@ -41,6 +43,21 @@ void verify_isolated_process(HANDLE process, PSID expected_sid = nullptr,
 void verify_graphics_process(HANDLE process, PSID expected_sid = nullptr);
 // Metadata-only service: LPAC, zero Windows capabilities, dynamic code prohibited.
 void verify_metadata_process(HANDLE process, PSID expected_sid = nullptr);
+// Borrowed byte-pipe reader, one OS owner and no concurrent/blocking readers.
+// Partial bytes remain in the pipe until an entire bounded frame is available.
+class PipeFramePoller final {
+  public:
+    explicit PipeFramePoller(HANDLE reader, std::chrono::milliseconds timeout = std::chrono::milliseconds{15000});
+    ~PipeFramePoller();
+    PipeFramePoller(const PipeFramePoller &) = delete;
+    PipeFramePoller &operator=(const PipeFramePoller &) = delete;
+    std::optional<Frame> poll();
+    void reset(); // After a successful blocking read consumed the same channel.
+    std::optional<std::chrono::steady_clock::time_point> partial_deadline() const;
+  private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 Frame read_pipe_frame(HANDLE reader);
 void write_pipe_frame(HANDLE writer, const Frame &frame);
 // Parent-owned, synchronous single-request channel. A separate hard-deadline thread
@@ -51,8 +68,10 @@ class WorkerProcess final {
     ~WorkerProcess();
     WorkerProcess(const WorkerProcess &) = delete;
     WorkerProcess &operator=(const WorkerProcess &) = delete;
+    std::uint64_t duplicate_progress_mapping(const WorkerProgress &progress);
     void send(const Frame &frame);
     Frame receive();
+    std::optional<Frame> try_receive_idle(); // Guest interactive idle only; arms exchange on a full frame.
     void begin_exchange();
     void end_exchange();
     std::uint32_t wait();
@@ -64,6 +83,9 @@ class WorkerProcess final {
     WorkerAccounting accounting() const;
 
   private:
+    friend class Broker;
+    HANDLE primary_thread() const noexcept;
+    std::uint64_t start_uptime_ticks() const noexcept;
     friend class GraphicsProcess;
     friend class IsolatedActivity;
     friend class MetadataProcess;

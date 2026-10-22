@@ -17,7 +17,7 @@ namespace aether::install {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr UINT_PTR poll_timer = 1;
-constexpr std::uint32_t supported = security::installed_clock | security::installed_files;
+constexpr std::uint32_t supported = security::installed_permission_mask;
 
 std::string error_code(const std::exception &error) {
     if (const auto *value = dynamic_cast<const InstallError *>(&error))
@@ -51,7 +51,9 @@ std::wstring report_text(const AppDiagnostics &report) {
     return safe_report_text(report.text() + "\nSaved timekeeping permission: " +
                             ((report.app.permissions & security::installed_clock) ? "allowed" : "denied") +
                             "\nSaved private-files permission: " +
-                            ((report.app.permissions & security::installed_files) ? "allowed" : "denied"));
+                            ((report.app.permissions & security::installed_files) ? "allowed" : "denied") +
+                            "\nSaved wall-clock permission: " +
+                            ((report.app.permissions & security::installed_wall_clock) ? "allowed" : "denied"));
 }
 void text(HWND window, int id, const std::wstring &value) {
     const auto control = GetDlgItem(window, id);
@@ -341,6 +343,8 @@ struct AppDialog {
                            draft & security::installed_clock ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(window, IDC_APP_FILES,
                            draft & security::installed_files ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(window, IDC_APP_WALL_CLOCK,
+                           draft & security::installed_wall_clock ? BST_CHECKED : BST_UNCHECKED);
         }
     }
     void render(HWND window) const {
@@ -373,6 +377,7 @@ struct AppDialog {
         if (settings) {
             EnableWindow(GetDlgItem(window, IDC_APP_CLOCK), !busy && reviewed.has_value());
             EnableWindow(GetDlgItem(window, IDC_APP_FILES), !busy && reviewed.has_value());
+            EnableWindow(GetDlgItem(window, IDC_APP_WALL_CLOCK), !busy && reviewed.has_value());
             EnableWindow(GetDlgItem(window, IDC_APP_APPLY), can_apply());
             EnableWindow(GetDlgItem(window, IDC_APP_DISCARD), !busy && fresh && editing && shown.has_value());
         }
@@ -552,12 +557,16 @@ struct AppDialog {
                     return TRUE;
                 case IDC_APP_CLOCK:
                 case IDC_APP_FILES:
+                case IDC_APP_WALL_CLOCK:
                     if (self->settings && self->reviewed && !self->write.valid() && !self->choosing) {
                         self->draft = (IsDlgButtonChecked(window, IDC_APP_CLOCK) == BST_CHECKED
                                            ? security::installed_clock
                                            : 0) |
                                       (IsDlgButtonChecked(window, IDC_APP_FILES) == BST_CHECKED
                                            ? security::installed_files
+                                           : 0) |
+                                      (IsDlgButtonChecked(window, IDC_APP_WALL_CLOCK) == BST_CHECKED
+                                           ? security::installed_wall_clock
                                            : 0);
                         self->editing = true;
                         self->render(window);

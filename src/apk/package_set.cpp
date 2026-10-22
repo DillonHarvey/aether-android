@@ -70,7 +70,7 @@ std::set<std::string> types(std::string_view value) {
 }
 std::size_t metadata_size(const ManifestInfo &m) {
     std::size_t size = 256 + m.package_id.size() + m.version_name.size() + m.split.size() +
-                       m.config_for_split.size() + m.required_split_types.size() + m.split_types.size() +
+                       m.application_name.size() + m.app_component_factory_name.size() + m.config_for_split.size() + m.required_split_types.size() + m.split_types.size() +
                        m.label.literal.size() + m.icon.literal.size() + m.round_icon.literal.size() +
                        m.permission.literal.size();
     for (const auto &s : m.required_splits)

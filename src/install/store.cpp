@@ -10,6 +10,7 @@
 #include "aether/install/diagnostics.hpp"
 #include "aether/install/runtime.hpp"
 #include "aether/install/shell.hpp"
+#include "aether/security/storage.hpp"
 #include "aether/security/worker_image.hpp"
 #include "private.hpp"
 #include <Windows.h>
@@ -18,6 +19,7 @@
 #include <array>
 #include <bcrypt.h>
 #include <cstring>
+#include <future>
 #include <map>
 #include <sddl.h>
 #include <shlobj.h>
@@ -461,7 +463,8 @@ void delete_file(const std::filesystem::path &path, std::uint64_t limit, bool br
            FALSE,
        "Cannot remove the selected app file");
 }
-bool data_name(std::wstring_view name) {
+bool data_name(std::wstring_view name, bool app_data = false) {
+    if (app_data && name.starts_with(L'@')) name.remove_prefix(1);
     return !name.empty() && name.size() <= 127 && name.front() != L'.' && name.back() != L'.' &&
            name.find(L"..") == std::wstring_view::npos &&
            std::all_of(name.begin(), name.end(), [](wchar_t c) {
@@ -572,6 +575,8 @@ std::string InstalledApp::json() const {
         out << "\"monotonic-clock\"";
     if (effective & security::installed_files)
         out << ((effective & security::installed_clock) ? "," : "") << "\"private-files\"";
+    if (effective & security::installed_wall_clock)
+        out << ((effective & (security::installed_clock | security::installed_files)) ? "," : "") << "\"wall-clock\"";
     out << "],\"declaredPermissions\":[";
     bool first = true;
     for (const auto &permission : declared_permissions) {
@@ -583,20 +588,45 @@ std::string InstalledApp::json() const {
     out << "]}";
     return out.str();
 }
-InstallPreview preview(const std::filesystem::path &path) {
+PreparedInstall PreparedInstall::read(const std::filesystem::path &path) {
+    PreparedInstall result;
     apk::InspectLimits limits;
     limits.archive_bytes = maximum_package;
-    const auto bytes = apk::read_package(path, limits);
+    result.bytes_ = apk::read_package(path, limits);
+    const auto bytes = apk::Bytes(result.bytes_);
     const auto format = apk::package_preview_format(bytes, limits);
     require(format != apk::PreviewFormat::apks && format != apk::PreviewFormat::apkm &&
                 format != apk::PreviewFormat::aab,
             "AETHER_INSTALL_FORMAT_UNSUPPORTED",
-            "This package format supports file-icon preview only. APKS, APKM and AAB installation is not "
-            "implemented; no application has been installed or run.");
-    auto report = apk::inspect_package(bytes, limits, {.modern = true});
-    auto signing = apk::verify_package_signature(bytes, report.format);
+            "APKS, APKM and AAB support preview only; installation is not implemented.");
+    auto signing = std::async(std::launch::async, [bytes, format] {
+        return apk::verify_package_signature(
+            bytes, format == apk::PreviewFormat::xapk ? apk::PackageFormat::xapk : apk::PackageFormat::apk);
+    });
+    auto report = apk::inspect_package(bytes, limits, {.modern = true, .metadata_preview = true},
+                                       apk::ScanScope::installation);
     const auto compatibility = apk::execution_compatibility(report);
-    return {std::move(report), compatibility.installable, std::move(signing), compatibility.reason};
+    result.preview_ = {std::move(report), compatibility.installable, signing.get(), compatibility.reason};
+    return result;
+}
+InstallPreview preview(const std::filesystem::path &path) { return PreparedInstall::read(path).preview(); }
+InstalledApp PreparedInstall::commit(const std::filesystem::path &root, std::uint32_t permissions,
+                                     const std::optional<InstalledApp> &current,
+                                     const InstallProgress &progress) const {
+    require(preview_.installable, "AETHER_INSTALL_UNSUPPORTED", preview_.reason.c_str());
+    require(current.has_value() || ((permissions & security::installed_clock) &&
+                                    !(permissions & ~security::installed_permission_mask)),
+            "AETHER_INSTALL_PERMISSION_REQUIRED", "Monotonic time is required for installed launch");
+    PackageStore store(root, current ? PackageStore::Access::existing_write : PackageStore::Access::write);
+    if (current) {
+        if (progress)
+            progress(InstallStage::writing);
+        auto result = store.update_bytes(bytes_, preview_, current->id, current->sha256);
+        if (progress)
+            progress(InstallStage::complete);
+        return result;
+    }
+    return store.install_windows_bytes(bytes_, preview_.inspection, preview_.signing, permissions, progress);
 }
 std::string InstallPreview::json() const {
     return "{\"schemaVersion\":1,\"operation\":\"install-preview\",\"developerOnly\":false,\"installable\":" +
@@ -682,8 +712,8 @@ struct PackageStore::Impl {
                 "An update needs explicit repair before another store write");
     }
     void transition(const InstalledApp &app, bool apply = true, bool legacy_icons = false,
-                    bool legacy_artwork = false) {
-        corrupt(app.permissions <= (security::installed_clock | security::installed_files));
+                    bool legacy_artwork = false, bool legacy_compiled = false) {
+        corrupt(!(app.permissions & ~security::installed_permission_mask));
         corrupt(valid_shell_record(app));
         corrupt(valid_signing(app) && app.package_generation <= maximum_records);
         const auto previous = apps.find(app.id);
@@ -715,7 +745,7 @@ struct PackageStore::Impl {
                              ? app.shell == ShellState::none
                              : app.shell == ShellState::pending && old.launcher == app.launcher &&
                                    old.shortcut_name != app.shortcut_name && !app.icon_sha256.empty() &&
-                                   app.icon_renderer == (legacy_artwork ? 1U : 2U) &&
+                                   app.icon_renderer == (legacy_artwork ? 1U : legacy_compiled ? 2U : 3U) &&
                                    app.icon_generation == (legacy_icons || old.icon_sha256.empty()
                                                                ? app.package_generation
                                                                : old.icon_generation)));
@@ -763,7 +793,7 @@ struct PackageStore::Impl {
                 old.state == State::installed && app.state == State::installed && !app.keep_data &&
                 old.permissions == app.permissions &&
                 ((old.shell == ShellState::none && app.shell == ShellState::pending &&
-                  (legacy_artwork || app.icon_renderer == 2) &&
+                  (legacy_artwork || app.icon_renderer == (legacy_compiled ? 2U : 3U)) &&
                   app.icon_generation == (app.icon_sha256.empty() ? 0 : app.package_generation)) ||
                  (same_shell(old, app, false) && old.shell != app.shell && old.shell != ShellState::none &&
                   app.shell != ShellState::none));
@@ -772,7 +802,7 @@ struct PackageStore::Impl {
             const bool native_plan =
                 old.state == State::installing_windows && app.state == State::installing_windows &&
                 !app.keep_data && old.permissions == app.permissions && old.shell == ShellState::none &&
-                (legacy_artwork || app.icon_renderer == 2) && app.shell == ShellState::pending;
+                (legacy_artwork || app.icon_renderer == (legacy_compiled ? 2U : 3U)) && app.shell == ShellState::pending;
             const bool native_commit =
                 old.state == State::installing_windows && app.state == State::installed && !app.keep_data &&
                 old.permissions == app.permissions && old.shell == ShellState::pending &&
@@ -801,7 +831,7 @@ struct PackageStore::Impl {
             Decoder in{frame};
             corrupt(in.text() == magic);
             const auto schema = in.number();
-            corrupt((schema >= 1 && schema <= 13) && in.number() == records + 1 && in.text() == digest);
+            corrupt((schema >= 1 && schema <= 14) && in.number() == records + 1 && in.text() == digest);
             corrupt(schema >= registry_schema);
             const auto state = in.number();
             const auto keep = in.number();
@@ -837,7 +867,8 @@ struct PackageStore::Impl {
             app.keep_data = keep != 0;
             corrupt(std::all_of(frame.begin() + static_cast<std::ptrdiff_t>(in.offset),
                                 frame.begin() + digest_offset, [](auto value) { return value == 0; }));
-            transition(app, true, schema < 8, schema < 13);
+            corrupt(schema >= 14 || app.icon_renderer <= 2);
+            transition(app, true, schema < 8, schema < 13, schema < 14);
             digest = stored;
             registry_schema = schema;
             ++records;
@@ -850,7 +881,7 @@ struct PackageStore::Impl {
         transition(app, false);
         Encoder out;
         out.text(magic);
-        out.number(13);
+        out.number(14);
         out.number(records + 1);
         out.text(digest);
         out.number(static_cast<std::uint32_t>(app.state));
@@ -880,7 +911,7 @@ struct PackageStore::Impl {
         write_durable(registry.get(), out.bytes);
         transition(app);
         digest = next;
-        registry_schema = 13;
+        registry_schema = 14;
         ++records;
         poisoned = false;
     }
@@ -899,7 +930,10 @@ struct PackageStore::Impl {
         const auto bytes = read_all(file.get());
         require(bytes.size() == app.package_bytes && apk::sha256(bytes) == app.sha256,
                 "AETHER_INSTALL_INTEGRITY", "Installed APK differs from the committed package checksum");
-        auto inspection = apk::inspect_package(bytes, {}, {.modern = app.icon_renderer == 2});
+        auto inspection =
+            apk::inspect_package(bytes, {}, {.modern = app.icon_renderer >= 2,
+                                  .metadata_preview = app.icon_renderer >= 3},
+                                 inspected ? apk::ScanScope::full : apk::ScanScope::installation);
         auto actual = from_inspection(inspection, true);
         auto signing = apk::verify_package_signature(bytes, inspection.format);
         verify_recorded_signing(app, signing);
@@ -1020,7 +1054,11 @@ struct PackageStore::Impl {
             if (!app.keep_data) {
                 std::vector<std::filesystem::path> children;
                 for (const auto &entry : std::filesystem::directory_iterator(data_path)) {
-                    require(children.size() < 32 && data_name(entry.path().filename().wstring()),
+                    const auto maximum_children = std::wstring_view(name) == L"audit"
+                                                      ? security::PrivateStorage::maximum_audit_names
+                                                      : security::PrivateStorage::maximum_names;
+                    require(children.size() < maximum_children &&
+                                data_name(entry.path().filename().wstring(), std::wstring_view(name) == L"data"),
                             "AETHER_INSTALL_PATH", "Unsupported data entry prevents removal");
                     auto file =
                         open_file(entry.path(), FILE_READ_ATTRIBUTES, OPEN_EXISTING, 1024 * 1024, 0, true);
@@ -1210,7 +1248,8 @@ InstalledApp update_package(const std::filesystem::path &path, const std::filesy
             "Confirm the app ID and both current and proposed SHA-256 checksums from update preview");
     const auto bytes = apk::read_package(path);
     InstallPreview candidate;
-    candidate.inspection = apk::inspect_package(bytes, {}, {.modern = true});
+    candidate.inspection = apk::inspect_package(bytes, {}, {.modern = true, .metadata_preview = true},
+                                                apk::ScanScope::installation);
     require(candidate.inspection.sha256 == expected_sha256, "AETHER_INSTALL_SOURCE_CHANGED",
             "The proposed APK changed after review; inspect it and confirm again");
     candidate.signing = apk::verify_package_signature(bytes, candidate.inspection.format);
@@ -1309,7 +1348,7 @@ InstalledApp PackageStore::install_package(const std::filesystem::path &path,
     limits.archive_bytes = maximum_package;
     const auto bytes = apk::read_package(path, limits);
     // One held source read produces both metadata and the exact final package bytes.
-    const auto report = apk::inspect_package(bytes, limits);
+    const auto report = apk::inspect_package(bytes, limits, {}, apk::ScanScope::installation);
     require(!fixture_only || report.sha256 == dex::fixture::apk_sha256, "AETHER_INSTALL_UNSUPPORTED",
             "--developer-fixture accepts only the exact self-authored development fixture");
     require(report.sha256 == expected_sha256, "AETHER_INSTALL_SOURCE_CHANGED",
@@ -1359,13 +1398,14 @@ InstalledApp install_windows(const std::filesystem::path &path, const std::files
     require(hex(expected_sha256, 64), "AETHER_INSTALL_CONFIRMATION_REQUIRED",
             "Windows installation requires the SHA-256 from the reviewed package preview");
     require((permissions & security::installed_clock) &&
-                permissions <= (security::installed_clock | security::installed_files),
+                !(permissions & ~security::installed_permission_mask),
             "AETHER_INSTALL_PERMISSION_REQUIRED",
             "Explicit clock permission is required for installed launch");
     apk::InspectLimits limits;
     limits.archive_bytes = maximum_package;
     const auto bytes = apk::read_package(path, limits);
-    const auto report = apk::inspect_package(bytes, limits);
+    const auto report = apk::inspect_package(bytes, limits, {.modern = true, .metadata_preview = true},
+                                       apk::ScanScope::installation);
     require(report.sha256 == expected_sha256, "AETHER_INSTALL_SOURCE_CHANGED",
             "The APK changed after inspection. Inspect the current source and confirm it again");
     const auto compatibility = apk::execution_compatibility(report);
@@ -1377,7 +1417,7 @@ InstalledApp install_windows(const std::filesystem::path &path, const std::files
 }
 InstalledApp PackageStore::install_windows_bytes(apk::Bytes bytes, const apk::InspectResult &report,
                                                  const apk::SignatureReport &signing,
-                                                 std::uint32_t permissions) {
+                                                 std::uint32_t permissions, const InstallProgress &progress) {
     impl_->settled();
     for (const auto &[id, old] : impl_->apps) {
         (void)id;
@@ -1402,6 +1442,8 @@ InstalledApp PackageStore::install_windows_bytes(apk::Bytes bytes, const apk::In
     try {
         auto shell_lease = hold_shell_registration();
         impl_->append(app);
+        if (progress)
+            progress(InstallStage::writing);
         {
             auto directory = open_directory(impl_->path / app.id, true, true);
             auto data = open_directory(impl_->path / app.id / L"data", true, true);
@@ -1411,14 +1453,20 @@ InstalledApp PackageStore::install_windows_bytes(apk::Bytes bytes, const apk::In
             require(apk::sha256(read_all(file.get())) == report.sha256, "AETHER_INSTALL_INTEGRITY",
                     "Final package bytes failed readback validation");
         }
+        if (progress)
+            progress(InstallStage::registering);
         auto lease = impl_->hold_app(app);
-        plan_shell_registration(app, impl_->path);
+        plan_shell_registration(app, impl_->path, report.presentation.get());
         impl_->append(app);
-        apply_shell_registration(app, impl_->path);
+        apply_shell_registration(app, impl_->path, report.presentation.get());
+        if (progress)
+            progress(InstallStage::finishing);
         app.state = State::installed;
         app.shell = ShellState::ready;
         app.shell_verified = true;
         impl_->append(app);
+        if (progress)
+            progress(InstallStage::complete);
         return app;
     } catch (const std::exception &original) {
         const std::string original_message = original.what();
@@ -1473,14 +1521,14 @@ InstalledApp PackageStore::uninstall(std::string_view id, bool keep_data) {
 InstalledApp PackageStore::set_permissions(std::string_view id, std::uint32_t allow, std::uint32_t deny,
                                            const std::optional<PermissionReview> &review) {
     impl_->settled();
-    require((allow | deny) <= (security::installed_clock | security::installed_files) && !(allow & deny),
+    require(!((allow | deny) & ~security::installed_permission_mask) && !(allow & deny),
             "AETHER_INSTALL_PERMISSION", "Unsupported or contradictory permission decision");
     auto app = impl_->find(id);
     if (review) {
         require(review->sha256.size() == 64 &&
                     std::all_of(review->sha256.begin(), review->sha256.end(),
                                 [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }) &&
-                    review->permissions <= (security::installed_clock | security::installed_files),
+                    !(review->permissions & ~security::installed_permission_mask),
                 "AETHER_SETTINGS_REVIEW", "The reviewed package checksum or permission set is invalid");
         require(app.sha256 == review->sha256 && app.permissions == review->permissions,
                 "AETHER_SETTINGS_CHANGED",
@@ -1544,7 +1592,7 @@ security::InstalledActivity PackageStore::prepare_launch(std::string_view id) {
     auto bytes = std::make_shared<const std::vector<std::uint8_t>>(read_all(lease->package.get()));
     require(bytes->size() == app.package_bytes && apk::sha256(*bytes) == app.sha256,
             "AETHER_INSTALL_INTEGRITY", "Installed APK no longer matches its committed checksum");
-    const auto inspection = apk::inspect_package(*bytes);
+    const auto inspection = apk::inspect_package(*bytes, {}, {}, apk::ScanScope::installation);
     const auto compatibility = apk::execution_compatibility(inspection);
     require(compatibility.installable, "AETHER_INSTALL_UNSUPPORTED", compatibility.reason.c_str());
     verify_recorded_signing(app, apk::verify_package_signature(*bytes, inspection.format));

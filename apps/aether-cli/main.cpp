@@ -19,6 +19,7 @@
 #include "aether/install/runtime.hpp"
 #include "aether/install/store.hpp"
 #include "aether/security/apk_session.hpp"
+#include "aether/security/activity_session.hpp"
 #include "aether/shell/icon_broker.hpp"
 #include <algorithm>
 #include <array>
@@ -45,6 +46,24 @@ int run(const std::vector<std::string> &arguments, bool json) {
             const auto data = aether::apk::icon_file(bundle ? aether::apk::bundle_fallback_icon()
                                                           : aether::apk::fallback_icon(), 2);
             const auto path = directory / (bundle ? L"bundle.ico" : L"package.ico");
+            {
+                aether::host::UniqueHandle existing(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+                if (existing) {
+                    LARGE_INTEGER size{};
+                    if (!GetFileSizeEx(existing.get(), &size))
+                        throw std::runtime_error("Cannot inspect final Shell icon resource");
+                    if (size.QuadPart == static_cast<LONGLONG>(data.size())) {
+                        std::vector<std::uint8_t> bytes(data.size()); DWORD received = 0;
+                        if (!ReadFile(existing.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &received, nullptr) ||
+                            received != bytes.size())
+                            throw std::runtime_error("Cannot read final Shell icon resource");
+                        if (bytes == data)
+                            continue; // Preserve timestamps so unchanged artwork does not relink a new DLL.
+                    }
+                } else if (GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
+                    throw std::runtime_error("Cannot open final Shell icon resource");
+            }
             aether::host::UniqueHandle file(CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                                                         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
             DWORD written = 0;
@@ -301,7 +320,7 @@ int run(const std::vector<std::string> &arguments, bool json) {
                    "  install <apk> --developer-fixture --yes (exact fixture package storage)\n"
                    "  install <apk> --expected-sha256 <preview-hash> --yes (experimental APK storage)\n"
                    "    Add --windows --expected-sha256 <preview-hash> --allow-clock\n"
-                   "    [--allow-private-files] for one complete Windows installation.\n"
+                   "    [--allow-private-files] [--allow-wall-clock] for one complete Windows installation.\n"
                    "  update <apk> --app-id <id> --dry-run (review both versions)\n"
                    "  update <apk> --app-id <id> --expected-current-sha256 <old-hash>\n"
                    "    --expected-sha256 <new-hash> --yes (verified newer version; preserves grants/data)\n"
@@ -324,9 +343,9 @@ int run(const std::vector<std::string> &arguments, bool json) {
                    "  runtime forget-store --store <empty-store> [--root <runtime>] --yes\n"
                    "  privacy [--json] (offline privacy and permissions guide for this build)\n"
                    "  settings --app-id <id> (inspect recorded permission grants)\n"
-                   "    [--allow-clock|--deny-clock] [--allow-private-files|--deny-private-files] --yes\n"
+                   "    [--allow-clock|--deny-clock] [--allow-private-files|--deny-private-files] [--allow-wall-clock|--deny-wall-clock] --yes\n"
                    "    Optional review: --expected-current-sha256 <hash> --expected-permissions <grants>\n"
-                   "    Grants: none, monotonic-clock, private-files, or monotonic-clock,private-files.\n"
+                   "    Grants: none, or comma-separated monotonic-clock, private-files and wall-clock.\n"
                    "  diagnostics --app-id <id> [--output <new-report.json>] (read-only app checks)\n"
                    "    No APK execution or private app data collection. Exit 1 if a check fails.\n"
                    "  troubleshoot --app-id <id> [--include-host-details] [--include-audit-summaries]\n"
@@ -494,6 +513,8 @@ int wmain(int argc, wchar_t **argv) {
                     : error.code == "AETHER_INSTALL_UNSUPPORTED" ? 3
                                                                  : 1,
                     json);
+    } catch(const aether::security::ActivityProcessExited &exit) {
+        return fail({"AETHER_GUEST_EXIT","application",exit.what(),"The app exited; this does not establish a usable Activity or video playback.",{},{},{{"guestExitStatus",std::to_string(exit.status)}}},1,json);
     } catch (const aether::security::ProtocolError &error) {
         return fail({"AETHER_ISOLATED_WORKER_FAILED",
                      "isolation",

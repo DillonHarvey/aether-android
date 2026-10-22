@@ -88,6 +88,8 @@ class GuestLoader {
     GuestLoader(const GuestLoader &) = delete;
     GuestLoader &operator=(const GuestLoader &) = delete;
     void load(std::span<const ModuleInput> inputs, std::string_view root);
+    // Append an authorized root after successful initialization; resident content must match.
+    void extend(std::span<const ModuleInput> inputs, std::string_view root);
     GuestSymbol symbol(std::string_view module, std::string_view name) const;
     void initialize(a64::GuestCpu &cpu, Address stack_top);
     void finalize(a64::GuestCpu &cpu, Address stack_top);
@@ -95,6 +97,7 @@ class GuestLoader {
     std::size_t relocation_count() const noexcept;
 
   private:
+    void load_graph(std::span<const ModuleInput> inputs, std::string_view root, bool additional);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

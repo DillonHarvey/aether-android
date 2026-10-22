@@ -7,12 +7,16 @@ struct ArchiveDexInput {
     std::shared_ptr<apk::Archive> archive;
     apk::DexInfo file;
 };
+// Directory input has no content claims. Index construction itself must read,
+// CRC/hash/check and index every member before any class may be loaded.
+enum class ArchiveIndexPolicy { inspected, directory };
 // Compact class-to-file inventory, not an executable decoded image. Retains no
 // expanded DEX file between calls. Archive backing bytes must remain immutable.
 class ArchiveSource final : public ClassSource {
   public:
     ArchiveSource(std::shared_ptr<apk::Archive> archive, std::span<const apk::DexInfo> files);
-    explicit ArchiveSource(std::span<const ArchiveDexInput> files);
+    explicit ArchiveSource(std::span<const ArchiveDexInput> files,
+                           ArchiveIndexPolicy policy = ArchiveIndexPolicy::inspected);
     ~ArchiveSource();
     std::optional<std::size_t> source_for(std::string_view descriptor) const override;
     std::string_view source_name(std::size_t index) const override;

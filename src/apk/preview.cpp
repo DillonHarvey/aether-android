@@ -86,12 +86,14 @@ PackagePreview preview_package(Bytes bytes, const IconRequest &request) {
         const auto &info = selection.manifest;
         result.selected_container = selection.package.parts.front().path;
         result.package_name = info.package_id;
+        result.declared_permissions = info.permissions;
         result.version_name = info.version_name;
         if (info.version_code)
             result.version_code =
                 (std::uint64_t(info.version_code_major.value_or(0)) << 32) | *info.version_code;
         result.presentation = artwork(selection.package, info, result.selected_container,
                                       {true, request.size_px, request.dpi, 35, true});
+        result.presentation.renderer_version = 2;
         result.package_declared = result.presentation.icon_source != "aether-fallback";
         result.status = result.package_declared ? IconStatus::extracted : IconStatus::no_icon;
         if (result.presentation.icon_status == "unsupported")

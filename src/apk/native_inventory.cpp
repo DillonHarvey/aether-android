@@ -1,4 +1,5 @@
 #include "aether/apk/native_inventory.hpp"
+#include "aether/apk/package.hpp"
 #include "aether/elf/limits.hpp"
 #include <algorithm>
 
@@ -94,5 +95,71 @@ std::vector<std::size_t> NativeInventory::select(std::string_view root) const {
     // Unpackaged dependencies still require GuestLoader's actual import provider;
     // selection never invents a system library or treats its absence as success.
     return selected;
+}
+
+NativeDirectory::NativeDirectory(std::span<const NativeInfo> inputs) {
+    std::size_t metadata = 0;
+    constexpr std::string_view prefix = "lib/arm64-v8a/";
+    for (const auto &input : inputs) {
+        if (input.abi != "arm64-v8a")
+            continue;
+        const auto &file = input.file;
+        const auto path = std::string_view(file.path);
+        if (!path.starts_with(prefix) || !leaf(path.substr(prefix.size())))
+            bad("ARM64 native members require unique bounded leaf names: " + file.path);
+        if (files_.size() == NativeInventory::maximum_members || file.bytes > elf::streamed_native_bytes)
+            bad("Native directory exceeds the supported ARM64 inventory bounds.");
+        const auto name = path.substr(prefix.size());
+        const auto charge =
+            sizeof(PackageFile) + path.size() + name.size() + file.container.size() + file.sha256.size();
+        if (charge > NativeInventory::maximum_metadata_bytes - metadata)
+            bad("ARM64 package inventory exceeds 4 MiB of accounted metadata.");
+        metadata += charge;
+        if (!files_.emplace(name, file).second)
+            bad("Duplicate ARM64 native member: " + file.path);
+    }
+    if (!inputs.empty() && files_.empty())
+        bad("Native libraries require arm64-v8a; this APK provides only unsupported ABIs.");
+}
+
+NativeInventory NativeDirectory::inspect(const PackageView &package, std::string_view root) const {
+    if (!files_.contains(root))
+        bad("APK has no arm64-v8a/" + std::string(root), true);
+    std::vector<NativeInfo> selected;
+    std::vector<std::string> pending{std::string(root)};
+    std::uint64_t bytes = 0;
+    // Count and charge the complete requested graph before each member read.
+    // Unknown system dependencies still require the actual ELF import provider.
+    for (std::size_t n = 0; n < pending.size(); ++n) {
+        const auto &identity = files_.at(pending[n]);
+        if (identity.bytes > elf::streamed_native_bytes - bytes)
+            bad("Requested native dependency graph exceeds 128 MiB of ELF input.", true);
+        bytes += identity.bytes;
+        const auto member = package.file(identity);
+        NativeInfo inspected;
+        try {
+            inspected = inspect_native_member(*member.archive, member.index, "arm64-v8a");
+        } catch (InspectError &error) {
+            error.diagnostic.module = identity.path;
+            throw;
+        }
+        inspected.file.container = identity.container;
+        if (!identity.sha256.empty() && identity.sha256 != inspected.file.sha256)
+            bad("Native source differs from its inspected immutable identity: " + identity.path, true);
+        // Reuse full hash, machine, dependency-name and metadata validation.
+        (void)NativeInventory(std::span(&inspected, 1));
+        if (!inspected.is_elf)
+            bad("Native member is opaque data, not executable ELF: " + identity.path, true);
+        for (const auto &dependency : inspected.dependencies) {
+            if (!files_.contains(dependency) ||
+                std::find(pending.begin(), pending.end(), dependency) != pending.end())
+                continue;
+            if (pending.size() == elf::native_graph_modules)
+                bad("Requested native dependency graph exceeds 16 packaged ELF modules.", true);
+            pending.push_back(dependency);
+        }
+        selected.push_back(std::move(inspected));
+    }
+    return NativeInventory(selected);
 }
 } // namespace aether::apk

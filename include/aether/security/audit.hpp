@@ -14,6 +14,7 @@ struct AuditEntry {
     std::uint32_t audio_error = 0;
     std::uint32_t graphics_operation = UINT32_MAX;
 };
+inline constexpr std::uint32_t audit_known_capabilities = 1u | 2u | 4u | 8u | 16u | 32u;
 struct AuditContext {
     std::uint64_t app_id = 0, session = 0;
     std::uint32_t capabilities = 0, parent_process = 0, worker_process = 0;
@@ -22,6 +23,9 @@ struct AuditContext {
 enum class AuditKind : std::uint32_t { start = 1, intent, outcome, end };
 inline constexpr std::size_t audit_record_bytes = 168;
 inline constexpr std::uint64_t audit_request_limit = 3000;
+inline constexpr std::size_t audit_retained_successes = 16;
+inline constexpr std::size_t audit_file_limit = 1024 * 1024;
+inline constexpr std::size_t audit_total_limit = 16 * 1024 * 1024;
 using AuditDigest = std::array<std::uint8_t, 32>;
 struct AuditRecord {
     AuditKind kind = AuditKind::start;
@@ -82,8 +86,9 @@ class AuditTrail final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-// Files are final app audit artifacts: protected broker-only roots, 16 retained
-// sessions per app, one MiB per file, no overwrite/repair of incomplete records.
+// Final broker-only artifacts: 16 successful sessions plus preserved failures,
+// up to 256 files / 16 MiB total. Reserve one MiB for each new session; never
+// overwrite or repair prior records. Audit roots expose no FileService access.
 std::shared_ptr<AuditTrail> make_file_audit(const std::filesystem::path &parent);
 std::shared_ptr<AuditTrail> make_file_audit_at_root(const std::filesystem::path &root);
 } // namespace aether::security

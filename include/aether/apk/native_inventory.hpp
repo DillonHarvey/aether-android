@@ -27,4 +27,17 @@ class NativeInventory {
     std::map<std::string, std::size_t, std::less<>> names_;
     std::size_t metadata_bytes_ = 0;
 };
+
+struct PackageView;
+// Directory identities are sufficient until System.loadLibrary selects a root.
+// Inspection then validates every member of that bounded dependency closure.
+class NativeDirectory {
+  public:
+    NativeDirectory() = default;
+    explicit NativeDirectory(std::span<const NativeInfo> inputs);
+    NativeInventory inspect(const PackageView &package, std::string_view root) const;
+
+  private:
+    std::map<std::string, PackageFile, std::less<>> files_;
+};
 } // namespace aether::apk

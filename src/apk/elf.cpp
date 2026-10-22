@@ -171,9 +171,10 @@ NativeInfo inspect_native_member(Archive &archive, std::size_t index, std::strin
     const auto &entry = archive.entries().at(index);
     NativeInfo result;
     std::string digest;
-    // Small libraries need only one decompression. Large ones retain a header,
-    // program table, dynamic table and <=1024 dependency windows in four passes.
-    if (entry.bytes <= (std::min)(archive.buffer_limit(), std::uint64_t{1024 * 1024})) {
+    // Reuse one bounded decompression for ordinary libraries. The allocation is
+    // released before inspecting the next member; larger libraries still retain
+    // only their header, program/dynamic tables and bounded dependency windows.
+    if (entry.bytes <= (std::min)(archive.buffer_limit(), std::uint64_t{16 * 1024 * 1024})) {
         const auto contents = archive.read(index);
         digest = sha256(contents);
         if (elf_magic(contents))

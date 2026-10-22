@@ -47,9 +47,10 @@ bool dex_name(const std::string &name) {
 }
 } // namespace
 
-InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
+InspectResult inspect(Bytes bytes, const InspectLimits &limits, ScanScope scope) {
     Archive archive(bytes, limits, ArchiveNames::case_sensitive);
     InspectResult result;
+    result.scope = scope;
     result.archive_bytes = bytes.size();
     result.entry_count = archive.entries().size();
     result.sha256 = sha256(bytes);
@@ -61,7 +62,8 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
         // Every member is fully size/CRC checked. Only consumers that require
         // contiguous bytes materialize a member, within the separate buffer cap.
         if (entry.directory) {
-            archive.stream(i, [](auto, Bytes) {});
+            if (scope == ScanScope::full)
+                archive.stream(i, [](auto, Bytes) {});
             continue;
         }
         const auto &name = entry.path;
@@ -74,6 +76,12 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
             result.manifest_file = file(contents);
             have_manifest = true;
         } else if (dex_name(name)) {
+            if (scope != ScanScope::full) {
+                DexInfo metadata;
+                metadata.file = {name, entry.compressed_bytes, entry.bytes, {}};
+                result.dex.push_back(std::move(metadata));
+                continue;
+            }
             const auto contents = archive.read(i);
             auto metadata = inspect_dex(contents);
             metadata.file = file(contents);
@@ -85,6 +93,15 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
                                    "Unsupported native library directory layout");
             const auto abi = name.substr(4, slash - 4);
             NativeInfo metadata;
+            if (scope != ScanScope::full) {
+                metadata.file = {name, entry.compressed_bytes, entry.bytes, {}};
+                metadata.abi = abi;
+                metadata.metadata_status = scope == ScanScope::installation ? "deferred-until-launch"
+                                                                          : "deferred-until-requested";
+                metadata.is_elf = false;
+                result.native.push_back(std::move(metadata));
+                continue;
+            }
             try {
                 metadata = inspect_native_member(archive, i, abi);
             } catch (InspectError &error) {
@@ -98,7 +115,8 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
                                    "Total dependency metadata size limit exceeded");
             result.native.push_back(std::move(metadata));
         } else {
-            archive.stream(i, [](auto, Bytes) {});
+            if (scope == ScanScope::full)
+                archive.stream(i, [](auto, Bytes) {});
             if (name.starts_with("res/") || name == "resources.arsc")
                 result.resources.push_back(name);
             else if (name.starts_with("assets/"))
@@ -121,7 +139,8 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
         "Presentation supports bounded default string/reference labels and RGB/RGBA PNG icons; other "
         "resource configurations and icon formats use an explicit fallback. SDK values are declared "
         "values (null means absent).",
-        "Installed execution is experimental: bounded demand-loaded DEX 035/037, optional ARM64 native "
+        "Installed execution is experimental: bounded demand-loaded DEX 035/037/038 subset, optional ARM64 "
+        "native "
         "libraries and a bounded Android API subset. Inspection does not grant execution authority."};
     if (!result.manifest.split.empty() || !result.manifest.required_splits.empty() ||
         !result.manifest.required_split_types.empty() ||
@@ -132,6 +151,13 @@ InspectResult inspect(Bytes bytes, const InspectLimits &limits) {
         result.limitations.push_back(
             "Native-directory non-ELF members are opaque data, not executable libraries. Embedded "
             "containers/DEX are not loaded; requesting one as a native library fails ELF validation.");
+    if (scope != ScanScope::full)
+        result.limitations = {
+            scope == ScanScope::installation
+                ? "Installation reads manifests and archive directories. DEX/native validation is deferred "
+                  "to isolated launch; unused payloads are not decompressed."
+                : "Runtime directory inspection defers DEX content validation to the complete class-index "
+                  "pass and native content to requested loading; consumed resources retain validation."};
     return result;
 }
 
@@ -142,6 +168,10 @@ std::string InspectResult::json(const SignatureReport *signing) const {
         manifest.extract_native_libs ? (*manifest.extract_native_libs ? "true" : "false") : "null";
     return "{\"schemaVersion\":1,\"kind\":" +
            json_quote(format == PackageFormat::apk ? "apk-inspection" : "xapk-package-inspection") +
+           ",\"scanScope\":" +
+           json_quote(scope == ScanScope::full      ? "full"
+                      : scope == ScanScope::runtime ? "runtime"
+                                                    : "installation") +
            (format == PackageFormat::apk
                 ? ""
                 : ",\"packageFormat\":\"xapk\",\"members\":" +
@@ -160,6 +190,10 @@ std::string InspectResult::json(const SignatureReport *signing) const {
            (signing && signing->verified() ? "true" : "false") +
            ",\"signing\":" + (signing ? signing->json() : "null") +
            ",\"package\":{\"id\":" + json_quote(manifest.package_id) +
+           ",\"applicationName\":" +
+           (manifest.application_name.empty() ? "null" : json_quote(manifest.application_name)) +
+           ",\"applicationComponentFactory\":" +
+           (manifest.app_component_factory_name.empty() ? "null" : json_quote(manifest.app_component_factory_name)) +
            ",\"versionName\":" + json_quote(manifest.version_name) +
            ",\"versionCode\":" + number(manifest.version_code) + ",\"minSdk\":" + number(manifest.min_sdk) +
            ",\"targetSdk\":" + number(manifest.target_sdk) + ",\"extractNativeLibs\":" + native_flag +
@@ -200,11 +234,15 @@ std::string InspectResult::json(const SignatureReport *signing) const {
            array_json(native,
                       [](const NativeInfo &info) {
                           return "{\"file\":" + file_json(info.file) + ",\"abi\":" + json_quote(info.abi) +
-                                 ",\"isElf\":" + (info.is_elf ? "true" : "false") +
+                                 ",\"isElf\":" +
+                                 (info.metadata_status.starts_with("deferred-") ? "null"
+                                  : info.is_elf                                   ? "true"
+                                                                                  : "false") +
                                  ",\"initialExecutionTarget\":" +
                                  (info.is_elf && info.abi == "arm64-v8a" ? "true" : "false") +
                                  ",\"executionStatus\":" +
-                                 json_quote(!info.is_elf              ? "not-executable"
+                                 json_quote(info.metadata_status.starts_with("deferred-") ? "not-assessed"
+                                            : !info.is_elf                                  ? "not-executable"
                                             : info.abi == "arm64-v8a" ? "experimental-installed-only"
                                                                       : "unsupported-abi") +
                                  ",\"machine\":" + std::to_string(info.machine) +
@@ -222,6 +260,9 @@ std::string InspectResult::text(bool verbose, const SignatureReport *signing) co
         << ", target " << number(manifest.target_sdk) << "\nSHA-256: " << sha256
         << "\nEntries: " << entry_count << ", archive bytes: " << archive_bytes
         << ", expanded bytes: " << expanded_bytes << '\n';
+    out << "Application class: "
+        << (manifest.application_name.empty() ? "android.app.Application (default)" : manifest.application_name)
+        << '\n';
     if (signing)
         out << signing->text();
     if (presentation) {

@@ -46,9 +46,9 @@ def main():
         for path in sorted((project / "third_party" / "licenses").glob("*.txt"))
     ]
     payload = bytearray()
-    # Contract 7: stable launcher arguments/paths, package journal schemas 1-13,
+    # Contract 9: compact catalogue schema 5, retained icon capacity; stable launcher arguments/paths, package journal schemas 1-14,
     # existing Shell projections, LPAC worker policy, no app-data migration.
-    manifest = bytearray(number(7) + number(len(files)))
+    manifest = bytearray(number(9) + number(len(files)))
     for name, source in files:
         data = source.read_bytes()
         if not 0 < len(data) <= 256 * 1024 * 1024:

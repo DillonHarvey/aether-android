@@ -4,6 +4,7 @@
 #include "aether/security/activity_session.hpp"
 #include "aether/security/broker.hpp"
 #include "aether/security/storage.hpp"
+#include "aether/security/worker_progress.hpp"
 #include <bcrypt.h>
 #include <cstdio>
 #include <sstream>
@@ -30,17 +31,19 @@ struct IsolatedActivity::Impl {
     std::string package_hash;
     std::shared_ptr<AuditTrail> journal;
     std::unique_ptr<Broker> broker;
+    std::unique_ptr<WorkerProgress> progress;
     std::unique_ptr<WorkerProcess> worker;
     bool exited = false, failed = false;
     explicit Impl(const std::filesystem::path &path, ActivityMode mode,
                   const InstalledActivity *application = nullptr) {
-        require(mode == ActivityMode::normal || mode == ActivityMode::read_recovery_probe,
+        require(mode == ActivityMode::normal || mode == ActivityMode::read_recovery_probe ||
+                    mode == ActivityMode::exit_zero_probe || mode == ActivityMode::exit_255_probe,
                 "Invalid Activity mode");
         apk::InspectLimits limits;
         if (application)
             require(valid_installed_id(application->id) && application->package && application->lease &&
                         application->package_file && !application->package->empty() &&
-                        application->permissions <= (installed_clock | installed_files) &&
+                        (application->permissions & ~installed_permission_mask) == 0 &&
                         (application->permissions & installed_clock) &&
                         application->data_root.is_absolute() && application->audit_root.is_absolute() &&
                         mode == ActivityMode::normal,
@@ -72,17 +75,31 @@ struct IsolatedActivity::Impl {
             journal = make_file_audit(directory / "audit-data");
             storage = std::make_unique<PrivateStorage>(storage_parent, app_id);
         }
-        broker = std::make_unique<Broker>(BrokerPolicy{app_id, session, (permissions & installed_clock) != 0,
-                                                       256, (permissions & installed_files) != 0, true},
-                                          journal, std::move(storage), std::move(package));
+        struct StartupCompletion {
+            Impl &session;
+            bool ready = false;
+            ~StartupCompletion() {
+                if (!ready) {
+                    session.worker.reset();
+                    session.journal->finish_aborted();
+                }
+            }
+        } startup{*this};
+        BrokerPolicy policy{app_id, session, (permissions & installed_clock) != 0,
+                            256, (permissions & installed_files) != 0, true};
+        policy.wall_time = (permissions & installed_wall_clock) != 0;
+        broker = std::make_unique<Broker>(policy, journal, std::move(storage), std::move(package));
+        if (application) progress = std::make_unique<WorkerProgress>();
         worker = std::make_unique<WorkerProcess>(
             WorkerOptions{directory / "runtime" / "aether_worker.exe", profile, true, 15000, true});
         journal->bind_worker(worker->process_id());
+        broker->bind_worker_thread(*worker);
         Frame boot{{Operation::boot, 0, session, 40, Status::ok}, {}};
         for (const auto value :
-             {std::uint64_t{application                    ? 20u
+             {std::uint64_t{application ? 20u
                             : mode == ActivityMode::normal ? 11u
-                                                           : 12u},
+                            : mode == ActivityMode::read_recovery_probe ? 12u
+                            : mode == ActivityMode::exit_zero_probe ? 29u : 30u},
               static_cast<std::uint64_t>(GetCurrentProcessId()), app_id, std::uint64_t{1}, std::uint64_t{0}})
             append_u64(boot.payload, value);
         if (application) {
@@ -91,8 +108,10 @@ struct IsolatedActivity::Impl {
             require(static_cast<bool>(mapping), "Cannot map the held installed package for read access");
             append_u64(boot.payload, worker->duplicate_package_mapping(mapping.get()));
             append_u64(boot.payload, application->package->size());
+            append_u64(boot.payload, worker->duplicate_progress_mapping(*progress));
             boot.header.payload_size = static_cast<std::uint32_t>(boot.payload.size());
         }
+        try {
         worker->send(boot);
         const auto ack = worker->receive();
         require(ack.header.operation == Operation::boot && ack.header.sequence == 0 &&
@@ -101,23 +120,46 @@ struct IsolatedActivity::Impl {
         state = *receive_state(0);
         require(state.lifecycle == android::Lifecycle::resumed && state.content, "Activity did not launch");
         worker->end_exchange();
+        startup.ready = true;
+        } catch (const ActivityProcessExited &) {
+            startup.ready = true; // The typed exit has already been waited and journaled.
+            throw;
+        } catch (const std::exception &error) {
+            // Never read worker-writable diagnostics while the process can mutate
+            // them. These records are untrusted context, never policy evidence.
+            if (!progress) throw;
+            try { worker->request_stop(); (void)worker->wait(); }
+            catch (...) { throw ProtocolError(std::string(error.what()) + "; startup diagnostics unavailable: worker exit not confirmed"); }
+            throw ProtocolError(std::string(error.what()) + "; worker-reported startup diagnostics (untrusted): " + progress->summary_after_exit());
+        }
     }
     ~Impl() {
         worker.reset();
         journal->finish_aborted(); // This session, including destruction, belongs to its I/O thread.
+    }
+    [[noreturn]] void process_exited(const Frame &frame) {
+        const auto status = guest_exit_status(frame, session);
+        require(worker->wait() == status && !worker->timed_out(),
+                "Guest exit record differs from its Windows process result");
+        broker->close();
+        journal->finish();
+        exited = true;
+        throw ActivityProcessExited(status);
     }
     std::optional<ActivityState> receive_state(std::uint64_t sequence, bool reading = false) {
         ActivityReassembly received(Operation::activity_state, sequence, session, activity_state_limit);
         bool began = false;
         while (!received.complete()) {
             const auto frame = worker->receive();
+            if (frame.header.operation == Operation::guest_exited)
+                process_exited(frame);
             if (frame.header.operation == Operation::activity_read_unavailable) {
                 validate_activity_read_unavailable(frame, sequence, session, reading, began);
                 return std::nullopt;
             }
             if (frame.header.operation == Operation::finished) {
                 require(frame.header.session == session && frame.header.status == Status::invalid &&
-                            frame.payload.size() <= 512,
+                            frame.payload.size() <= maximum_worker_error,
                         "Unexpected worker completion record");
                 throw ProtocolError("AETHER_ACTIVITY_WORKER: " +
                                     std::string(frame.payload.begin(), frame.payload.end()));
@@ -138,6 +180,36 @@ struct IsolatedActivity::Impl {
                         result.framework.view_revision >= state.framework.view_revision,
                     "Worker changed application identity or regressed its view revision");
         return result;
+    }
+    bool service_background() {
+        require(std::this_thread::get_id() == owner && !exited && !failed,
+                "Wrong owner thread or closed background service");
+        try {
+            const auto frame = worker->try_receive_idle();
+            if (!frame) return false;
+            if (frame->header.operation == Operation::guest_exited)
+                process_exited(*frame);
+            if (frame->header.operation == Operation::finished) {
+                require(frame->header.session == session && frame->header.status == Status::invalid &&
+                    frame->payload.size() <= maximum_worker_error, "Unexpected idle worker completion record");
+                throw ProtocolError("AETHER_ACTIVITY_WORKER: " + std::string(frame->payload.begin(), frame->payload.end()));
+            }
+            require(frame->header.operation != Operation::activity_state &&
+                    frame->header.operation != Operation::activity_read_unavailable,
+                    "Unsolicited presentation response while idle");
+            worker->send(broker->dispatch_idle(*frame));
+            worker->end_exchange();
+            return true;
+        } catch (const ActivityProcessExited &) {
+            throw; // App-owned termination is already waited and is not a runtime refusal.
+        } catch (...) {
+            failed = true;
+            broker->close();
+            try { worker->terminate(); }
+            catch (...) { std::fputs("AETHER_ACTIVITY_TERMINATION_FAILED\n", stderr); }
+            journal->finish_aborted();
+            throw;
+        }
     }
     void transact(const ActivityCommand &command) {
         require(std::this_thread::get_id() == owner && !exited && !failed && next_command != UINT64_MAX,
@@ -170,6 +242,8 @@ struct IsolatedActivity::Impl {
             }
             if (next)
                 state = std::move(*next);
+        } catch (const ActivityProcessExited &) {
+            throw; // App-owned termination is already waited and is not a runtime refusal.
         } catch (...) {
             failed = true;
             broker->close();
@@ -191,6 +265,7 @@ IsolatedActivity::IsolatedActivity(InstalledActivity application)
     : impl_(std::make_unique<Impl>(std::filesystem::path{}, ActivityMode::normal, &application)) {}
 IsolatedActivity::~IsolatedActivity() = default;
 void IsolatedActivity::dispatch(const ActivityCommand &command) { impl_->transact(command); }
+bool IsolatedActivity::service_background() { return impl_->service_background(); }
 void IsolatedActivity::cancel() noexcept { impl_->worker->request_stop(); }
 void IsolatedActivity::signal(android::WindowSignal value) {
     if (value == android::WindowSignal::close) {

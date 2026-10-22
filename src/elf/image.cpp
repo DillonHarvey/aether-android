@@ -80,7 +80,7 @@ bool library_name(std::string_view s) {
            std::all_of(s.begin(), s.end(),
                        [](unsigned char c) {
                            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+                                  (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '+';
                        }) &&
            s.find("..") == std::string_view::npos;
 }
@@ -194,9 +194,13 @@ struct Parser {
             offset(dynamic_address, dynamic_size) != dynamic_offset)
             fail("DYNAMIC", "PT_DYNAMIC must be uniquely backed by loadable file bytes");
         if (relro_seen) {
-            const auto &s = segment(image.relro_begin, image.relro_end - image.relro_begin);
-            if (!a64::has(s.permissions, a64::Permission::write))
-                fail("RELRO", "GNU RELRO must be contained in a writable load segment");
+            // Linkers may include the owning LOAD's final mapped-page padding.
+            // The raw start must still name actual segment memory; other dynamic
+            // metadata continues to use exact segment extents through segment().
+            const auto &s = segment(image.relro_begin, 1);
+            if (!a64::has(s.permissions, a64::Permission::write) ||
+                image.relro_end > page_up(s.address + s.memory_size))
+                fail("RELRO", "GNU RELRO must stay within its owning writable load mapping");
             image.relro_begin = page_down(image.relro_begin);
             image.relro_end = page_up(image.relro_end);
         }
@@ -282,9 +286,12 @@ struct Parser {
             fail("SONAME", "A safe, explicit DT_SONAME is required");
         for (const auto name : needed) {
             auto dependency = string(name);
-            if (!library_name(dependency) || dependency == image.soname ||
-                std::find(image.needed.begin(), image.needed.end(), dependency) != image.needed.end())
-                fail("DEPENDENCY", "Invalid, self-referencing or duplicate DT_NEEDED");
+            if (!library_name(dependency))
+                fail("DEPENDENCY", "Invalid DT_NEEDED basename in " + image.soname);
+            if (dependency == image.soname)
+                fail("DEPENDENCY", "Self-referencing DT_NEEDED in " + image.soname);
+            if (std::find(image.needed.begin(), image.needed.end(), dependency) != image.needed.end())
+                fail("DEPENDENCY", "Duplicate DT_NEEDED " + dependency + " in " + image.soname);
             image.needed.push_back(std::move(dependency));
         }
     }
@@ -441,7 +448,9 @@ struct Parser {
             const auto raw = file.u16(p + i * 2), index = static_cast<std::uint16_t>(raw & 0x7fff);
             s.version_hidden = (raw & 0x8000) != 0;
             if (index < 2) {
-                if (s.version_hidden || (index == 0 && s.binding != 0))
+                // Undefined references use index 0 or 1 for no version constraint.
+                // This does not turn an STB_WEAK/STB_GLOBAL import into STB_LOCAL.
+                if (s.version_hidden || (index == 0 && s.binding != 0 && s.defined))
                     fail("VERSION", "Invalid local/global symbol version");
                 continue;
             }

@@ -79,13 +79,19 @@ struct ArchiveSource::Impl {
             bad("DEX source differs from its inspected immutable identity");
         return bytes;
     }
-    explicit Impl(std::span<const ArchiveDexInput> inputs) {
+    explicit Impl(std::span<const ArchiveDexInput> inputs, ArchiveIndexPolicy policy) {
+        if (policy != ArchiveIndexPolicy::inspected && policy != ArchiveIndexPolicy::directory)
+            bad("Unknown class inventory validation policy");
         if (inputs.empty() || inputs.size() > 64)
             bad("Class inventory requires 1 through 64 DEX sources");
         std::uint64_t total = 0, classes = 0;
         std::set<std::string> unique;
         for (const auto &source : inputs) {
             const auto &input = source.file;
+            if (policy == ArchiveIndexPolicy::directory &&
+                (!input.file.sha256.empty() || !input.version.empty() || input.strings || input.methods ||
+                 input.classes))
+                bad("Directory inventory must not claim previously inspected DEX content");
             const auto name = input.file.container.empty() ? input.file.path
                                                            : input.file.container + "!/" + input.file.path;
             if (!source.archive || !unique.insert(name).second || input.file.bytes > source_file_bytes ||
@@ -104,11 +110,24 @@ struct ArchiveSource::Impl {
         }
         entries.reserve(static_cast<std::size_t>(classes));
         for (std::size_t file = 0; file < files.size(); ++file) {
-            const auto bytes = read(file);
+            // The runtime's directory path combines its first content check
+            // with class indexing. Already inspected callers retain their
+            // exact identity/count cross-checks. Selected loads recheck the
+            // retained hash in either case.
+            const auto bytes = policy == ArchiveIndexPolicy::inspected
+                                   ? read(file)
+                                   : files[file].archive->read(files[file].entry);
             const auto inventory = apk::inspect_dex(bytes);
             if ((inventory.version != "035" && inventory.version != "037" && inventory.version != "038") ||
-                inventory.classes != inputs[file].file.classes)
+                (policy == ArchiveIndexPolicy::inspected && inventory.classes != inputs[file].file.classes))
                 bad("Unsupported or inconsistent DEX class inventory");
+            if (policy == ArchiveIndexPolicy::directory) {
+                if (inventory.classes > maximum_classes - classes)
+                    bad("DEX class inventory exceeds its class-count bound");
+                classes += inventory.classes;
+                entries.reserve(static_cast<std::size_t>(classes));
+                files[file].hash = apk::sha256(bytes);
+            }
             apk::View view(bytes, "dex-class-index");
             const auto map = view.u32(52), count = view.u32(map);
             std::uint32_t begin = 0, end = 0;
@@ -151,9 +170,10 @@ ArchiveSource::ArchiveSource(std::shared_ptr<apk::Archive> archive, std::span<co
           inputs.reserve(files.size());
           for (const auto &file : files)
               inputs.push_back({archive, file});
-          return std::make_unique<Impl>(inputs);
+          return std::make_unique<Impl>(inputs, ArchiveIndexPolicy::inspected);
       }()) {}
-ArchiveSource::ArchiveSource(std::span<const ArchiveDexInput> files) : impl_(std::make_unique<Impl>(files)) {}
+ArchiveSource::ArchiveSource(std::span<const ArchiveDexInput> files, ArchiveIndexPolicy policy)
+    : impl_(std::make_unique<Impl>(files, policy)) {}
 ArchiveSource::~ArchiveSource() = default;
 std::optional<std::size_t> ArchiveSource::source_for(std::string_view descriptor) const {
     const auto &p = *impl_;

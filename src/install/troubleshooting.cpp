@@ -2,6 +2,7 @@
 #include "aether/build_info.hpp"
 #include "aether/common/text.hpp"
 #include "aether/security/audit.hpp"
+#include "aether/security/storage.hpp"
 #include "private.hpp"
 #include <Windows.h>
 #include <algorithm>
@@ -10,7 +11,8 @@
 
 namespace aether::install {
 namespace {
-constexpr std::size_t session_limit = 16, file_limit = 1024 * 1024;
+constexpr std::size_t session_limit = security::PrivateStorage::maximum_audit_names;
+constexpr std::size_t file_limit = security::audit_file_limit;
 const char *boolean(bool value) { return value ? "true" : "false"; }
 void require(bool value, const char *code) {
     if (!value)
@@ -39,14 +41,19 @@ std::string windows_build() {
                : "unavailable";
 }
 AuditSessionSummary inspect_session(const std::filesystem::path &path, std::uint64_t broker,
-                                    const std::string &session) {
+                                    const std::string &session, std::size_t &remaining_bytes) {
     AuditSessionSummary result;
     result.session = session;
     result.state = "unavailable";
     try {
         auto file =
             detail::private_file(path, GENERIC_READ, OPEN_EXISTING, file_limit, FILE_SHARE_READ, true);
+        LARGE_INTEGER size{};
+        require(GetFileSizeEx(file.get(), &size) && size.QuadPart >= 0 &&
+                    static_cast<std::uint64_t>(size.QuadPart) <= remaining_bytes,
+                "AETHER_TROUBLESHOOT_AUDIT_LIMIT");
         const auto bytes = detail::read_contents(file.get());
+        remaining_bytes -= bytes.size();
         const auto summary = security::inspect_audit(bytes);
         std::uint64_t expected = 0;
         const auto parsed = std::from_chars(session.data(), session.data() + session.size(), expected, 16);
@@ -104,10 +111,13 @@ void collect_audits(TroubleshootingReport &report, const std::filesystem::path &
             paths.push_back(entry.path());
         }
         std::sort(paths.begin(), paths.end());
+        std::size_t remaining_bytes = security::audit_total_limit;
         for (const auto &path : paths) {
             report.sessions.push_back(
                 inspect_session(path, security::installed_broker_id(report.diagnostics.app.id),
-                                utf8(path.filename().wstring().substr(8, 16))));
+                                utf8(path.filename().wstring().substr(8, 16)), remaining_bytes));
+            require(report.sessions.back().code != "AETHER_TROUBLESHOOT_AUDIT_LIMIT",
+                    "AETHER_TROUBLESHOOT_AUDIT_LIMIT");
             if (!report.sessions.back().code.empty())
                 report.collection_complete = false;
         }
@@ -128,7 +138,8 @@ std::string troubleshooting_plan(TroubleshootingOptions options) {
            std::string(options.host_details ? "selected" : "not selected") +
            "\nAudit session summaries (completion and request/error counts): " +
            (options.audit_summaries ? "selected" : "not selected") +
-           "\nAudit limit: 16 sessions, 1 MiB per file. Active or unsafe logs are reported as unavailable.\n"
+           "\nAudit limit: 256 sessions, 16 MiB total, 1 MiB per file. Active or unsafe logs are reported as "
+           "unavailable.\n"
            "No host paths, usernames, process IDs, absolute timestamps, raw log records, private files, "
            "environment or memory. Nothing is uploaded. Review the captured preview before sharing.\n";
 }
@@ -173,8 +184,9 @@ std::string TroubleshootingReport::json() const {
             << ",\"configuration\":" << json_quote(build::configuration)
             << ",\"compiler\":" << json_quote(build::compiler) << '}';
     out << ",\"auditSummaries\":{\"status\":" << json_quote(audit_status)
-        << ",\"code\":" << json_quote(audit_code) << ",\"maximumSessions\":16,\"maximumFileBytes\":1048576,"
-        << "\"contentAuthenticityEstablished\":false,\"sessions\":[";
+        << ",\"code\":" << json_quote(audit_code) << ",\"maximumSessions\":" << session_limit
+        << ",\"maximumFileBytes\":" << file_limit << ",\"maximumTotalBytes\":" << security::audit_total_limit
+        << ',' << "\"contentAuthenticityEstablished\":false,\"sessions\":[";
     for (std::size_t n = 0; n < sessions.size(); ++n) {
         const auto &s = sessions[n];
         out << (n ? "," : "") << "{\"session\":" << json_quote(s.session)
@@ -218,6 +230,6 @@ std::string TroubleshootingReport::text() const {
     return out.str();
 }
 void export_troubleshooting(const TroubleshootingReport &report, const std::filesystem::path &destination) {
-    detail::export_report_json(report.json(), destination);
+    detail::export_report_json(report.json(), destination, 256 * 1024);
 }
 } // namespace aether::install

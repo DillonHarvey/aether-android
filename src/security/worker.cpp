@@ -1,3 +1,4 @@
+#include "aether/security/worker_progress.hpp"
 #include "aether/security/worker.hpp"
 #include "aether/host/windows/unique_handle.hpp"
 #include <aclapi.h>
@@ -193,6 +194,51 @@ void verify_metadata_process(HANDLE process, PSID expected_sid) {
                 extensions.DisableExtensionPoints,
             "Metadata service mitigation policy differs from parent policy");
 }
+struct PipeFramePoller::Impl {
+    HANDLE reader;
+    const std::thread::id owner = std::this_thread::get_id();
+    const std::chrono::milliseconds timeout;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    bool broken = false;
+    Impl(HANDLE handle, std::chrono::milliseconds bound) : reader(handle), timeout(bound) {
+        if (!reader || reader == INVALID_HANDLE_VALUE || timeout.count() <= 0 || timeout > std::chrono::seconds(30) ||
+            GetFileType(reader) != FILE_TYPE_PIPE || !PeekNamedPipe(reader, nullptr, 0, nullptr, nullptr, nullptr))
+            throw ProtocolError("AETHER_IPC_POLL: invalid borrowed pipe reader or timeout");
+    }
+    void check() const {
+        if (std::this_thread::get_id() != owner)
+            throw ProtocolError("AETHER_IPC_POLL: pipe belongs to another thread");
+        if (broken) throw ProtocolError("AETHER_IPC_POLL: channel is closed");
+    }
+};
+PipeFramePoller::PipeFramePoller(HANDLE reader, std::chrono::milliseconds timeout)
+    : impl_(std::make_unique<Impl>(reader, timeout)) {}
+PipeFramePoller::~PipeFramePoller() = default;
+std::optional<Frame> PipeFramePoller::poll() {
+    auto &p = *impl_;p.check();
+    try {
+        DWORD available = 0, copied = 0;
+        std::array<std::uint8_t, header_bytes> prefix{};
+        if (!PeekNamedPipe(p.reader, prefix.data(), static_cast<DWORD>(prefix.size()), &copied, &available, nullptr))
+            throw ProtocolError("AETHER_IPC_POLL: peer closed or pipe peek failed");
+        const auto now = std::chrono::steady_clock::now();
+        if (available && !p.deadline) p.deadline = now + p.timeout;
+        if (p.deadline && now >= *p.deadline)
+            throw ProtocolError("AETHER_IPC_POLL: absolute partial-frame deadline expired");
+        if (copied < header_bytes) return {};
+        const auto header = decode_header(prefix); // Bounds payload before allocation or consumption.
+        if (available < header_bytes + header.payload_size) return {};
+        auto result = read_pipe_frame(p.reader);
+        if (p.deadline && std::chrono::steady_clock::now() >= *p.deadline)
+            throw ProtocolError("AETHER_IPC_POLL: full frame completed after its absolute deadline");
+        p.deadline.reset();
+        return result;
+    } catch (...) { p.broken = true; throw; }
+}
+void PipeFramePoller::reset() { impl_->check();impl_->deadline.reset(); }
+std::optional<std::chrono::steady_clock::time_point> PipeFramePoller::partial_deadline() const {
+    impl_->check();return impl_->deadline;
+}
 Frame read_pipe_frame(HANDLE reader) {
     std::array<std::uint8_t, header_bytes> bytes{};
     read_exact(reader, bytes);
@@ -210,12 +256,14 @@ void write_pipe_frame(HANDLE writer, const Frame &frame) {
 }
 struct WorkerProcess::Impl {
     WorkerRole role = WorkerRole::guest;
-    UniqueHandle job, process, reader, writer;
+    UniqueHandle job, process, reader, writer, primary_thread;
+    std::unique_ptr<PipeFramePoller> poller;
     std::unique_ptr<WorkerImage> image;
     WorkerImageAccess image_permissions;
     std::jthread watchdog;
     std::atomic<bool> expired = false;
     DWORD pid = 0;
+    std::uint64_t start_uptime_ticks = 0;
     std::uint32_t sent = 0, received = 0;
     std::mutex deadline_mutex;
     std::condition_variable deadline_changed;
@@ -230,9 +278,11 @@ struct WorkerProcess::Impl {
         deadline_changed.notify_all();
     }
     void check_exchange() {
+        (void)poller->partial_deadline(); // Validate the channel owner before any blocking I/O.
         if (exchange_deadlines) {
             std::lock_guard lock(deadline_mutex);
-            require(armed && !stopping && !expired, "I/O requires an active trusted exchange");
+            require(armed && !stopping && !expired && std::chrono::steady_clock::now() < deadline,
+                    "I/O requires an active unexpired trusted exchange");
         }
     }
     ~Impl() {
@@ -322,6 +372,7 @@ struct WorkerProcess::Impl {
                 "Cannot create command pipe");
         writer.reset(parent_write);
         UniqueHandle child_reader(child_read);
+        poller = std::make_unique<PipeFramePoller>(reader.get(), std::chrono::milliseconds(options.timeout_ms));
         require(SetHandleInformation(reader.get(), HANDLE_FLAG_INHERIT, 0) &&
                     SetHandleInformation(writer.get(), HANDLE_FLAG_INHERIT, 0),
                 "Cannot restrict pipe inheritance");
@@ -437,7 +488,12 @@ struct WorkerProcess::Impl {
                     }
                 }
             });
+            // Freeze this worker's execution-start uptime before any worker/app
+            // code runs. Use the same sleep-excluding 100ns clock as uptimeMillis.
+            ULONGLONG startup_ticks = 0;QueryUnbiasedInterruptTimePrecise(&startup_ticks);
+            start_uptime_ticks = startup_ticks;
             require(ResumeThread(thread.get()) != static_cast<DWORD>(-1), "Cannot resume isolated worker");
+            primary_thread = std::move(thread);
         }
     }
 };
@@ -445,6 +501,17 @@ WorkerProcess::WorkerProcess(const WorkerOptions &options) : impl_(std::make_uni
     impl_->start(options);
 }
 WorkerProcess::~WorkerProcess() = default;
+std::uint64_t WorkerProcess::duplicate_progress_mapping(const WorkerProgress &progress) {
+    const auto source = progress.handle();
+    impl_->check_exchange();
+    require(impl_->role == WorkerRole::guest && source && source != INVALID_HANDLE_VALUE,
+            "Startup diagnostics require the isolated guest process");
+    HANDLE target = nullptr;
+    require(DuplicateHandle(GetCurrentProcess(), source, impl_->process.get(), &target,
+                            SECTION_MAP_READ | SECTION_MAP_WRITE, FALSE, 0),
+            "Cannot duplicate the anonymous startup diagnostic mapping");
+    return reinterpret_cast<std::uint64_t>(target);
+}
 std::uint64_t WorkerProcess::duplicate_package_mapping(HANDLE source) {
     impl_->check_exchange();
     require(impl_->role == WorkerRole::guest && source && source != INVALID_HANDLE_VALUE,
@@ -480,22 +547,39 @@ void WorkerProcess::send(const Frame &frame) {
     if (++impl_->sent > (impl_->exchange_deadlines ? 10000u : 258u))
         throw ProtocolError("AETHER_IPC_QUOTA: outbound frame limit");
     write_pipe_frame(impl_->writer.get(), frame);
+    impl_->check_exchange(); // A late write is never reported as successful before the watchdog runs.
 }
 Frame WorkerProcess::receive() {
     impl_->check_exchange();
-    if (++impl_->received > (impl_->exchange_deadlines ? 10000u : 258u))
+    const auto partial = impl_->poller->partial_deadline();
+    // Metadata permits bounded permission frames plus a maximum 512 px bitmap.
+    if (++impl_->received > (impl_->exchange_deadlines             ? 10000u
+                             : impl_->role == WorkerRole::metadata ? 300u
+                                                                   : 258u))
         throw ProtocolError("AETHER_IPC_QUOTA: inbound frame limit");
     try {
-        return read_pipe_frame(impl_->reader.get());
+        auto result = read_pipe_frame(impl_->reader.get());
+        require(!partial || std::chrono::steady_clock::now() < *partial,
+                "Reply exceeded its absolute partial-frame deadline");
+        impl_->check_exchange(); // Check the actual clock, not only the asynchronously set expired flag.
+        impl_->poller->reset();
+        return result;
     } catch (const std::exception &error) {
         DWORD code = 0;
         GetExitCodeProcess(impl_->process.get(), &code);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
         const bool queried = QueryInformationJobObject(impl_->job.get(), JobObjectExtendedLimitInformation,
                                                        &limits, sizeof(limits), nullptr) != FALSE;
+        FILETIME created{}, exited{}, kernel{}, user{};
+        const bool timed = GetProcessTimes(impl_->process.get(), &created, &exited, &kernel, &user) != FALSE;
+        const auto user_ticks = (static_cast<std::uint64_t>(user.dwHighDateTime) << 32) | user.dwLowDateTime;
         throw ProtocolError(
             std::string(error.what()) + "; worker exit=" + std::to_string(code) +
-            "; peak commit=" + (queried ? std::to_string(limits.PeakProcessMemoryUsed) : "unknown"));
+            "; peak commit=" + (queried ? std::to_string(limits.PeakProcessMemoryUsed) : "unknown") +
+            "; user CPU 100ns=" + (timed ? std::to_string(user_ticks) : "unknown") +
+            "; CPU limit 100ns=" +
+            (queried ? std::to_string(limits.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart)
+                     : "unknown"));
     }
 }
 std::uint32_t WorkerProcess::wait() {
@@ -505,19 +589,46 @@ std::uint32_t WorkerProcess::wait() {
     impl_->stop_watchdog();
     return code;
 }
+std::optional<Frame> WorkerProcess::try_receive_idle() {
+    {
+        std::lock_guard lock(impl_->deadline_mutex);
+        require(impl_->role == WorkerRole::guest && impl_->exchange_deadlines && !impl_->armed &&
+                    !impl_->stopping && !impl_->expired, "Idle receive requires an inactive interactive guest exchange");
+    }
+    const auto partial = impl_->poller->partial_deadline();
+    auto frame = impl_->poller->poll();
+    if (!frame) return {};
+    require(!partial || std::chrono::steady_clock::now() < *partial,
+            "Idle reply exceeded its absolute partial-frame deadline");
+    begin_exchange();
+    if (partial) {
+        std::lock_guard lock(impl_->deadline_mutex);
+        if (*partial < impl_->deadline) impl_->deadline = *partial;
+        impl_->deadline_changed.notify_all();
+    }
+    impl_->check_exchange();
+    impl_->received = 1;
+    return frame;
+}
 void WorkerProcess::begin_exchange() {
+    const auto partial = impl_->poller->partial_deadline();
     std::lock_guard lock(impl_->deadline_mutex);
     require(impl_->exchange_deadlines && !impl_->armed && !impl_->stopping && !impl_->expired,
             "Cannot begin this worker exchange");
+    const auto now = std::chrono::steady_clock::now();
+    require(!partial || now < *partial, "Cannot begin an exchange after its partial-frame deadline");
     impl_->sent = impl_->received = 0;
-    impl_->deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(impl_->timeout_ms);
+    impl_->deadline = now + std::chrono::milliseconds(impl_->timeout_ms);
+    if (partial && *partial < impl_->deadline) impl_->deadline = *partial;
     impl_->armed = true;
     impl_->deadline_changed.notify_all();
 }
 void WorkerProcess::end_exchange() {
+    (void)impl_->poller->partial_deadline();
     std::lock_guard lock(impl_->deadline_mutex);
-    require(impl_->exchange_deadlines && impl_->armed && !impl_->stopping && !impl_->expired,
-            "Cannot finish this worker exchange");
+    require(impl_->exchange_deadlines && impl_->armed && !impl_->stopping && !impl_->expired &&
+                std::chrono::steady_clock::now() < impl_->deadline,
+            "Cannot finish an inactive or expired worker exchange");
     impl_->armed = false;
     impl_->deadline_changed.notify_all();
 }
@@ -529,6 +640,10 @@ void WorkerProcess::request_stop() noexcept {
     if (!TerminateJobObject(impl_->job.get(), 1))
         std::fputs("AETHER_WORKER_CANCEL_FAILED\n", stderr);
 }
+HANDLE WorkerProcess::primary_thread() const noexcept {
+    return impl_->role == WorkerRole::guest ? impl_->primary_thread.get() : nullptr;
+}
+std::uint64_t WorkerProcess::start_uptime_ticks() const noexcept { return impl_->start_uptime_ticks; }
 std::uint32_t WorkerProcess::process_id() const noexcept { return impl_->pid; }
 WorkerImageAccess WorkerProcess::image_access() const noexcept { return impl_->image_permissions; }
 bool WorkerProcess::timed_out() const noexcept { return impl_->expired; }

@@ -26,6 +26,7 @@ namespace {
 using host::UniqueHandle;
 constexpr wchar_t record_file[] = L"runtime.registry", lease_file[] = L"runtime.lease";
 constexpr std::size_t frame_size = 65536, digest_offset = frame_size - 64, max_frames = 1024;
+constexpr std::size_t max_catalogue_payloads = 256;
 constexpr std::uint64_t max_image = 256ull * 1024 * 1024;
 enum class Phase : std::uint64_t { preparing = 1, ready, removing, upgrading };
 struct Payload {
@@ -263,7 +264,7 @@ struct Catalogue {
             Reader reader{frame.first(digest_offset)};
             corrupt(reader.text(16) == "AETHRUNTIME1");
             const auto version = reader.number();
-            corrupt((version >= 1 && version <= 4) && reader.number() == count + 1 &&
+            corrupt((version >= 1 && version <= 5) && reader.number() == count + 1 &&
                     reader.text(64) == digest);
             const auto phase = reader.number();
             corrupt(phase >= 1 && phase <= (version >= 3 ? 4u : 3u));
@@ -273,7 +274,7 @@ struct Catalogue {
             next.root = utf16(reader.text(800));
             corrupt(same_path(next.root, root));
             const auto files = reader.number();
-            corrupt(files <= 96);
+            corrupt(files <= (version >= 5 ? max_catalogue_payloads : 96));
             std::set<std::string> names;
             for (std::uint64_t n = 0; n < files; ++n) {
                 Payload item;
@@ -283,12 +284,17 @@ struct Catalogue {
                 const auto kind = reader.number();
                 corrupt(kind <= 1);
                 item.worker = kind != 0;
+                if (version >= 5 && item.path.empty()) {
+                    corrupt(!item.worker && hex(item.sha256));
+                    item.path = "shell-icons/" + item.sha256 + "/AetherShellIcons.dll";
+                }
                 corrupt(payload_name(item.path, item.worker) && hex(item.sha256) && item.size &&
                         item.size <= max_image && names.insert(item.path).second);
                 corrupt(!icon_payload(item.path) ||
                         (version >= 4 && item.path.substr(12, 64) == item.sha256));
                 next.files.push_back(std::move(item));
             }
+            corrupt(std::count_if(next.files.begin(), next.files.end(), [](const auto &item) { return !icon_payload(item.path); }) <= 96);
             const auto stores = reader.number();
             corrupt(stores <= 32);
             for (std::uint64_t n = 0; n < stores; ++n) {
@@ -307,7 +313,7 @@ struct Catalogue {
                 next.compatibility = reader.number();
                 corrupt(next.compatibility >= 1 && next.compatibility <= current_runtime_compatibility);
                 const auto pending = reader.number();
-                corrupt(pending <= 96);
+                corrupt(pending <= (version >= 5 ? max_catalogue_payloads : 96));
                 std::set<std::string> pending_names;
                 for (std::uint64_t n = 0; n < pending; ++n) {
                     Payload item;
@@ -317,12 +323,18 @@ struct Catalogue {
                     const auto kind = reader.number();
                     corrupt(kind <= 1);
                     item.worker = kind != 0;
+                    if (version >= 5 && item.path.empty()) {
+                        corrupt(!item.worker && hex(item.sha256));
+                        item.path = "shell-icons/" + item.sha256 + "/AetherShellIcons.dll";
+                    }
                     corrupt(payload_name(item.path, item.worker) && hex(item.sha256) && item.size &&
                             item.size <= max_image && pending_names.insert(item.path).second);
                     corrupt(!icon_payload(item.path) ||
                             (version >= 4 && item.path.substr(12, 64) == item.sha256));
                     next.pending.push_back(std::move(item));
                 }
+                corrupt(version < 5 || next.compatibility >= 9);
+                corrupt(std::count_if(next.pending.begin(), next.pending.end(), [](const auto &item) { return !icon_payload(item.path); }) <= 96);
                 corrupt((next.phase == Phase::upgrading) == !next.pending.empty());
                 corrupt(next.pending.empty() || (version >= 4 ? additive_layout(next.files, next.pending)
                                                               : same_layout(next.files, next.pending)));
@@ -413,7 +425,7 @@ struct Catalogue {
         out.text(utf8(record.root.wstring()));
         out.number(record.files.size());
         for (const auto &item : record.files) {
-            out.text(item.path);
+            out.text(record.schema >= 5 && icon_payload(item.path) ? "" : item.path);
             out.text(item.sha256);
             out.number(item.size);
             out.number(item.worker ? 1 : 0);
@@ -427,7 +439,7 @@ struct Catalogue {
             out.number(record.compatibility);
             out.number(record.pending.size());
             for (const auto &item : record.pending) {
-                out.text(item.path);
+                out.text(record.schema >= 5 && icon_payload(item.path) ? "" : item.path);
                 out.text(item.sha256);
                 out.number(item.size);
                 out.number(item.worker ? 1 : 0);
@@ -612,8 +624,8 @@ Inventory payload_inventory(const std::filesystem::path &root, const std::vector
                             "Unknown material in a shell icon directory is preserved");
             }
             if (!expected) {
-                require(result.payload.size() < 92, "AETHER_RUNTIME_LIMIT",
-                        "Runtime payload exceeds the 96-file catalogue bound");
+                require(result.payload.size() < max_catalogue_payloads, "AETHER_RUNTIME_LIMIT",
+                        "Runtime payload exceeds the bounded retained-payload catalogue");
                 result.payload.push_back({relative, {}, 0, worker});
             }
         }
@@ -630,13 +642,16 @@ Inventory payload_inventory(const std::filesystem::path &root, const std::vector
             result.payload.push_back({leaf, {}, 0, false});
         if (!missing(root / L"aether-setup.exe"))
             result.payload.push_back({"aether-setup.exe", {}, 0, false});
-        require(result.payload.size() >= 8 && result.payload.size() <= 96 &&
+        require(result.payload.size() >= 8 && result.payload.size() <= max_catalogue_payloads &&
                     std::count_if(result.payload.begin(), result.payload.end(),
                                   [](const auto &item) { return item.worker; }) == 3,
                 "AETHER_RUNTIME_PAYLOAD",
                 "All three workers, the icon DLL and distribution licences are required");
         (void)single_icon(result.payload);
     }
+    require(std::count_if(result.payload.begin(), result.payload.end(),
+                          [](const auto &item) { return !icon_payload(item.path); }) <= 96,
+            "AETHER_RUNTIME_LIMIT", "Non-icon runtime inventory exceeds its original bound");
     std::sort(result.payload.begin(), result.payload.end(),
               [](const auto &a, const auto &b) { return a.path < b.path; });
     for (auto &item : result.payload) {
@@ -1071,7 +1086,7 @@ void install_runtime(const std::filesystem::path &root, const std::vector<Runtim
     auto held = detail::hold_directory(root, true, true);
     auto lease = use_file(root, true, true);
     Catalogue state(root, true, true);
-    state.record.schema = 4;
+    state.record.schema = 5;
     state.record.compatibility = current_runtime_compatibility;
     state.record.native_id = native_identity();
     state.record.files = std::move(inventory);
@@ -1266,7 +1281,7 @@ std::string repair_runtime(const std::filesystem::path &root, const RuntimeBundl
 std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBundle &bundle) {
     PendingShellNotice notice;
     require(bundle.compatibility == current_runtime_compatibility, "AETHER_RUNTIME_COMPATIBILITY",
-            "Upgrade requires runtime compatibility contract 7 (package schemas 1-13); older or incompatible "
+            "Upgrade requires runtime compatibility contract 9 (catalogue schema 5; package schemas 1-14); older or incompatible "
             "distributions are "
             "refused");
     auto candidate = native_inventory(bundle.files);
@@ -1294,8 +1309,10 @@ std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBund
         }
     std::sort(candidate.begin(), candidate.end(),
               [](const auto &a, const auto &b) { return a.path < b.path; });
-    require(candidate.size() <= 96 && additive_layout(state.record.files, candidate),
+    require(candidate.size() <= max_catalogue_payloads && additive_layout(state.record.files, candidate),
             "AETHER_RUNTIME_COMPATIBILITY", "The upgrade exceeds the bounded additive runtime layout");
+    require(std::count_if(candidate.begin(), candidate.end(), [](const auto &item) { return !icon_payload(item.path); }) <= 96,
+            "AETHER_RUNTIME_COMPATIBILITY", "Non-icon runtime layout exceeds its original bound");
     const bool resuming = state.record.phase == Phase::upgrading;
     require(!resuming || state.record.compatibility == bundle.compatibility, "AETHER_RUNTIME_COMPATIBILITY",
             "An interrupted upgrade requires its recorded runtime compatibility contract");
@@ -1322,7 +1339,7 @@ std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBund
         return "{\"schemaVersion\":1,\"operation\":\"runtime-upgrade\",\"state\":\"unchanged\","
                "\"packageStoresPreserved\":true,\"launcherPathsPreserved\":true}";
     if (!resuming) {
-        state.record.schema = 4;
+        state.record.schema = 5;
         state.record.compatibility = current_runtime_compatibility;
         state.record.phase = Phase::upgrading;
         state.record.pending = candidate;
@@ -1524,7 +1541,7 @@ int runtime_cli(const std::vector<std::string> &arguments, bool json) {
         auto target = detail::hold_directory(root, true, true);
         auto lease = use_file(root, true, true);
         Catalogue state(root, true, true);
-        state.record.schema = 4;
+        state.record.schema = 5;
         state.record.compatibility = current_runtime_compatibility;
         state.commit();
         auto workers = detail::hold_directory(root / L"runtime", true, true);

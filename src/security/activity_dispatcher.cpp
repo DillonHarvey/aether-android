@@ -109,9 +109,14 @@ struct ActivityDispatcher::Impl {
                 Request request;
                 {
                     std::unique_lock lock(mutex);
-                    wake.wait(lock, [&] { return stopping || !requests.empty(); });
+                    wake.wait_for(lock, std::chrono::milliseconds(10), [&] { return stopping || !requests.empty(); });
                     if (stopping)
                         break;
+                    if (requests.empty()) {
+                        lock.unlock();
+                        (void)session.service_background();
+                        continue;
+                    }
                     request = std::move(requests.front());
                     requests.pop_front();
                 }

@@ -24,7 +24,8 @@ inline std::uint64_t installed_broker_id(std::string_view id) {
         value = (value << 4) | static_cast<unsigned>(c <= '9' ? c - '0' : c - 'a' + 10);
     return value | (std::uint64_t{1} << 63);
 }
-inline constexpr std::uint32_t installed_clock = 1, installed_files = 2;
+inline constexpr std::uint32_t installed_clock = 1, installed_files = 2, installed_wall_clock = 4;
+inline constexpr std::uint32_t installed_permission_mask = 7;
 // Trusted window metadata only. The command resolves an installed ID again;
 // it never carries package paths, worker options or capability grants.
 struct InstalledRelaunch {

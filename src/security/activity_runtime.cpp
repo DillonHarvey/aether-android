@@ -6,10 +6,15 @@
 #include "aether/apk/package.hpp"
 #include "aether/dex/archive_source.hpp"
 #include "aether/dex/fixture_hash.hpp"
+#include "aether/common/text.hpp"
+#include "aether/common/process_exit.hpp"
 #include "aether/elf/archive_source.hpp"
 #include "aether/security/activity_session.hpp"
 #include "aether/security/client.hpp"
+#include "aether/security/worker_progress.hpp"
 #include <algorithm>
+
+#include <thread>
 
 namespace aether::security {
 namespace {
@@ -19,27 +24,40 @@ struct ActivityPackage {
     apk::ResourceTable resources;
     std::shared_ptr<dex::ClassSource> code;
     apk::PackageView archives;
-    apk::NativeInventory libraries;
-    std::vector<apk::PackageView::Member> native_entries;
-    std::string hash, package, launcher, descriptor;
-    explicit ActivityPackage(BrokerClient &client, bool installed, apk::Bytes mapped) {
+    apk::NativeDirectory libraries;
+    std::string hash, package, launcher, descriptor, application_descriptor, factory_descriptor;
+    explicit ActivityPackage(BrokerClient &client, bool installed, apk::Bytes mapped, WorkerProgressWriter *progress) {
+        const auto stage = [progress](std::uint32_t id, std::string_view label) { if (progress) progress->stage(id,label); };
+        stage(101,"package_verify");
         apk::InspectLimits limits;
         if (installed)
             client.verify_package(mapped);
         else
             bytes = client.read_package();
         const auto input = installed ? mapped : apk::Bytes(bytes);
+        stage(102,"package_hash");
         hash = apk::sha256(input);
         if (!installed && hash != dex::fixture::apk_sha256)
             throw dex::DexError("AETHER_ANDROID_FIXTURE_NOT_TRUSTED",
                                 "Developer Activity probes accept only the exact first-party APK");
-        const auto report = apk::inspect_package(input, limits);
+        stage(103,"package_inspect");
+        const auto report = apk::inspect_package(input, limits, {}, apk::ScanScope::runtime);
         const auto compatibility = apk::execution_compatibility(report);
         if (!compatibility.installable)
             throw dex::DexError("AETHER_ANDROID_PACKAGE_UNSUPPORTED", compatibility.reason);
+        stage(104,"package_open");
         archives = apk::open_package(input, limits);
         const auto &manifest = report.manifest;
         package = manifest.package_id;
+        application_descriptor = manifest.application_name.empty() ? "android.app.Application"
+                                                                 : manifest.application_name;
+        std::replace(application_descriptor.begin(), application_descriptor.end(), '.', '/');
+        application_descriptor = 'L' + application_descriptor + ';';
+        if (!manifest.app_component_factory_name.empty()) {
+            factory_descriptor = manifest.app_component_factory_name;
+            std::replace(factory_descriptor.begin(), factory_descriptor.end(), '.', '/');
+            factory_descriptor = 'L' + factory_descriptor + ';';
+        }
         const auto selection = apk::select_launcher(manifest);
         if (!selection.activity)
             fail(selection.reason);
@@ -51,40 +69,19 @@ struct ActivityPackage {
         std::vector<dex::ArchiveDexInput> dex_inputs;
         for (const auto &dex : report.dex)
             dex_inputs.push_back({archives.part(dex.file.container).archive, dex});
-        code = std::make_shared<dex::ArchiveSource>(dex_inputs);
+        stage(105,"dex_directory_index");
+        code = std::make_shared<dex::ArchiveSource>(dex_inputs, dex::ArchiveIndexPolicy::directory);
         // Fixed neutral resource context, not an Android API-support claim or a
         // projection of Windows locale/DPI. Device-qualified resources remain
         // unavailable until the corresponding runtime configuration exists.
-        constexpr apk::ResourceConfiguration resource_target{160, 35,
+        constexpr apk::ResourceConfiguration resource_target{160, android::compatibility_sdk,
                                                              apk::ResourceSelectionPolicy::neutral_runtime};
+        stage(106,"resource_compose");
         resources =
             apk::ResourceTable::compose(archives, package, &resource_target,
-                                        {.names = apk::ResourceNamePolicy::compiled, .retain_bags = true});
-        libraries = apk::NativeInventory(report.native);
-        native_entries.resize(libraries.members().size());
-        constexpr std::string_view native_prefix = "lib/arm64-v8a/";
-        // Scan the directory once, rather than searching every archive entry for
-        // each library in a potentially large native catalogue.
-        for (const auto &part : archives.parts) {
-            const auto &archive = part.archive;
-            for (std::size_t index = 0; index < archive->entries().size(); ++index) {
-                const auto &entry = archive->entries()[index];
-                if (!entry.path.starts_with(native_prefix))
-                    continue;
-                if (const auto member =
-                        libraries.find(std::string_view(entry.path).substr(native_prefix.size()))) {
-                    const auto &file = libraries.members()[*member].file;
-                    if (native_entries[*member].archive || entry.bytes != file.bytes ||
-                        entry.compressed_bytes != file.compressed_bytes || entry.path != file.path ||
-                        part.path != file.container)
-                        fail("Native archive entry differs from its inspected identity");
-                    native_entries[*member] = {archive, index};
-                }
-            }
-        }
-        if (std::any_of(native_entries.begin(), native_entries.end(),
-                        [](const auto &entry) { return !entry.archive; }))
-            fail("An inspected native member is absent from the immutable archive");
+                                        {.names = apk::ResourceNamePolicy::optimized, .retain_bags = true});
+        libraries = apk::NativeDirectory(report.native);
+        stage(107,"managed_create");
     }
 };
 
@@ -105,32 +102,35 @@ class NativeLibraries final : public dex::NativeInterface {
         managed.set_native_interface(this);
     }
     ~NativeLibraries() { managed.set_native_interface(nullptr); }
+    bool supports_background() const noexcept override {return true;}
+    std::uint64_t capture_signal_mask(dex::ManagedRuntime &runtime) override {return bridge?bridge->capture_signal_mask(runtime):0;}
     void load_library(dex::ManagedRuntime &runtime, std::u16string_view name) override {
-        if (!bridge) {
+        {
             std::string root = "lib";
             if (name.empty() || name.size() > 128)
                 throw dex::DexError("AETHER_JNI_LIBRARY_UNSUPPORTED", "Invalid native library name");
             for (auto c : name) {
                 if (!((c >= u'a' && c <= u'z') || (c >= u'A' && c <= u'Z') || (c >= u'0' && c <= u'9') ||
-                      c == u'_' || c == u'-' || c == u'.'))
+                      c == u'_' || c == u'-' || c == u'.' || c == u'+'))
                     throw dex::DexError("AETHER_JNI_LIBRARY_UNSUPPORTED", "Unsupported native library name");
                 root += static_cast<char>(c);
             }
             root += ".so";
-            const auto selected = package.libraries.select(root);
+            if (bridge && bridge->has_library(root)) { bridge->load_library(runtime, name); return; }
+            const auto selected = package.libraries.inspect(package.archives, root);
             std::vector<elf::ModuleInput> modules;
-            modules.reserve(selected.size());
+            modules.reserve(selected.members().size());
             auto budget = std::make_shared<elf::ArchiveScanBudget>();
-            for (const auto index : selected) {
-                const auto &member = package.libraries.members()[index];
+            for (const auto &member : selected.members()) {
+                const auto entry = package.archives.file(member.file);
                 modules.push_back({member.name,
                                    {},
-                                   std::make_shared<elf::ArchiveSource>(
-                                       *package.native_entries[index].archive,
-                                       package.native_entries[index].index, member.file.sha256, budget)});
+                                   std::make_shared<elf::ArchiveSource>(*entry.archive, entry.index,
+                                                                        member.file.sha256, budget)});
             }
-            bridge =
-                std::make_unique<jni::Bridge>(managed, memory, app, client, modules, root, &client, false);
+            if (bridge) bridge->add_library(modules, root);
+            else bridge =
+                std::make_unique<jni::Bridge>(managed, memory, app, client, modules, root, &client, false, package.package);
         }
         bridge->load_library(runtime, name);
     }
@@ -159,12 +159,34 @@ class Runtime {
     android::ActivitySession activity;
 
   public:
-    Runtime(BrokerClient &client, std::uint64_t app_id, bool installed, apk::Bytes mapped)
-        : fixture(client, installed, mapped), managed(std::move(fixture.code)), app{app_id, true},
+    Runtime(BrokerClient &client, std::uint64_t app_id, bool installed, apk::Bytes mapped, WorkerProgressWriter *progress)
+        : fixture(client, installed, mapped, progress), managed(std::move(fixture.code)), app{app_id, true},
           bridge(managed, memory, app, client, fixture),
-          activity(managed, fixture.package, std::move(fixture.resources)) {
-        activity.launch(fixture.descriptor);
+          activity(managed, fixture.package, std::move(fixture.resources), &client, &client) {
+        app.process_state = managed.process_state();
+        managed.set_progress_sink(progress);
+        if (progress) progress->stage(108,"application_initialize");
+        std::string_view stage = "Application";
+        try {
+            activity.initialize_application(fixture.application_descriptor, fixture.factory_descriptor);
+            if (progress) progress->stage(109,"activity_launch");
+            stage = "Activity";
+            activity.launch(fixture.descriptor);
+        } catch (const dex::JavaException &error) {
+            const auto message = managed.exception_message(error.object);
+            throw dex::DexError("AETHER_ANDROID_STARTUP_EXCEPTION",
+                                std::string(stage) + " startup raised " +
+                                    std::string(managed.object_type(error.object)) + ": " +
+                                    utf8(std::wstring(message.begin(), message.end())));
+        }
     }
+    ~Runtime() {
+        managed.close_tasks();
+        managed.close_main_callbacks();
+    }
+    bool pump_one() { return managed.run_task(); }
+    bool pump_main() { return managed.run_main_callback(); }
+    auto next_deadline() const { return managed.next_task_deadline(); }
     ActivityState snapshot(bool handled = false) {
         ActivityState result;
         result.apk_hash = fixture.hash;
@@ -211,6 +233,8 @@ class Runtime {
             activity.signal(command.signal);
             break;
         case ActivityCommandKind::close:
+            managed.close_tasks();
+            managed.close_main_callbacks();
             activity.close();
             bridge.shutdown();
             managed.collect();
@@ -226,18 +250,28 @@ void send_state(HANDLE writer, const ActivityState &state, std::uint64_t sequenc
                          activity_fragment(bytes, offset, Operation::activity_state, sequence, session));
 }
 } // namespace
-void run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t session, std::uint64_t app_id,
-                         bool read_recovery_probe, bool installed, apk::Bytes mapped_package) {
+std::uint8_t run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t session, std::uint64_t app_id,
+                         bool read_recovery_probe, bool installed, apk::Bytes mapped_package, WorkerProgressWriter *progress) {
     try {
-        BrokerClient client(reader, writer, session, true);
-        Runtime runtime(client, app_id, installed, mapped_package);
+        BrokerClient client(reader, writer, session, true, true);
+        Runtime runtime(client, app_id, installed, mapped_package, progress);
+        if (progress) progress->stage(110,"initial_state");
         send_state(writer, runtime.snapshot(), 0, session);
         for (std::uint64_t sequence = 1; sequence != UINT64_MAX; ++sequence) {
-            ActivityReassembly request(Operation::activity_command, sequence, session,
-                                       activity_command_limit);
-            while (!request.complete())
-                request.accept(read_pipe_frame(reader));
-            const auto command = ActivityCommand::decode(request.take());
+            std::optional<std::vector<std::uint8_t>> bytes;
+            while (!(bytes = client.poll_activity_command(sequence))) {
+                // Command delivery takes priority before each single managed quantum.
+                // BrokerClient retains commands that arrive during a broker RPC.
+                const bool delivered = runtime.pump_main();
+                if ((bytes = client.poll_activity_command(sequence))) break;
+                const bool advanced = runtime.pump_one();
+                if (delivered || advanced) continue;
+                const auto now = std::chrono::steady_clock::now();
+                auto wake = now + std::chrono::milliseconds(10);
+                if (const auto deadline = runtime.next_deadline()) wake = std::min(wake, *deadline);
+                if (wake > now) std::this_thread::sleep_for(wake - now);
+            }
+            const auto command = ActivityCommand::decode(*bytes);
             if (read_recovery_probe && command.kind == ActivityCommandKind::refresh) {
                 // Controlled first-party failure: no read, guest callback or state mutation occurs.
                 // The public run path never enables this probe.
@@ -249,9 +283,13 @@ void run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t session, st
             }
             send_state(writer, runtime.execute(command), sequence, session);
             if (command.kind == ActivityCommandKind::close)
-                return;
+                return 0;
         }
         fail("Activity command sequence exhausted");
+    } catch (const ProcessExit &exit) {
+        if (progress) progress->stage(111,"guest_exited");
+        write_pipe_frame(writer, guest_exit_frame(session, exit.status));
+        return exit.status;
     } catch (const dex::DexError &error) {
         throw ProtocolError(error.code + ": " + error.what());
     }

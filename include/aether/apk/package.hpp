@@ -26,7 +26,7 @@ struct PackageView {
 };
 PackageView open_package(Bytes bytes, const InspectLimits &limits = {});
 InspectResult inspect_package(Bytes bytes, const InspectLimits &limits = {},
-                              const ArtworkOptions &artwork_options = {});
+                              const ArtworkOptions &artwork_options = {}, ScanScope scope = ScanScope::full);
 // Host-only verification of either a standalone APK or every original member
 // of a consistent XAPK set. A set has no invented outer APK signature.
 SignatureReport verify_package_signature(Bytes bytes, PackageFormat format);

@@ -978,7 +978,9 @@ WindowReport run_installed_window(security::InstalledActivity application) {
     const auto relaunch = application.relaunch;
     check_win(application.package != nullptr, "Installed artwork package");
     const auto presentation =
-        apk::inspect_package(*application.package, {}, {.modern = application.icon_renderer == 2})
+        apk::inspect_package(*application.package, {}, {.modern = application.icon_renderer >= 2,
+                                  .metadata_preview = application.icon_renderer >= 3},
+                             apk::ScanScope::installation)
             .presentation;
     security::ActivityDispatcher session(std::move(application));
     return run_window(session, false, id, presentation, relaunch);

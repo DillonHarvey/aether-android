@@ -16,6 +16,7 @@ struct PackagePreview {
     std::string package_name, version_name, selected_container, code, reason;
     std::optional<std::uint64_t> version_code;
     Artwork presentation;
+    std::vector<std::string> declared_permissions;
     bool package_declared = false;
     std::string json() const;
 };

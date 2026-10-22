@@ -20,122 +20,6 @@
 namespace {
 using namespace aether;
 using namespace aether::install;
-constexpr int keep_button = 100, delete_button = 101;
-struct Observation {
-    std::wstring content;
-    bool available = false;
-};
-struct Confirmation {
-    std::filesystem::path root;
-    std::string id;
-    std::future<Observation> read;
-    std::wstring shown;
-    bool available = true;
-    ULONGLONG last_read = 0;
-    Confirmation(std::filesystem::path path, std::string identity)
-        : root(std::move(path)), id(std::move(identity)) {}
-
-    Observation observe() const {
-        try {
-            PackageStore store(root);
-            const auto app = store.info(id);
-            if (app.state == State::updating || app.state == State::update_committed ||
-                app.state == State::update_rolled_back)
-                return {L"This app has an unfinished update or update cleanup. Complete Aether's explicit "
-                        L"repair before uninstalling it. No removal has been attempted.",
-                        false};
-            const bool present = app.state == State::installed || app.state == State::data_retained;
-            return {
-                L"Package: " + utf16(app.package_id) + L"\nVersion: " + utf16(app.version_name) + L"\n\n" +
-                    (present ? L"Choose whether to keep this app's private data and diagnostic history. "
-                               L"Other apps and the shared Aether runtime will stay installed."
-                             : L"This application is no longer installed. You can close this confirmation."),
-                present};
-        } catch (const std::exception &) {
-            return {L"The current app status could not be read. Checking again automatically. "
-                    L"Your confirmation stays open; no removal has been attempted.",
-                    false};
-        }
-    }
-    void update(HWND window) {
-        if (read.valid()) {
-            if (read.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
-                return; // Coalesce timer ticks while one read is in flight.
-            const auto value = read.get();
-            if (shown != value.content) {
-                shown = value.content;
-                SendMessageW(window, TDM_UPDATE_ELEMENT_TEXT, TDE_CONTENT,
-                             reinterpret_cast<LPARAM>(shown.c_str()));
-            }
-            if (available != value.available) {
-                available = value.available;
-                SendMessageW(window, TDM_ENABLE_BUTTON, keep_button, available);
-                SendMessageW(window, TDM_ENABLE_BUTTON, delete_button, available);
-            }
-        }
-        const auto now = GetTickCount64();
-        if (now - last_read >= 1000) {
-            last_read = now;
-            read = std::async(std::launch::async, [this] { return observe(); });
-        }
-    }
-    static HRESULT CALLBACK callback(HWND window, UINT notification, WPARAM choice, LPARAM, LONG_PTR data) {
-        auto &self = *reinterpret_cast<Confirmation *>(data);
-        try {
-            if (notification == TDN_CREATED) {
-                SendMessageW(window, TDM_ENABLE_BUTTON, keep_button, self.available);
-                SendMessageW(window, TDM_ENABLE_BUTTON, delete_button, self.available);
-                STARTUPINFOW startup{};
-                startup.cb = sizeof(startup);
-                GetStartupInfoW(&startup);
-                if ((startup.dwFlags & STARTF_USESHOWWINDOW) && startup.wShowWindow == SW_SHOWMINNOACTIVE)
-                    ShowWindow(window, SW_SHOWMINNOACTIVE);
-            } else if (notification == TDN_TIMER)
-                self.update(window);
-            else if (notification == TDN_BUTTON_CLICKED &&
-                     (choice == keep_button || choice == delete_button) && !self.available)
-                return S_FALSE;
-            return S_OK;
-        } catch (...) {
-            self.available = false;
-            SendMessageW(window, TDM_ENABLE_BUTTON, keep_button, FALSE);
-            SendMessageW(window, TDM_ENABLE_BUTTON, delete_button, FALSE);
-            return S_OK;
-        }
-    }
-};
-int confirm(const std::filesystem::path &root, const InstalledApp &app) {
-    Confirmation state{root, app.id};
-    const auto initial = state.observe();
-    state.shown = initial.content;
-    state.available = initial.available;
-    const auto initial_content = state.shown;
-    const auto title = utf16(app.display_name.empty() ? app.package_id : app.display_name);
-    const auto instruction = L"Uninstall " + title + L"?";
-    const TASKDIALOG_BUTTON buttons[] = {
-        {keep_button, L"Uninstall and keep data\nRemove the app and its Windows entries. Keep its private "
-                      L"data and diagnostic history."},
-        {delete_button, L"Uninstall and delete data\nRemove the app, its Windows entries, private data and "
-                        L"diagnostic history."}};
-    TASKDIALOGCONFIG config{};
-    config.cbSize = sizeof(config);
-    config.hInstance = GetModuleHandleW(nullptr);
-    config.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION | TDF_CALLBACK_TIMER;
-    config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
-    config.pszWindowTitle = L"Aether - Uninstall app";
-    config.pszMainInstruction = instruction.c_str();
-    config.pszContent = initial_content.c_str();
-    config.cButtons = static_cast<UINT>(std::size(buttons));
-    config.pButtons = buttons;
-    config.nDefaultButton = IDCANCEL;
-    config.pfCallback = Confirmation::callback;
-    config.lpCallbackData = reinterpret_cast<LONG_PTR>(&state);
-    int selected = IDCANCEL;
-    const auto status = TaskDialogIndirect(&config, &selected, nullptr, nullptr);
-    if (FAILED(status))
-        throw InstallError("AETHER_SHELL_DIALOG", "Windows could not open the uninstall confirmation");
-    return selected;
-}
 int run(const std::vector<std::string> &arguments, bool json) {
     if (!arguments.empty() && arguments[0] == "privacy") {
         if (arguments.size() > 2 || (arguments.size() == 2 && arguments[1] != "--json"))
@@ -192,22 +76,7 @@ int run(const std::vector<std::string> &arguments, bool json) {
         return dispatch_cli(arguments, json).value();
     if (arguments[0] == "settings" || arguments[0] == "diagnostics")
         return show_app_dialog(root, id, arguments[0] == "settings", json);
-    const auto app = [&] {
-        PackageStore store(root);
-        return store.info(id);
-    }();
-    const auto choice = confirm(root, app);
-    if (choice != keep_button && choice != delete_button) {
-        if (json)
-            std::cout << "{\"schemaVersion\":1,\"operation\":\"uninstall\",\"cancelled\":true}\n";
-        return 0;
-    }
-    PackageStore store(root, PackageStore::Access::write);
-    const auto result = store.uninstall(id, choice == keep_button);
-    if (json)
-        std::cout << "{\"schemaVersion\":1,\"operation\":\"uninstall\",\"cancelled\":false,\"app\":"
-                  << result.json() << "}\n";
-    return 0;
+    return show_uninstall_dialog(root, id, json);
 }
 } // namespace
 

@@ -8,7 +8,16 @@ class ActivityReadUnavailable final : public std::exception {
   public:
     const char *what() const noexcept override { return "AETHER_ACTIVITY_READ_UNAVAILABLE"; }
 };
-enum class ActivityMode { normal, read_recovery_probe };
+// Genuine Android process termination, including status zero before any Activity.
+// Distinct from runtime refusal, Java failure and successful Activity startup.
+class ActivityProcessExited final : public std::runtime_error {
+  public:
+    explicit ActivityProcessExited(std::uint8_t value)
+        : std::runtime_error("AETHER_GUEST_EXIT: Android application exited with status " + std::to_string(value)),
+          status(value) {}
+    const std::uint8_t status;
+};
+enum class ActivityMode { normal, read_recovery_probe, exit_zero_probe, exit_255_probe };
 // Synchronous connection owned by one host I/O thread. Presentation and execution
 // remain separate; ActivityDispatcher publishes immutable state to the HWND owner.
 class IsolatedActivity final {
@@ -25,6 +34,7 @@ class IsolatedActivity final {
     void refresh();
     void close();
     void dispatch(const ActivityCommand &command);
+    bool service_background(); // Single I/O owner; no presentation command or publication.
     void cancel() noexcept; // Cross-thread abort only; never calls guest code or waits.
     const ActivityState &snapshot() const noexcept;
     const auto &views() const noexcept { return snapshot().views; }
@@ -43,8 +53,11 @@ class IsolatedActivity final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+class WorkerProgressWriter;
 // Called only after the executable has verified its own token and inherited channel.
-void run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t session, std::uint64_t app_id,
+// Return normal close zero or the genuine guest exit status; never call host ExitProcess.
+std::uint8_t run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t session, std::uint64_t app_id,
                          bool read_recovery_probe = false, bool installed = false,
-                         std::span<const std::uint8_t> mapped_package = {});
+                         std::span<const std::uint8_t> mapped_package = {},
+                         WorkerProgressWriter *progress = nullptr);
 } // namespace aether::security

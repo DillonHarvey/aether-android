@@ -42,6 +42,7 @@ struct Instruction {
     std::uint64_t literal = 0;
     std::int32_t branch = 0;
     std::int32_t switch_first = 0;
+    std::vector<std::int32_t> switch_keys;
     std::vector<std::uint32_t> switch_targets;
     std::vector<std::uint16_t> arguments;
 };

@@ -3,9 +3,11 @@
 #include "aether/apk/native_inventory.hpp"
 #include "aether/common/prefix_strings.hpp"
 #include "aether/dex/limits.hpp"
+#include "aether/elf/limits.hpp"
 #include <algorithm>
 #include <charconv>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 namespace aether::apk {
@@ -63,7 +65,8 @@ Compatibility execution_compatibility(const InspectResult &package) {
     std::map<std::string, std::map<unsigned, std::string>> dex_names;
     std::uint64_t dex_bytes = 0;
     for (const auto &dex : package.dex) {
-        if (dex.version != "035" && dex.version != "037" && dex.version != "038")
+        if (package.scope == ScanScope::full && dex.version != "035" && dex.version != "037" &&
+            dex.version != "038")
             return {false, "The managed runtime supports an instruction subset of DEX 035, 037 and 038."};
         const auto &path = dex.file.path;
         unsigned number = 1;
@@ -100,7 +103,10 @@ Compatibility execution_compatibility(const InspectResult &package) {
         }
     }
     try {
-        (void)NativeInventory(package.native);
+        if (package.scope != ScanScope::full)
+            (void)NativeDirectory(package.native);
+        else
+            (void)NativeInventory(package.native);
     } catch (const InspectError &error) {
         return {false, error.what()};
     }

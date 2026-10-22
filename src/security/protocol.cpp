@@ -82,4 +82,31 @@ std::string read_text(std::span<const std::uint8_t> bytes, std::size_t &offset, 
     offset += static_cast<std::size_t>(size);
     return result;
 }
+Frame guest_exit_frame(std::uint64_t session, std::uint8_t status) {
+    if (!session)
+        throw ProtocolError("AETHER_IPC_GUEST_EXIT: missing session identity");
+    return {{Operation::guest_exited, 0, session, 1, Status::ok}, {status}};
+}
+std::uint8_t guest_exit_status(const Frame &frame, std::uint64_t session) {
+    if (!session || frame.header.operation != Operation::guest_exited ||
+        frame.header.sequence != 0 || frame.header.session != session ||
+        frame.header.status != Status::ok || frame.header.payload_size != 1 || frame.payload.size() != 1)
+        throw ProtocolError("AETHER_IPC_GUEST_EXIT: invalid terminal process record");
+    return frame.payload[0];
+}
+std::string bounded_worker_error(std::string_view message) {
+    if (message.size() <= maximum_worker_error)
+        return std::string(message);
+    constexpr std::string_view omitted = " ... [middle omitted] ... ";
+    const auto continuation = [&](std::size_t index) {
+        return (static_cast<unsigned char>(message[index]) & 0xc0) == 0x80;
+    };
+    std::size_t head = 128;
+    while (head && continuation(head))
+        --head;
+    auto tail = message.size() - (maximum_worker_error - head - omitted.size());
+    while (tail < message.size() && continuation(tail))
+        ++tail;
+    return std::string(message.substr(0, head)) + std::string(omitted) + std::string(message.substr(tail));
+}
 } // namespace aether::security

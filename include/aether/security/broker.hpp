@@ -5,10 +5,12 @@
 #include "aether/security/audit.hpp"
 #include "aether/security/graphics_service.hpp"
 #include "aether/security/protocol.hpp"
+#include <chrono>
 #include <map>
 #include <vector>
 
 namespace aether::security {
+class WorkerProcess;
 struct BrokerPolicy {
     std::uint64_t app_id = 0, session = 0;
     bool monotonic_time = false;
@@ -17,6 +19,7 @@ struct BrokerPolicy {
     bool interactive = false;
     bool audio_playback = false;
     bool graphics = false;
+    bool wall_time = false;
 };
 // Each instance belongs to exactly one parent-verified process and inherited channel.
 // No request supplies an app identity, host path/address or function name.
@@ -28,7 +31,9 @@ class Broker final {
                     std::unique_ptr<GraphicsService> graphics = {});
     ~Broker();
     Frame dispatch(const Frame &request);
+    Frame dispatch_idle(const Frame &request); // Interactive only; independent absolute one-second quota.
     Frame dispatch_prepared(const Frame &request, AuditTicket ticket); // No audit file I/O on this thread.
+    void bind_worker_thread(const WorkerProcess &worker); // Trusted setup, before any request.
     void close() noexcept;
     void revoke_storage() noexcept;
     void revoke_audio() noexcept { audio_.revoke(); }
@@ -48,6 +53,9 @@ class Broker final {
     std::uint64_t total_requests_ = 0;
     std::uint32_t turn_requests_ = 0;
     bool closed_ = false;
+    bool idle_dispatch_ = false, executing_ = false;
+    std::uint32_t idle_requests_ = 0;
+    std::chrono::steady_clock::time_point idle_window_start_{};
     std::unique_ptr<host::FileService> files_;
     std::map<std::uint64_t, int> descriptors_;
     const std::vector<std::uint8_t> package_;

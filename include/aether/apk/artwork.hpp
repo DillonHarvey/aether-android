@@ -7,8 +7,8 @@ struct ArtworkOptions {
     bool modern = false;
     std::uint32_t size_px = 256, dpi = 96;
     std::uint16_t sdk = 35;
-    // Metadata-only file previews can read newer tables without changing
-    // persisted renderer-1/2 installed artwork or runtime resource admission.
+    // Bounded compiled metadata policy, persisted as installed renderer 3.
+    // Renderer 1/2 reconstruction and runtime resource admission stay unchanged.
     bool metadata_preview = false;
 };
 struct IconBitmap {

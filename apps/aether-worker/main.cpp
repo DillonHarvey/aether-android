@@ -4,6 +4,7 @@
 #include "aether/host/audio_stream.hpp"
 #include "aether/host/windows/unique_handle.hpp"
 #include "aether/security/activity_session.hpp"
+#include "aether/security/worker_progress.hpp"
 #include "aether/security/apk_session.hpp"
 #include "aether/security/audio_session.hpp"
 #include "aether/security/graphics_session.hpp"
@@ -231,11 +232,71 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
             path = utf16(read_text(boot.payload, offset, 2048));
         require(offset == boot.payload.size(), "Trailing APK boot configuration");
     } else if (scenario == 20) {
-        require(path_size == 0 && boot.payload.size() == 56, "Invalid installed package mapping fields");
+        require(path_size == 0 && boot.payload.size() == 64, "Invalid installed package mapping fields");
+    } else if (scenario == 28) {
+        require(path_size == 0 && boot.payload.size() == 56, "Invalid compiled native fault fields");
+    } else if (scenario == 27) {
+        require(path_size == 0 && boot.payload.size() == 56, "Invalid compiled preferences fields");
+    } else if (scenario == 25) {
+        require(path_size == 0 && boot.payload.size() == 48, "Invalid compiled progress mapping fields");
     } else {
         require(boot.payload.size() == 40 + path_size, "Trailing worker fixture configuration");
     }
     write_pipe_frame(writer, {{Operation::boot, 0, boot.header.session, 0, Status::ok}, {}});
+    if (scenario == 29 || scenario == 30) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 76 && allowed == 1,
+                "Invalid compiled process exit policy");
+        return run_process_exit_probe(writer, session, static_cast<std::uint8_t>(scenario == 29 ? 0 : 255));
+    }
+    if (scenario == 28) {
+        require(lpac && path_size == 0 && app_id == 73 && allowed == 0 && read_u64(boot.payload,48) <= 1,
+                "Invalid compiled native fault policy");
+        run_native_fault_probe(reinterpret_cast<HANDLE>(read_u64(boot.payload,40)),read_u64(boot.payload,48));
+        return 0;
+    }
+    if (scenario == 27) {
+        require(lpac && path_size == 0 && app_id == 73 && read_u64(boot.payload,40) <= 2 &&
+                (allowed != 0) == (read_u64(boot.payload,40) != 2),
+                "Invalid compiled preferences policy");
+        run_preferences_probe(reader, writer, session, read_u64(boot.payload,40), read_u64(boot.payload,48));
+        return 0;
+    }
+    if (scenario == 26) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 73,
+                "Invalid compiled nanoTime probe policy");
+        run_nano_time_probe(reader, writer, session, allowed != 0);
+        return 0;
+    }
+    if (scenario == 25) {
+        require(lpac && path_size == 0 && app_id == 73 && allowed == 0,
+                "Invalid compiled startup progress policy");
+        run_progress_probe(reinterpret_cast<HANDLE>(read_u64(boot.payload, 40)));
+        return 0;
+    }
+    if (scenario == 24) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 73 && allowed == 0,
+                "Invalid compiled regex probe policy");
+        run_regex_probe(writer, session);
+        return 0;
+    }
+    if (scenario == 23) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 73 && allowed == 0,
+                "Invalid compiled UUID probe policy");
+        run_uuid_probe(writer, session);
+        return 0;
+    }
+    if (scenario == 22) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 73 && allowed == 0,
+                "Invalid compiled stream probe policy");
+        run_stream_probe(writer, session);
+        return 0;
+    }
+    if (scenario == 21) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 73 && allowed == 0,
+                "Invalid compiled AsyncTask probe policy");
+        run_async_task_probe(writer, session);
+        return 0;
+    }
     if (scenario >= 17 && scenario <= 19) {
         require(lpac && path_size == 0 && app_id == 73 && allowed == 0,
                 "Invalid compiled resource probe policy");
@@ -263,12 +324,14 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
     if (scenario == 11 || scenario == 12) {
         require(lpac && path_size == 0 && app_id == 76 && allowed == 1,
                 "Invalid isolated Activity startup policy");
-        run_activity_worker(reader, writer, session, app_id, scenario == 12);
-        return 0;
+        return run_activity_worker(reader, writer, session, app_id, scenario == 12);
     }
     if (scenario == 20) {
         require(lpac && path_size == 0 && (app_id & (std::uint64_t{1} << 63)) && allowed == 1,
                 "Invalid installed Activity startup policy");
+        WorkerProgressWriter progress(reinterpret_cast<HANDLE>(read_u64(boot.payload, 56)));
+        ScopedWorkerFaultCapture faults(progress);
+        progress.stage(100, "installed_package_map");
         const auto size = read_u64(boot.payload, 48);
         host::UniqueHandle mapping(reinterpret_cast<HANDLE>(read_u64(boot.payload, 40)));
         require(mapping && size && size <= SIZE_MAX, "Missing installed package mapping");
@@ -288,9 +351,8 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
         std::unique_ptr<void, decltype(unmap)> view(
             MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(size)), unmap);
         require(static_cast<bool>(view), "Cannot map the installed package for read access");
-        run_activity_worker(reader, writer, session, app_id, false, true,
-                            {static_cast<const std::uint8_t *>(view.get()), static_cast<std::size_t>(size)});
-        return 0;
+        return run_activity_worker(reader, writer, session, app_id, false, true,
+                            {static_cast<const std::uint8_t *>(view.get()), static_cast<std::size_t>(size)}, &progress);
     }
     if (scenario == 10) {
         BrokerClient client(reader, writer, session);
@@ -438,7 +500,7 @@ int wmain(int argc, wchar_t **argv) {
     } catch (const std::exception &error) {
         if (writer && session) {
             try {
-                const auto message = std::string_view(error.what()).substr(0, 512);
+                const auto message = bounded_worker_error(error.what());
                 write_pipe_frame(writer.get(), {{Operation::finished, 0, session,
                                                  static_cast<std::uint32_t>(message.size()), Status::invalid},
                                                 {message.begin(), message.end()}});

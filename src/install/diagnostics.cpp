@@ -24,6 +24,8 @@ void permissions(std::ostream &out, std::uint32_t mask) {
         out << "\"monotonic-clock\"";
     if (mask & security::installed_files)
         out << ((mask & security::installed_clock) ? "," : "") << "\"private-files\"";
+    if (mask & security::installed_wall_clock)
+        out << ((mask & (security::installed_clock | security::installed_files)) ? "," : "") << "\"wall-clock\"";
     out << ']';
 }
 } // namespace
@@ -90,7 +92,8 @@ std::string AppDiagnostics::text() const {
 void export_diagnostics(const AppDiagnostics &report, const std::filesystem::path &destination) {
     detail::export_report_json(report.json(), destination);
 }
-void detail::export_report_json(std::string_view json, const std::filesystem::path &destination) {
+void detail::export_report_json(std::string_view json, const std::filesystem::path &destination,
+                                std::size_t maximum_bytes) {
     const auto path = std::filesystem::absolute(destination).lexically_normal();
     const auto native = path.native();
     require(native.size() >= 4 && native[1] == L':' && (native[2] == L'\\' || native[2] == L'/') &&
@@ -105,7 +108,8 @@ void detail::export_report_json(std::string_view json, const std::filesystem::pa
                 "AETHER_DIAGNOSTICS_OUTPUT", "Diagnostics output path contains an unsafe component");
     }
     const auto bytes = std::string(json) + '\n';
-    require(bytes.size() <= 64 * 1024, "AETHER_DIAGNOSTICS_OUTPUT", "Diagnostics report exceeds its bound");
+    require(maximum_bytes && maximum_bytes <= 256 * 1024 && bytes.size() <= maximum_bytes,
+            "AETHER_DIAGNOSTICS_OUTPUT", "Diagnostics report exceeds its bound");
     host::UniqueHandle file(CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
     if (!file) {

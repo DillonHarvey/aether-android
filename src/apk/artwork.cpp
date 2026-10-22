@@ -365,7 +365,7 @@ std::vector<std::uint8_t> icon_file(const IconBitmap &bitmap, std::uint32_t rend
         bad("Invalid icon bitmap dimensions");
     constexpr std::array<unsigned, 4> legacy_sizes{16, 32, 48, 256};
     constexpr std::array<unsigned, 7> current_sizes{16, 24, 32, 48, 64, 128, 256};
-    if (renderer_version != 1 && renderer_version != 2)
+    if (renderer_version != 1 && renderer_version != 2 && renderer_version != 3)
         bad("Unknown icon renderer version", "UNSUPPORTED");
     const auto sizes = renderer_version == 1 ? std::span<const unsigned>(legacy_sizes)
                                              : std::span<const unsigned>(current_sizes);
@@ -404,7 +404,7 @@ std::vector<std::uint8_t> icon_file(const IconBitmap &bitmap, std::uint32_t rend
                     out.insert(out.end(), 4, 0);
                     continue;
                 }
-                if (renderer_version == 2) {
+                if (renderer_version >= 2) {
                     const auto pixel =
                         resample(bitmap, x - (size - width) / 2, y - (size - height) / 2, width, height);
                     out.insert(out.end(), pixel.begin(), pixel.end());
@@ -458,7 +458,7 @@ Artwork artwork(Bytes package, const ManifestInfo &manifest) {
 Artwork artwork(const PackageView &package, const ManifestInfo &manifest, std::string_view launcher_container,
                 const ArtworkOptions &options) {
     Artwork result;
-    result.renderer_version = options.modern ? 2 : 1;
+    result.renderer_version = options.modern ? (options.metadata_preview ? 3 : 2) : 1;
     result.label = clean_display_name(manifest.package_id, "Aether app");
     result.bitmap = fallback_icon();
     auto label = manifest.label, icon = manifest.icon;

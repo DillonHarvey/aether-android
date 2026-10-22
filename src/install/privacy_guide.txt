@@ -1,12 +1,12 @@
 # Aether privacy and permissions
 
-This guide describes the current Windows x64 development build and its installed Android-app path, reviewed on 2026-10-11. Aether is experimental: installation eligibility and a successful diagnostic report do not establish that an app works. See the [tested apps and limits](COMPATIBILITY_MATRIX.md) and [release status](ALPHA_READINESS.md).
+This guide describes the current Windows x64 development build and its installed Android-app path, reviewed on 2026-10-21. Aether is experimental: installation eligibility and a successful diagnostic report do not establish that an app works. See the [tested apps and limits](COMPATIBILITY_MATRIX.md) and [release status](ALPHA_READINESS.md).
 
-Read this build's guide offline through **Privacy...** in runtime setup, APK installation, app settings or diagnostics. You can also open `aether-shell.exe privacy` or print it with `aether.exe privacy`; `aether.exe privacy --json` includes the source document's checksum. Reading the guide does not install or run an app, change permissions or save a report. The text is embedded when Aether is built, so an older installed build retains its own guide until upgraded. Project-document references below are descriptive text in the native view; it opens no links or browser.
+Read this build's guide offline through **Privacy...** in runtime setup, app settings or diagnostics, or **Permissions**, then **Privacy** in the APK installer. You can also open `aether-shell.exe privacy` or print it with `aether.exe privacy`; `aether.exe privacy --json` includes the source document's checksum. Reading the guide does not install or run an app, change permissions or save a report. The text is embedded when Aether is built, so an older installed build retains its own guide until upgraded. Project-document references below are descriptive text in the native view; it opens no links or browser.
 
 ## What happens on this PC
 
-Aether inspects an APK before installation, asks for an installation decision and copies the reviewed package into its local store. Installing does not start the app. Launching a registered app starts an isolated worker; a trusted host checks its requests against that app's permissions. Apps have separate identities and private storage.
+Opening an APK reads its name, icon and declared permissions. The installer appears after those details are ready. Choose **Install** once to approve installation with the choices shown under **Permissions**. Aether then verifies package integrity and supported signatures, saves the selected package and completes Windows registration in the same window. Installation does not decompress and inspect every app file; code validation happens during isolated launch, and resources are checked when consumed. Installing does not start the app. Launching a registered app starts an isolated worker; a trusted host checks its requests against that app's permissions. Apps have separate identities and private storage.
 
 The current installation, launch, settings and report flows run locally and have no automatic report upload or built-in telemetry endpoint. Aether does keep the local installation history and security audit described below. This guide covers Aether's behavior; Windows, security software and any synchronization software managing a chosen export folder have their own behavior.
 
@@ -16,11 +16,14 @@ Android permissions declared inside an APK do not grant access to Windows resour
 
 | Choice | What it permits in an installed app | Default and effect |
 |---|---|---|
-| Monotonic clock | Elapsed-time queries through Aether's host | Requires an explicit grant. The current installed Activity path cannot launch without it. It is not a calendar, location or network permission. |
+| Monotonic clock | Elapsed-time queries through Aether's host | Selected by default in the installer and granted by your Install decision. The CLI still requires an explicit grant. The current installed Activity path cannot launch without it. It is not a calendar, location or network permission. |
+| Wall-clock date and time | Current UTC time and conversion using Windows local timezone rules, including the timezone name, through Aether's broker | Denied unless separately granted. Independent of elapsed-time permission; no location, network or calendar-event access. |
 | App-private files | Bounded file operations in this app's own Aether data directory | Denied unless granted. It does not expose Documents, Downloads, another app's data or arbitrary host paths. |
 | Other host resources | No installed-app grant currently exists for network, clipboard, camera, microphone, audio or graphics services | Unsupported requests are refused. Separate developer audio/graphics fixtures do not establish these capabilities for installed apps. |
 
 Use the selected app's on-demand settings dialog (`aether-shell.exe settings --app-id ID`) or the [CLI settings commands](WINDOWS_NATIVE_INTEGRATION.md#current-commands). Close the app before changing permissions; changes to a running app are refused. Apply is an explicit action. Automatic one-second reads preserve unsaved choices and recover after read failures without granting permissions or retrying a write. Revoking private-file permission prevents future brokered access; it does not delete existing files.
+
+An app can read Aether's logical process name and its own isolated Windows worker process ID. A read-only Android compatibility view at `/proc/PID/cmdline` uses its own worker process ID and contains that logical app name and a terminating zero byte. It does not expose the Windows command line, another process, host folders or startup arguments. This app metadata needs no private-file grant. Ordinary private-file input streams still require the app-private-files permission above and use the same bounded broker.
 
 ## Local data and retention
 
@@ -35,7 +38,7 @@ Windows resolves the actual user folders. The usual runtime destination is `%LOC
 | Runtime catalogue | Records the installed runtime's payload and enrolled store locations so upgrades and removal can check dependencies. |
 | Exported reports | A file you explicitly save at your chosen destination. Aether does not remove this separate file when you uninstall an app. |
 
-Audits are mandatory for the current brokered launch path. Each app retains at most 16 session files, each bounded to one MiB. On a new launch, the oldest completed sessions can be retired to make room. Damaged or unfinished evidence is preserved; if no completed session can be retired, launch is refused. This is a capacity policy, not a promise to delete records after a number of days. Opting out of an audit-summary export does not disable local auditing.
+Audits are mandatory for the current brokered launch path. Each app retains at most 16 successful session files alongside failed or unfinished evidence, within 256 files and 16 MiB total. Each file is bounded to one MiB, with that space reserved before startup. On a new launch, only the oldest successful completed sessions can be retired to make room. Failed, damaged or unfinished evidence is preserved; if capacity cannot be made available, launch is refused. This is a capacity policy, not a promise to delete records after a number of days. Opting out of an audit-summary export does not disable local auditing.
 
 The store uses Windows access controls for the current user and SYSTEM, with guest access mediated by Aether. Aether does not encrypt these files. These controls and unkeyed checksums do not protect against an administrator or a malicious host process running as the same user.
 

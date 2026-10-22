@@ -2,6 +2,7 @@
 #include "aether/apk/inspect.hpp"
 #include "aether/apk/signature.hpp"
 #include "aether/security/installed_activity.hpp"
+#include <functional>
 #include <memory>
 
 namespace aether::install {
@@ -53,7 +54,7 @@ struct InstalledApp {
     std::uint64_t package_generation = 0;
     // Retained across APK updates; existing icon paths become stable in schema 8.
     std::uint64_t icon_generation = 0;
-    // Schema 13 records the generator; older hashes continue to use renderer 1.
+    // Schema 14 adds compiled metadata renderer 3; older generators remain readable.
     std::uint32_t icon_renderer = 1;
     std::vector<std::string> declared_permissions;
     State state = State::preparing;
@@ -84,6 +85,22 @@ struct UpdatePreview {
 struct PermissionReview {
     std::string sha256;
     std::uint32_t permissions = 0;
+};
+enum class InstallStage { verifying, writing, registering, finishing, complete };
+using InstallProgress = std::function<void(InstallStage)>;
+// One immutable source snapshot, prepared only after the user's Install action.
+// The caller pins the selected source identity while preparing it.
+class PreparedInstall final {
+  public:
+    static PreparedInstall read(const std::filesystem::path &path);
+    const InstallPreview &preview() const noexcept { return preview_; }
+    InstalledApp commit(const std::filesystem::path &root, std::uint32_t permissions,
+                        const std::optional<InstalledApp> &current = {},
+                        const InstallProgress &progress = {}) const;
+
+  private:
+    std::vector<std::uint8_t> bytes_;
+    InstallPreview preview_;
 };
 // Inspection never creates a store or executes package code.
 InstallPreview preview(const std::filesystem::path &apk);
@@ -130,6 +147,7 @@ class PackageStore final {
     const std::filesystem::path &root() const noexcept;
 
   private:
+    friend class PreparedInstall;
     friend InstalledApp install_windows(const std::filesystem::path &, const std::filesystem::path &,
                                         std::string_view, std::uint32_t);
     friend InstalledApp update_package(const std::filesystem::path &, const std::filesystem::path &,
@@ -137,7 +155,8 @@ class PackageStore final {
     InstalledApp update_bytes(apk::Bytes bytes, const InstallPreview &candidate, std::string_view id,
                               std::string_view expected_current_sha256);
     InstalledApp install_windows_bytes(apk::Bytes bytes, const apk::InspectResult &inspection,
-                                       const apk::SignatureReport &signing, std::uint32_t permissions);
+                                       const apk::SignatureReport &signing, std::uint32_t permissions,
+                                       const InstallProgress &progress = {});
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

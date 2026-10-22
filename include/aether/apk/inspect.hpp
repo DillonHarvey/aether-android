@@ -69,6 +69,10 @@ inline constexpr std::size_t manifest_activity_record_bytes = 256;
 static_assert(sizeof(Activity) <= manifest_activity_record_bytes);
 struct ManifestInfo {
     std::string package_id;
+    // Empty only when android:name is absent; otherwise package-qualified.
+    std::string application_name;
+    // Empty when no application android:appComponentFactory is declared.
+    std::string app_component_factory_name;
     std::string version_name;
     std::optional<std::uint32_t> version_code;
     std::optional<std::uint32_t> version_code_major;
@@ -119,7 +123,11 @@ struct PackageMember {
     std::string path, split, sha256;
     std::uint64_t bytes = 0;
 };
+// Installation reads manifests/directory; runtime indexes DEX and validates requested native code.
+// Diagnostic inspection alone checks every archive member. No scope bypasses ZIP structure checks.
+enum class ScanScope { full, runtime, installation };
 struct InspectResult {
+    ScanScope scope = ScanScope::full;
     PackageFormat format = PackageFormat::apk;
     std::vector<PackageMember> members;
     std::string sha256;
@@ -140,7 +148,7 @@ struct InspectResult {
 ManifestInfo parse_manifest(Bytes bytes);
 DexInfo inspect_dex(Bytes bytes);
 NativeInfo inspect_elf(Bytes bytes, std::string abi);
-InspectResult inspect(Bytes bytes, const InspectLimits &limits = {});
+InspectResult inspect(Bytes bytes, const InspectLimits &limits = {}, ScanScope scope = ScanScope::full);
 std::vector<std::uint8_t> read_package(const std::filesystem::path &path, const InspectLimits &limits = {});
 std::string sha256(Bytes bytes);
 std::string sha1(Bytes bytes); // DEX format checksum only, never package authentication.

@@ -128,6 +128,18 @@ ManifestInfo parse_manifest(Bytes bytes) {
                         bad("Duplicate application element");
                     have_app = true;
                     element.application = true;
+                    if (const auto *value = attribute(attrs, "name")) {
+                        if (value->type != 3)
+                            throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                                               "Application android:name is not a literal string");
+                        result.application_name = qualify(string_value(value, true), result.package_id);
+                    }
+                    if (const auto *value = attribute(attrs, "appComponentFactory")) {
+                        if (value->type != 3)
+                            throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                                               "Application android:appComponentFactory is not a literal string");
+                        result.app_component_factory_name = qualify(string_value(value, true), result.package_id);
+                    }
                     result.label = display_value(attribute(attrs, "label"));
                     result.icon = display_value(attribute(attrs, "icon"));
                     result.round_icon = display_value(attribute(attrs, "roundIcon"));
