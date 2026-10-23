@@ -42,7 +42,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue implementation** | **724 of 3,589 implemented (20.17%)** |
+| **Catalogue implementation** | **778 of 3,589 implemented (21.68%)** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -105,17 +105,17 @@ The public implementation is in [package handling](src/apk/), [managed execution
 
 ## Progress counts
 
-The **21 October 2026 source audit of all 3,589 entries** records **724 implemented, 694 in progress and 2,171 not started**, with none unassessed. This replaces the saved 18 October total of 483 implemented (13.46%).
+The **23 October 2026 source follow-up** records **778 implemented, 724 in progress and 2,087 not started** among the same **3,589 entries**, with none unassessed. This corrects the 21 October snapshot of 724 implemented (20.17%) to **21.68%**.
 
-That is **241 additional counted requirements**, including newer source work and corrections to older undercounting. Missing tests were previously treated as missing implementation in some entries. The audit keeps test verification separate and retains concrete semantic gaps as partial work. It adds no runtime functionality or acceptance-test pass.
+That is **54 additional counted requirements**. The review checked affected native-library and linker contracts against source and retained the earlier all-entry audit for unrelated requirements. Missing behavior remains partial; test verification stays separate. This accounting update adds no runtime functionality or acceptance-test pass.
 
-Source checkpoint: **21 October 2026, 22:40:18 Sydney (11:40:18 UTC)**. Per-entry reasons and source hashes are retained locally; later development requires affected-entry reassessment.
+Reviewed scope: runtime work through **23 October 2026, ADR0295 (Unicode classification and simple case)**. Concurrent later floating-parser development is excluded until reassessed. Per-entry reasons, scope and source hashes are retained locally.
 
 The tables count **implemented catalogue requirements**. Partial work and unsupported requirements do not increase the percentage. Implementation and complete test verification remain separate, and successful real-app workflows are reported separately below.
 
 <!-- aether:compatibility-progress:start -->
 
-**724 / 3,589 entries implemented (20.17%)**
+**778 / 3,589 entries implemented (21.68%)**
 
 Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
@@ -125,7 +125,7 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | :--- | ---: | ---: | ---: |
 | Packages & signing | 140 | 40 | 28.57% |
 | ARM64 translation | 238 | 105 | 44.12% |
-| Native libraries & POSIX | 457 | 60 | 13.13% |
+| Native libraries & POSIX | 457 | 114 | 24.95% |
 | DEX & Java runtime | 601 | 244 | 40.60% |
 | Java/native bridge (JNI) | 285 | 125 | 43.86% |
 | Android framework | 231 | 11 | 4.76% |
@@ -136,7 +136,7 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | Security & permissions | 88 | 31 | 35.23% |
 | Windows integration | 65 | 29 | 44.62% |
 | Quality & reproducibility | 60 | 11 | 18.33% |
-| **Total** | **3,589** | **724** | **20.17%** |
+| **Total** | **3,589** | **778** | **21.68%** |
 
 Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
@@ -149,10 +149,10 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | APK and manifest detailed formats | 94 | 18 | 19.15% |
 | ARM64 guest translation and ABI | 27 | 10 | 37.04% |
 | AArch64 instruction conformance | 211 | 95 | 45.02% |
-| Android native ELF loading and dynamic linker | 30 | 0 | 0.00% |
-| ELF and linker detailed conformance | 71 | 16 | 22.54% |
-| Bionic libc and POSIX compatibility | 42 | 3 | 7.14% |
-| Bionic and POSIX exported calls | 314 | 41 | 13.06% |
+| Android native ELF loading and dynamic linker | 30 | 1 | 3.33% |
+| ELF and linker detailed conformance | 71 | 18 | 25.35% |
+| Bionic libc and POSIX compatibility | 42 | 9 | 21.43% |
+| Bionic and POSIX exported calls | 314 | 86 | 27.39% |
 | DEX parser, linking and runtime support | 45 | 12 | 26.67% |
 | DEX opcodes | 224 | 162 | 72.32% |
 | DEX runtime detailed contracts | 67 | 28 | 41.79% |
