@@ -17,12 +17,15 @@ class ActivityProcessExited final : public std::runtime_error {
           status(value) {}
     const std::uint8_t status;
 };
-enum class ActivityMode { normal, read_recovery_probe, exit_zero_probe, exit_255_probe };
+enum class ActivityMode { normal, read_recovery_probe, exit_zero_probe, exit_255_probe, abort_probe };
 // Synchronous connection owned by one host I/O thread. Presentation and execution
 // remain separate; ActivityDispatcher publishes immutable state to the HWND owner.
 class IsolatedActivity final {
   public:
-    explicit IsolatedActivity(const std::filesystem::path &apk, ActivityMode mode = ActivityMode::normal);
+    // Optional trusted developer output root; never changes APK admission or worker lookup.
+    // Empty preserves the installation-local developer storage and audit paths.
+    explicit IsolatedActivity(const std::filesystem::path &apk, ActivityMode mode = ActivityMode::normal,
+                              const std::filesystem::path &developer_output_root = {});
     explicit IsolatedActivity(InstalledActivity application);
     ~IsolatedActivity();
     IsolatedActivity(const IsolatedActivity &) = delete;

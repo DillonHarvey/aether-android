@@ -1,5 +1,6 @@
 #pragma once
 #include "aether/android/input.hpp"
+#include "aether/android/profile.hpp"
 #include "aether/apk/resources.hpp"
 #include "aether/dex/runtime.hpp"
 #include "aether/host/time_service.hpp"
@@ -7,8 +8,6 @@
 #include <map>
 
 namespace aether::android {
-// Android API dispatch/resource target, not a claim of complete Android conformance.
-inline constexpr std::uint16_t compatibility_sdk = 35;
 enum class ApiStatus { not_started, stub, partial, tested };
 struct ApiSupport {
     std::string_view owner, name, signature;

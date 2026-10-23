@@ -1,6 +1,8 @@
 #include "polling.hpp"
 #include "descriptors.hpp"
 #include "threads.hpp"
+#include "signals.hpp"
+#include <algorithm>
 #include <chrono>
 #include <thread>
 namespace aether::bionic {
@@ -8,7 +10,7 @@ namespace {
 template<std::size_t N> std::array<std::uint8_t,N> bytes(std::uint64_t value){std::array<std::uint8_t,N> result{};for(unsigned i=0;i<N;++i)result[i]=static_cast<std::uint8_t>(value>>(8*i));return result;}
 std::uint64_t word(std::span<const std::uint8_t> input){std::uint64_t result=0;for(unsigned i=0;i<input.size();++i)result|=std::uint64_t{input[i]}<<(8*i);return result;}
 }
-a64::Fault NativePolling::invoke(a64::Address error,std::array<std::uint64_t,31> &r,bool full_frame) {
+a64::Fault NativePolling::invoke(a64::Address error,std::array<std::uint64_t,31> &r,bool full_frame,a64::ServiceState *frame) {
     using a64::Fault;using Clock=std::chrono::steady_clock;
     const auto fail=[&](unsigned code){if(!memory_.write(error,bytes<4>(code)))return Fault::write;r[0]=UINT64_MAX;return Fault::none;};
     const auto address=r[0];const auto count=static_cast<std::uint32_t>(r[1]);const auto timeout=static_cast<std::int32_t>(r[2]);
@@ -34,16 +36,23 @@ a64::Fault NativePolling::invoke(a64::Address error,std::array<std::uint64_t,31>
             r[0]=ready;return Fault::none;
         }
         if(!full_frame)return fail(95);
+        if(signals_.ready()){
+            a64::ServiceState empty;const auto deliveries=signals_.delivery_serial();
+            const auto fault=signals_.deliver_pending(frame?*frame:empty,frame!=nullptr);
+            if(fault!=Fault::none)return fault;
+            if(signals_.delivery_serial()!=deliveries)return fail(4);
+        }
         if(threads_.has_runnable()){
             if(!budget)return Fault::budget;
             std::uint64_t spent=0;const auto fault=threads_.run_next(budget,spent);budget=spent>=budget?0:budget-spent;
             if(fault!=Fault::none)return fault;
             continue;
         }
-        if(timeout<0)return fail(95); // No continuation or external producer exists in this profile.
+        const auto alarm=signals_.alarm_deadline();
+        if(timeout<0 && !alarm)return fail(95); // No continuation or external producer exists in this profile.
         // All current descriptor kinds change readiness only via owned queued work;
         // a finite idle timeout is a genuine monotonic Windows-hosted wait.
-        std::this_thread::sleep_until(deadline);
+        std::this_thread::sleep_until(timeout<0?*alarm:(alarm?std::min(deadline,*alarm):deadline));
     }
 }
 }

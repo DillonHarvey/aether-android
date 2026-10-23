@@ -1,6 +1,10 @@
 #include "aether/bionic/guest_posix.hpp"
+#include "aether/a64/capabilities.hpp"
+#include "aether/common/thread_exit.hpp"
 #include "logging.hpp"
 #include "threads.hpp"
+#include "thread_specific.hpp"
+#include "thread_attributes.hpp"
 #include "zlib.hpp"
 #include "mutexes.hpp"
 #include "rwlocks.hpp"
@@ -10,11 +14,27 @@
 #include "signals.hpp"
 #include "conditions.hpp"
 #include "calendar.hpp"
+#include "locale.hpp"
+#include "ctype.hpp"
+#include "unicode.hpp"
+#include "once.hpp"
+#include "multibyte.hpp"
 #include "descriptors.hpp"
 #include "polling.hpp"
 #include "sleeping.hpp"
 #include "jumps.hpp"
 #include "access.hpp"
+#include "executing.hpp"
+#include "string_memory.hpp"
+#include "file_metadata.hpp"
+#include "removing.hpp"
+#include "opening.hpp"
+#include "creating.hpp"
+#include "renaming.hpp"
+#include "error_strings.hpp"
+#include "dynamic_linker.hpp"
+#include "properties.hpp"
+#include "mappings.hpp"
 #include "aether/host/process_info.hpp"
 #include <algorithm>
 #include <array>
@@ -43,7 +63,7 @@ enum class Operation {
     close,
     create_thread,join_thread,self_thread,stack_failure,
     mutex_lock,mutex_trylock,mutex_unlock,mutex_init,mutex_destroy,attr_init,attr_destroy,attr_settype,attr_gettype,attr_setshared,attr_getshared,attr_setprotocol,attr_getprotocol,
-    rw_read,rw_write,rw_tryread,rw_trywrite,rw_unlock,rw_init,rw_destroy,rw_attr_init,rw_attr_destroy,rw_attr_setshared,rw_attr_getshared,rw_attr_setkind,rw_attr_getkind,process_id,process_probe,resource_limit,duplicate,bounded_duplicate,string_copy,string_cat,checked_string_copy,checked_string_cat,system_call,directory_open,directory_read,directory_close,directory_rewind,stdio_open,stdio_close,stdio_read,stdio_write,stdio_getc,stdio_gets,stdio_eof,stdio_error,stdio_clear,stdio_fd,stdio_flush,integer_unsigned,integer_signed,integer_atoi,integer_atol,scan,sig_empty,sig_fill,sig_add,sig_del,sig_member,pthread_mask,process_mask,signal_handler,signal_action,signal_raise,signal_pending,signal_wait,cond_wait,cond_signal,cond_broadcast,cond_init,cond_destroy,cond_attr_init,cond_attr_destroy,cond_attr_getshared,cond_attr_setshared,cond_attr_getclock,cond_attr_setclock,epoch_time,local_time,epoch_timeval,descriptor_dup,jump_save,jump_set,jump_plain,jump_restore,format_list,format_direct,format_checked_list,format_checked_direct,file_lock,file_access,realtime_min,realtime_max,priority_set,priority_get,event_create,poll_descriptors,sleep_seconds,sleep_micros,sleep_nanos,process_exit,thread_exit
+    rw_read,rw_write,rw_tryread,rw_trywrite,rw_unlock,rw_init,rw_destroy,rw_attr_init,rw_attr_destroy,rw_attr_setshared,rw_attr_getshared,rw_attr_setkind,rw_attr_getkind,process_id,process_probe,resource_limit,duplicate,bounded_duplicate,string_copy,string_cat,checked_string_copy,checked_string_cat,system_call,directory_open,directory_read,directory_close,directory_rewind,stdio_open,stdio_close,stdio_read,stdio_write,stdio_getc,stdio_gets,stdio_eof,stdio_error,stdio_clear,stdio_fd,stdio_flush,integer_unsigned,integer_signed,integer_atoi,integer_atol,scan,sig_empty,sig_fill,sig_add,sig_del,sig_member,pthread_mask,process_mask,signal_handler,signal_action,signal_raise,signal_pending,signal_wait,cond_wait,cond_signal,cond_broadcast,cond_init,cond_destroy,cond_attr_init,cond_attr_destroy,cond_attr_getshared,cond_attr_setshared,cond_attr_getclock,cond_attr_setclock,epoch_time,local_time,epoch_timeval,descriptor_dup,jump_save,jump_set,jump_plain,jump_restore,format_list,format_direct,format_checked_list,format_checked_direct,file_lock,file_access,realtime_min,realtime_max,priority_set,priority_get,event_create,poll_descriptors,sleep_seconds,sleep_micros,sleep_nanos,process_exit,thread_exit,alarm_timer,execute_list_path,allocate_zero,resize_allocation,string_compare,string_compare_n,string_copy_n,string_find_char,string_find_last_char,string_find_text,string_compare_bytes,string_find_byte,string_find_bytes,string_checked_length,string_checked_find_char,string_checked_find_last_char,string_checked_copy_n,string_checked_copy_n_source,string_checked_move,heap_information,file_read_link,file_read_link_at,file_descriptor_stat,file_descriptor_seek,file_user_id,file_remove,file_unlink,file_unlink_at,file_remove_directory,checked_open,checked_read,checked_write,checked_read_link,checked_read_link_at,resource_set_limit,open_at,checked_open_at,access_at,thread_attr_init,thread_attr_destroy,thread_attr_setdetach,thread_attr_getdetach,thread_attr_setstacksize,thread_attr_getstacksize,thread_attr_setguard,thread_attr_getguard,thread_attr_getstack,thread_getattr,thread_detach,signal_stack,page_size,address_info,system_configuration,memory_map,memory_unmap,memory_protect,cond_timedwait,directory_create,directory_create_at,file_rename,file_rename_at,process_control,error_description,system_property,process_fork,thread_set_name,thread_get_name,system_information,format_checked_unbounded_list,dynamic_open,dynamic_symbol,dynamic_close,dynamic_error,auxiliary_value,key_create,key_delete,key_get,key_set,process_abort,string_copy_sized,process_trace,process_wait,calendar_format,string_tokenize,string_tokenize_reentrant,stdio_rewind,stdio_seek,stdio_tell,string_checked_copy_bytes,string_checked_copy_end,string_checked_fill,string_length_n,thread_signal,scan_list,locale_new,locale_duplicate,locale_free,locale_use,locale_set,locale_conventions,locale_width,character_wide_control,character_alnum,character_alpha,character_blank,character_control,character_digit,character_graph,character_lower,character_print,character_punct,character_space,character_upper,character_xdigit,character_to_lower,character_to_upper,thread_once,multibyte_wcsnrtombs,multibyte_wcsrtombs,multibyte_wcrtomb,multibyte_btowc,multibyte_wctob,multibyte_mbrtowc,multibyte_mbrlen,multibyte_mbsnrtowcs,multibyte_mbsrtowcs,multibyte_mbsinit,unicode_iswalnum,unicode_iswalpha,unicode_iswblank,unicode_iswdigit,unicode_iswgraph,unicode_iswlower,unicode_iswprint,unicode_iswpunct,unicode_iswspace,unicode_iswupper,unicode_iswxdigit,unicode_towlower,unicode_towupper
 };
 struct Entry {
     std::string_view name;
@@ -89,7 +109,7 @@ constexpr std::uint32_t zlib_service=0x1c0;
 constexpr Address zlib_trampoline=GuestPosixServices::trampoline_base+0xc00;
 constexpr std::uint32_t first_service = 0x100;
 static_assert(entries.size()<=log_service-first_service);
-constexpr std::array extended_entries{Entry{"sleep",Operation::sleep_seconds},Entry{"usleep",Operation::sleep_micros},Entry{"nanosleep",Operation::sleep_nanos},Entry{"_exit",Operation::process_exit},Entry{"_Exit",Operation::process_exit},Entry{"pthread_exit",Operation::thread_exit}};
+constexpr std::array extended_entries{Entry{"sleep",Operation::sleep_seconds},Entry{"usleep",Operation::sleep_micros},Entry{"nanosleep",Operation::sleep_nanos},Entry{"_exit",Operation::process_exit},Entry{"_Exit",Operation::process_exit},Entry{"pthread_exit",Operation::thread_exit},Entry{"alarm",Operation::alarm_timer},Entry{"execlp",Operation::execute_list_path},Entry{"calloc",Operation::allocate_zero},Entry{"realloc",Operation::resize_allocation},Entry{"strcmp",Operation::string_compare},Entry{"strncmp",Operation::string_compare_n},Entry{"strncpy",Operation::string_copy_n},Entry{"strchr",Operation::string_find_char},Entry{"strrchr",Operation::string_find_last_char},Entry{"strstr",Operation::string_find_text},Entry{"memcmp",Operation::string_compare_bytes},Entry{"memchr",Operation::string_find_byte},Entry{"memmem",Operation::string_find_bytes},Entry{"__strlen_chk",Operation::string_checked_length},Entry{"__strchr_chk",Operation::string_checked_find_char},Entry{"__strrchr_chk",Operation::string_checked_find_last_char},Entry{"__strncpy_chk",Operation::string_checked_copy_n},Entry{"__strncpy_chk2",Operation::string_checked_copy_n_source},Entry{"__memmove_chk",Operation::string_checked_move},Entry{"mallinfo",Operation::heap_information},Entry{"readlink",Operation::file_read_link},Entry{"readlinkat",Operation::file_read_link_at},Entry{"fstat",Operation::file_descriptor_stat},Entry{"fstat64",Operation::file_descriptor_stat},Entry{"lseek",Operation::file_descriptor_seek},Entry{"lseek64",Operation::file_descriptor_seek},Entry{"getuid",Operation::file_user_id},Entry{"geteuid",Operation::file_user_id},Entry{"getgid",Operation::file_user_id},Entry{"getegid",Operation::file_user_id},Entry{"remove",Operation::file_remove},Entry{"unlink",Operation::file_unlink},Entry{"unlinkat",Operation::file_unlink_at},Entry{"rmdir",Operation::file_remove_directory},Entry{"__open_2",Operation::checked_open},Entry{"__read_chk",Operation::checked_read},Entry{"__write_chk",Operation::checked_write},Entry{"__readlink_chk",Operation::checked_read_link},Entry{"__readlinkat_chk",Operation::checked_read_link_at},Entry{"setrlimit",Operation::resource_set_limit},Entry{"setrlimit64",Operation::resource_set_limit},Entry{"open64",Operation::open},Entry{"openat",Operation::open_at},Entry{"openat64",Operation::open_at},Entry{"__openat_2",Operation::checked_open_at},Entry{"faccessat",Operation::access_at},Entry{"pthread_attr_init",Operation::thread_attr_init},Entry{"pthread_attr_destroy",Operation::thread_attr_destroy},Entry{"pthread_attr_setdetachstate",Operation::thread_attr_setdetach},Entry{"pthread_attr_getdetachstate",Operation::thread_attr_getdetach},Entry{"pthread_attr_setstacksize",Operation::thread_attr_setstacksize},Entry{"pthread_attr_getstacksize",Operation::thread_attr_getstacksize},Entry{"pthread_attr_setguardsize",Operation::thread_attr_setguard},Entry{"pthread_attr_getguardsize",Operation::thread_attr_getguard},Entry{"pthread_attr_getstack",Operation::thread_attr_getstack},Entry{"pthread_getattr_np",Operation::thread_getattr},Entry{"pthread_detach",Operation::thread_detach},Entry{"sigaltstack",Operation::signal_stack},Entry{"getpagesize",Operation::page_size},Entry{"dladdr",Operation::address_info},Entry{"sysconf",Operation::system_configuration},Entry{"mmap",Operation::memory_map},Entry{"mmap64",Operation::memory_map},Entry{"munmap",Operation::memory_unmap},Entry{"mprotect",Operation::memory_protect},Entry{"pthread_cond_timedwait",Operation::cond_timedwait},Entry{"mkdir",Operation::directory_create},Entry{"mkdirat",Operation::directory_create_at},Entry{"rename",Operation::file_rename},Entry{"renameat",Operation::file_rename_at},Entry{"prctl",Operation::process_control},Entry{"strerror",Operation::error_description},Entry{"__system_property_get",Operation::system_property},Entry{"fork",Operation::process_fork},Entry{"pthread_setname_np",Operation::thread_set_name},Entry{"pthread_getname_np",Operation::thread_get_name},Entry{"sysinfo",Operation::system_information},Entry{"__vsprintf_chk",Operation::format_checked_unbounded_list},Entry{"dlopen",Operation::dynamic_open},Entry{"dlsym",Operation::dynamic_symbol},Entry{"dlclose",Operation::dynamic_close},Entry{"dlerror",Operation::dynamic_error},Entry{"getauxval",Operation::auxiliary_value},Entry{"pthread_key_create",Operation::key_create},Entry{"pthread_key_delete",Operation::key_delete},Entry{"pthread_getspecific",Operation::key_get},Entry{"pthread_setspecific",Operation::key_set},Entry{"abort",Operation::process_abort},Entry{"strlcpy",Operation::string_copy_sized},Entry{"ptrace",Operation::process_trace},Entry{"waitpid",Operation::process_wait},Entry{"wait4",Operation::process_wait},Entry{"strftime",Operation::calendar_format},Entry{"strtok",Operation::string_tokenize},Entry{"strtok_r",Operation::string_tokenize_reentrant},Entry{"rewind",Operation::stdio_rewind},Entry{"fseek",Operation::stdio_seek},Entry{"fseeko",Operation::stdio_seek},Entry{"fseeko64",Operation::stdio_seek},Entry{"ftell",Operation::stdio_tell},Entry{"ftello",Operation::stdio_tell},Entry{"ftello64",Operation::stdio_tell},Entry{"__memcpy_chk",Operation::string_checked_copy_bytes},Entry{"__mempcpy_chk",Operation::string_checked_copy_end},Entry{"__memset_chk",Operation::string_checked_fill},Entry{"strnlen",Operation::string_length_n},Entry{"tgkill",Operation::thread_signal},Entry{"strtoull_l",Operation::integer_unsigned},Entry{"strtoll_l",Operation::integer_signed},Entry{"strtoul_l",Operation::integer_unsigned},Entry{"strtol_l",Operation::integer_signed},Entry{"vsscanf",Operation::scan_list},Entry{"newlocale",Operation::locale_new},Entry{"duplocale",Operation::locale_duplicate},Entry{"freelocale",Operation::locale_free},Entry{"uselocale",Operation::locale_use},Entry{"setlocale",Operation::locale_set},Entry{"localeconv",Operation::locale_conventions},Entry{"__ctype_get_mb_cur_max",Operation::locale_width},Entry{"iswcntrl",Operation::character_wide_control},Entry{"iswcntrl_l",Operation::character_wide_control},Entry{"isalnum",Operation::character_alnum},Entry{"isalpha",Operation::character_alpha},Entry{"isblank",Operation::character_blank},Entry{"iscntrl",Operation::character_control},Entry{"isdigit",Operation::character_digit},Entry{"isgraph",Operation::character_graph},Entry{"islower",Operation::character_lower},Entry{"isprint",Operation::character_print},Entry{"ispunct",Operation::character_punct},Entry{"isspace",Operation::character_space},Entry{"isupper",Operation::character_upper},Entry{"isxdigit",Operation::character_xdigit},Entry{"tolower",Operation::character_to_lower},Entry{"toupper",Operation::character_to_upper},Entry{"isalnum_l",Operation::character_alnum},Entry{"isalpha_l",Operation::character_alpha},Entry{"isblank_l",Operation::character_blank},Entry{"iscntrl_l",Operation::character_control},Entry{"isdigit_l",Operation::character_digit},Entry{"isgraph_l",Operation::character_graph},Entry{"islower_l",Operation::character_lower},Entry{"isprint_l",Operation::character_print},Entry{"ispunct_l",Operation::character_punct},Entry{"isspace_l",Operation::character_space},Entry{"isupper_l",Operation::character_upper},Entry{"isxdigit_l",Operation::character_xdigit},Entry{"tolower_l",Operation::character_to_lower},Entry{"toupper_l",Operation::character_to_upper},Entry{"pthread_once",Operation::thread_once},Entry{"wcsnrtombs",Operation::multibyte_wcsnrtombs},Entry{"wcsrtombs",Operation::multibyte_wcsrtombs},Entry{"wcrtomb",Operation::multibyte_wcrtomb},Entry{"btowc",Operation::multibyte_btowc},Entry{"wctob",Operation::multibyte_wctob},Entry{"mbrtowc",Operation::multibyte_mbrtowc},Entry{"mbrlen",Operation::multibyte_mbrlen},Entry{"mbsnrtowcs",Operation::multibyte_mbsnrtowcs},Entry{"mbsrtowcs",Operation::multibyte_mbsrtowcs},Entry{"mbsinit",Operation::multibyte_mbsinit},Entry{"iswalnum",Operation::unicode_iswalnum},Entry{"iswalpha",Operation::unicode_iswalpha},Entry{"iswblank",Operation::unicode_iswblank},Entry{"iswdigit",Operation::unicode_iswdigit},Entry{"iswgraph",Operation::unicode_iswgraph},Entry{"iswlower",Operation::unicode_iswlower},Entry{"iswprint",Operation::unicode_iswprint},Entry{"iswpunct",Operation::unicode_iswpunct},Entry{"iswspace",Operation::unicode_iswspace},Entry{"iswupper",Operation::unicode_iswupper},Entry{"iswxdigit",Operation::unicode_iswxdigit},Entry{"towlower",Operation::unicode_towlower},Entry{"towupper",Operation::unicode_towupper},Entry{"iswalnum_l",Operation::unicode_iswalnum},Entry{"iswalpha_l",Operation::unicode_iswalpha},Entry{"iswblank_l",Operation::unicode_iswblank},Entry{"iswdigit_l",Operation::unicode_iswdigit},Entry{"iswgraph_l",Operation::unicode_iswgraph},Entry{"iswlower_l",Operation::unicode_iswlower},Entry{"iswprint_l",Operation::unicode_iswprint},Entry{"iswpunct_l",Operation::unicode_iswpunct},Entry{"iswspace_l",Operation::unicode_iswspace},Entry{"iswupper_l",Operation::unicode_iswupper},Entry{"iswxdigit_l",Operation::unicode_iswxdigit},Entry{"towlower_l",Operation::unicode_towlower},Entry{"towupper_l",Operation::unicode_towupper}};
 constexpr std::uint32_t extended_service=0x200,extended_capacity=512;
 constexpr Address extended_trampoline=GuestPosixServices::trampoline_base+4096;
 static_assert(extended_entries.size()<=extended_capacity);
@@ -120,11 +140,26 @@ struct GuestPosixServices::Impl {
     host::FileService *files;
     NativeLogging logging;
     NativeAccess access;
+    NativeFileMetadata metadata;
+    NativeRemoving removing;
+    NativeOpening opening;
+    NativeCreating creating;
+    NativeRenaming renaming;
+    NativeMappings mappings;
+    NativeExecuting executing;
+    NativeStringMemory string_memory;
     NativeFormatting formatting;
+    NativeThreadSpecific specific;
     NativeThreads threads;
+    NativeLocale locales;
+    NativeOnce once;
+    NativeMultibyte multibyte;
+    NativeDynamicLinker dynamic_linker;
+    NativeErrorStrings error_strings;
+    NativeThreadAttributes thread_attributes;
+    NativeSignals signals;
     NativePolling polling;
     NativeSleeping sleeping;
-    NativeSignals signals;
     NativeJumps jumps;
     NativeZlib compression;
     NativeMutexes mutexes;
@@ -135,16 +170,21 @@ struct GuestPosixServices::Impl {
     const std::uint32_t tid;
     ServiceMetrics stats;
     std::string_view rejection;
-    std::map<Address, std::size_t> allocations;
+    struct Allocation {std::size_t mapped,requested;};
+    std::map<Address, Allocation> allocations;
     struct Directory {std::vector<host::DirectoryEntry> entries;std::size_t position=0;};
     std::map<Address,Directory> directories;
+    AddressLookup address_lookup;
+    std::map<std::string,Address,std::less<>> lookup_strings;
     Address next_directory=0x38000000;
     Address next_heap = 0x40000000;
+    std::size_t heap_peak=0;
     bool trampoline_owned = false, extended_owned=false, errno_owned = false;
     Impl(a64::GuestMemory &m, const a64::AppContext &a, const host::TimeService &t, std::uint32_t id,
          host::FileService *f,host::NativeLogSink *logs,std::string_view package)
-        : memory(m), app(a), time(t), descriptors(f), files(f?&descriptors:nullptr), logging(m,logs), access(m,files,package), formatting(m), threads(m,id,GuestPosixServices::errno_address), polling(m,descriptors,threads), sleeping(m,threads), signals(m,threads), jumps(m,threads,signals), compression(m,zlib_trampoline+32,zlib_trampoline+40), mutexes(m), conditions(m,threads,mutexes), calendar(m,t), rwlocks(m), stdio(m,f?&descriptors:nullptr), tid(id) {}
+        : memory(m), app(a), time(t), descriptors(f), files(f?&descriptors:nullptr), logging(m,logs), access(m,files,package), metadata(m,a,descriptors,access,package), removing(m,descriptors,package), opening(m,descriptors,package), creating(m,descriptors,package), renaming(m,descriptors,package), mappings(m), executing(m,access), string_memory(m), formatting(m), specific(m), threads(m,id,GuestPosixServices::errno_address,&specific), locales(m,threads), once(m,threads,a), multibyte(m,threads), dynamic_linker(m,threads,a), error_strings(m,threads), thread_attributes(m,threads), signals(m,threads,a), polling(m,descriptors,threads,signals), sleeping(m,threads,signals), jumps(m,threads,signals), compression(m,zlib_trampoline+32,zlib_trampoline+40), mutexes(m), conditions(m,threads,mutexes,t,signals,a), calendar(m,t), rwlocks(m), stdio(m,descriptors,f!=nullptr), tid(id) {}
     ~Impl() {
+        for(const auto &[name,address]:lookup_strings){(void)name;unmap(address);}
         for(const auto &[address,directory]:directories){(void)directory;unmap(address);}
         for (const auto &[address, size] : allocations) {
             (void)size;
@@ -169,6 +209,19 @@ struct GuestPosixServices::Impl {
         r[0] = null_return ? 0 : ~std::uint64_t{0};
         return Fault::none;
     }
+    Fault wait_operation(std::array<std::uint64_t,31> &r,std::uint64_t pid,std::uint64_t options) {
+        // Linux wait4 validates int flags before pid; this app has no process children.
+        constexpr std::uint32_t allowed=0xe000000bU;
+        if(static_cast<std::uint32_t>(options)&~allowed)return error(r,22);
+        return error(r,static_cast<std::uint32_t>(pid)==0x80000000U?3U:10U);
+    }
+    Fault abort_operation(a64::ServiceState &state,bool full) noexcept {
+        try {
+            const auto fault=signals.abort(state,full,*app.process_state);
+            rejection=signals.abort_failure()==Fault::none?std::string_view{"abort: guest SIGABRT termination"}:a64::fault_name(signals.abort_failure());
+            return fault;
+        }catch(...){app.process_state->request_signal(6);rejection="abort: SIGABRT handler threw; forced fatal termination";return Fault::process_exit;}
+    }
     Fault dispatch_cxx(CxxOperation operation,std::array<std::uint64_t,31> &r) {
         if(operation==CxxOperation::pure){rejection="__cxa_pure_virtual: guest pure virtual call";++stats.rejected_operations;return Fault::invalid_call;}
         if(operation==CxxOperation::release)return dispatch(Operation::release,r);
@@ -178,9 +231,13 @@ struct GuestPosixServices::Impl {
         }
         return fault;
     }
-    Fault scanning(a64::ServiceState &state,bool full) {
-        const auto fault=scan_text(memory,state,full,threads.error_address());
-        if(fault!=Fault::none){rejection="sscanf: unsupported format/limit or invalid guest access";++stats.rejected_operations;}
+    Fault once_operation(a64::ServiceState &state,bool full) {
+        const auto fault=once.invoke(state,full);
+        if(fault!=Fault::none){rejection=once.rejection();++stats.rejected_operations;}return fault;
+    }
+    Fault scanning(a64::ServiceState &state,bool full,bool list=false) {
+        const auto fault=scan_text(memory,state,full,threads.error_address(),list);
+        if(fault!=Fault::none){rejection=list?"vsscanf: unsupported format/limit or invalid guest access":"sscanf: unsupported format/limit or invalid guest access";++stats.rejected_operations;}
         return fault;
     }
     Fault mask_operation(Operation operation,a64::ServiceState &state,bool full) {
@@ -200,8 +257,21 @@ struct GuestPosixServices::Impl {
         if(fault!=Fault::none){rejection="signal: unsupported action/delivery or invalid guest access";++stats.rejected_operations;}
         return fault;
     }
+    Fault thread_signal_operation(a64::ServiceState &state,bool full,bool syscall=false) {
+        const auto &r=state.registers;const unsigned at=syscall?1U:0U;
+        const auto fault=signals.tgkill(r[at],r[at+1],r[at+2],state,full);
+        if(fault!=Fault::none){rejection="tgkill: unsupported logical signal delivery or invalid guest access";++stats.rejected_operations;}
+        else if(state.registers[0]==UINT64_MAX)++stats.errors;
+        return fault;
+    }
+    Fault execute_operation(a64::ServiceState &state,bool full) {
+        const auto fault=executing.invoke(threads.error_address(),state,full);
+        if(fault!=Fault::none){rejection=executing.rejection();++stats.rejected_operations;}
+        else if(state.registers[0]==UINT64_MAX)++stats.errors;
+        return fault;
+    }
     Fault format_operation(Operation operation,a64::ServiceState &state,bool full) {
-        const auto fault=formatting.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::format_list),state,full);
+        const auto fault=formatting.invoke(operation==Operation::format_checked_unbounded_list?4U:static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::format_list),state,full);
         if(fault!=Fault::none){rejection=formatting.rejection();++stats.rejected_operations;}return fault;
     }
     Fault jump_operation(Operation operation,a64::ServiceState &state,bool full) {
@@ -209,22 +279,162 @@ struct GuestPosixServices::Impl {
         if(fault!=Fault::none){rejection="setjmp/longjmp: invalid or stale context, cross-invocation jump, or unsupported frame";++stats.rejected_operations;}
         return fault;
     }
-    Fault condition_operation(Operation operation,std::array<std::uint64_t,31> &r,bool full) {
-        const auto fault=conditions.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::cond_wait),r,full);
+    Fault condition_operation(Operation operation,std::array<std::uint64_t,31> &r,bool full,a64::ServiceState *frame=nullptr) {
+        const auto fault=conditions.invoke(operation==Operation::cond_timedwait?11:static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::cond_wait),r,full,frame);
         stats.threads_created=threads.created;stats.threads_started=threads.started;stats.threads_joined=threads.joined;
-        if(fault!=Fault::none){rejection="pthread condition: unsupported wait/scheduling/state or invalid guest access";++stats.rejected_operations;}
+        if(fault!=Fault::none){rejection="pthread condition: unavailable clock/capability, unsupported wait/scheduling/state, nested failure or invalid guest access";++stats.rejected_operations;}
         return fault;
     }
+    Address lookup_string(const std::string &text) {
+        if(const auto at=lookup_strings.find(text);at!=lookup_strings.end())return at->second;
+        if(text.size()>=a64::GuestMemory::page_size || text.find('\0')!=std::string::npos || lookup_strings.size()>=256)
+            throw a64::GuestError("AETHER_DLADDR_LIMIT","dladdr metadata exceeds readonly string profile");
+        const Address address=0x3c000000ULL+lookup_strings.size()*a64::GuestMemory::page_size;
+        auto [at,inserted]=lookup_strings.emplace(text,address);bool owned=false;
+        try {
+            memory.map(address,a64::GuestMemory::page_size,a64::read_write);owned=true;
+            if(!memory.write(address,{reinterpret_cast<const std::uint8_t *>(text.c_str()),text.size()+1}))
+                throw a64::GuestError("AETHER_DLADDR_STRING","dladdr string copy failed");
+            memory.protect(address,a64::Permission::read);return address;
+        } catch(...) {if(owned)unmap(address);lookup_strings.erase(at);throw;}
+    }
+    std::optional<elf::AddressInfo> shim_address(Address address) const {
+        const auto entry=[&](std::string_view module,std::string_view name,Address base,Address start,std::size_t size)->std::optional<elf::AddressInfo>{
+            if(address<start || address-start>=size)return {};
+            return elf::AddressInfo{std::string(module),std::string(name),base,start};
+        };
+        if(auto found=entry("libc.so","__sF",trampoline_base,NativeStdio::standard_base,456))return found;
+        constexpr std::array<std::string_view,3> standard_names{"stdin","stdout","stderr"};
+        for(unsigned i=0;i<3;++i)if(auto found=entry("libc.so",standard_names[i],trampoline_base,NativeStdio::standard_base+512+i*8,8))return found;
+        for(std::size_t i=0;i<entries.size();++i)if(auto found=entry("libc.so",entries[i].name,trampoline_base,trampoline_base+i*8,8))return found;
+        for(std::size_t i=0;i<extended_entries.size();++i)if(auto found=entry("libc.so",extended_entries[i].name,trampoline_base,extended_trampoline+i*8,8))return found;
+        for(std::size_t i=0;i<log_entries.size();++i)if(auto found=entry("liblog.so",log_entries[i],log_trampoline,log_trampoline+i*8,8))return found;
+        for(std::size_t i=0;i<cxx_entries.size();++i)if(auto found=entry("libstdc++.so",cxx_entries[i].name,cxx_trampoline,cxx_trampoline+i*8,8))return found;
+        for(std::size_t i=0;i<zlib_entries.size();++i)if(auto found=entry("libz.so",zlib_entries[i],zlib_trampoline,zlib_trampoline+i*8,8))return found;
+        return entry("libstdc++.so","_ZSt7nothrow",cxx_trampoline,nothrow_address,1);
+    }
+    Fault address_operation(std::array<std::uint64_t,31> &r) {
+        auto found=shim_address(r[0]);
+        if(!found){
+            if(!address_lookup){rejection="dladdr: owned guest module lookup is unavailable";++stats.rejected_operations;return Fault::unsupported_service;}
+            found=address_lookup(r[0]);
+        }
+        if(!found){r[0]=0;return Fault::none;}
+        if(!memory.accessible(r[1],32,a64::Permission::write)){rejection="dladdr: invalid guest Dl_info output";++stats.rejected_operations;return Fault::write;}
+        if(found->module.empty() || !found->base || found->base>=a64::GuestMemory::address_limit || found->symbol_address>=a64::GuestMemory::address_limit){
+            rejection="dladdr: invalid owned guest address metadata";++stats.rejected_operations;return Fault::unsupported_service;
+        }
+        std::array<std::uint8_t,32> output{};
+        try {
+            const auto name=lookup_string(found->module);
+            const auto symbol=found->has_symbol?lookup_string(found->symbol):0;
+            const std::array<Address,4> fields{name,found->base,symbol,symbol?found->symbol_address:0};
+            for(unsigned i=0;i<4;++i){const auto bytes=little<8>(fields[i]);std::copy(bytes.begin(),bytes.end(),output.begin()+i*8);}
+        } catch(...) {rejection="dladdr: readonly guest string storage unavailable or limit exceeded";++stats.rejected_operations;return Fault::unsupported_service;}
+        if(!memory.write(r[1],output)){rejection="dladdr: guest output write failed";++stats.rejected_operations;return Fault::write;}
+        r[0]=1;return Fault::none;
+    }
     Fault dispatch(Operation operation, std::array<std::uint64_t, 31> &r,bool full_frame=false) {
-        if(operation>=Operation::format_list && operation<=Operation::format_checked_direct){a64::ServiceState state;state.registers=r;const auto fault=format_operation(operation,state,false);r=state.registers;return fault;}
+        if(operation>=Operation::memory_map && operation<=Operation::memory_protect){
+            const auto before=mappings.errors;
+            const auto fault=mappings.invoke(static_cast<MappingOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::memory_map)),threads.error_address(),r);
+            stats.errors+=mappings.errors-before;
+            if(fault!=Fault::none){rejection=mappings.rejection();++stats.rejected_operations;}
+            return fault;
+        }
+        if(operation==Operation::address_info)return address_operation(r);
+        if(operation==Operation::signal_stack){rejection="sigaltstack: trusted live guest frame required";++stats.rejected_operations;return Fault::unsupported_service;}
+        if(operation>=Operation::thread_attr_init && operation<=Operation::thread_detach){
+            return thread_attributes.invoke(static_cast<ThreadAttributeOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::thread_attr_init)),r);
+        }
+        if(operation>=Operation::checked_read && operation<=Operation::checked_read_link_at){
+            const bool at=operation==Operation::checked_read_link_at;
+            const auto count=r[at?3:2],capacity=r[at?4:3];
+            if(count>INT64_MAX || count>capacity){
+                static constexpr std::array count_errors{std::string_view{"__read_chk: fortify count exceeds SSIZE_MAX"},std::string_view{"__write_chk: fortify count exceeds SSIZE_MAX"},std::string_view{"__readlink_chk: fortify count exceeds SSIZE_MAX"},std::string_view{"__readlinkat_chk: fortify count exceeds SSIZE_MAX"}};
+                static constexpr std::array object_errors{std::string_view{"__read_chk: fortify transfer exceeds buffer object size"},std::string_view{"__write_chk: fortify transfer exceeds buffer object size"},std::string_view{"__readlink_chk: fortify transfer exceeds buffer object size"},std::string_view{"__readlinkat_chk: fortify transfer exceeds buffer object size"}};
+                const auto index=static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::checked_read);
+                rejection=count>INT64_MAX?count_errors[index]:object_errors[index];
+                ++stats.rejected_operations;return Fault::unsupported_service;
+            }
+            const auto target=operation==Operation::checked_read?Operation::read:operation==Operation::checked_write?Operation::write:at?Operation::file_read_link_at:Operation::file_read_link;
+            return dispatch(target,r,full_frame);
+        }
+        if(operation==Operation::checked_open){
+            const auto flags=static_cast<std::uint32_t>(r[1]);
+            if((flags&64U) || (flags&0x404000U)==0x404000U){
+                rejection="__open_2: fortify violation, O_CREAT/O_TMPFILE requires a mode argument";
+                ++stats.rejected_operations;return Fault::unsupported_service;
+            }
+            r[2]=0;return dispatch(Operation::open,r,full_frame);
+        }
+        if(operation==Operation::open || operation==Operation::open_at || operation==Operation::checked_open_at || operation==Operation::access_at){
+            if(operation==Operation::open && !files)return error(r,guest_eacces); // Preserve the existing capability-before-pointer open contract.
+            ++stats.file_operations;
+            const auto selected=operation==Operation::open?OpeningOperation::open:operation==Operation::open_at?OpeningOperation::open_at:operation==Operation::checked_open_at?OpeningOperation::checked_open_at:OpeningOperation::access_at;
+            const auto fault=opening.invoke(selected,threads.error_address(),r);
+            if(fault!=Fault::none){rejection=opening.rejection();++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;
+            return fault;
+        }
+        if(operation>=Operation::file_remove && operation<=Operation::file_remove_directory){
+            ++stats.file_operations;
+            const auto fault=removing.invoke(static_cast<RemovingOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::file_remove)),threads.error_address(),r);
+            if(fault!=Fault::none){rejection=removing.rejection();++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;
+            return fault;
+        }
+        if(operation>=Operation::file_read_link && operation<=Operation::file_user_id){
+            if(operation!=Operation::file_user_id)++stats.file_operations;
+            const auto fault=metadata.invoke(static_cast<FileMetadataOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::file_read_link)),threads.error_address(),r);
+            if(fault!=Fault::none){rejection=metadata.rejection();++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;
+            return fault;
+        }
+        if(operation==Operation::string_length_n){
+            const auto fault=string_memory.invoke(StringMemoryOperation::length_n,r);
+            if(fault!=Fault::none){rejection=string_memory.rejection();++stats.rejected_operations;}return fault;
+        }
+        if(operation>=Operation::string_checked_copy_bytes && operation<=Operation::string_checked_fill){
+            const auto fault=string_memory.invoke(static_cast<StringMemoryOperation>(static_cast<unsigned>(StringMemoryOperation::checked_copy)+static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::string_checked_copy_bytes)),r);
+            if(fault!=Fault::none){rejection=string_memory.rejection();++stats.rejected_operations;}return fault;
+        }
+        if(operation==Operation::string_tokenize || operation==Operation::string_tokenize_reentrant){
+            const auto fault=string_memory.invoke(operation==Operation::string_tokenize?StringMemoryOperation::tokenize:StringMemoryOperation::tokenize_reentrant,r);
+            if(fault!=Fault::none){rejection=string_memory.rejection();++stats.rejected_operations;}return fault;
+        }
+        if((operation>=Operation::string_compare && operation<=Operation::string_checked_move) || operation==Operation::string_copy_sized){
+            const auto fault=string_memory.invoke(operation==Operation::string_copy_sized?StringMemoryOperation::copy_sized:static_cast<StringMemoryOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::string_compare)),r);
+            if(fault!=Fault::none){rejection=string_memory.rejection();++stats.rejected_operations;}return fault;
+        }
+        if((operation>=Operation::format_list && operation<=Operation::format_checked_direct) || operation==Operation::format_checked_unbounded_list){a64::ServiceState state;state.registers=r;const auto fault=format_operation(operation,state,false);r=state.registers;return fault;}
         if(operation>=Operation::jump_save && operation<=Operation::jump_restore){a64::ServiceState state;state.registers=r;const auto fault=jump_operation(operation,state,false);r=state.registers;return fault;}
-        if(operation>=Operation::cond_wait && operation<=Operation::cond_attr_setclock)return condition_operation(operation,r,false);
+        if(operation==Operation::cond_timedwait || (operation>=Operation::cond_wait && operation<=Operation::cond_attr_setclock))return condition_operation(operation,r,false);
         if(operation>=Operation::rw_read && operation<=Operation::rw_attr_getkind){const auto fault=rwlocks.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::rw_read),threads.tid(),r);if(fault!=Fault::none){rejection=rwlocks.rejection();++stats.rejected_operations;}return fault;}
         if(operation>=Operation::mutex_lock && operation<=Operation::attr_getprotocol){const auto fault=mutexes.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::mutex_lock),threads.tid(),r);if(fault!=Fault::none){rejection=mutexes.rejection();++stats.rejected_operations;}return fault;}
+        if(operation>=Operation::stdio_rewind && operation<=Operation::stdio_tell)return stdio.invoke(11+static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::stdio_rewind),threads.error_address(),r);
         if(operation>=Operation::stdio_open && operation<=Operation::stdio_flush)return stdio.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::stdio_open),threads.error_address(),r);
+        if(operation>=Operation::unicode_iswalnum && operation<=Operation::unicode_towupper){
+            r[0]=native_unicode(static_cast<UnicodeOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::unicode_iswalnum)),static_cast<std::uint32_t>(r[0]));return Fault::none;
+        }
+        if(operation>=Operation::multibyte_wcsnrtombs && operation<=Operation::multibyte_mbsinit){
+            const auto fault=multibyte.invoke(static_cast<MultibyteOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::multibyte_wcsnrtombs)),r);
+            if(fault!=Fault::none){rejection=multibyte.rejection();++stats.rejected_operations;}
+            else if(r[0]==UINT64_MAX)++stats.errors;
+            return fault;
+        }
+        if(operation>=Operation::character_wide_control && operation<=Operation::character_to_upper){
+            r[0]=native_character(static_cast<CharacterOperation>(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::character_wide_control)),static_cast<std::uint32_t>(r[0]));return Fault::none;
+        }
+        if(operation>=Operation::locale_new && operation<=Operation::locale_width){
+            const auto fault=locales.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::locale_new),r);
+            if(fault!=Fault::none){rejection=locales.rejection();++stats.rejected_operations;}return fault;
+        }
         if(operation>=Operation::integer_unsigned && operation<=Operation::integer_atol){const auto fault=convert_integer(memory,threads.error_address(),static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::integer_unsigned),r);if(fault!=Fault::none){rejection="integer conversion: guest input/output fault or 1 MiB scan limit";++stats.rejected_operations;}return fault;}
         switch (operation) {
+        case Operation::file_rename:case Operation::file_rename_at:{++stats.file_operations;const auto fault=renaming.invoke(operation==Operation::file_rename_at,threads.error_address(),r);if(fault!=Fault::none){rejection="rename: private namespace marshalling failed; no automatic mutation retry";++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;return fault;}
+        case Operation::directory_create:case Operation::directory_create_at:{++stats.file_operations;const auto fault=creating.invoke(operation==Operation::directory_create_at,threads.error_address(),r);if(fault!=Fault::none){rejection="mkdir: private directory marshalling failed; no automatic mutation retry";++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;return fault;}
+        case Operation::execute_list_path:{a64::ServiceState state;state.registers=r;const auto fault=execute_operation(state,false);r=state.registers;return fault;}
+        case Operation::alarm_timer:r[0]=signals.alarm(static_cast<std::uint32_t>(r[0]));return Fault::none;
         case Operation::thread_exit:threads.request_exit(r[0]);return Fault::thread_exit;
+        case Operation::process_abort:{a64::ServiceState state;state.registers=r;const auto fault=abort_operation(state,false);r=state.registers;return fault;}
         case Operation::process_exit:app.process_state->request_exit(static_cast<std::uint32_t>(r[0]));return Fault::process_exit;
         case Operation::sleep_seconds:case Operation::sleep_micros:case Operation::sleep_nanos:{const auto fault=sleeping.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::sleep_seconds),threads.error_address(),r,full_frame);stats.threads_created=threads.created;stats.threads_started=threads.started;stats.threads_joined=threads.joined;if(fault!=Fault::none){rejection="native sleep: nested work failed or monotonic chunk unavailable";++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;return fault;}
         case Operation::poll_descriptors:{const auto fault=polling.invoke(threads.error_address(),r,full_frame);stats.threads_created=threads.created;stats.threads_started=threads.started;stats.threads_joined=threads.joined;if(fault!=Fault::none){rejection="poll: nested native work failed";++stats.rejected_operations;}else if(r[0]==UINT64_MAX)++stats.errors;return fault;}
@@ -248,7 +458,12 @@ struct GuestPosixServices::Impl {
             if(!memory.write(r[0],little<8>(bits)))return Fault::write;
             r[0]=0;return Fault::none;
         }
-        case Operation::scan:{a64::ServiceState state;state.registers=r;const auto fault=scanning(state,false);r=state.registers;return fault;}
+        case Operation::unicode_iswalnum:case Operation::unicode_iswalpha:case Operation::unicode_iswblank:case Operation::unicode_iswdigit:case Operation::unicode_iswgraph:case Operation::unicode_iswlower:case Operation::unicode_iswprint:case Operation::unicode_iswpunct:case Operation::unicode_iswspace:case Operation::unicode_iswupper:case Operation::unicode_iswxdigit:case Operation::unicode_towlower:case Operation::unicode_towupper:return Fault::unsupported_service;
+        case Operation::multibyte_wcsnrtombs:case Operation::multibyte_wcsrtombs:case Operation::multibyte_wcrtomb:case Operation::multibyte_btowc:case Operation::multibyte_wctob:case Operation::multibyte_mbrtowc:case Operation::multibyte_mbrlen:case Operation::multibyte_mbsnrtowcs:case Operation::multibyte_mbsrtowcs:case Operation::multibyte_mbsinit:return Fault::unsupported_service;
+        case Operation::thread_once:{a64::ServiceState state;state.registers=r;const auto fault=once_operation(state,false);r=state.registers;return fault;}
+        case Operation::scan:case Operation::scan_list:{a64::ServiceState state;state.registers=r;const auto fault=scanning(state,false,operation==Operation::scan_list);r=state.registers;return fault;}
+        case Operation::character_wide_control:case Operation::character_alnum:case Operation::character_alpha:case Operation::character_blank:case Operation::character_control:case Operation::character_digit:case Operation::character_graph:case Operation::character_lower:case Operation::character_print:case Operation::character_punct:case Operation::character_space:case Operation::character_upper:case Operation::character_xdigit:case Operation::character_to_lower:case Operation::character_to_upper:return Fault::unsupported_service;
+        case Operation::locale_new:case Operation::locale_duplicate:case Operation::locale_free:case Operation::locale_use:case Operation::locale_set:case Operation::locale_conventions:case Operation::locale_width:return Fault::unsupported_service;
         case Operation::integer_unsigned:case Operation::integer_signed:case Operation::integer_atoi:case Operation::integer_atol:return Fault::unsupported_service;
         case Operation::stdio_open:case Operation::stdio_close:case Operation::stdio_read:case Operation::stdio_write:case Operation::stdio_getc:case Operation::stdio_gets:case Operation::stdio_eof:case Operation::stdio_error:case Operation::stdio_clear:case Operation::stdio_fd:case Operation::stdio_flush:return Fault::unsupported_service;
         case Operation::rw_read:case Operation::rw_write:case Operation::rw_tryread:case Operation::rw_trywrite:case Operation::rw_unlock:case Operation::rw_init:case Operation::rw_destroy:case Operation::rw_attr_init:case Operation::rw_attr_destroy:case Operation::rw_attr_setshared:case Operation::rw_attr_getshared:case Operation::rw_attr_setkind:case Operation::rw_attr_getkind:return Fault::unsupported_service;
@@ -300,10 +515,80 @@ struct GuestPosixServices::Impl {
             if(!memory.write(address,bytes))return error(r,guest_efault,true);
             ++directory.position;r[0]=address;return Fault::none;
         }
+        case Operation::dynamic_open:case Operation::dynamic_symbol:case Operation::dynamic_close:case Operation::dynamic_error: {
+            const auto fault=dynamic_linker.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::dynamic_open),r);
+            if(fault!=Fault::none){rejection=dynamic_linker.rejection();++stats.rejected_operations;}
+            return fault;
+        }
+        case Operation::key_create:case Operation::key_delete:case Operation::key_get:case Operation::key_set: {
+            const auto fault=specific.invoke(static_cast<unsigned>(operation)-static_cast<unsigned>(Operation::key_create),threads.tid(),threads.tls(),r);
+            if(fault!=Fault::none){rejection="pthread key: invalid guest access or logical owner state";++stats.rejected_operations;}
+            return fault;
+        }
+        case Operation::auxiliary_value:
+            // Full-width unsigned-long key. Present zero is success, not absence.
+            if(r[0]==16){r[0]=a64::guest_hwcap;return Fault::none;}
+            if(r[0]==26){r[0]=a64::guest_hwcap2;return Fault::none;}
+            return error(r,2,true); // ENOENT; no invented Linux process pointers/data.
+        case Operation::system_information:
+            // No Linux system snapshot provider; never fabricate physical/load/swap data.
+            return error(r,38);
+        case Operation::process_wait:return wait_operation(r,r[0],r[2]);
+        case Operation::process_trace:
+            // Guest tracing has no backend, parent trace relationship or stop/wait model.
+            // Refuse before interpreting request/pid/pointers; never expose host debugging.
+            return error(r,38);
+        case Operation::process_fork:
+            // No guest process cloning backend; never manufacture a child PID.
+            return error(r,38);
+        case Operation::system_property: {
+            const auto fault=get_system_property(memory,r);
+            if(fault!=Fault::none){rejection="system property: bounded name or guest output unavailable";++stats.rejected_operations;}
+            return fault;
+        }
+        case Operation::error_description: {
+            const auto fault=error_strings.invoke(r);
+            if(fault!=Fault::none){rejection=error_strings.rejection();++stats.rejected_operations;}
+            return fault;
+        }
+        case Operation::thread_set_name:case Operation::thread_get_name:
+            return threads.thread_name(r,operation==Operation::thread_set_name);
+        case Operation::process_control:
+            if(static_cast<std::uint32_t>(r[0])==15 || static_cast<std::uint32_t>(r[0])==16){
+                const bool set=static_cast<std::uint32_t>(r[0])==15;
+                const auto fault=threads.thread_name(r,set,true);
+                return fault!=Fault::none?fault:r[0]?error(r,static_cast<std::uint32_t>(r[0])):Fault::none;
+            }
+            // Linux prctl specifies EINVAL for controls unavailable on this system.
+            // LPAC/job restrictions are not Linux dumpability, Yama or prctl state.
+            // Refuse without reading variadic arguments or changing host authority.
+            return error(r,22);
+        case Operation::thread_signal: {
+            a64::ServiceState state;state.registers=r;const auto fault=thread_signal_operation(state,false);r=state.registers;return fault;
+        }
         case Operation::system_call: {
+            if(r[0]==131){a64::ServiceState state;state.registers=r;const auto fault=thread_signal_operation(state,false,true);r=state.registers;return fault;}
+            if(r[0]==260)return wait_operation(r,r[1],r[3]); // arm64 wait4; no child/output access.
             Operation target;
             // Android arm64 asm-generic syscall numbers, using the existing guest providers.
             switch(r[0]){
+            case 34:target=Operation::directory_create_at;break;
+            case 35:target=Operation::file_unlink_at;break;
+            case 38:target=Operation::file_rename_at;break;
+            case 48:target=Operation::access_at;break;
+            case 56:target=Operation::open_at;break;
+            case 132:target=Operation::signal_stack;break;
+            case 222:target=Operation::memory_map;break;
+            case 215:target=Operation::memory_unmap;break;
+            case 226:target=Operation::memory_protect;break;
+            case 163:target=Operation::resource_limit;break;
+            case 164:target=Operation::resource_set_limit;break;
+            case 167:target=Operation::process_control;break;
+            case 179:target=Operation::system_information;break;
+            case 62:target=Operation::file_descriptor_seek;break;
+            case 78:target=Operation::file_read_link_at;break;
+            case 80:target=Operation::file_descriptor_stat;break;
+            case 174:case 175:case 176:case 177:target=Operation::file_user_id;break;
             case 94:target=Operation::process_exit;break;
             case 101:target=Operation::sleep_nanos;break;
             case 19:target=Operation::event_create;break;
@@ -317,7 +602,9 @@ struct GuestPosixServices::Impl {
             default:return error(r,38);
             }
             // libc syscall(number,...) places the six kernel arguments in x1..x6.
+            const bool kernel_access=r[0]==48;
             for(unsigned i=0;i<6;++i)r[i]=r[i+1];
+            if(kernel_access)r[3]=0; // faccessat syscall has three arguments.
             return dispatch(target,r,full_frame);
         }
         case Operation::string_copy:case Operation::string_cat:
@@ -370,16 +657,51 @@ struct GuestPosixServices::Impl {
             return Fault::none;
         }
         case Operation::resource_limit: {
-            const auto resource=static_cast<std::int32_t>(r[0]);
-            if(resource<0 || resource>=16)return error(r,guest_einval);
-            // The guest runtime has no core-file producer. Its enforced core limit is zero.
-            // Do not present Windows limits or invented Linux defaults as guest limits.
-            if(resource!=4)return error(r,38); // ENOSYS: this resource accounting is not implemented.
+            const auto resource=static_cast<std::uint32_t>(r[0]);
+            if(resource>=16)return error(r,guest_einval);
+            if(resource!=4 && resource!=7)return error(r,38);
             if(!memory.accessible(r[1],16,a64::Permission::write))return error(r,guest_efault);
-            const std::array<std::uint8_t,16> limit{};
+            std::array<std::uint8_t,16> limit{};
+            if(resource==7){
+                const auto soft=little<8>(descriptors.descriptor_soft_limit()),hard=little<8>(descriptors.descriptor_hard_limit());
+                std::copy(soft.begin(),soft.end(),limit.begin());std::copy(hard.begin(),hard.end(),limit.begin()+8);
+            }
+            // CORE remains zero: this guest runtime has no core-file producer.
             if(!memory.write(r[1],limit))return error(r,guest_efault);
             r[0]=0;return Fault::none;
         }
+        case Operation::resource_set_limit: {
+            // Linux setrlimit copies the complete user input before resource checks.
+            std::array<std::uint8_t,16> limit{};
+            if(!memory.read(r[1],limit))return error(r,guest_efault);
+            const auto resource=static_cast<std::uint32_t>(r[0]);
+            if(resource>=16)return error(r,guest_einval);
+            std::uint64_t soft=0,hard=0;
+            for(unsigned i=0;i<8;++i){soft|=std::uint64_t{limit[i]}<<(8*i);hard|=std::uint64_t{limit[i+8]}<<(8*i);}
+            if(soft>hard)return error(r,guest_einval);
+            if(resource==4){if(hard)return error(r,1);r[0]=0;return Fault::none;}
+            if(resource!=7)return error(r,38);
+            if(hard>descriptors.descriptor_hard_limit())return error(r,1);
+            if(!descriptors.set_descriptor_limits(soft,hard))return error(r,guest_einval);
+            r[0]=0;return Fault::none;
+        }
+        case Operation::system_configuration: {
+            // Android selector numbers are an ABI, independent of the Windows CRT.
+            const auto name=static_cast<std::int32_t>(r[0]);
+            switch(name){
+            case 0x06: r[0]=100;return Fault::none; // Android USER_HZ accounting unit, not host scheduler frequency.
+            case 0x0b: r[0]=descriptors.descriptor_soft_limit();return Fault::none;
+            case 0x27: case 0x28: r[0]=a64::GuestMemory::page_size;return Fault::none;
+            case 0x4c: r[0]=NativeThreadOptions::minimum_stack_size;return Fault::none;
+            default: break;
+            }
+            const bool legacy=name==0x0f || name==0x21 || (name>=0x2a && name<=0x2d);
+            if(legacy || name<0 || (name>0x55 && name<0x60) || name>0x9e)return error(r,guest_einval);
+            rejection="sysconf: recognized Android query is not implemented";
+            ++stats.rejected_operations;return Fault::unsupported_service;
+        }
+        case Operation::page_size:
+            r[0]=a64::GuestMemory::page_size;return Fault::none;
         case Operation::process_id:
             r[0]=host::current_process_id();return Fault::none;
         case Operation::process_probe: {
@@ -407,7 +729,12 @@ struct GuestPosixServices::Impl {
             return Fault::unsupported_service;
         case Operation::create_thread:
         case Operation::join_thread: {
-            const auto fault=operation==Operation::create_thread?threads.create(r):threads.join(r);
+            NativeThreadOptions options;
+            if(operation==Operation::create_thread && r[1]){
+                const auto code=thread_attributes.read(r[1],options);
+                if(code==14)return Fault::read;if(code){r[0]=code;return Fault::none;}
+            }
+            const auto fault=operation==Operation::create_thread?threads.create(r,options):threads.join(r);
             stats.threads_created=threads.created;stats.threads_started=threads.started;stats.threads_joined=threads.joined;
             if(fault!=Fault::none){rejection=threads.rejection();++stats.rejected_operations;}return fault;
         }
@@ -432,6 +759,7 @@ struct GuestPosixServices::Impl {
             ++stats.clock_reads;r[0]=0;return Fault::none;
         }
         case Operation::local_time:return calendar.localtime(r,threads.error_address());
+        case Operation::calendar_format:return calendar.strftime(r,threads.error_address());
         case Operation::epoch_time: {
             host::EpochTime now;
             const auto status=time.read_wall_time(now);
@@ -504,6 +832,67 @@ struct GuestPosixServices::Impl {
                 return Fault::read;
             return memory.write(r[0], bytes) ? Fault::none : Fault::write;
         }
+        case Operation::string_compare:
+        case Operation::string_compare_n:
+        case Operation::string_copy_n:
+        case Operation::string_find_char:
+        case Operation::string_find_last_char:
+        case Operation::string_find_text:
+        case Operation::string_compare_bytes:
+        case Operation::string_find_byte:
+        case Operation::string_find_bytes:
+        case Operation::string_checked_length:
+        case Operation::string_checked_find_char:
+        case Operation::string_checked_find_last_char:
+        case Operation::string_checked_copy_n:
+        case Operation::string_checked_copy_n_source:
+        case Operation::string_checked_move:
+            return Fault::unsupported_service;
+        case Operation::checked_read:case Operation::checked_write:case Operation::checked_read_link:case Operation::checked_read_link_at:
+        case Operation::thread_attr_init:case Operation::thread_attr_destroy:case Operation::thread_attr_setdetach:case Operation::thread_attr_getdetach:case Operation::thread_attr_setstacksize:case Operation::thread_attr_getstacksize:case Operation::thread_attr_setguard:case Operation::thread_attr_getguard:case Operation::thread_attr_getstack:case Operation::thread_getattr:case Operation::thread_detach:return Fault::unsupported_service;
+        case Operation::signal_stack:return Fault::unsupported_service;
+        case Operation::checked_open:
+        case Operation::open_at:case Operation::checked_open_at:case Operation::access_at:
+        case Operation::file_remove:case Operation::file_unlink:case Operation::file_unlink_at:case Operation::file_remove_directory:
+        case Operation::file_read_link:case Operation::file_read_link_at:case Operation::file_descriptor_stat:case Operation::file_descriptor_seek:case Operation::file_user_id:return Fault::unsupported_service;
+        case Operation::heap_information: {
+            // Bionic LP64 returns this 80-byte aggregate indirectly through x8.
+            // The page allocator retains no free arenas, bins or trim cache.
+            std::array<std::uint8_t,80> output{};
+            for(const auto [field,value]:std::array{std::pair{4U,stats.allocated_bytes},std::pair{5U,heap_peak},std::pair{7U,stats.allocated_bytes}}){
+                const auto encoded=little<8>(value);std::copy(encoded.begin(),encoded.end(),output.begin()+field*8);
+            }
+            return memory.write(r[8],output)?Fault::none:Fault::write;
+        }
+        case Operation::allocate_zero: {
+            const auto count=r[0],element=r[1];
+            if(element && count>UINT64_MAX/element)return error(r,guest_enomem,true);
+            r[0]=count*element;
+            // New guarded Windows MEM_COMMIT pages are zero-initialized.
+            return dispatch(Operation::allocate,r);
+        }
+        case Operation::resize_allocation: {
+            const auto address=r[0],requested=r[1];
+            if(!address){r[0]=requested;return dispatch(Operation::allocate,r);}
+            const auto old=allocations.find(address);
+            if(old==allocations.end()){
+                rejection="realloc: address is not a live allocation";++stats.rejected_operations;return Fault::invalid_call;
+            }
+            if(!requested){const auto fault=dispatch(Operation::release,r);if(fault==Fault::none)r[0]=0;return fault;}
+            if(requested>maximum_heap)return error(r,guest_enomem,true);
+            if(requested<=old->second.mapped){old->second.requested=static_cast<std::size_t>(requested);return Fault::none;}
+            const auto retained=std::min<std::size_t>(old->second.requested,static_cast<std::size_t>(requested));
+            std::vector<std::uint8_t> saved(retained);
+            if(retained && !memory.read(address,saved))return Fault::read;
+            r[0]=requested;const auto allocated=dispatch(Operation::allocate,r);
+            if(allocated!=Fault::none || !r[0])return allocated;
+            const auto replacement=r[0];
+            if(retained && !memory.write(replacement,saved)){
+                (void)dispatch(Operation::release,r);r[0]=address;return Fault::write;
+            }
+            r[0]=address;const auto released=dispatch(Operation::release,r);
+            r[0]=replacement;return released;
+        }
         case Operation::allocate: {
             if (r[0] > maximum_heap || allocations.size() >= 4096)
                 return error(r, guest_enomem, true);
@@ -512,7 +901,7 @@ struct GuestPosixServices::Impl {
             if (size > maximum_heap - stats.allocated_bytes || next_heap + size > 0x50000000)
                 return error(r, guest_enomem, true);
             const auto address = next_heap;
-            const auto [it, inserted] = allocations.emplace(address, size);
+            const auto [it, inserted] = allocations.emplace(address, Allocation{size,static_cast<std::size_t>(r[0])});
             if (!inserted)
                 return error(r, guest_enomem, true);
             try {
@@ -524,6 +913,7 @@ struct GuestPosixServices::Impl {
             next_heap +=
                 size + 4096; // Unmapped page between allocations; addresses are not immediately reused.
             stats.allocated_bytes += size;
+            heap_peak=std::max(heap_peak,stats.allocated_bytes);
             ++stats.allocations;
             r[0] = address;
             return Fault::none;
@@ -538,7 +928,7 @@ struct GuestPosixServices::Impl {
                 return Fault::invalid_call;
             }
             memory.unmap(it->first);
-            stats.allocated_bytes -= it->second;
+            stats.allocated_bytes -= it->second.mapped;
             allocations.erase(it);
             ++stats.frees;
             return Fault::none;
@@ -559,27 +949,6 @@ struct GuestPosixServices::Impl {
                 result=descriptors.duplicate_to(static_cast<std::int32_t>(r[0]),static_cast<std::int32_t>(r[1]));
             } else if(operation==Operation::file_lock){
                 result=descriptors.lock(static_cast<std::int32_t>(r[0]),static_cast<std::uint32_t>(r[1]));
-            } else if (operation == Operation::open) {
-                std::string name;
-                for (std::size_t i = 0; i < 128; ++i) {
-                    std::array<std::uint8_t, 1> c{};
-                    if (r[0] >= a64::GuestMemory::address_limit ||
-                        i >= a64::GuestMemory::address_limit - r[0] || !memory.read(r[0] + i, c))
-                        return error(r, guest_efault);
-                    if (!c[0])
-                        break;
-                    name.push_back(static_cast<char>(c[0]));
-                }
-                const auto flags = static_cast<std::uint32_t>(r[1]);
-                // Android O_ACCMODE, O_CREAT, O_EXCL, O_TRUNC, O_CLOEXEC. No guest exec exists.
-                if ((flags & ~std::uint32_t{3 | 64 | 128 | 512 | 0x80000}) || (flags & 3) == 3)
-                    return error(r, 95); // EOPNOTSUPP: unsupported flags are never silently ignored.
-                if ((flags & 64) && static_cast<std::uint32_t>(r[2]) != 0600)
-                    return error(r,
-                                 95); // One guest identity per scope; host ACL isolation is a Phase 7 gate.
-                result = files->open(name, {(flags & 3) != 1, (flags & 3) != 0, (flags & 64) != 0,
-                                            (flags & 128) != 0, (flags & 512) != 0});
-                if(result.error==host::FileError::none)descriptors.set_close_on_exec(static_cast<int>(result.value),(flags&0x80000)!=0);
             } else if (operation == Operation::close) {
                 result = descriptors.close(static_cast<std::int32_t>(r[0]));
             } else {
@@ -634,6 +1003,10 @@ struct GuestPosixServices::Impl {
                 return error(r, 28);
             case host::FileError::would_block:
                 return error(r,11);
+            case host::FileError::is_directory:return error(r,21);
+            case host::FileError::not_directory:return error(r,20);
+            case host::FileError::not_empty:return error(r,39);
+            case host::FileError::not_seekable:return error(r,29);
             case host::FileError::io:
                 return error(r, guest_eio);
             }
@@ -682,8 +1055,12 @@ GuestPosixServices::GuestPosixServices(a64::GuestMemory &memory, const a64::AppC
     memory.map(errno_address, 4096, a64::read_write);
     impl_->errno_owned = true;
     impl_->threads.initialize();
+    impl_->locales.initialize();
+    impl_->descriptors.initialize_standard_streams([p=impl_.get()](int fd,std::span<const std::uint8_t> bytes){return p->logging.write_stream(fd,bytes);});
+    impl_->stdio.initialize();
 }
 GuestPosixServices::~GuestPosixServices() = default;
+void GuestPosixServices::set_address_lookup(AddressLookup lookup){impl_->address_lookup=std::move(lookup);}
 bool GuestPosixServices::has_library(std::string_view library) const noexcept {
     return library == "libz.so" || library == "libc.so" || library == "libm.so" || library == "libdl.so" || library == "liblog.so" || library == "libstdc++.so";
 }
@@ -701,13 +1078,23 @@ std::optional<elf::GuestSymbol> GuestPosixServices::resolve(std::string_view lib
             return elf::GuestSymbol{std::string(name),"liblog.so","LIBLOG",log_trampoline+i*8,8,2};
         return std::nullopt;
     }
+    if(library=="libdl.so" && (version.empty() || version=="LIBC")){
+        if(name=="dladdr")return resolve("libc.so",name,version);
+        for(std::size_t i=0;i<extended_entries.size();++i)
+            if(extended_entries[i].operation>=Operation::dynamic_open && extended_entries[i].operation<=Operation::dynamic_error && extended_entries[i].name==name)
+                return elf::GuestSymbol{std::string(name),"libdl.so","LIBC",extended_trampoline+i*8,8,2};
+        return std::nullopt;
+    }
     if (library != "libc.so" || (!version.empty() && version != "LIBC"))
         return std::nullopt;
+    if(name=="__sF")return elf::GuestSymbol{std::string(name),"libc.so","LIBC",NativeStdio::standard_base,456,1};
+    constexpr std::array<std::string_view,3> standard_names{"stdin","stdout","stderr"};
+    for(unsigned i=0;i<3;++i)if(name==standard_names[i])return elf::GuestSymbol{std::string(name),"libc.so","LIBC",NativeStdio::standard_base+512+i*8,8,1};
     for (std::size_t i = 0; i < entries.size(); ++i)
         if (entries[i].name == name)
             return elf::GuestSymbol{std::string(name), "libc.so", "LIBC", trampoline_base + i * 8, 8, 2};
     for(std::size_t i=0;i<extended_entries.size();++i)
-        if(extended_entries[i].name==name)return elf::GuestSymbol{std::string(name),"libc.so","LIBC",extended_trampoline+i*8,8,2};
+        if(extended_entries[i].name==name && !(extended_entries[i].operation>=Operation::dynamic_open && extended_entries[i].operation<=Operation::dynamic_error))return elf::GuestSymbol{std::string(name),"libc.so","LIBC",extended_trampoline+i*8,8,2};
     return std::nullopt;
 }
 a64::Fault GuestPosixServices::invoke(std::uint32_t service, Address instruction,
@@ -751,17 +1138,52 @@ a64::Fault GuestPosixServices::invoke_frame(std::uint32_t service,Address instru
     auto &p=*impl_;
     if(p.app.process_state->exit_status())return Fault::process_exit;
     if(p.signals.terminated())return Fault::invalid_call;
+    if(const auto operation=registered_operation(service,instruction);operation && *operation==Operation::thread_once){
+        ++p.stats.calls;
+        try{return p.once_operation(state,true);}catch(...){p.rejection="pthread_once: callback marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+    }
+    if(const auto operation=registered_operation(service,instruction);operation && (*operation==Operation::thread_signal || (*operation==Operation::system_call && state.registers[0]==131))){
+        ++p.stats.calls;
+        try{return p.thread_signal_operation(state,true,*operation==Operation::system_call);}
+        catch(...){p.rejection="tgkill: logical signal marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+    }
+    if(const auto operation=registered_operation(service,instruction);operation && (*operation==Operation::signal_stack || (*operation==Operation::system_call && state.registers[0]==132))){
+        ++p.stats.calls;
+        if(*operation==Operation::system_call)for(unsigned i=0;i<6;++i)state.registers[i]=state.registers[i+1];
+        try{const auto fault=p.signals.alternate_stack(state,true);if(fault!=Fault::none){p.rejection="sigaltstack: trusted frame or logical signal stack failed";++p.stats.rejected_operations;}else if(state.registers[0]==UINT64_MAX)++p.stats.errors;return fault;}catch(...){p.rejection="sigaltstack: logical signal stack marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+    }
+
     if(const auto selected=registered_operation(service,instruction)){
         const auto operation=*selected;
-        if(operation==Operation::read || operation==Operation::write || operation==Operation::system_call || operation==Operation::poll_descriptors || (operation>=Operation::sleep_seconds && operation<=Operation::sleep_nanos)){
+        if(operation==Operation::process_abort){++p.stats.calls;return p.abort_operation(state,true);}
+        if(operation==Operation::execute_list_path){++p.stats.calls;return p.execute_operation(state,true);}
+        if(operation==Operation::poll_descriptors){
+            ++p.stats.calls;
+            try{const auto fault=p.polling.invoke(p.threads.error_address(),state.registers,true,&state);
+                p.stats.threads_created=p.threads.created;p.stats.threads_started=p.threads.started;p.stats.threads_joined=p.threads.joined;
+                if(fault!=Fault::none){p.rejection="poll: signal delivery or nested native work failed";++p.stats.rejected_operations;}
+                else if(state.registers[0]==UINT64_MAX)++p.stats.errors;return fault;}
+            catch(...){p.rejection="poll: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+        }
+        if((operation>=Operation::sleep_seconds && operation<=Operation::sleep_nanos) || (operation==Operation::system_call && state.registers[0]==101)){
+            ++p.stats.calls;
+            auto sleep=operation;
+            if(operation==Operation::system_call){for(unsigned i=0;i<6;++i)state.registers[i]=state.registers[i+1];sleep=Operation::sleep_nanos;}
+            try{const auto fault=p.sleeping.invoke(static_cast<unsigned>(sleep)-static_cast<unsigned>(Operation::sleep_seconds),p.threads.error_address(),state.registers,true,&state);
+                p.stats.threads_created=p.threads.created;p.stats.threads_started=p.threads.started;p.stats.threads_joined=p.threads.joined;
+                if(fault!=Fault::none){p.rejection="native sleep: signal delivery or nested native work failed";++p.stats.rejected_operations;}
+                else if(state.registers[0]==UINT64_MAX)++p.stats.errors;return fault;}
+            catch(...){p.rejection="native sleep: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+        }
+        if(operation==Operation::read || operation==Operation::write || (operation>=Operation::checked_read && operation<=Operation::checked_read_link_at) || operation==Operation::system_call || operation==Operation::poll_descriptors || (operation>=Operation::sleep_seconds && operation<=Operation::sleep_nanos)){
             ++p.stats.calls;try{return p.dispatch(operation,state.registers,true);}catch(...){p.rejection="descriptor: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
         }
-        if(operation>=Operation::format_list && operation<=Operation::format_checked_direct){++p.stats.calls;return p.format_operation(operation,state,true);}
+        if((operation>=Operation::format_list && operation<=Operation::format_checked_direct) || operation==Operation::format_checked_unbounded_list){++p.stats.calls;return p.format_operation(operation,state,true);}
         if(operation>=Operation::jump_save && operation<=Operation::jump_restore){
             ++p.stats.calls;try{return p.jump_operation(operation,state,true);}catch(...){p.rejection="setjmp/longjmp: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
         }
-        if(operation==Operation::cond_wait){
-            ++p.stats.calls;try{return p.condition_operation(operation,state.registers,true);}catch(...){p.rejection="pthread condition: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
+        if(operation==Operation::cond_wait || operation==Operation::cond_timedwait){
+            ++p.stats.calls;try{return p.condition_operation(operation,state.registers,true,&state);}catch(...){p.rejection="pthread condition: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
         }
         if(operation==Operation::pthread_mask || operation==Operation::process_mask || (operation>=Operation::signal_handler && operation<=Operation::signal_wait)){
             ++p.stats.calls;try{return operation==Operation::pthread_mask || operation==Operation::process_mask?p.mask_operation(operation,state,true):p.signal_operation(operation,state,true);}catch(...){p.rejection="signal: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
@@ -771,19 +1193,52 @@ a64::Fault GuestPosixServices::invoke_frame(std::uint32_t service,Address instru
         ++p.stats.calls;const auto fault=p.logging.invoke(log_entries[service-log_service],state,true);
         p.stats.log_messages=p.logging.messages();if(fault!=Fault::none){p.rejection=p.logging.rejection();++p.stats.rejected_operations;}return fault;
     }
-    if(const auto operation=registered_operation(service,instruction);operation && *operation==Operation::scan){
-        ++p.stats.calls;try{return p.scanning(state,true);}catch(...){p.rejection="sscanf: host marshalling failure";++p.stats.rejected_operations;return Fault::unsupported_service;}
+    if(const auto operation=registered_operation(service,instruction);operation && *operation==Operation::thread_getattr){
+        ++p.stats.calls;return p.thread_attributes.invoke(ThreadAttributeOperation::get_current,state.registers,&state);
+    }
+    if(const auto operation=registered_operation(service,instruction);operation && (*operation==Operation::scan || *operation==Operation::scan_list)){
+        ++p.stats.calls;try{return p.scanning(state,true,*operation==Operation::scan_list);}catch(...){p.rejection="scanf: host marshalling failure";++p.stats.rejected_operations;return Fault::unsupported_service;}
     }
     return invoke(service,instruction,state.registers);
+}
+bool GuestPosixServices::event_pending() noexcept {
+    try{return impl_->signals.terminated() || impl_->signals.ready();}catch(...){return true;}
+}
+a64::Fault GuestPosixServices::checkpoint(a64::ServiceState &state) noexcept {
+    auto &p=*impl_;
+    if(p.app.process_state->exit_status())return Fault::process_exit;
+    try{return p.signals.deliver_pending(state,true);}
+    catch(...){p.rejection="signal checkpoint: host marshalling failed";++p.stats.rejected_operations;return Fault::unsupported_service;}
 }
 std::optional<GuestPosixServices::ThreadBinding> GuestPosixServices::exchange_thread_binding(std::optional<ThreadBinding> value){return impl_->threads.exchange_binding(value);}
 std::uint64_t GuestPosixServices::signal_mask(){return impl_->threads.signal_mask();}
 std::uint64_t GuestPosixServices::binding_signal_mask(const ThreadBinding &binding){return impl_->threads.binding_signal_mask(binding);}
 void GuestPosixServices::set_signal_runner(SignalRunner runner){impl_->signals.runner(std::move(runner));}
+void GuestPosixServices::set_once_runner(OnceRunner runner){impl_->once.runner(std::move(runner));}
 void GuestPosixServices::set_managed_priority_service(int baseline,host::PriorityService service){impl_->threads.managed_priority(baseline,std::move(service));}
 host::PriorityResult GuestPosixServices::current_thread_priority(std::optional<std::int32_t> nice){return impl_->threads.priority(0,0,nice);}
 std::optional<std::uint64_t> GuestPosixServices::thread_exit_value(Address tls) const noexcept {return impl_->threads.exit_value(tls);}
 void GuestPosixServices::request_thread_exit(std::uint64_t value) noexcept {impl_->threads.request_exit(value);}
+GuestPosixServices::ThreadExecution GuestPosixServices::finish_current_thread(const DestructorRunner &runner,std::uint64_t budget) {
+    auto &p=*impl_;
+    if(const auto status=p.app.process_state->exit_status()){
+        ThreadExecution out;out.result.fault=Fault::process_exit;out.result.detail=*status;out.finalization_failed=true;return out;
+    }
+    p.threads.begin_finalization();
+    struct End {NativeThreads &threads;~End(){threads.end_finalization();}} end{p.threads};
+    const auto checked=[&](Address entry,Address value,std::uint64_t remaining){
+        p.app.process_state->checkpoint();
+        return runner(entry,value,remaining);
+    };
+    try {
+        auto out=p.specific.finalize(p.threads.tid(),p.threads.tls(),checked,budget);
+        out.finalization_failed=out.result.fault!=Fault::none || !out.result.returned;
+        if(out.finalization_failed){p.rejection="pthread key destructor: guest finalization failed";++p.stats.rejected_operations;}
+        return out;
+    }catch(const ProcessExit &exit){p.app.process_state->request_exit(exit.status);throw;}
+    catch(const ThreadExit &exit){p.threads.request_exit(exit.value);throw;}
+}
+void GuestPosixServices::discard_thread(std::uint32_t id,Address tls) noexcept {impl_->threads.retire(id,tls);}
 void GuestPosixServices::set_thread_runner(ThreadRunner runner){impl_->threads.runner(std::move(runner));}
 a64::Address GuestPosixServices::thread_pointer()const noexcept{return impl_->threads.tls();}
 bool GuestPosixServices::is_main_native_thread()const noexcept{return impl_->threads.tid()==impl_->tid;}
@@ -793,6 +1248,10 @@ a64::Fault GuestPosixServices::run_pending_threads(std::uint64_t budget) noexcep
         if(fault!=Fault::none){p.rejection=p.threads.rejection();++p.stats.rejected_operations;}return fault;
     }catch(...){p.rejection="Native thread pump failed";return a64::Fault::windows_service;}
 }
-const ServiceMetrics &GuestPosixServices::metrics() const noexcept { return impl_->stats; }
+const ServiceMetrics &GuestPosixServices::metrics() const noexcept { impl_->stats.log_messages=impl_->logging.messages();return impl_->stats; }
 std::string_view GuestPosixServices::last_rejection() const noexcept { return impl_->rejection; }
 } // namespace aether::bionic
+
+namespace aether::bionic {
+void GuestPosixServices::set_dynamic_linker(DynamicLinkCallbacks callbacks){impl_->dynamic_linker.callbacks(std::move(callbacks));}
+}

@@ -81,6 +81,7 @@ struct PrivateStorage::Impl {
     DirectoryLease lease;
     std::unique_ptr<host::HostFileService> files;
     const std::size_t name_limit;
+    std::vector<std::uint8_t> owner_sid;
     explicit Impl(const std::filesystem::path &root, StoragePurpose purpose)
         : path(root), name_limit(purpose == StoragePurpose::audit ? maximum_audit_names : maximum_names) {
         require(purpose == StoragePurpose::private_files || purpose == StoragePurpose::audit,
@@ -108,6 +109,7 @@ struct PrivateStorage::Impl {
         require(GetTokenInformation(token.get(), TokenUser, bytes.data(), length, &length),
                 "Cannot read owner identity");
         const auto owner = reinterpret_cast<const TOKEN_USER *>(bytes.data())->User.Sid;
+        owner_sid.resize(GetLengthSid(owner));require(CopySid(static_cast<DWORD>(owner_sid.size()),owner_sid.data(),owner),"Cannot retain storage owner");
         LocalOwner owner_text;
         require(ConvertSidToStringSidW(owner, reinterpret_cast<LPWSTR *>(&owner_text.value)),
                 "Cannot encode owner SID");
@@ -141,35 +143,49 @@ struct PrivateStorage::Impl {
         if (purpose == StoragePurpose::private_files)
             files = std::make_unique<host::HostFileService>(path);
         require(count_names() <= name_limit, "Protected storage already exceeds its file quota");
-        // Existing files can have explicit ACLs that do not inherit the protected root policy.
-        // Inspect every bounded child before permitting any worker to use this storage.
-        for (const auto &entry : std::filesystem::directory_iterator(path)) {
-            const auto name = entry.path().filename().string();
-            require(safe_name(name) || (purpose == StoragePurpose::private_files && name.starts_with('@') &&
-                        safe_name(std::string_view(name).substr(1))), "Private storage has an unsupported name");
-            UniqueHandle file(CreateFileW(
-                entry.path().c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
-            BY_HANDLE_FILE_INFORMATION file_info{};
-            LARGE_INTEGER file_size{};
-            require(file && GetFileType(file.get()) == FILE_TYPE_DISK &&
-                        GetFileInformationByHandle(file.get(), &file_info) &&
-                        !(file_info.dwFileAttributes &
-                          (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
-                        file_info.nNumberOfLinks == 1 && GetFileSizeEx(file.get(), &file_size) &&
-                        file_size.QuadPart >= 0 && file_size.QuadPart <= 1024 * 1024,
-                    "Private storage has an unsafe or oversized existing file");
-            verify_acl(file.get(), owner, false);
-        }
+        // The bounded recursive scan verifies all existing objects before admitting a worker.
     }
-    std::size_t count_names() const {
-        std::size_t count = 0;
-        for (const auto &entry : std::filesystem::directory_iterator(path)) {
-            (void)entry;
-            if (++count > name_limit)
-                break;
+    std::size_t scan(const std::filesystem::path &parent,unsigned depth,std::size_t length,std::size_t &count) const {
+        // Ancestors remain held without delete sharing while child paths are inspected.
+        UniqueHandle held(CreateFileW(parent.c_str(),READ_CONTROL|FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+        BY_HANDLE_FILE_INFORMATION directory_info{};
+        require(held && GetFileInformationByHandle(held.get(),&directory_info) &&
+            (directory_info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) && !(directory_info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT),"Unsafe storage directory");
+        verify_acl(held.get(),const_cast<std::uint8_t*>(owner_sid.data()),true);
+        for(const auto &entry:std::filesystem::directory_iterator(parent)){
+            auto name=entry.path().filename().string();std::string_view logical=name;
+            if(depth==0 && files && logical.starts_with('@'))logical.remove_prefix(1);
+            require(safe_name(logical),"Private storage has an unsupported component");
+            const auto child_length=length+(length?1:0)+logical.size();
+            require(depth<host::private_path_depth && child_length<=host::private_path_limit,"Private storage path bound exceeded");
+            if(++count>name_limit)return count;
+            UniqueHandle child(CreateFileW(entry.path().c_str(),READ_CONTROL|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,
+                nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+            BY_HANDLE_FILE_INFORMATION info{};LARGE_INTEGER size{};
+            require(child && GetFileType(child.get())==FILE_TYPE_DISK && GetFileInformationByHandle(child.get(),&info) &&
+                !(info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT),"Private storage has an unsafe object");
+            const bool child_directory=(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+            if(child_directory){
+                require(static_cast<bool>(files),"Audit storage cannot contain directories");
+                verify_acl(child.get(),const_cast<std::uint8_t*>(owner_sid.data()),true);
+                if(scan(entry.path(),depth+1,child_length,count)>name_limit)return count;
+            }else{
+                require(info.nNumberOfLinks==1 && GetFileSizeEx(child.get(),&size) && size.QuadPart>=0 &&
+                    static_cast<std::uint64_t>(size.QuadPart)<=host::private_file_size_limit,"Private storage has an unsafe or oversized file");
+                verify_acl(child.get(),const_cast<std::uint8_t*>(owner_sid.data()),false);
+            }
         }
         return count;
+    }
+    std::size_t count_names() const {std::size_t count=0;return scan(path,0,0,count);}
+    host::FileResult room(host::FileAccessScope scope,std::string_view name,int parent) const noexcept {
+        try{
+            const auto existing=parent<0?files->access(scope,name,0):files->access_relative(parent,name,0);
+            if(existing.error==host::FileError::none)return {0,host::FileError::none};
+            if(existing.error!=host::FileError::missing)return existing;
+            return count_names()>=name_limit?host::FileResult{-1,host::FileError::quota}:host::FileResult{0,host::FileError::none};
+        }catch(...){return {-1,host::FileError::io};}
     }
 };
 PrivateStorage::PrivateStorage(const std::filesystem::path &parent, std::uint64_t app_id,
@@ -191,16 +207,40 @@ host::FileResult PrivateStorage::list_directory(std::vector<host::DirectoryEntry
     return impl_->files ? impl_->files->list_directory(entries) : host::FileResult{-1,host::FileError::denied};
 }
 host::FileResult PrivateStorage::open(std::string_view name, host::FileOpen options) {
-    if (!impl_->files || !safe_name(name))
-        return {-1, host::FileError::denied};
-    try {
-        if (options.create && !std::filesystem::exists(impl_->path / std::string(name)) &&
-            impl_->count_names() >= maximum_names)
-            return {-1, host::FileError::quota};
-        return impl_->files->open(name, options);
-    } catch (...) {
-        return {-1, host::FileError::io};
-    }
+    return open_scoped(host::FileAccessScope::files_leaf, name, options);
+}
+host::FileResult PrivateStorage::open_scoped(host::FileAccessScope scope,std::string_view name,host::FileOpen options) {
+    if(!impl_->files || (scope!=host::FileAccessScope::files_leaf && scope!=host::FileAccessScope::data_leaf) || !host::valid_file_access(scope,name,0))return {-1,host::FileError::denied};
+    if(options.create){const auto room=impl_->room(scope,name,-1);if(room.error!=host::FileError::none)return room;}
+    return impl_->files->open_scoped(scope,name,options);
+}
+host::FileResult PrivateStorage::make_directory(host::FileAccessScope scope,std::string_view name,std::uint32_t mode) noexcept {
+    if(!impl_->files)return {-1,host::FileError::denied};if(mode!=0700)return {-1,host::FileError::unsupported};
+    const auto room=impl_->room(scope,name,-1);if(room.error!=host::FileError::none)return room;
+    return impl_->files->make_directory(scope,name,mode);
+}
+host::FileResult PrivateStorage::open_directory(host::FileAccessScope scope,std::string_view name) {return impl_->files?impl_->files->open_directory(scope,name):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::directory_valid(int descriptor) noexcept {return impl_->files?impl_->files->directory_valid(descriptor):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::open_relative(int parent,std::string_view name,host::FileOpen options) {if(parent<0)return {-1,host::FileError::bad_descriptor};
+    if(!impl_->files)return {-1,host::FileError::denied};
+    if(options.create){const auto room=impl_->room(host::FileAccessScope::files_leaf,name,parent);if(room.error!=host::FileError::none)return room;}
+    return impl_->files->open_relative(parent,name,options);
+}
+host::FileResult PrivateStorage::open_directory_relative(int parent,std::string_view name) {if(parent<0)return {-1,host::FileError::bad_descriptor};return impl_->files?impl_->files->open_directory_relative(parent,name):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::make_directory_relative(int parent,std::string_view name,std::uint32_t mode) noexcept {if(parent<0)return {-1,host::FileError::bad_descriptor};
+    if(!impl_->files)return {-1,host::FileError::denied};if(mode!=0700)return {-1,host::FileError::unsupported};
+    const auto room=impl_->room(host::FileAccessScope::files_leaf,name,parent);if(room.error!=host::FileError::none)return room;
+    return impl_->files->make_directory_relative(parent,name,mode);
+}
+host::FileResult PrivateStorage::access_relative(int parent,std::string_view name,std::uint32_t mode) noexcept {if(parent<0)return {-1,host::FileError::bad_descriptor};return impl_->files?impl_->files->access_relative(parent,name,mode):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::remove_relative(int parent,std::string_view name,host::FileRemoveMode mode,bool directory_required) noexcept {if(parent<0)return {-1,host::FileError::bad_descriptor};return impl_->files?impl_->files->remove_relative(parent,name,mode,directory_required):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::rename_path(const host::FilePathRef &source,const host::FilePathRef &destination,host::FileRenameInfo &output) noexcept {
+    if(!impl_->files)return {-1,host::FileError::denied};
+    try{
+        // A rename adds no names, but all existing descendants must retain the protected ACL/profile.
+        if(impl_->count_names()>impl_->name_limit)return {-1,host::FileError::quota};
+        return impl_->files->rename_path(source,destination,output);
+    }catch(...){return {-1,host::FileError::io};}
 }
 host::FileResult PrivateStorage::observe_data_file(std::string_view name) {
     if (!impl_->files || !safe_name(name)) return {-1, host::FileError::denied};
@@ -216,9 +256,20 @@ host::FileResult PrivateStorage::write(int descriptor, std::span<const std::uint
         return {-1, host::FileError::denied};
     return impl_->files->write(descriptor, input);
 }
+host::FileResult PrivateStorage::metadata(int descriptor, host::FileMetadata &output) noexcept {
+    return impl_->files ? impl_->files->metadata(descriptor, output) : host::FileResult{-1, host::FileError::denied};
+}
+host::FileResult PrivateStorage::remove(host::FileAccessScope scope, std::string_view name, host::FileRemoveMode mode, bool directory_required) noexcept {
+    return impl_->files ? impl_->files->remove(scope, name, mode, directory_required) : host::FileResult{-1, host::FileError::denied};
+}
+host::FileResult PrivateStorage::seek(int descriptor, std::int64_t offset, unsigned whence) noexcept {
+    return impl_->files ? impl_->files->seek(descriptor, offset, whence) : host::FileResult{-1, host::FileError::denied};
+}
 host::FileResult PrivateStorage::flush(int descriptor) noexcept {
     return impl_->files ? impl_->files->flush(descriptor) : host::FileResult{-1, host::FileError::denied};
 }
+host::FileResult PrivateStorage::access_path(host::FileAccessScope scope,std::string_view name,std::uint32_t mode,bool directory_required) noexcept {return impl_->files?impl_->files->access_path(scope,name,mode,directory_required):host::FileResult{-1,host::FileError::denied};}
+host::FileResult PrivateStorage::access_relative_path(int parent,std::string_view name,std::uint32_t mode,bool directory_required) noexcept {if(parent<0)return {-1,host::FileError::bad_descriptor};return impl_->files?impl_->files->access_relative_path(parent,name,mode,directory_required):host::FileResult{-1,host::FileError::denied};}
 host::FileResult PrivateStorage::lock(int descriptor,std::uint32_t operation) noexcept {
     return impl_->files?impl_->files->lock(descriptor,operation):host::FileResult{-1,host::FileError::denied};
 }

@@ -1,6 +1,7 @@
 #include "scanning.hpp"
 #include <algorithm>
 #include <bitset>
+#include <bit>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -38,7 +39,37 @@ struct Arguments {
     bool full;
     unsigned gp = 2;
     Address stack;
+    bool list=false,loaded=false;
+    Address gr_top=0;
+    std::int32_t gr_offs=0;
+    Address word(Address address) {
+        std::array<std::uint8_t,8> bytes{};
+        if(!memory.read(address,bytes))throw Failure{Fault::read};
+        std::uint64_t value=0;for(unsigned i=0;i<8;++i)value|=std::uint64_t{bytes[i]}<<(i*8);
+        return value;
+    }
     Address next() {
+        if(list){
+            if(!loaded){
+                // Copy the indirect AAPCS64 cursor; scanf arguments are all pointers.
+                const auto pointer=state.registers[2];
+                if(!pointer || pointer>a64::GuestMemory::address_limit-28)throw Failure{Fault::read};
+                std::array<std::uint8_t,4> offset{};
+                if(!memory.read(pointer+24,offset))throw Failure{Fault::read};
+                std::uint32_t bits=0;for(unsigned i=0;i<4;++i)bits|=std::uint32_t{offset[i]}<<(i*8);
+                stack=word(pointer);gr_top=word(pointer+8);
+                gr_offs=std::bit_cast<std::int32_t>(bits);
+                if(gr_offs<0 && (gr_offs < -64 || gr_offs%8))unsupported();
+                loaded=true; // The unused SIMD bank supplies no scanf destination.
+            }
+            if(gr_offs<0){
+                const auto distance=static_cast<std::uint64_t>(-gr_offs);
+                if(gr_top<distance || (gr_top-distance)%8)throw Failure{Fault::read};
+                const auto value=word(gr_top-distance);gr_offs+=8;return value;
+            }
+            if(stack%8 || stack>a64::GuestMemory::address_limit-8)throw Failure{Fault::read};
+            const auto value=word(stack);stack+=8;return value;
+        }
         if (gp < 8) return state.registers[gp++];
         if (!full) unsupported();
         std::array<std::uint8_t, 8> bytes{};
@@ -190,11 +221,11 @@ Number integer(Input &input, const Instruction &item) {
 } // namespace
 
 a64::Fault scan_text(a64::GuestMemory &memory, a64::ServiceState &state, bool full_frame,
-                     a64::Address error_address) {
+                     a64::Address error_address,bool argument_list) {
     try {
         const auto instructions = format(memory, state.registers[1]);
         Input input{memory, state.registers[0]};
-        Arguments arguments{memory, state, full_frame, 2, state.stack_pointer};
+        Arguments arguments{memory, state, full_frame, 2, state.stack_pointer,argument_list};
         std::uint64_t assigned = 0;
         const auto finish = [&](bool input_failure) {
             // Bionic counts assignments here: suppression and %n do not prevent EOF.

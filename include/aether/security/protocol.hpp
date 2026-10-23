@@ -42,9 +42,15 @@ enum class Operation : std::uint16_t {
     local_calendar = 26, // Signed Unix seconds -> local calendar, existing wall-time consent.
     file_lock = 27, // Existing private-file token + flock operation; never a path/handle.
     file_access = 28, // Typed app-private namespace, safe leaf and R/W/X mask; no host path.
+    file_metadata = 29, // Existing private-file token; bounded metadata, no host path/ID.
+    file_seek = 30, // Existing token + signed offset bits + SEEK_SET/CUR/END.
+    file_remove = 31, // Typed private safe leaf/mode/directory requirement; exactly one removal attempt.
     activity_command = 32,
     activity_state = 33,
     activity_read_unavailable = 34, // Empty negative acknowledgement, only for a state read.
+    file_open_scoped = 35, // Typed private regular leaf; scope + open flags + safe leaf, opaque token reply.
+    file_path = 36, // Bounded scoped or owned-directory-relative operation; action/base/options/text.
+    file_rename = 37, // Two typed private endpoints; compact owned-descriptor relocation reply.
     audio_open = 40,
     audio_control = 41,
     audio_observe = 42,
@@ -97,4 +103,5 @@ std::string bounded_worker_error(std::string_view message);
 // App-owned terminal record, independent of an in-flight presentation/RPC sequence.
 Frame guest_exit_frame(std::uint64_t session, std::uint8_t status);
 std::uint8_t guest_exit_status(const Frame &frame, std::uint64_t session);
+
 } // namespace aether::security

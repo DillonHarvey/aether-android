@@ -110,6 +110,8 @@ struct Bridge::Impl {
     std::vector<std::string> loaded_roots;
     unsigned load_state = 0;
     bool on_load_active = false;
+    ModuleProvider module_provider;
+    bool dynamic_poisoned=false;
     const std::thread::id owner_thread = std::this_thread::get_id();
     std::size_t native_depth = 0;
     bool closed = false;
@@ -161,11 +163,15 @@ struct Bridge::Impl {
             runtime.bind_process_state(process);process->checkpoint();
             posix.set_managed_priority_service(runtime.thread_priority_baseline(),[this](std::optional<std::int32_t> nice){return this->runtime.thread_priority(nice);});
             cpu.set_thread_pointer(posix.thread_pointer());
+            posix.set_once_runner([this](Address entry,Address stack,Address tls,std::uint64_t budget){return cpu.call(entry,{},stack,budget,{},tls);});
             posix.set_signal_runner([this](Address entry,std::uint32_t signal,Address stack,Address tls){return cpu.call(entry,std::array<std::uint64_t,1>{signal},stack,1'000'000,{},tls);});
         posix.set_thread_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
                 return run_worker(entry,argument,stack,tls,budget);
             });
+            posix.set_address_lookup([this](Address address){return loader.address_info(address);});
             loader.load(modules, this->root);
+            posix.set_dynamic_linker({[this](std::string_view name){dynamic_open(name);},
+                [this](std::string_view module,std::string_view name){return loader.lookup(module,name);}});
             map(tables, 8192);
             map(trampolines, 4096);
             write(Bridge::environment, function_table, 8);
@@ -314,6 +320,7 @@ struct Bridge::Impl {
     }
     void release_managed_binding(ManagedBinding &binding) {
         if(!binding.thread)return;
+        posix.discard_thread(binding.tid,binding.tls);
         for(auto it=buffers.begin();it!=buffers.end();) {
             if(it->second.context!=binding.tls){++it;continue;}
             memory.unmap(it->first);runtime.release(it->second.string);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
@@ -382,6 +389,24 @@ struct Bridge::Impl {
         }
         Address stack() const { return stacks + (p.native_depth - 1) * stride + stack_size - 4096; }
     };
+    void dynamic_open(std::string_view name) try {
+        process->checkpoint();
+        if(std::this_thread::get_id()!=owner_thread || closed || dynamic_poisoned)
+            throw elf::ElfError("AETHER_ELF_LOAD_STATE","Dynamic module owner is unavailable");
+        if(posix.has_library(name))return;
+        for(const auto &module:loader.modules())if(module.image.soname==name && module.initialized)return;
+        if(!module_provider)throw elf::ElfError("AETHER_ELF_SOURCE","No authorized module inventory");
+        // Do not relax the constructor-time extension guard or expose provisional modules.
+        for(const auto &module:loader.modules())if(!module.initialized)
+            throw elf::ElfError("AETHER_ELF_LOAD_STATE","Constructor-time module extension is unsupported");
+        auto modules=module_provider(name);
+        Scope scope(*this);
+        loader.extend(modules,name);
+        try {loader.initialize(cpu,scope.stack(),posix.thread_pointer());process->checkpoint();}
+        catch(const elf::InitializerError &failure){dynamic_poisoned=true;throw bionic::DynamicLinkExecution{failure.fault};}
+        catch(...){dynamic_poisoned=true;throw;}
+        // Plain dlopen runs ELF constructors, never JNI_OnLoad or JNI-root rebinding.
+    }catch(const elf::ElfError &failure){throw bionic::DynamicLinkSourceError{failure.code};}
     void clear_attachment() {
         while(!frames.empty())pop();
         pending_exception(0);
@@ -391,8 +416,33 @@ struct Bridge::Impl {
         }
         metrics.string_buffers=buffers.size();attached=false;
     }
+    std::uint64_t native_charged_ticks=0;
+    bionic::GuestPosixServices::ThreadExecution thread_guest_call(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
+        process->checkpoint();
+        const auto available=std::min(budget,runtime.thread_instruction_budget());
+        bionic::GuestPosixServices::ThreadExecution out;
+        if(!available){out.result.fault=a64::Fault::budget;return out;}
+        const auto before=cpu.metrics().guest_ticks,charged_before=native_charged_ticks;
+        out.result=cpu.call(entry,std::array{argument},stack,available,{},tls);
+        out.ticks=cpu.metrics().guest_ticks-before;
+        // Nested native workers debit their context and its parent on return.
+        // Their inclusive CPU ticks must not be charged again by this caller.
+        const auto nested=native_charged_ticks-charged_before;
+        const auto uncharged=out.ticks>=nested?out.ticks-nested:0;
+        const auto remaining=runtime.thread_instruction_budget();
+        const auto charged=std::min(uncharged,remaining);
+        runtime.charge_thread_instructions(charged);native_charged_ticks+=charged;
+        if(uncharged>remaining && out.result.fault==a64::Fault::none){out.result.returned=false;out.result.fault=a64::Fault::budget;}
+        return out;
+    }
+    bionic::GuestPosixServices::ThreadExecution finalize_bound_thread(Address stack,std::uint64_t budget) {
+        return posix.finish_current_thread([&](Address entry,Address argument,std::uint64_t remaining){
+            Scope scope(*this);
+            return thread_guest_call(entry,argument,stack,posix.thread_pointer(),remaining);
+        },budget);
+    }
     bionic::GuestPosixServices::ThreadExecution run_worker(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
-        const auto before=cpu.metrics().guest_ticks;a64::ExecutionResult result;
+        const auto before=cpu.metrics().guest_ticks;a64::ExecutionResult result;bool finalization_failed=false;
         try {runtime.run_native_thread([&]{
             auto parent_frames=std::move(frames);const auto parent_pending=std::exchange(pending,0);
             const auto parent_context=context,parent_environment=current_environment;const auto parent_attached=attached;
@@ -402,10 +452,17 @@ struct Bridge::Impl {
                 ~Restore(){p.clear_attachment();p.frames=std::move(frames);p.pending=pending;p.context=context;p.current_environment=environment;p.attached=attached;}
             } restore{*this,std::move(parent_frames),parent_pending,parent_context,parent_environment,parent_attached};
             write(current_environment,function_table,8);
-            result=cpu.call(entry,std::array{argument},stack,budget,{},tls);
+            result=thread_guest_call(entry,argument,stack,tls,budget).result;
+            if(result.returned || result.fault==a64::Fault::thread_exit){
+                runtime.run_thread_finalizers([&]{
+                    const auto spent=cpu.metrics().guest_ticks-before;
+                    const auto cleanup=finalize_bound_thread(stack,spent>=budget?0:budget-spent);
+                    if(cleanup.finalization_failed){result=cleanup.result;result.returned=false;finalization_failed=true;}
+                });
+            }
         },[this](std::optional<std::int32_t> nice){return posix.current_thread_priority(nice);});}
-        catch(const ThreadExit &exit){process->checkpoint();posix.request_thread_exit(exit.value);result.fault=a64::Fault::thread_exit;result.registers[0]=exit.value;}
-        return {result,cpu.metrics().guest_ticks-before};
+        catch(const ThreadExit &exit){process->checkpoint();if(!finalization_failed){posix.request_thread_exit(exit.value);result.fault=a64::Fault::thread_exit;result.registers[0]=exit.value;}}
+        return {result,cpu.metrics().guest_ticks-before,finalization_failed};
     }
     void pending_exception(ObjectId object) {
         if (object)
@@ -893,6 +950,32 @@ void Bridge::add_library(std::span<const elf::ModuleInput> modules, std::string 
     p.root = std::move(root);
     p.load_state = 0;
 }
+void Bridge::finish_logical_thread(dex::ManagedRuntime &runtime) {
+    auto &p=*impl_;p.process->checkpoint();
+    if(&runtime!=&p.runtime || p.closed || p.native_depth || std::this_thread::get_id()!=p.owner_thread)
+        bad("THREAD","Logical finalization requires the idle native owner");
+    const auto thread=runtime.current_thread();
+    if(std::none_of(p.managed_bindings.begin(),p.managed_bindings.end(),[&](const auto &binding){return binding.thread==thread;}))return;
+    Impl::LogicalScope logical(p);Impl::Scope scope(p);
+    const auto result=p.finalize_bound_thread(scope.stack(),std::min(std::uint64_t{1000000},runtime.thread_instruction_budget()));
+    if(result.finalization_failed){
+        if(result.result.fault==a64::Fault::process_exit){p.process->request_exit(result.result.detail);p.process->checkpoint();}
+        bad("NATIVE_FINALIZATION",std::string(a64::fault_name(result.result.fault))+": "+std::string(p.posix.last_rejection()));
+    }
+    p.check_pending();
+}
+void Bridge::discard_logical_thread(dex::ObjectId thread) noexcept {
+    auto &p=*impl_;
+    // Terminal bookkeeping is nonexecuting: retire values and release the held
+    // JNI buffers, thread pin and TLS mapping before this identity can be reused.
+    for(auto &binding:p.managed_bindings)if(binding.thread==thread)p.release_managed_binding(binding);
+}
+void Bridge::set_module_provider(ModuleProvider provider) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_depth)
+        bad("LOAD_STATE","Module provider requires the idle bridge owner");
+    p.module_provider=std::move(provider);
+}
 void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name) {
     auto &p = *impl_;p.process->checkpoint();
     if (std::this_thread::get_id() != p.owner_thread)
@@ -1022,6 +1105,8 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
     return p.decode(type == "F" || type == "D" ? result.vectors[0][0] : result.registers[0], type);
 }
 std::optional<std::uint64_t> Bridge::thread_exit_value(Address tls) const noexcept {return impl_->posix.thread_exit_value(tls);}
+bool Bridge::event_pending() noexcept {return impl_->posix.event_pending();}
+a64::Fault Bridge::checkpoint(a64::ServiceState &state) noexcept {return impl_->posix.checkpoint(state);}
 
 a64::Fault Bridge::invoke(std::uint32_t service, Address instruction,
                           std::array<std::uint64_t, 31> &registers) noexcept {

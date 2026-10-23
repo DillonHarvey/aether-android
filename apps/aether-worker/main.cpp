@@ -243,10 +243,11 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
         require(boot.payload.size() == 40 + path_size, "Trailing worker fixture configuration");
     }
     write_pipe_frame(writer, {{Operation::boot, 0, boot.header.session, 0, Status::ok}, {}});
-    if (scenario == 29 || scenario == 30) {
+    if (scenario == 29 || scenario == 30 || scenario == 31) {
         require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 76 && allowed == 1,
                 "Invalid compiled process exit policy");
-        return run_process_exit_probe(writer, session, static_cast<std::uint8_t>(scenario == 29 ? 0 : 255));
+        return run_process_exit_probe(writer, session,
+                                      static_cast<std::uint8_t>(scenario == 29 ? 0 : scenario == 30 ? 255 : 134));
     }
     if (scenario == 28) {
         require(lpac && path_size == 0 && app_id == 73 && allowed == 0 && read_u64(boot.payload,48) <= 1,

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -38,12 +39,20 @@ class GuestMemory {
     void map(Address address, std::size_t size, Permission permissions);
     void protect(Address address, Permission permissions);
     void unmap(Address address);
+    // Page ranges may split views while retaining their original guarded backing.
+    // Partial unmaps retain the backing's full quota charge until its last view dies.
+    void protect_range(Address address, std::size_t size, Permission permissions);
+    void unmap_range(Address address, std::size_t size);
+    std::optional<Address> find_free(Address begin, Address end, std::size_t size) const noexcept;
     bool accessible(Address address, std::size_t size, Permission permission) const noexcept;
     bool read(Address address, std::span<std::uint8_t> target,
               Permission permission = Permission::read) const noexcept;
     bool write(Address address, std::span<const std::uint8_t> source) noexcept;
     std::uint64_t generation() const noexcept;
     std::size_t mapped_bytes() const noexcept;
+    struct Mapping {Address address;std::size_t size;Permission permissions;};
+    // Guest-only bounds/protection; never exposes a host allocation or pointer.
+    std::optional<Mapping> mapping(Address address) const noexcept;
     bool host_pages_are_non_executable() const noexcept;
 
   private:

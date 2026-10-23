@@ -182,6 +182,12 @@ WindowsLog default_sink;
 }
 bool native_log_symbol(std::string_view name) noexcept {return name=="__android_log_write" || name=="__android_log_print" || name=="__android_log_assert";}
 NativeLogging::NativeLogging(a64::GuestMemory &memory,host::NativeLogSink *sink):memory_(memory),sink_(sink?sink:&default_sink){}
+bool NativeLogging::write_stream(int fd,std::span<const std::uint8_t> bytes) noexcept {
+    if((fd!=1 && fd!=2) || bytes.size()>1024*1024)return false;
+    const std::string_view message{reinterpret_cast<const char*>(bytes.data()),bytes.size()};
+    const auto accepted=sink_->write({fd==2?6:4,fd==2?"stderr":"stdout",message,false});
+    if(accepted)++messages_;return accepted;
+}
 a64::Fault NativeLogging::invoke(std::string_view name,a64::ServiceState &state,bool full) noexcept {
     try {
         auto &r=state.registers;const bool assertion=name=="__android_log_assert";const auto priority=assertion?7:std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[0]));
@@ -199,14 +205,16 @@ a64::Fault NativeLogging::invoke(std::string_view name,a64::ServiceState &state,
 }
 a64::Fault NativeFormatting::invoke(unsigned operation,a64::ServiceState &state,bool full) noexcept {
     try {
-        auto &r=state.registers;const bool checked=operation>=2,variadic_list=(operation%2)==0;
-        const auto destination=r[0],size=r[1],pointer=r[checked?4:2];
-        if(checked && size>r[3])throw Failure{Fault::invalid_call,"printf: destination size exceeds compiler object size"};
-        if(size>static_cast<std::uint64_t>(INT64_MAX))throw Failure{Fault::invalid_call,"printf: size exceeds SSIZE_MAX"};
+        auto &r=state.registers;const bool sprintf_checked=operation==4;
+        const bool checked=operation>=2,variadic_list=(operation%2)==0;
+        const auto destination=r[0],size=r[sprintf_checked?2:1],pointer=r[sprintf_checked?3:checked?4:2];
+        if(checked && !sprintf_checked && size>r[3])throw Failure{Fault::invalid_call,"printf: destination size exceeds compiler object size"};
+        if(size>static_cast<std::uint64_t>(INT64_MAX) && !(sprintf_checked && size==UINT64_MAX))throw Failure{Fault::invalid_call,"printf: size exceeds SSIZE_MAX"};
         std::string rendered;
-        if(variadic_list){VaArguments args{memory_,r[checked?5:3]};rendered=format(memory_,pointer,args);}
+        if(variadic_list){VaArguments args{memory_,r[sprintf_checked?4:checked?5:3]};rendered=format(memory_,pointer,args);}
         else {Arguments args{memory_,state,full,checked?5U:3U,0,state.stack_pointer};rendered=format(memory_,pointer,args);}
         const auto full_count=rendered.size();
+        if(sprintf_checked && full_count>=size)throw Failure{Fault::invalid_call,"vsprintf: rendered output exceeds compiler object size"};
         if(size) {
             const auto count=static_cast<std::size_t>(std::min<std::uint64_t>(rendered.size(),size-1));
             // Format and validate everything before publishing a single guest write.

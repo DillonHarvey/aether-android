@@ -337,7 +337,10 @@ struct Frame {
 // including suspended and terminal retained contexts, participates in GC.
 struct ExecutionContext {
     const host::PriorityService *native_priority=nullptr;
-    std::optional<std::uint64_t> thread_exit;
+    std::optional<std::uint64_t> thread_exit, native_finalizing_exit;
+    bool native_finalizing=false, native_finalization_started=false;
+    std::exception_ptr native_finalization_failure;
+    bool native_discarded=false, cancellation_requested=false;
     std::vector<Frame *> frames;
     Value last_result;
     ObjectId last_exception = 0;
@@ -525,7 +528,16 @@ struct ManagedRuntime::Impl {
     }
     void execution_checkpoint() const {
         process->checkpoint();
-        if(const auto value=current_context().thread_exit)throw ThreadExit{*value};
+        const auto &context=current_context();
+        if(context.native_finalization_failure)std::rethrow_exception(context.native_finalization_failure);
+        if(context.thread_exit && !(context.native_finalizing && context.native_finalizing_exit==context.thread_exit))
+            throw ThreadExit{*context.thread_exit};
+    }
+    void failure_checkpoint() const {
+        process->checkpoint();
+        // Private scheduler cancellation must unwind unchanged. In particular,
+        // an older caught pthread exit cannot turn cancellation into completion.
+        if(!current_context().cancellation_requested)execution_checkpoint();
     }
     template<class F> decltype(auto) provider_call(F &&call) const {
         execution_checkpoint();
@@ -536,7 +548,7 @@ struct ManagedRuntime::Impl {
             } else {
                 decltype(auto) result=call();execution_checkpoint();return result;
             }
-        } catch(...) {execution_checkpoint();throw;}
+        } catch(...) {failure_checkpoint();throw;}
     }
     bool scheduled_task() const {return Scheduler::execution_token()!=execution_owner;}
     bool background() const { return native_context_depth || Scheduler::execution_token() != execution_owner; }
@@ -595,6 +607,15 @@ struct ManagedRuntime::Impl {
         for (const auto *frame : context.frames)
             if (frame->monitor_count)
                 fail("THREAD_BLOCKING_UNSUPPORTED", "Thread suspension while holding a monitor requires logical monitor parking");
+    }
+    void discard_native_context(ExecutionContext &context) noexcept {
+        if(context.native_discarded)return;
+        context.native_discarded=true;
+        if(native && context.thread_object)native->discard_logical_thread(context.thread_object);
+    }
+    void finish_task_context(ExecutionContext &context) noexcept {
+        if(context.thread_object)finish_java_thread(context.thread_object);
+        discard_native_context(context);
     }
     void end_native_thread(ExecutionContext &context) noexcept {
         if(context.thread_object) {
@@ -739,7 +760,7 @@ struct ManagedRuntime::Impl {
                 background_executed = true;
                 if (progress_sink && !progress_sink->prepare_native_stack())
                     fail("PROGRESS_STACK", "Cannot prepare bounded native fault diagnostics on task stack");
-                struct LocalEnd {Impl &impl;ExecutionContext &context;~LocalEnd(){impl.clear_thread_locals(context.thread_object);}} local_end{*this,task->context};
+                struct LocalEnd {Impl &impl;ExecutionContext &context;~LocalEnd(){impl.finish_task_context(context);}} local_end{*this,task->context};
                 try {
                     try {
                         if (task->worker) {
@@ -759,15 +780,18 @@ struct ManagedRuntime::Impl {
                         } else if (virtual_dispatch) (void)runtime.invoke_virtual(method, task->arguments);
                         else (void)runtime.invoke(method, task->arguments);
                         execution_checkpoint();
-                    } catch(...) {execution_checkpoint();throw;}
+                    } catch(...) {failure_checkpoint();throw;}
                 } catch(const ThreadExit &exit) {
                     process->checkpoint();
+                    if(task->context.cancellation_requested)throw;
                     // A nested native child's exit must be consumed by its native
                     // runner; an unlatched foreign exit cannot terminate this task.
                     if(!task->context.thread_exit || *task->context.thread_exit!=exit.value)throw;
                     task->context.last_exception=0;task->context.last_result=Value::nothing();
-                    if(task->context.thread_object)finish_java_thread(task->context.thread_object);
                 }
+                // Only orderly completion or this context's recognized exit can
+                // reach fallible cleanup. Failure/cancellation only retire state.
+                if(native)runtime.run_thread_finalizers([&]{native->finish_logical_thread(runtime);});
             },inherited_priority);
         } catch (...) {
             metrics.heap_bytes -= task->charged;
@@ -3345,10 +3369,6 @@ struct ManagedRuntime::Impl {
         std::array<Value, 1> roots;
         JavaThreadEntry(Impl &owner, ObjectId receiver) : owner(owner), roots{Value::reference(receiver)} {}
         void run(ManagedRuntime &) override {
-            struct Finish {
-                Impl &owner; ObjectId receiver;
-                ~Finish() { owner.finish_java_thread(receiver); }
-            } finish{owner, roots[0].bits};
             try {owner.run_runnable(roots[0].bits, true);}
             catch(const JavaException &error) {
                 // Delivery is on the dying Java logical thread, before exit clears
@@ -3393,7 +3413,7 @@ struct ManagedRuntime::Impl {
             if(process->exit_status()) {
                 // No pool maintenance, exception formatting or new pins while
                 // terminal stacks are being reclaimed.
-                finish_java_thread(entry->context.thread_object);
+                finish_task_context(entry->context);
                 scheduler->release(entry->id);metrics.heap_bytes-=entry->charged;entry.reset();
                 continue;
             }
@@ -3408,7 +3428,7 @@ struct ManagedRuntime::Impl {
                 catch (const std::exception &error) { diagnostic = error.what(); }
                 catch (...) { diagnostic = "Unknown host failure"; }
             }
-            finish_java_thread(entry->context.thread_object); // Also handles cancellation before first run.
+            finish_task_context(entry->context); // Also handles cancellation before first run.
             const auto pool=entry->maintenance_pool;
             const bool abrupt=entry->maintenance_abrupt;
             const bool missing=entry->missing_worker;
@@ -3547,7 +3567,13 @@ struct ManagedRuntime::Impl {
         // Contexts and their traced roots remain alive while cancellation unwinds
         // suspended interpreter stacks. Never delete live callback stacks.
         if (scheduler) {
-            try { tasks_closing=true; scheduler->close(); reap_java_threads(false); } catch (...) { std::terminate(); }
+            try {
+                tasks_closing=true;
+                for(auto &task:tasks)if(task)task->context.cancellation_requested=true;
+                scheduler->close();
+                for(auto &task:tasks)if(task)finish_task_context(task->context);
+                reap_java_threads(false);
+            } catch (...) { std::terminate(); }
         }
     }
     Impl(ManagedRuntime &runtime, DexImage input, RuntimeLimits limits,
@@ -7354,7 +7380,7 @@ Value ManagedRuntime::invoke_resolved(Index method, std::span<const Value> argum
         p.current_context().last_exception = error.object;
         throw;
     } catch(...) {
-        p.execution_checkpoint();throw;
+        p.failure_checkpoint();throw;
     }
 }
 Value ManagedRuntime::invoke_static(std::string_view owner, std::string_view name, std::string_view signature,
@@ -7391,7 +7417,7 @@ Value ManagedRuntime::invoke_virtual_named(ObjectId receiver, std::string_view n
         context.last_exception = error.object;
         throw;
     } catch(...) {
-        p.execution_checkpoint();throw;
+        p.failure_checkpoint();throw;
     }
 }
 Index ManagedRuntime::lookup(std::string_view owner, std::string_view name, std::string_view signature,
@@ -7610,8 +7636,9 @@ std::shared_ptr<ProcessState> ManagedRuntime::process_state() const {
 [[noreturn]] void ManagedRuntime::exit_current_thread(std::uint64_t value) {
     auto &p=*impl_;p.check_thread(true);p.execution_checkpoint();
     if(!p.background())fail("THREAD_EXIT_UNSUPPORTED","Exiting the root managed thread requires a process lifecycle model");
-    p.current_context().thread_exit=value;
-    throw ThreadExit{value};
+    auto &context=p.current_context();
+    if(!context.thread_exit)context.thread_exit=value;
+    throw ThreadExit{*context.thread_exit};
 }
 void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority) {
     auto &p=*impl_;p.check_thread();
@@ -7626,13 +7653,73 @@ void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const 
     struct Restore {
         Impl &p;ExecutionContext &parent,&child;std::uint64_t initial;
         ~Restore(){
+            p.discard_native_context(child);
             p.end_native_thread(child);
             --p.native_context_depth;p.native_contexts[p.native_context_depth]=nullptr;
             if(parent.invocations){const auto spent=initial-child.remaining;parent.remaining=spent>=parent.remaining?0:parent.remaining-spent;}
         }
     } restore{p,parent,child,initial};
-    try {entry();}catch(...) {p.execution_checkpoint();throw;}
-    p.execution_checkpoint();
+    try {
+        try {entry();}catch(...) {
+            // A cleanup failure outranks this child's already latched pthread exit.
+            // Process termination remains authoritative; ordinary paths keep the
+            // existing sticky-exit checkpoint and never resume the dying context.
+            if(child.native_finalization_failure) {
+                p.process->checkpoint();std::rethrow_exception(child.native_finalization_failure);
+            }
+            p.failure_checkpoint();
+            throw;
+        }
+        p.execution_checkpoint();
+    } catch(const JavaException &error) {
+        // The child's traced roots disappear in Restore. Transfer the actual
+        // propagated throwable before retirement so its caller can catch/collect
+        // without the exception's opaque ObjectId becoming an unrooted reference.
+        parent.last_exception=error.object;
+        throw;
+    }
+}
+void ManagedRuntime::run_thread_finalizers(const std::function<void()> &entry) {
+    auto &p=*impl_;p.check_thread();p.process->checkpoint();
+    auto &context=p.current_context();
+    if(!entry || !p.background() || context.native_finalization_started || context.cancellation_requested)
+        fail("THREAD_FINALIZATION_STATE","Finalizers require one active owned background context and cannot repeat");
+    context.native_finalization_started=true;
+    context.native_finalizing_exit=context.thread_exit;
+    context.native_finalizing=true;
+    // Managed callbacks during cleanup belong to the original invocation budget,
+    // even though its top-level DEX body has already unwound.
+    ++context.invocations;
+    struct Restore {
+        ExecutionContext &context;
+        ~Restore(){--context.invocations;context.native_finalizing=false;context.native_finalizing_exit.reset();}
+    } restore{context};
+    NonYielding barrier(context);
+    try {entry();p.execution_checkpoint();}
+    catch(const JavaException &error) {
+        context.last_exception=error.object;
+        context.native_finalization_failure=std::current_exception();
+        p.process->checkpoint();throw;
+    } catch(...) {
+        context.native_finalization_failure=std::current_exception();
+        p.process->checkpoint();throw;
+    }
+}
+std::uint64_t ManagedRuntime::thread_instruction_budget() const {
+    auto &p=*impl_;p.check_thread(true);p.process->checkpoint();
+    if(p.current_context().cancellation_requested)fail("TASK_CANCELLED","Cancelled context cannot admit native work");
+    auto remaining=p.current_context().remaining;
+    if(p.scheduled_task())remaining=std::min(remaining,p.task_work_remaining);
+    else if(p.main_callback_inflight)remaining=std::min(remaining,p.main_callback_work_remaining);
+    return remaining;
+}
+void ManagedRuntime::charge_thread_instructions(std::uint64_t instructions) {
+    auto &p=*impl_;p.check_thread(true);p.process->checkpoint();
+    auto &context=p.current_context();
+    if(instructions>thread_instruction_budget())fail("BUDGET","Native instructions exceed the remaining logical thread allowance");
+    context.remaining-=instructions;
+    if(p.scheduled_task())p.task_work_remaining-=instructions;
+    else if(p.main_callback_inflight)p.main_callback_work_remaining-=instructions;
 }
 bool ManagedRuntime::detach_native_thread() {
     auto &p=*impl_;p.check_thread();if(!p.native_context_depth)return false;
@@ -7767,8 +7854,8 @@ std::exception_ptr ManagedRuntime::task_exception(TaskId id) const {
 }
 void ManagedRuntime::cancel_task(TaskId id) {
     auto &p = *impl_;
-    p.task_owner(); (void)p.task(id);
-    p.scheduler->cancel(id);
+    p.task_owner();auto &task=p.task(id);
+    p.scheduler->cancel(id);task.context.cancellation_requested=true;
 }
 void ManagedRuntime::release_task(TaskId id) {
     auto &p = *impl_;
@@ -7776,6 +7863,7 @@ void ManagedRuntime::release_task(TaskId id) {
     if (!task.context.frames.empty() || task.context.invocations)
         fail("TASK_STATE", "Managed task stack has not unwound");
     p.scheduler->release(id); // Reject nonterminal state before dropping any roots.
+    p.finish_task_context(task.context);
     p.metrics.heap_bytes -= task.charged;
     for (auto &entry : p.tasks) if (entry.get() == &task) { entry.reset(); return; }
 }
@@ -7787,7 +7875,9 @@ void ManagedRuntime::close_tasks() {
         fail("TASK_STATE", "Managed task shutdown requires an idle external main context");
     (void)p.scheduler->current();
     p.tasks_closing=true;
+    for(auto &task:p.tasks)if(task)task->context.cancellation_requested=true;
     p.scheduler->close();
+    for(auto &task:p.tasks)if(task)p.finish_task_context(task->context);
     p.reap_java_threads();
 }
 void ManagedRuntime::post_main(Index method, std::span<const Value> arguments, bool virtual_dispatch) {

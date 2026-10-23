@@ -37,6 +37,7 @@ struct WindowReport {
 };
 // Only a hash-identified first-party APK may execute until the Phase 7 security gate.
 // Selftest uses a hidden real HWND, bounded message exercise, PNG evidence and automatic close.
-WindowReport run_fixture_window(const std::filesystem::path &apk, bool selftest);
+WindowReport run_fixture_window(const std::filesystem::path &apk, bool selftest,
+                                const std::filesystem::path &developer_output_root = {});
 WindowReport run_installed_window(security::InstalledActivity application);
 } // namespace aether::host

@@ -24,7 +24,8 @@ struct ActivityPublication {
 // consumes completions without waiting on pipes. One read may be pending at a time.
 class ActivityDispatcher final {
   public:
-    explicit ActivityDispatcher(const std::filesystem::path &apk, ActivityMode mode = ActivityMode::normal);
+    explicit ActivityDispatcher(const std::filesystem::path &apk, ActivityMode mode = ActivityMode::normal,
+                                const std::filesystem::path &developer_output_root = {});
     explicit ActivityDispatcher(InstalledActivity application);
     ~ActivityDispatcher();
     ActivityDispatcher(const ActivityDispatcher &) = delete;

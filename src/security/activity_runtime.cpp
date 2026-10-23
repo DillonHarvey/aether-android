@@ -85,8 +85,8 @@ struct ActivityPackage {
     }
 };
 
-// Resolve System.loadLibrary from this immutable APK. The existing bridge owns
-// one dependency graph; a second independent native root fails explicitly.
+// Resolve Java and guest dynamic roots only from this immutable installed APK.
+// The bridge retains validated resident graphs and separates JNI/ELF initialization.
 class NativeLibraries final : public dex::NativeInterface {
     dex::ManagedRuntime &managed;
     a64::GuestMemory &memory;
@@ -95,6 +95,16 @@ class NativeLibraries final : public dex::NativeInterface {
     const ActivityPackage &package;
     std::unique_ptr<jni::Bridge> bridge;
 
+    std::vector<elf::ModuleInput> module_inputs(std::string_view root) {
+        const auto selected=package.libraries.inspect(package.archives,root);
+        std::vector<elf::ModuleInput> modules;modules.reserve(selected.members().size());
+        auto budget=std::make_shared<elf::ArchiveScanBudget>();
+        for(const auto &member:selected.members()){
+            const auto entry=package.archives.file(member.file);
+            modules.push_back({member.name,{},std::make_shared<elf::ArchiveSource>(*entry.archive,entry.index,member.file.sha256,budget)});
+        }
+        return modules;
+    }
   public:
     NativeLibraries(dex::ManagedRuntime &managed, a64::GuestMemory &memory, const a64::AppContext &app,
                     BrokerClient &client, const ActivityPackage &package)
@@ -103,6 +113,9 @@ class NativeLibraries final : public dex::NativeInterface {
     }
     ~NativeLibraries() { managed.set_native_interface(nullptr); }
     bool supports_background() const noexcept override {return true;}
+    void finish_logical_thread(dex::ManagedRuntime &runtime) override {if(bridge)bridge->finish_logical_thread(runtime);}
+    void discard_logical_thread(dex::ObjectId thread) noexcept override {if(bridge)bridge->discard_logical_thread(thread);}
+
     std::uint64_t capture_signal_mask(dex::ManagedRuntime &runtime) override {return bridge?bridge->capture_signal_mask(runtime):0;}
     void load_library(dex::ManagedRuntime &runtime, std::u16string_view name) override {
         {
@@ -117,20 +130,15 @@ class NativeLibraries final : public dex::NativeInterface {
             }
             root += ".so";
             if (bridge && bridge->has_library(root)) { bridge->load_library(runtime, name); return; }
-            const auto selected = package.libraries.inspect(package.archives, root);
-            std::vector<elf::ModuleInput> modules;
-            modules.reserve(selected.members().size());
-            auto budget = std::make_shared<elf::ArchiveScanBudget>();
-            for (const auto &member : selected.members()) {
-                const auto entry = package.archives.file(member.file);
-                modules.push_back({member.name,
-                                   {},
-                                   std::make_shared<elf::ArchiveSource>(*entry.archive, entry.index,
-                                                                        member.file.sha256, budget)});
-            }
+            auto modules=module_inputs(root);
             if (bridge) bridge->add_library(modules, root);
-            else bridge =
-                std::make_unique<jni::Bridge>(managed, memory, app, client, modules, root, &client, false, package.package);
+            else {
+                bridge=std::make_unique<jni::Bridge>(managed,memory,app,client,modules,root,&client,false,package.package);
+                bridge->set_module_provider([this](std::string_view requested){
+                    try{return module_inputs(requested);}
+                    catch(const apk::InspectError &failure){throw bionic::DynamicLinkSourceError{failure.diagnostic.code};}
+                });
+            }
         }
         bridge->load_library(runtime, name);
     }
@@ -287,6 +295,7 @@ std::uint8_t run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t ses
         }
         fail("Activity command sequence exhausted");
     } catch (const ProcessExit &exit) {
+        if(exit.signal)throw ProtocolError("AETHER_GUEST_SIGNAL: guest terminated abnormally by signal " + std::to_string(exit.signal));
         if (progress) progress->stage(111,"guest_exited");
         write_pipe_frame(writer, guest_exit_frame(session, exit.status));
         return exit.status;

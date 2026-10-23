@@ -144,6 +144,10 @@ class NativeInterface {
     virtual ~NativeInterface() = default;
     virtual bool supports_background() const noexcept {return false;}
     virtual std::uint64_t capture_signal_mask(ManagedRuntime &) {return 0;}
+    // Fallible, same-context orderly termination; never called by a destructor.
+    virtual void finish_logical_thread(ManagedRuntime &) {}
+    // Nonexecuting retirement, including cancellation and failed contexts.
+    virtual void discard_logical_thread(ObjectId) noexcept {}
     virtual void load_library(ManagedRuntime &, std::u16string_view name) = 0;
     virtual Value invoke(ManagedRuntime &, Index method, std::span<const Value> arguments) = 0;
 };
@@ -199,6 +203,13 @@ class ManagedRuntime {
     // Synchronous owned native-worker boundary. Independent logical state and
     // GC roots share heap/frame/instruction quotas; scheduler suspension is barred.
     void run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority={});
+    // Trusted once-only cleanup on the current background/native context. Keeps
+    // its first exit value and remaining budget; callbacks cannot reset either.
+    void run_thread_finalizers(const std::function<void()> &entry);
+    // Trusted nonexecuting accounting also works after an owned exit latch.
+    // Exact debit to zero succeeds; overrun fails without modifying allowances.
+    std::uint64_t thread_instruction_budget() const;
+    void charge_thread_instructions(std::uint64_t instructions);
     // One owned background/native logical thread; root main exit is unsupported.
     [[noreturn]] void exit_current_thread(std::uint64_t value);
     host::PriorityResult thread_priority(std::optional<std::int32_t> nice={});

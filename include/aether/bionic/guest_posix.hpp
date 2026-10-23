@@ -1,5 +1,6 @@
 #pragma once
 #include "aether/elf/guest_loader.hpp"
+#include "aether/bionic/dynamic_linker.hpp"
 #include "aether/host/file_service.hpp"
 #include "aether/host/time_service.hpp"
 #include "aether/host/native_log.hpp"
@@ -25,11 +26,26 @@ class GuestPosixServices final : public a64::GuestServices, public elf::ImportRe
                       std::array<std::uint64_t, 31> &registers) noexcept override;
     a64::Fault invoke_frame(std::uint32_t service, a64::Address instruction, a64::ServiceState &state) noexcept override;
     std::optional<std::uint64_t> thread_exit_value(a64::Address tls) const noexcept override;
+    bool event_pending() noexcept override;
+    a64::Fault checkpoint(a64::ServiceState &) noexcept override;
     void request_thread_exit(std::uint64_t value) noexcept;
-    struct ThreadExecution {a64::ExecutionResult result;std::uint64_t ticks=0;};
+    struct ThreadExecution {a64::ExecutionResult result;std::uint64_t ticks=0;bool finalization_failed=false;};
+    // The trusted runner finalizes orderly return/exit with finish_current_thread
+    // before leaving its original TLS/JNI scope, and reports finalization failure.
     using ThreadRunner=std::function<ThreadExecution(a64::Address,a64::Address,a64::Address,a64::Address,std::uint64_t)>;
+    using DestructorRunner=std::function<ThreadExecution(a64::Address,a64::Address,std::uint64_t)>;
+    // Trusted terminal-thread phase, while its original TLS/JNI context is alive.
+    ThreadExecution finish_current_thread(const DestructorRunner &,std::uint64_t budget);
+    void discard_thread(std::uint32_t id,a64::Address tls) noexcept;
     using SignalRunner=std::function<a64::ExecutionResult(a64::Address,std::uint32_t,a64::Address,a64::Address)>;
     void set_signal_runner(SignalRunner runner);
+    // Same logical thread callback: normal return must not finalize the thread.
+    using OnceRunner=std::function<a64::ExecutionResult(a64::Address,a64::Address,a64::Address,std::uint64_t)>;
+    void set_once_runner(OnceRunner runner);
+    using AddressLookup = std::function<std::optional<elf::AddressInfo>(a64::Address)>;
+    // The owner keeps the lookup target alive for all calls; results contain guest metadata only.
+    void set_address_lookup(AddressLookup lookup);
+    void set_dynamic_linker(DynamicLinkCallbacks callbacks);
     struct ThreadBinding {std::uint32_t id; a64::Address tls,error;std::uint64_t initial_signal_mask=0;};
     std::optional<ThreadBinding> exchange_thread_binding(std::optional<ThreadBinding> binding);
     void set_thread_runner(ThreadRunner runner);

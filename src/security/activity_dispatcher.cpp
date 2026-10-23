@@ -84,10 +84,11 @@ struct ActivityDispatcher::Impl {
         notify();
     }
     void run(std::filesystem::path apk, ActivityMode mode,
-             const InstalledActivity *application = nullptr) noexcept {
+             const InstalledActivity *application = nullptr,
+             const std::filesystem::path &developer_output_root = {}) noexcept {
         try {
             auto owned = application ? std::make_unique<IsolatedActivity>(*application)
-                                     : std::make_unique<IsolatedActivity>(apk, mode);
+                                     : std::make_unique<IsolatedActivity>(apk, mode, developer_output_root);
             auto &session = *owned;
             {
                 std::lock_guard lock(mutex);
@@ -145,9 +146,12 @@ struct ActivityDispatcher::Impl {
         }
     }
 };
-ActivityDispatcher::ActivityDispatcher(const std::filesystem::path &apk, ActivityMode mode)
+ActivityDispatcher::ActivityDispatcher(const std::filesystem::path &apk, ActivityMode mode,
+                                       const std::filesystem::path &developer_output_root)
     : impl_(std::make_unique<Impl>()) {
-    impl_->io = std::jthread([self = impl_.get(), apk, mode] { self->run(apk, mode); });
+    impl_->io = std::jthread([self = impl_.get(), apk, mode, developer_output_root] {
+        self->run(apk, mode, nullptr, developer_output_root);
+    });
 }
 ActivityDispatcher::~ActivityDispatcher() = default;
 ActivityDispatcher::ActivityDispatcher(InstalledActivity application) : impl_(std::make_unique<Impl>()) {

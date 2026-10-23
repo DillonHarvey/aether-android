@@ -464,6 +464,59 @@
           "sha256": "cc3273e0694ea5896145e0677699b53471b03ea43021ddc50e7923fbb9f5023c"
         }
       ]
+    },
+    {
+      "name": "Bionic error description data",
+      "revision": "731631f300090436d7f5df80d50b6275c8c60a93",
+      "license": "BSD-2-Clause",
+      "scope": "runtime-data",
+      "descriptionSource": "https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/private/bionic_errdefs.h",
+      "descriptionSourceSha256": "20adad662c5df1b785d28396b96b7509e1179a45d4c8957c5211682fb077e050",
+      "files": [
+        {
+          "path": "third_party/licenses/bionic-error-descriptions-BSD-2-Clause.txt",
+          "source": "https://android.googlesource.com/platform/bionic/+/731631f300090436d7f5df80d50b6275c8c60a93/libc/private/bionic_errdefs.h",
+          "sha256": "892844bdeee8ee86d2743a4db099f67e4a7a299c86c1fe5b97c56b875f7cd0e8"
+        }
+      ]
+    },
+    {
+      "name": "Unicode character data",
+      "version": "16.0.0",
+      "license": "Unicode-3.0",
+      "scope": "runtime-data",
+      "reason": "Pinned Bionic wide classification and simple case mapping; no host Unicode API.",
+      "transformation": "ADR0295: nonASCII classifier bit intervals and simple UnicodeData mappings; original lookup implementation.",
+      "upstreamFiles": [
+        {
+          "source": "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt",
+          "sha256": "7676ab755a41ef82108460238569e60ad65c191ddafe61b36c6765ec1353f293"
+        },
+        {
+          "source": "https://www.unicode.org/Public/16.0.0/ucd/DerivedCoreProperties.txt",
+          "sha256": "39d35161f2954497f69e08bdb9e701493f476a3d30222de20028feda36c1dabd"
+        },
+        {
+          "source": "https://www.unicode.org/Public/16.0.0/ucd/PropList.txt",
+          "sha256": "53d614508e2a0b2305a8aa21cd60d993de9326cdf65993660dfcce4503548583"
+        },
+        {
+          "source": "https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt",
+          "sha256": "ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f"
+        }
+      ],
+      "files": [
+        {
+          "path": "third_party/unicode/ucd16.hpp",
+          "source": "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt",
+          "sha256": "91e094a1cf88a51d7ede2291fa71ce1b453713803fd27a2be8fc329e8c37776f"
+        },
+        {
+          "path": "third_party/licenses/unicode-16-Unicode-3.0.txt",
+          "source": "https://www.unicode.org/license.txt",
+          "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+        }
+      ]
     }
   ]
 }

@@ -149,6 +149,7 @@ class ActivityWindow {
     DpiScope dpi_scope;
     security::ActivityDispatcher &session;
     WindowReport &report;
+    std::filesystem::path developer_output_root;
     HWND window = nullptr;
     HINSTANCE instance = GetModuleHandleW(nullptr);
     ATOM registered = 0;
@@ -517,12 +518,14 @@ class ActivityWindow {
         case 10: {
             check("activate-message-resumes-activity", session.state() == Lifecycle::resumed);
             render();
-            std::array<wchar_t, 32768> module{};
-            const auto count = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
-            if (!count || count >= module.size())
-                fail("Cannot resolve evidence output directory");
-            const auto capture = std::filesystem::path(std::wstring(module.data(), count)).parent_path() /
-                                 L"window-capture.png";
+            auto parent = developer_output_root;
+            if (parent.empty()) {
+                std::array<wchar_t, 32768> module{};
+                const auto count = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+                if (!count || count >= module.size()) fail("Cannot resolve evidence output directory");
+                parent = std::filesystem::path(std::wstring(module.data(), count)).parent_path();
+            }
+            const auto capture = parent / L"window-capture.png";
             buffer.capture(capture);
             report.capture_path = utf8(capture.wstring());
             exercised = true;
@@ -810,8 +813,9 @@ class ActivityWindow {
 
   public:
     ActivityWindow(security::ActivityDispatcher &session, WindowReport &report,
-                   const std::shared_ptr<const apk::Artwork> &presentation)
-        : session(session), report(report) {
+                   const std::shared_ptr<const apk::Artwork> &presentation,
+                   const std::filesystem::path &developer_output_root)
+        : session(session), report(report), developer_output_root(developer_output_root) {
         if (presentation) {
             icon_bytes = apk::icon_file(presentation->bitmap, presentation->renderer_version);
             report.display_name = presentation->label;
@@ -906,7 +910,8 @@ class ActivityWindow {
 namespace {
 WindowReport run_window(security::ActivityDispatcher &session, bool selftest, std::string installed_id = {},
                         std::shared_ptr<const apk::Artwork> presentation = {},
-                        security::InstalledRelaunch relaunch = {}) {
+                        security::InstalledRelaunch relaunch = {},
+                        const std::filesystem::path &developer_output_root = {}) {
     // Startup precedes HWND creation; subsequent I/O never blocks the window thread.
     check_win(WaitForSingleObject(session.completion_event(), 30000) == WAIT_OBJECT_0, "Activity startup");
     (void)session.consume();
@@ -922,7 +927,7 @@ WindowReport run_window(security::ActivityDispatcher &session, bool selftest, st
     report.window_process = GetCurrentProcessId();
     report.worker_process = session.publication().process_id;
     {
-        ActivityWindow window(session, report, presentation);
+        ActivityWindow window(session, report, presentation, developer_output_root);
         window.run();
     }
     const auto &state = session.snapshot();
@@ -968,10 +973,11 @@ WindowReport run_window(security::ActivityDispatcher &session, bool selftest, st
     return report;
 }
 } // namespace
-WindowReport run_fixture_window(const std::filesystem::path &path, bool selftest) {
+WindowReport run_fixture_window(const std::filesystem::path &path, bool selftest,
+                                const std::filesystem::path &developer_output_root) {
     security::ActivityDispatcher session(path, selftest ? security::ActivityMode::read_recovery_probe
-                                                        : security::ActivityMode::normal);
-    return run_window(session, selftest);
+                                                        : security::ActivityMode::normal, developer_output_root);
+    return run_window(session, selftest, {}, {}, {}, developer_output_root);
 }
 WindowReport run_installed_window(security::InstalledActivity application) {
     const auto id = application.id;

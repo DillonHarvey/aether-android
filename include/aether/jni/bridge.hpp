@@ -22,10 +22,15 @@ class Bridge final : public dex::NativeInterface, public a64::GuestServices {
     Bridge(const Bridge &) = delete;
     Bridge &operator=(const Bridge &) = delete;
     std::uint64_t capture_signal_mask(dex::ManagedRuntime&) override;
+    void finish_logical_thread(dex::ManagedRuntime &) override;
+    void discard_logical_thread(dex::ObjectId) noexcept override;
     bool supports_background() const noexcept override {return true;}
     // Known explicit roots include the pending/active JNI_OnLoad root.
     bool has_library(std::string_view root) const noexcept;
     void add_library(std::span<const elf::ModuleInput> modules, std::string root);
+    using ModuleProvider=std::function<std::vector<elf::ModuleInput>(std::string_view)>;
+    // Trusted app-scoped immutable module inventory, not a host filesystem loader.
+    void set_module_provider(ModuleProvider provider);
     void load_library(dex::ManagedRuntime &, std::u16string_view name) override;
     dex::Value invoke(dex::ManagedRuntime &, dex::Index method,
                       std::span<const dex::Value> arguments) override;
@@ -34,6 +39,8 @@ class Bridge final : public dex::NativeInterface, public a64::GuestServices {
     a64::Fault invoke_frame(std::uint32_t service, a64::Address instruction,
                             a64::ServiceState &) noexcept override;
     std::optional<std::uint64_t> thread_exit_value(a64::Address tls) const noexcept override;
+    bool event_pending() noexcept override;
+    a64::Fault checkpoint(a64::ServiceState &) noexcept override;
     const Metrics &metrics() const noexcept;
     const a64::Metrics &cpu_metrics() const noexcept;
     std::string_view last_error() const noexcept;

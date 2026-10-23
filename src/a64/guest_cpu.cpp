@@ -216,6 +216,7 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         ++stats.block_lookups;
         if (hit)
             ++stats.cache_hits;
+        if(services && services->event_pending())jit->HaltExecution();
     }
     void BlockCompiled(Address pc, const void *code, std::size_t size,
                        std::uint64_t elapsed) noexcept override {
@@ -352,6 +353,16 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     for (;;) {
         if(p.app.process_state->exit_status()){p.stop(Fault::process_exit,p.jit->GetPC());break;}
         if(p.services && p.services->thread_exit_value(logical_tls)){p.stop(Fault::thread_exit,p.jit->GetPC());break;}
+        if(p.services && p.services->event_pending()){
+            ServiceState state{p.jit->GetRegisters(),p.jit->GetVectors(),p.jit->GetSP(),p.active_invocation,stack_top};
+            p.dispatching_service=true;
+            const auto fault=p.services->checkpoint(state);
+            p.dispatching_service=false;
+            if(p.app.process_state->exit_status()){p.stop(Fault::process_exit,p.jit->GetPC());break;}
+            if(p.services->thread_exit_value(logical_tls)){p.stop(Fault::thread_exit,p.jit->GetPC());break;}
+            if(fault!=Fault::none){p.stop(fault,p.jit->GetPC());break;}
+            p.jit->ClearExclusiveState();p.monitor.Clear();
+        }
         if (!p.remaining) {
             p.stop(Fault::budget, p.jit->GetPC());
             break;
@@ -367,6 +378,7 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         p.stats.execution_nanoseconds += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                 .count());
+        if(!p.service_pending && p.result.fault==Fault::none && !p.result.returned && p.services && p.services->event_pending())continue;
         if (!p.service_pending || p.result.fault != Fault::none || p.result.returned)
             break;
         const auto service = p.pending_service;
@@ -409,6 +421,7 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     p.result.returned = p.result.returned && p.result.fault == Fault::none;
     return p.result;
 }
+void GuestCpu::process_checkpoint() const {impl_->app.process_state->checkpoint();}
 const Metrics &GuestCpu::metrics() const noexcept { return impl_->stats; }
 std::uint64_t GuestCpu::counter_frequency() const noexcept { return impl_->frequency; }
 } // namespace aether::a64

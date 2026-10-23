@@ -58,6 +58,8 @@ class Broker final {
     std::chrono::steady_clock::time_point idle_window_start_{};
     std::unique_ptr<host::FileService> files_;
     std::map<std::uint64_t, int> descriptors_;
+    struct FilePathLedger;
+    std::unique_ptr<FilePathLedger> file_paths_;
     const std::vector<std::uint8_t> package_;
     const std::string package_hash_;
     AudioBroker audio_;

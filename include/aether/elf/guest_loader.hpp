@@ -24,6 +24,11 @@ class ElfError : public std::runtime_error {
     ElfError(std::string code, std::string message);
     const std::string code;
 };
+class InitializerError : public ElfError {
+  public:
+    InitializerError(a64::Fault fault, std::string message);
+    const a64::Fault fault;
+};
 struct Segment {
     std::uint64_t offset = 0, address = 0, file_size = 0, memory_size = 0;
     a64::Permission permissions = a64::Permission::none;
@@ -61,6 +66,12 @@ struct GuestSymbol {
     std::uint64_t size = 0;
     std::uint8_t type = 0;
 };
+struct AddressInfo {
+    std::string module, symbol;
+    // Lowest mapped PT_LOAD page, rather than the ELF relocation load bias.
+    Address base = 0, symbol_address = 0;
+    bool has_symbol = !symbol.empty();
+};
 class ImportResolver {
   public:
     virtual ~ImportResolver() = default;
@@ -91,7 +102,13 @@ class GuestLoader {
     // Append an authorized root after successful initialization; resident content must match.
     void extend(std::span<const ModuleInput> inputs, std::string_view root);
     GuestSymbol symbol(std::string_view module, std::string_view name) const;
-    void initialize(a64::GuestCpu &cpu, Address stack_top);
+    // Search a committed root and its DT_NEEDED closure in breadth-first order.
+    // Registered virtual libraries are terminal nodes in that same scope.
+    std::optional<GuestSymbol> lookup(std::string_view root, std::string_view name) const;
+    // Observe committed guest PT_LOAD spans and their covering dynamic symbols.
+    // Page padding, gaps and in-progress/rolled-back modules have no identity.
+    std::optional<AddressInfo> address_info(Address address) const;
+    void initialize(a64::GuestCpu &cpu, Address stack_top, std::optional<Address> thread_pointer = {});
     void finalize(a64::GuestCpu &cpu, Address stack_top);
     const std::vector<GuestModule> &modules() const noexcept;
     std::size_t relocation_count() const noexcept;

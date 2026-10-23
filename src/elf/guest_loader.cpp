@@ -8,6 +8,8 @@
 #include <set>
 
 namespace aether::elf {
+InitializerError::InitializerError(a64::Fault fault_, std::string message)
+    : ElfError("AETHER_ELF_INITIALIZER_FAILED", std::move(message)), fault(fault_) {}
 namespace {
 constexpr Address page = a64::GuestMemory::page_size;
 Address down(Address value) { return value & ~(page - 1); }
@@ -36,13 +38,16 @@ struct GuestLoader::Impl {
     // Owned names survive resident module vector growth across appended graphs.
     // Each list retains breadth-first module order and dynamic symbol order.
     std::map<std::string, std::vector<std::pair<std::size_t, std::size_t>>, std::less<>> exports;
+    using LookupIndex=std::map<std::string,std::vector<std::size_t>,std::less<>>;
+    // Committed immutable symbol tables; avoid rescanning them on every guest dlsym.
+    mutable std::map<std::string,LookupIndex,std::less<>> lookup_exports;
     std::size_t resolution_steps = 0;
     std::size_t relocations = 0;
     std::vector<std::string> hashes;
     Address next = 0x10000000;
     std::uint64_t input_bytes = 0, mapped_bytes = 0;
     bool finalized = false;
-    bool loaded = false, initialization_started = false, initialization_failed = false;
+    bool loaded = false, loading = false, initialization_started = false, initialization_failed = false;
     Impl(a64::GuestMemory &m, const ImportResolver &i) : memory(m), imports(i) {}
     ~Impl() { clear(); }
     void clear() noexcept {
@@ -55,6 +60,7 @@ struct GuestLoader::Impl {
         }
         mappings.clear();
         exports.clear();
+        lookup_exports.clear();
         modules.clear();
         scope.clear();
         init_order.clear();
@@ -137,18 +143,20 @@ struct GuestLoader::Impl {
             }
         return std::nullopt;
     }
-    void call(a64::GuestCpu &cpu, Address address, Address stack_top) const {
+    void call(a64::GuestCpu &cpu, Address address, Address stack_top,
+              std::optional<Address> thread_pointer = {}) const {
         if (!address || address == std::numeric_limits<Address>::max())
             return;
         if (address % 4 || !memory.accessible(address, 4, a64::Permission::execute))
             throw ElfError("AETHER_ELF_INITIALIZER", "Initializer/finalizer target is not guest executable");
         constexpr std::array<std::uint64_t, 3> arguments{}; // argc, argv, envp for Android constructors.
-        const auto result = cpu.call(address, arguments, stack_top);
-        if(result.fault==a64::Fault::process_exit)throw ProcessExit{static_cast<std::uint8_t>(result.detail)};
+        const auto result = cpu.call(address, arguments, stack_top, 1'000'000, {}, thread_pointer);
+        if(result.fault==a64::Fault::process_exit){cpu.process_checkpoint();throw ProcessExit{static_cast<std::uint8_t>(result.detail)};}
         if(result.fault==a64::Fault::thread_exit)throw ThreadExit{result.registers[0]};
         if (!result.returned)
-            throw ElfError("AETHER_ELF_INITIALIZER_FAILED", "Guest initializer/finalizer failed: " +
-                                                                std::string(a64::fault_name(result.fault)));
+            throw InitializerError(result.fault == a64::Fault::none ? a64::Fault::invalid_call : result.fault,
+                                   "Guest initializer/finalizer failed: " +
+                                       std::string(a64::fault_name(result.fault)));
     }
     Address read_pointer(Address address) const {
         std::array<std::uint8_t, 8> bytes{};
@@ -171,11 +179,18 @@ void GuestLoader::extend(std::span<const ModuleInput> inputs, std::string_view r
 }
 void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_view root, bool additional) {
     auto &p = *impl_;
-    if (inputs.empty() || inputs.size() > native_graph_modules ||
+    if (p.loading || inputs.empty() || inputs.size() > native_graph_modules ||
         (!additional && p.loaded) ||
         (additional && (!p.loaded || !p.initialization_started || p.initialization_failed || p.finalized ||
                        std::any_of(p.modules.begin(), p.modules.end(), [](const auto &m) { return !m.initialized; }))))
         throw ElfError("AETHER_ELF_LOAD_STATE", "Native graph requires a fresh loader or successfully initialized resident modules");
+    // A ModuleSource can call trusted observers while being read. Never expose
+    // provisional modules before the complete graph mutation has committed.
+    struct Loading {
+        bool &state;
+        explicit Loading(bool &value) : state(value) { state = true; }
+        ~Loading() { state = false; }
+    } loading{p.loading};
     const auto old_modules = p.modules.size(), old_mappings = p.mappings.size(), old_init = p.init_order.size();
     const auto old_steps = p.resolution_steps;
     auto old_scope = std::move(p.scope);
@@ -369,7 +384,71 @@ GuestSymbol GuestLoader::symbol(std::string_view module, std::string_view name) 
                 return located(p.modules[*at], s);
     throw ElfError("AETHER_ELF_SYMBOL_UNRESOLVED", "Export was not found: " + std::string(name));
 }
-void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top) {
+std::optional<GuestSymbol> GuestLoader::lookup(std::string_view root, std::string_view name) const {
+    const auto &p = *impl_;
+    if (p.loading || (!p.index(root) && !p.imports.has_library(root))) return std::nullopt;
+    const std::string symbol_name(name);
+    // Rebuild this root's scope, rather than reusing the latest appended graph's
+    // relocation scope. Owned names remain valid if a trusted resolver appends a
+    // graph; no references into the resident module vector survive its callback.
+    std::vector<std::string> scope{std::string(root)};
+    std::set<std::string, std::less<>> visited{scope.front()};
+    for (std::size_t i = 0; i < scope.size(); ++i)
+        if (const auto at = p.index(scope[i]))
+            for (const auto &dependency : p.modules[*at].image.needed)
+                if (visited.insert(dependency).second) scope.push_back(dependency);
+    // At most native_graph_modules parsed symbol tables and their bounded
+    // DT_NEEDED lists are visited. Unrelated resident roots are never searched.
+    for (const auto &library : scope) {
+        if (const auto at = p.index(library)) {
+            const auto &module = p.modules[*at];
+            auto cached=p.lookup_exports.find(module.image.soname);
+            if(cached==p.lookup_exports.end()){
+                Impl::LookupIndex index;
+                for(std::size_t i=0;i<module.image.symbols.size();++i){
+                    const auto &symbol=module.image.symbols[i];
+                    if(symbol.defined && (symbol.binding==1 || symbol.binding==2) &&
+                        symbol.visibility!=1 && symbol.visibility!=2 && !symbol.version_hidden && symbol.type<=2)
+                        index[symbol.name].push_back(i);
+                }
+                cached=p.lookup_exports.emplace(module.image.soname,std::move(index)).first;
+            }
+            if(const auto found=cached->second.find(symbol_name);found!=cached->second.end())
+                return located(module,module.image.symbols[found->second.front()]);
+        } else if (const auto found = p.imports.resolve(library, symbol_name, {}); found && found->type <= 2) {
+            return found;
+        }
+    }
+    return std::nullopt;
+}
+std::optional<AddressInfo> GuestLoader::address_info(Address address) const {
+    const auto &p = *impl_;
+    if (!p.loaded || p.loading) return std::nullopt;
+    for (const auto &module : p.modules) {
+        if (address < module.base) continue;
+        const auto relative = address - module.base;
+        const bool contained = std::any_of(module.image.segments.begin(), module.image.segments.end(),
+            [relative](const auto &segment) {
+                return relative >= segment.address && relative - segment.address < segment.memory_size;
+            });
+        if (!contained) continue;
+        const auto lowest = std::min_element(module.image.segments.begin(), module.image.segments.end(),
+            [](const auto &left, const auto &right) { return left.address < right.address; });
+        AddressInfo result{module.image.soname, {}, module.base + down(lowest->address), 0};
+        for (const auto &symbol : module.image.symbols) {
+            if (symbol.defined && symbol.type != 6 && relative >= symbol.value &&
+                relative - symbol.value < symbol.size) {
+                result.has_symbol = true;
+                result.symbol = symbol.name;
+                result.symbol_address = symbol.absolute ? symbol.value : module.base + symbol.value;
+                break;
+            }
+        }
+        return result;
+    }
+    return std::nullopt;
+}
+void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top, std::optional<Address> thread_pointer) {
     auto &p = *impl_;
     if (!p.loaded || p.initialization_started)
         throw ElfError("AETHER_ELF_LOAD_STATE",
@@ -380,9 +459,9 @@ void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top) {
             auto &m = p.modules[at];
             if (m.initialized) continue;
             if (m.image.init)
-                p.call(cpu, m.base + m.image.init, stack_top);
+                p.call(cpu, m.base + m.image.init, stack_top, thread_pointer);
             for (std::uint64_t i = 0; i < m.image.init_count; ++i)
-                p.call(cpu, p.read_pointer(m.base + m.image.init_array + i * 8), stack_top);
+                p.call(cpu, p.read_pointer(m.base + m.image.init_array + i * 8), stack_top, thread_pointer);
             m.initialized = true;
         }
     } catch (...) {

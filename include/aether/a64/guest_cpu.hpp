@@ -69,6 +69,9 @@ class GuestServices {
     virtual ~GuestServices() = default;
     // Sticky terminal value for this logical TLS owner, including nested callbacks.
     virtual std::optional<std::uint64_t> thread_exit_value(Address) const noexcept {return {};}
+    // Event polling may halt generated code; delivery runs only after Run returns.
+    virtual bool event_pending() noexcept {return false;}
+    virtual Fault checkpoint(ServiceState &) noexcept {return Fault::none;}
     virtual Fault invoke(std::uint32_t service, Address instruction,
                          std::array<std::uint64_t, 31> &registers) noexcept = 0;
     virtual Fault invoke_frame(std::uint32_t service, Address instruction, ServiceState &state) noexcept {
@@ -88,6 +91,8 @@ class GuestCpu {
                          std::span<const Vector> floating_arguments = {}, std::optional<Address> thread_pointer = {});
     // Bind an owned logical TLS block before any native call.
     void set_thread_pointer(Address address);
+    // Trusted host boundary: preserve the canonical process terminal cause.
+    void process_checkpoint() const;
     const Metrics &metrics() const noexcept;
     std::uint64_t counter_frequency() const noexcept;
 

@@ -35,9 +35,11 @@ struct IsolatedActivity::Impl {
     std::unique_ptr<WorkerProcess> worker;
     bool exited = false, failed = false;
     explicit Impl(const std::filesystem::path &path, ActivityMode mode,
-                  const InstalledActivity *application = nullptr) {
+                  const InstalledActivity *application = nullptr,
+                  const std::filesystem::path &developer_output_root = {}) {
         require(mode == ActivityMode::normal || mode == ActivityMode::read_recovery_probe ||
-                    mode == ActivityMode::exit_zero_probe || mode == ActivityMode::exit_255_probe,
+                    mode == ActivityMode::exit_zero_probe || mode == ActivityMode::exit_255_probe ||
+                    mode == ActivityMode::abort_probe,
                 "Invalid Activity mode");
         apk::InspectLimits limits;
         if (application)
@@ -70,9 +72,11 @@ struct IsolatedActivity::Impl {
             if (permissions & installed_files)
                 storage = std::make_unique<PrivateStorage>(application->data_root);
         } else {
-            const auto storage_parent = directory / "activity-data";
+            const auto &output = developer_output_root.empty() ? directory : developer_output_root;
+            require(output.is_absolute(), "Developer output root must be a trusted absolute path");
+            const auto storage_parent = output / "activity-data";
             std::filesystem::create_directory(storage_parent);
-            journal = make_file_audit(directory / "audit-data");
+            journal = make_file_audit(output / "audit-data");
             storage = std::make_unique<PrivateStorage>(storage_parent, app_id);
         }
         struct StartupCompletion {
@@ -99,7 +103,8 @@ struct IsolatedActivity::Impl {
              {std::uint64_t{application ? 20u
                             : mode == ActivityMode::normal ? 11u
                             : mode == ActivityMode::read_recovery_probe ? 12u
-                            : mode == ActivityMode::exit_zero_probe ? 29u : 30u},
+                            : mode == ActivityMode::exit_zero_probe ? 29u
+                            : mode == ActivityMode::exit_255_probe ? 30u : 31u},
               static_cast<std::uint64_t>(GetCurrentProcessId()), app_id, std::uint64_t{1}, std::uint64_t{0}})
             append_u64(boot.payload, value);
         if (application) {
@@ -259,8 +264,9 @@ struct IsolatedActivity::Impl {
             throw ActivityReadUnavailable{};
     }
 };
-IsolatedActivity::IsolatedActivity(const std::filesystem::path &apk, ActivityMode mode)
-    : impl_(std::make_unique<Impl>(apk, mode)) {}
+IsolatedActivity::IsolatedActivity(const std::filesystem::path &apk, ActivityMode mode,
+                                 const std::filesystem::path &developer_output_root)
+    : impl_(std::make_unique<Impl>(apk, mode, nullptr, developer_output_root)) {}
 IsolatedActivity::IsolatedActivity(InstalledActivity application)
     : impl_(std::make_unique<Impl>(std::filesystem::path{}, ActivityMode::normal, &application)) {}
 IsolatedActivity::~IsolatedActivity() = default;

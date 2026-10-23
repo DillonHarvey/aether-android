@@ -65,7 +65,7 @@ void validate(const AuditRecord &record) {
                 (record.context.capabilities & ~audit_known_capabilities) == 0 && entry.app_id == record.context.app_id &&
                 static_cast<std::uint32_t>(entry.operation) <= UINT16_MAX,
             "Invalid record identity or bounds");
-    require(static_cast<unsigned>(entry.file_error) <= static_cast<unsigned>(host::FileError::would_block) &&
+    require(static_cast<unsigned>(entry.file_error) <= static_cast<unsigned>(host::FileError::not_empty) &&
                 entry.audio_error <= 8 &&
                 (entry.graphics_operation == UINT32_MAX || entry.graphics_operation < 54),
             "Invalid typed service metadata");

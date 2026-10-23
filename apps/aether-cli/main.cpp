@@ -162,32 +162,24 @@ int run(const std::vector<std::string> &arguments, bool json) {
     bool wants_fixture = false;
     std::string apk_path;
     bool wants_apk = false;
+    std::string evidence_root;
+    bool wants_evidence_root = false;
     for (const auto &arg : arguments) {
-        if (wants_apk) {
+        if (wants_apk || wants_fixture || wants_evidence_root) {
+            const auto option = wants_apk ? "--apk" : wants_fixture ? "--fixture" : "--evidence-root";
             if (arg.empty() || arg.starts_with('-'))
-                return fail(
-                    {"AETHER_CLI_USAGE", "cli", "--apk requires a path", "Use aether --help.", {}, {}, {}}, 2,
-                    json);
-            apk_path = arg;
-            wants_apk = false;
+                return fail({"AETHER_CLI_USAGE", "cli", std::string(option) + " requires a path",
+                             "Use aether --help.", {}, {}, {}}, 2, json);
+            (wants_apk ? apk_path : wants_fixture ? fixture_path : evidence_root) = arg;
+            wants_apk = wants_fixture = wants_evidence_root = false;
+            continue;
+        }
+        if (arg == "--evidence-root" && evidence_root.empty()) {
+            wants_evidence_root = true;
             continue;
         }
         if (arg == "--apk" && apk_path.empty()) {
             wants_apk = true;
-            continue;
-        }
-        if (wants_fixture) {
-            if (arg.empty() || arg.starts_with('-'))
-                return fail({"AETHER_CLI_USAGE",
-                             "cli",
-                             "--fixture requires a path",
-                             "Use aether --help.",
-                             {},
-                             {},
-                             {}},
-                            2, json);
-            fixture_path = arg;
-            wants_fixture = false;
             continue;
         }
         if (arg == "--fixture" && fixture_path.empty()) {
@@ -225,6 +217,11 @@ int run(const std::vector<std::string> &arguments, bool json) {
     }
     if (command.empty())
         command = "--help";
+    if (wants_evidence_root || (!evidence_root.empty() &&
+        ((command != "run" && command != "window-selftest") ||
+         !std::filesystem::path(aether::utf16(evidence_root)).is_absolute())))
+        return fail({"AETHER_CLI_USAGE", "cli", "--evidence-root requires an absolute developer output root",
+                     "Use only with first-party fixture run or window-selftest.", {}, {}, {}}, 2, json);
     const bool apk_test = command == "dex-selftest" || command == "framework-selftest" ||
                           command == "window-selftest" || command == "isolation-selftest";
     if (wants_apk || (!apk_path.empty() && !apk_test) ||
@@ -315,6 +312,7 @@ int run(const std::vector<std::string> &arguments, bool json) {
                    "  audio-selftest --fixture <so> (first-party ARM64 AAudio/WASAPI; private session "
                    "muted)\n"
                    "  run <apk> (normal Win32 window; exact first-party fixture only)\n"
+                   "    run/window-selftest: --evidence-root <absolute-directory> isolates developer evidence\n"
                    "  api-support [query] (search Android class/method/signature/status)\n\n"
                    "  install <apk> --dry-run (inspection only; no execution or writes)\n"
                    "  install <apk> --developer-fixture --yes (exact fixture package storage)\n"
@@ -418,7 +416,8 @@ int run(const std::vector<std::string> &arguments, bool json) {
                          {}},
                         2, json);
         const auto report = aether::host::run_fixture_window(
-            aether::utf16(command == "run" ? positional[0] : apk_path), command == "window-selftest");
+            aether::utf16(command == "run" ? positional[0] : apk_path), command == "window-selftest",
+            aether::utf16(evidence_root));
         std::cout << (json ? report.json() + '\n' : report.text(verbose));
         return report.passed() ? 0 : 1;
     }
