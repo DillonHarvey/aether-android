@@ -10,7 +10,7 @@ Aether is a project working towards a simple idea: install an Android app on you
 
 This page explains the project in everyday language. No programming knowledge needed.
 
-**Project snapshot · 26 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
+**Project snapshot · 27 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
 [The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
@@ -44,7 +44,8 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 6 installed · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue implementation** | **875 of 3,589 implemented (24.38%)** |
+| **Catalogue implementation** | **894 of 3,589 implemented (24.91%)** |
+| **Remaining catalogue work** | **2,695 entries: 749 partial and 1,946 not started** |
 | **Public release** | Still in development; release requirements remain open |
 
 Development phases vary greatly in size. Completing eight phases does not mean the finished product is almost ready, or that a similar share of Android apps will work.
@@ -53,7 +54,7 @@ The local progress and app compatibility records contain the evidence behind thi
 
 ## What works today
 
-These are **demonstrated capabilities within a limited scope**, updated from local engineering records through 26 October 2026. They describe implementation progress separately from the checklist's review percentages below.
+These are **demonstrated capabilities within a limited scope**, updated from local engineering records through 27 October 2026. They describe implementation progress separately from the checklist's review percentages below.
 
 ### 📦 App files, installation and updates
 
@@ -75,9 +76,15 @@ These are **demonstrated capabilities within a limited scope**, updated from loc
 | **More language and resource behaviour** | Supports bounded switch instructions, array cloning, generated class names, compiled resource names, structured resource values and neutral density/API selection. Errors can identify the failing DEX table, record and byte offset. | Full Android themes, locale/device configuration and many language/API features remain unfinished. |
 | **Interactive windows and persistence** | Shows basic app screens in resizable Windows windows with mouse/keyboard input and app lifecycle events. Pocket Tally saves a count through its own ARM64 library and reloads it after reopening. | Saving needs the app's private-file permission; the counter's save is not crash-atomic. |
 
-### Recent source progress - 26 October 2026
+### Recent source progress - 27 October 2026
 
-Current work covers **1,277 requirements across five categories**: Windows integration, ARM64 translation, JNI, DEX/Java and security. All five remain incomplete. Recent source additions include ARM64 scheduling/cache operations and a bounded scalar atomic-instruction fallback; JNI primitive-array copies, string regions, ordinary constructors and nonvirtual calls; and Java string comparison, literal replacement and weak interning. Each retains explicit limits and unsupported cases.
+Current source adds Android launch information that app code can read and update, preserves the selected app component through startup and screen recreation, and implements seven more individual framework methods in the catalogue.
+
+Supported link-routing conditions can now be decoded and matched to eligible app screens. An internal launch path carries the supplied request into a genuine Android Intent, with the worker checking the selected component against the held APK before app initialization. Unknown policy/resources, competing screens and unsupported task or file-access flags are refused. Selected Release/Debug library builds and worker compilation are recorded as passing; running-app behavior remains unverified.
+
+Windows request forwarding and its permission choices, resource-backed routing, Android preference selection, broader task delivery and notification actions remain unfinished. These partial routing additions do not increase the implemented count beyond **894 / 3,589**.
+
+The current goal retains **all 3,589 catalogue entries**. Within that goal, the historical five-category subset covers 1,277 requirements across Windows integration, ARM64 translation, JNI, DEX/Java and security: **638 are source-implemented (49.96%); 639 remain.** All five remain incomplete. Windows integration has the highest implemented share at **53/65 (81.54%)**, with **12 entries remaining**. Recent source additions include ARM64 scheduling/cache operations and a bounded scalar atomic-instruction fallback; JNI primitive-array copies, string regions, ordinary constructors and nonvirtual calls; and Java string comparison, literal replacement and weak interning. Each retains explicit limits and unsupported cases. Recent source work also adds array copying, backed JNI local-reference capacity, precise cache-operation failures and a bounded vertical scrolling layout with Windows accessibility actions. These changes have compiled; running-app behavior remains unverified.
 
 Windows source work adds a bounded UI Automation view tree with supported Invoke/focus actions, legacy icon-path repair, graceful-close coordination before removal, interrupted-upgrade recovery and per-app native sound playback with explicit default-off consent. General editable/scrolling accessibility, Android media APIs and notification activation/consent remain unfinished. **Installed notifications stay disabled.**
 
@@ -109,15 +116,24 @@ The public implementation is in [package handling](src/apk/), [managed execution
 
 ## Progress counts
 
-The **26 October 2026 authoritative CSV snapshot** records **876 implemented (24.41%)**, **745 in progress** and **1,968 not started** among **3,589 entries**, with none unassessed or blocked. Category and area counts below are recalculated directly from the current CSV.
+The **27 October 2026 authoritative CSV snapshot** records **894 implemented (24.91%)**, **749 in progress** and **1,946 not started** among **3,589 entries**, with none unassessed or blocked. Category and area counts below are recalculated directly from the current CSV.
 
-These are recorded **source implementation dispositions**, including the latest 26 October follow-ups. They do not establish acceptance-test passes. Detailed source references, review notes and independent test/verification fields remain in the local catalogue; this README update does not reassess every implementation or change those records.
+| Implementation status | Entries | Share |
+| :--- | ---: | ---: |
+| Implemented | 894 | 24.91% |
+| In progress | 749 | 20.87% |
+| Not started | 1,946 | 54.22% |
+| **Total** | **3,589** | **100.00%** |
+
+There are **2,695 entries still incomplete**. New source work under review is not counted as implemented until its catalogue disposition is updated.
+
+These are recorded **source implementation dispositions**, checked against the CSV on 27 October 2026. They do not establish acceptance-test passes. Detailed source references, review notes and independent test/verification fields remain in the local catalogue; this README update does not reassess every implementation or change those records.
 
 The tables count **implemented catalogue requirements**. Partial work and unsupported requirements do not increase the percentage. Implementation and complete test verification remain separate, and successful real-app workflows are reported separately below.
 
 <!-- aether:compatibility-progress:start -->
 
-**875 / 3,589 entries implemented (24.38%)**
+**894 / 3,589 entries implemented (24.91%)**
 
 Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
@@ -126,11 +142,11 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | Category | Entries | Implemented | % |
 | :--- | ---: | ---: | ---: |
 | Packages & signing | 140 | 40 | 28.57% |
-| ARM64 translation | 238 | 135 | 56.72% |
+| ARM64 translation | 238 | 137 | 57.56% |
 | Native libraries & POSIX | 457 | 119 | 26.04% |
-| DEX & Java runtime | 601 | 254 | 42.26% |
-| Java/native bridge (JNI) | 285 | 153 | 53.68% |
-| Android framework | 231 | 11 | 4.76% |
+| DEX & Java runtime | 601 | 257 | 42.76% |
+| Java/native bridge (JNI) | 285 | 160 | 56.14% |
+| Android framework | 231 | 18 | 7.79% |
 | Screens & graphics | 862 | 54 | 6.26% |
 | Files & networking | 198 | 14 | 7.07% |
 | Media & devices | 236 | 0 | 0.00% |
@@ -138,7 +154,7 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | Security & permissions | 88 | 31 | 35.23% |
 | Windows integration | 65 | 53 | 81.54% |
 | Quality & reproducibility | 60 | 11 | 18.33% |
-| **Total** | **3,589** | **875** | **24.38%** |
+| **Total** | **3,589** | **894** | **24.91%** |
 
 Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
@@ -150,7 +166,7 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | APK, signing and distribution | 46 | 22 | 47.83% |
 | APK and manifest detailed formats | 94 | 18 | 19.15% |
 | ARM64 guest translation and ABI | 27 | 10 | 37.04% |
-| AArch64 instruction conformance | 211 | 125 | 59.24% |
+| AArch64 instruction conformance | 211 | 127 | 60.19% |
 | Android native ELF loading and dynamic linker | 30 | 1 | 3.33% |
 | ELF and linker detailed conformance | 71 | 18 | 25.35% |
 | Bionic libc and POSIX compatibility | 42 | 9 | 21.43% |
@@ -161,11 +177,11 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | ART-compatible managed semantics | 27 | 3 | 11.11% |
 | ART semantic edge cases | 44 | 5 | 11.36% |
 | Java/Kotlin standard runtime libraries | 33 | 0 | 0.00% |
-| Java core library individual methods | 161 | 44 | 27.33% |
-| JNI API | 234 | 118 | 50.43% |
-| JNI semantic edge cases | 51 | 35 | 68.63% |
+| Java core library individual methods | 161 | 47 | 29.19% |
+| JNI API | 234 | 124 | 52.99% |
+| JNI semantic edge cases | 51 | 36 | 70.59% |
 | Android framework and app lifecycle | 71 | 0 | 0.00% |
-| Android framework individual methods | 160 | 11 | 6.88% |
+| Android framework individual methods | 160 | 18 | 11.25% |
 | Android Views and resources | 63 | 0 | 0.00% |
 | Android graphics, UI and resources detailed | 105 | 1 | 0.95% |
 | EGL, GLES, Vulkan and shader runtime | 48 | 2 | 4.17% |
@@ -212,7 +228,7 @@ Each entry is counted once by its recorded source. Project-specific requirements
 
 <!-- aether:compatibility-progress:end -->
 
-**How this updates:** the catalogue tool recalculates every category and area from the authoritative CSV when synchronized. This README snapshot was read directly from the CSV on 26 October 2026; generated summaries can lag behind it. GitHub shows the latest committed README; the CSV, Excel view and detailed source evidence remain local.
+**How this updates:** the catalogue tool recalculates every category and area from the authoritative CSV when synchronized. This README snapshot was read directly from the CSV on 27 October 2026; generated summaries can lag behind it. GitHub shows the latest committed README; the CSV, Excel view and detailed source evidence remain local.
 
 **How to read the percentages:** Implemented entries divided by all entries in that category. Partial work contributes zero. All entries now have an implementation disposition, while test verification and real-app outcomes remain separate. Overlapping broad requirements and refinements mean this is a catalogue ratio, not the percentage of Android supported.
 
