@@ -1496,6 +1496,11 @@ a64::Fault GuestPosixServices::finalize_cxa(a64::ServiceState &state) noexcept {
 void GuestPosixServices::set_managed_priority_service(int baseline,host::PriorityService service){impl_->threads.managed_priority(baseline,std::move(service));}
 host::PriorityResult GuestPosixServices::current_thread_priority(std::optional<std::int32_t> nice){return impl_->threads.priority(0,0,nice);}
 std::optional<std::uint64_t> GuestPosixServices::thread_exit_value(Address tls) const noexcept {return impl_->threads.exit_value(tls);}
+std::shared_ptr<a64::ThreadRegisterState> GuestPosixServices::thread_register_state(Address trusted_tls) const {
+    auto state=impl_->threads.thread_register_state(trusted_tls);
+    if(!state)throw a64::GuestError("AETHER_GUEST_TLS","TLS register state requires the current owned logical thread");
+    return state;
+}
 void GuestPosixServices::request_thread_exit(std::uint64_t value) noexcept {impl_->threads.request_exit(value);}
 GuestPosixServices::ThreadExecution GuestPosixServices::finish_current_thread(const DestructorRunner &runner,std::uint64_t budget) {
     auto &p=*impl_;

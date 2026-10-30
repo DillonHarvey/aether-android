@@ -1,6 +1,7 @@
 #pragma once
 #include "aether/bionic/guest_posix.hpp"
 #include <array>
+#include <memory>
 #include <optional>
 #include <thread>
 namespace aether::bionic {
@@ -44,6 +45,8 @@ class NativeThreads {
     // run-to-completion cooperative progress, not resumable thread time slicing.
     a64::Fault yield(bool full_frame);
     a64::Address tls()const noexcept;
+    // Architectural values belong to the current trusted owner, not their bits.
+    std::shared_ptr<a64::ThreadRegisterState> thread_register_state(a64::Address trusted_tls) const noexcept;
     a64::Address error_address()const noexcept;
     std::optional<GuestPosixServices::ThreadBinding> exchange_binding(std::optional<GuestPosixServices::ThreadBinding> value);
     std::uint32_t tid()const noexcept{return external_?external_->id:active_;}
@@ -52,7 +55,7 @@ class NativeThreads {
   private:
     static constexpr std::array<char,16> initial_name{'a','e','t','h','e','r'};
     enum class State {runnable,running,completed,failed};
-    struct Thread {std::uint32_t id; a64::Address entry,arg,stack,tls;State state=State::runnable;GuestPosixServices::ThreadExecution execution;bool stack_owned=false,tls_owned=false,guard_owned=false,detached=false;std::uint64_t stack_size=0,mapped_size=0,guard_size=0;std::uint64_t signal_mask=0,pending_signals=0;std::int32_t nice=0;std::optional<std::uint64_t> exited;NativeSignalStack signal_stack;std::array<char,16> name=initial_name;std::uint64_t locale=UINT64_MAX;};
+    struct Thread {std::uint32_t id; a64::Address entry,arg,stack,tls;State state=State::runnable;GuestPosixServices::ThreadExecution execution;bool stack_owned=false,tls_owned=false,guard_owned=false,detached=false;std::uint64_t stack_size=0,mapped_size=0,guard_size=0;std::uint64_t signal_mask=0,pending_signals=0;std::int32_t nice=0;std::optional<std::uint64_t> exited;NativeSignalStack signal_stack;std::array<char,16> name=initial_name;std::uint64_t locale=UINT64_MAX;std::shared_ptr<a64::ThreadRegisterState> registers;};
     NativeThreadSpecific *specific_;
     struct Finalizing {std::uint32_t id; a64::Address tls;bool exited=false;};
     std::array<Finalizing,33> finalizing_{};
@@ -62,7 +65,8 @@ class NativeThreads {
     NativeSignalStack main_signal_stack_;
     std::array<char,16> main_name_=initial_name;
     std::optional<std::uint64_t> main_exit_;
-    struct ManagedMask {std::uint32_t id=0;a64::Address tls=0;std::uint64_t mask=0,pending=0;std::int32_t nice=0;std::optional<std::uint64_t> exited;NativeSignalStack signal_stack;std::array<char,16> name=initial_name;std::uint64_t locale=UINT64_MAX;};
+    std::shared_ptr<a64::ThreadRegisterState> main_registers_;
+    struct ManagedMask {std::uint32_t id=0;a64::Address tls=0;std::uint64_t mask=0,pending=0;std::int32_t nice=0;std::optional<std::uint64_t> exited;NativeSignalStack signal_stack;std::array<char,16> name=initial_name;std::uint64_t locale=UINT64_MAX;std::shared_ptr<a64::ThreadRegisterState> registers;};
     std::array<ManagedMask,16> managed_masks_{};
     std::optional<GuestPosixServices::ThreadBinding> external_;
     std::array<std::optional<Thread>,16> threads_;GuestPosixServices::ThreadRunner runner_;std::string_view rejection_;

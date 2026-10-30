@@ -92,10 +92,14 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
     GuestServices *services;
     Metrics stats;
     ExecutionResult result;
+    bool cpu_exception_pc_pending = false;
     Dynarmic::ExclusiveMonitor monitor{1};
     std::unique_ptr<Dynarmic::A64::Jit> jit;
     std::uint64_t remaining = 0, memory_generation = 0, frequency = 0;
     std::uint64_t tpidr = 0, tpidr_read_only = 0, default_tpidr = 0;
+    std::shared_ptr<ThreadRegisterState> default_registers = std::make_shared<ThreadRegisterState>();
+    std::shared_ptr<ThreadRegisterState> active_registers;
+    Address active_tls = 0;
     const DWORD owner_thread = GetCurrentThreadId();
     bool service_pending = false, dispatching_service = false;
     bool yield_pending = false;
@@ -155,24 +159,42 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         // A generic user halt alone is only observed at a later block boundary.
         jit->HaltExecution(reason);
     }
-    template <class T> T read(Address address) noexcept {
+    void stop_cpu(CpuExceptionKind kind, Fault fault, Address address, std::uint32_t bytes,
+                  std::uint32_t subtype = 0, std::optional<Address> pc = {}) noexcept {
+        if (result.fault == Fault::none) {
+            CpuException exception;
+            exception.kind = kind;
+            exception.address = address;
+            exception.access_bytes = bytes;
+            exception.subtype = subtype;
+            exception.state.pc = pc.value_or(0);
+            result.cpu_exception = exception;
+            // Translated memory callbacks do not yet have a materialized PC.
+            // Their MemoryAbort guard supplies it before Run returns.
+            cpu_exception_pc_pending = !pc.has_value();
+        }
+        stop(fault, address, subtype);
+    }
+    template <class T> T read(Address address, CpuExceptionKind origin = CpuExceptionKind::read_abort) noexcept {
         T value{};
         ++stats.memory_reads;
         if (!memory.read(address, {reinterpret_cast<std::uint8_t *>(&value), sizeof(value)}))
-            stop(Fault::read, address);
+            stop_cpu(origin, Fault::read, address, static_cast<std::uint32_t>(sizeof(T)));
         return value;
     }
     template <class T> void write(Address address, T value) noexcept {
         ++stats.memory_writes;
         if (!memory.write(address, {reinterpret_cast<const std::uint8_t *>(&value), sizeof(value)}))
-            stop(Fault::write, address);
+            stop_cpu(CpuExceptionKind::write_abort, Fault::write, address, static_cast<std::uint32_t>(sizeof(T)));
     }
     template <class T> bool exclusive(Address address, T value, T expected) noexcept {
         if (address % sizeof(T)) {
             stop(Fault::write, address);
             return false;
         }
-        if (read<T>(address) != expected || result.fault != Fault::none)
+        // The comparison read implements a guest exclusive STORE, not a load.
+        // Preserve its historical diagnostic Fault while recording CPU intent.
+        if (read<T>(address, CpuExceptionKind::write_abort) != expected || result.fault != Fault::none)
             return false;
         write(address, value);
         return result.fault == Fault::none;
@@ -212,7 +234,7 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         if (count == 1) {
             const auto instruction = MemoryReadCode(pc);
             if (!instruction) {
-                stop(Fault::execute, pc);
+                stop_cpu(CpuExceptionKind::instruction_abort, Fault::execute, pc, 4, 0, pc);
                 return;
             }
             if (const auto decoded = decode_scalar_lse(*instruction)) {
@@ -227,18 +249,24 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         const auto &decoded = pending.decoded;
         jit->SetPC(pending.pc);
         const auto address = decoded.base == 31 ? jit->GetSP() : jit->GetRegister(decoded.base);
-        if ((decoded.base == 31 && address % 16) || address % decoded.bytes) {
-            stop(Fault::alignment, address, pending.instruction);
+        if (decoded.base == 31 && address % 16) {
+            stop_cpu(CpuExceptionKind::stack_alignment, Fault::alignment, address, decoded.bytes,
+                     pending.instruction, pending.pc);
+            return;
+        }
+        if (address % decoded.bytes) {
+            stop_cpu(CpuExceptionKind::data_alignment, Fault::alignment, address, decoded.bytes,
+                     pending.instruction, pending.pc);
             return;
         }
         if (!memory.accessible(address, decoded.bytes, Permission::read)) {
-            stop(Fault::read, address, pending.instruction);
+            stop_cpu(CpuExceptionKind::read_abort, Fault::read, address, decoded.bytes, pending.instruction, pending.pc);
             return;
         }
         // An atomic is a read/write access, including a failed CAS comparison.
         // Preflight the entire range before reading or modifying guest state.
         if (!memory.accessible(address, decoded.bytes, Permission::write)) {
-            stop(Fault::write, address, pending.instruction);
+            stop_cpu(CpuExceptionKind::write_abort, Fault::write, address, decoded.bytes, pending.instruction, pending.pc);
             return;
         }
         const auto mask = decoded.bytes == 8 ? UINT64_MAX : (std::uint64_t{1} << (decoded.bytes * 8)) - 1;
@@ -252,7 +280,7 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         ++stats.memory_reads;
         if (!memory.read(address, {reinterpret_cast<std::uint8_t *>(&observed), decoded.bytes})) {
-            stop(Fault::read, address, pending.instruction);
+            stop_cpu(CpuExceptionKind::read_abort, Fault::read, address, decoded.bytes, pending.instruction, pending.pc);
             return;
         }
         auto changed = observed;
@@ -268,7 +296,7 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         if (store) {
             ++stats.memory_writes;
             if (!memory.write(address, {reinterpret_cast<const std::uint8_t *>(&changed), decoded.bytes})) {
-                stop(Fault::write, address, pending.instruction);
+                stop_cpu(CpuExceptionKind::write_abort, Fault::write, address, decoded.bytes, pending.instruction, pending.pc);
                 return;
             }
         }
@@ -282,15 +310,15 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         jit->SetPC(pending.pc + 4);
         ++stats.interpreted_lse_instructions;
     }
-    std::uint64_t counter() noexcept {
+    std::uint64_t counter(Address fault_origin = 0, std::uint32_t fault_detail = 0) noexcept {
         if (!app.monotonic_time_allowed) {
-            stop(Fault::capability_denied);
+            stop(Fault::capability_denied, fault_origin, fault_detail);
             return 0;
         }
         LARGE_INTEGER value{};
         ++stats.host_calls;
         if (!QueryPerformanceCounter(&value)) {
-            stop(Fault::windows_service);
+            stop(Fault::windows_service, fault_origin, fault_detail);
             return 0;
         }
         return static_cast<std::uint64_t>(value.QuadPart);
@@ -300,7 +328,8 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
             result.returned = true;
             jit->HaltExecution();
         } else if (service == 1) {
-            const auto ticks = counter();
+            const auto instruction = jit->GetPC() - 4;
+            const auto ticks = counter(instruction, service);
             if (result.fault == Fault::none) {
                 jit->SetRegister(0, ticks);
                 jit->SetRegister(1, frequency);
@@ -318,13 +347,15 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         // The typed callback preserves SP and identifies the actual effective
         // address. No load, store or exclusive-monitor operation has run yet.
         jit->SetPC(pc);
-        stop(Fault::alignment, address, static_cast<std::uint32_t>(Dynarmic::A64::Exception::DataAlignment));
+        stop_cpu(CpuExceptionKind::data_alignment, Fault::alignment, address, 0,
+                 static_cast<std::uint32_t>(Dynarmic::A64::Exception::DataAlignment), pc);
     }
     void ExceptionRaised(Address pc, Dynarmic::A64::Exception exception) override {
         if (exception == Dynarmic::A64::Exception::StackPointerAlignment) {
             // The backend has materialized the exact captured live SP and PC,
             // before any effective-address offset, memory access or writeback.
-            stop(Fault::alignment, jit->GetSP(), static_cast<std::uint32_t>(exception));
+            stop_cpu(CpuExceptionKind::stack_alignment, Fault::alignment, jit->GetSP(), 0,
+                     static_cast<std::uint32_t>(exception), pc);
             return;
         }
         if (exception == Dynarmic::A64::Exception::Yield) {
@@ -334,9 +365,21 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
             jit->HaltExecution();
             return;
         }
-        stop(exception == Dynarmic::A64::Exception::NoExecuteFault ? Fault::execute
-                                                                   : Fault::unsupported_instruction,
-             pc, static_cast<std::uint32_t>(exception));
+        switch (exception) {
+        case Dynarmic::A64::Exception::NoExecuteFault:
+            stop_cpu(CpuExceptionKind::instruction_abort, Fault::execute, pc, 4, static_cast<std::uint32_t>(exception), pc);
+            return;
+        case Dynarmic::A64::Exception::Breakpoint:
+            stop_cpu(CpuExceptionKind::breakpoint, Fault::unsupported_instruction, pc, 0, static_cast<std::uint32_t>(exception), pc);
+            return;
+        case Dynarmic::A64::Exception::UnallocatedEncoding:
+        case Dynarmic::A64::Exception::ReservedValue:
+            stop_cpu(CpuExceptionKind::undefined_encoding, Fault::unsupported_instruction, pc, 0,
+                     static_cast<std::uint32_t>(exception), pc);
+            return;
+        default:
+            stop(Fault::unsupported_instruction, pc, static_cast<std::uint32_t>(exception));
+        }
     }
     void DataCacheOperationRaised(Dynarmic::A64::DataCacheOperation op, Address value) override {
         if (op == Dynarmic::A64::DataCacheOperation::CleanByVAToPoU) {
@@ -426,7 +469,12 @@ void GuestCpu::set_thread_pointer(Address address) {
     auto &p=*impl_;
     if(GetCurrentThreadId()!=p.owner_thread || p.call_depth || p.jit->IsExecuting())throw GuestError("AETHER_GUEST_CPU_OWNERSHIP","TLS binding requires idle CPU owner");
     if(address && !p.memory.accessible(address,48,Permission::read))throw GuestError("AETHER_GUEST_TLS","TLS block is not guest readable");
-    p.default_tpidr=p.tpidr=address;
+    if (p.default_tpidr != address) {
+        // This one bounded fallback incarnation is preallocated. Provider-owned
+        // values are selected at call entry and are never changed by this setter.
+        *p.default_registers = ThreadRegisterState{address, 0};
+        p.default_tpidr = address;
+    }
 }
 ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arguments, Address stack_top,
                                std::uint64_t instruction_budget, std::span<const Vector> floating_arguments, std::optional<Address> thread_pointer) {
@@ -454,6 +502,21 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     }
     const auto invocation=next_invocation();
     if(!invocation){ExecutionResult invalid;invalid.fault=Fault::invalid_call;++p.stats.faults;return invalid;}
+    // Save the live software register before consulting any next-owner record.
+    // Lookup failure leaves the active frame and its backing unchanged.
+    if (p.active_registers)
+        *p.active_registers = ThreadRegisterState{p.tpidr, p.tpidr_read_only};
+    auto selected_registers = p.services ? p.services->thread_register_state(logical_tls) : nullptr;
+    if (p.active_registers && logical_tls == p.active_tls) {
+        if (selected_registers && selected_registers != p.active_registers)
+            throw GuestError("AETHER_GUEST_TLS", "Nested TLS owner incarnation changed");
+        selected_registers = p.active_registers;
+    } else if (selected_registers && selected_registers == p.active_registers) {
+        throw GuestError("AETHER_GUEST_TLS", "Different TLS owners share architectural register state");
+    }
+    if (!selected_registers)
+        selected_registers = logical_tls == p.default_tpidr ? p.default_registers :
+            std::make_shared<ThreadRegisterState>(ThreadRegisterState{logical_tls, 0});
     struct SavedFrame {
         Impl &p;
         ExecutionResult result;
@@ -462,7 +525,9 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         Address pc, sp;
         std::uint32_t pstate, fpsr, fpcr;
         std::uint64_t remaining, ticks, tpidr, tpidr_read_only, invocation;
-        bool dispatching, nested;
+        std::shared_ptr<ThreadRegisterState> parent_registers;
+        Address parent_tls;
+        bool dispatching, nested, cpu_exception_pc_pending;
         ~SavedFrame() {
             --p.call_depth;
             p.dispatching_service = dispatching;
@@ -470,7 +535,16 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
             p.yield_pending = false;
             p.instruction_cache_pending.reset();
             p.scalar_lse_pending.reset();
-            p.tpidr=tpidr;p.tpidr_read_only=tpidr_read_only;p.active_invocation=invocation;
+            if (p.active_registers)
+                *p.active_registers = ThreadRegisterState{p.tpidr, p.tpidr_read_only};
+            p.active_registers = std::move(parent_registers);
+            p.active_tls = parent_tls;
+            // Same-owner callbacks may have changed this shared state. Reload
+            // its current value rather than rolling back to the captured bits.
+            p.tpidr = p.active_registers ? p.active_registers->tpidr_el0 : tpidr;
+            p.tpidr_read_only = p.active_registers ? p.active_registers->tpidrro_el0 : tpidr_read_only;
+            p.active_invocation=invocation;
+            p.cpu_exception_pc_pending = cpu_exception_pc_pending;
             if (!nested)
                 return;
             p.jit->Reset();
@@ -499,9 +573,15 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
             p.remaining,
             p.stats.guest_ticks,
             p.tpidr,p.tpidr_read_only,p.active_invocation,
+            p.active_registers,p.active_tls,
             p.dispatching_service,
-            p.call_depth != 0};
+            p.call_depth != 0,
+            p.cpu_exception_pc_pending};
     p.active_invocation=invocation;
+    p.active_registers = std::move(selected_registers);
+    p.active_tls = logical_tls;
+    p.tpidr = p.active_registers->tpidr_el0;
+    p.tpidr_read_only = p.active_registers->tpidrro_el0;
     ++p.call_depth;
     p.stats.maximum_call_depth = std::max<std::uint64_t>(p.stats.maximum_call_depth, p.call_depth);
     if (saved.nested)
@@ -512,10 +592,10 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     p.instruction_cache_pending.reset();
     p.scalar_lse_pending.reset();
     p.result = {};
+    p.cpu_exception_pc_pending = false;
     p.jit->Reset();
     p.monitor.Clear();
     p.remaining = saved.nested ? std::min(instruction_budget, saved.remaining) : instruction_budget;
-    p.tpidr=thread_pointer.value_or(p.default_tpidr);
     p.jit->SetPC(entry);
     p.jit->SetSP(stack_top);
     p.jit->SetRegister(30, return_trampoline);
@@ -551,6 +631,10 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         p.stats.execution_nanoseconds += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                 .count());
+        if (p.cpu_exception_pc_pending && p.result.cpu_exception) {
+            p.result.cpu_exception->state.pc = p.jit->GetPC();
+            p.cpu_exception_pc_pending = false;
+        }
         if (p.result.fault == Fault::none && !p.result.returned) {
             if (p.scalar_lse_pending) {
                 const auto pending = *p.scalar_lse_pending;
@@ -620,6 +704,17 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
     p.result.fpcr = p.jit->GetFpcr();
     if(p.services)if(const auto value=p.services->thread_exit_value(logical_tls)){p.result.fault=Fault::thread_exit;p.result.registers[0]=*value;p.result.returned=false;}
     if(const auto status=p.app.process_state->exit_status()){p.result.fault=Fault::process_exit;p.result.detail=*status;p.result.returned=false;}
+    if (p.result.fault == Fault::process_exit || p.result.fault == Fault::thread_exit) {
+        p.result.cpu_exception.reset();
+    } else if (p.result.cpu_exception) {
+        auto &state = p.result.cpu_exception->state;
+        state.registers = p.result.registers;
+        state.vectors = p.result.vectors;
+        state.sp = p.result.sp;
+        state.pstate = p.result.pstate;
+        state.fpsr = p.result.fpsr;
+        state.fpcr = p.result.fpcr;
+    }
     p.result.returned = p.result.returned && p.result.fault == Fault::none;
     return p.result;
 }

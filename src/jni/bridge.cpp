@@ -212,7 +212,7 @@ struct Bridge::Impl {
     ObjectId allocation_error = 0; // Borrowed runtime-owned OOME; never retained/released as a pending pin.
     Address context=0,current_environment=Bridge::environment;
     bool attached=true;
-    struct ManagedBinding {ObjectId thread=0;Address tls=0;bool mapped=false;std::uint32_t tid=0;};
+    struct ManagedBinding {ObjectId thread=0;Address tls=0;bool mapped=false;std::uint32_t tid=0;std::shared_ptr<a64::ThreadRegisterState> registers;};
     std::array<ManagedBinding,16> managed_bindings{};
     std::uint32_t next_managed_tid=0x40000000;
     ObjectId active_managed_thread=0;
@@ -508,15 +508,18 @@ struct Bridge::Impl {
             if(next_managed_tid==0x7fffffffU)bad("THREAD_LIMIT","Managed native thread ID lifetime range exhausted");
             auto id=next_managed_tid+1;if(id==host::current_process_id())++id;
             if(id>0x7fffffffU)bad("THREAD_LIMIT","Managed native thread ID lifetime range exhausted");
+            const auto tls=Address{0x36000000}+slot*0x2000;
+            auto registers=std::make_shared<a64::ThreadRegisterState>(a64::ThreadRegisterState{tls,0});
             auto &binding=managed_bindings[slot];release_managed_binding(binding);
-            const auto tls=Address{0x36000000}+slot*0x2000;runtime.retain(thread);bool mapped=false;
+            runtime.retain(thread);bool mapped=false;
             try {
                 memory.map(tls,4096,a64::read_write);mapped=true;
                 write(tls,tls,8);write(tls+8,id,8);write(tls+40,read(0x25028,8),8);write(tls+0x200,function_table,8);
-                binding={thread,tls,true,id};next_managed_tid=id;
+                binding={thread,tls,true,id,std::move(registers)};next_managed_tid=id;
             }catch(...){if(mapped)memory.unmap(tls);runtime.release(thread);throw;}
         }
-        const auto tls=managed_bindings[slot].tls;return {managed_bindings[slot].tid,tls,tls+0x100,runtime.thread_initial_signal_mask(thread)};
+        const auto &binding=managed_bindings[slot];const auto tls=binding.tls;
+        return {binding.tid,tls,tls+0x100,runtime.thread_initial_signal_mask(thread),binding.registers};
     }
     struct LogicalScope {
         Impl &p;ObjectId owner;std::uint64_t token;bool switched=false;
@@ -1744,6 +1747,7 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
     return p.decode(type == "F" || type == "D" ? result.vectors[0][0] : result.registers[0], type);
 }
 std::optional<std::uint64_t> Bridge::thread_exit_value(Address tls) const noexcept {return impl_->posix.thread_exit_value(tls);}
+std::shared_ptr<a64::ThreadRegisterState> Bridge::thread_register_state(Address trusted_tls) const {return impl_->posix.thread_register_state(trusted_tls);}
 bool Bridge::event_pending() noexcept {return impl_->posix.event_pending();}
 a64::Fault Bridge::checkpoint(a64::ServiceState &state) noexcept {return impl_->posix.checkpoint(state);}
 

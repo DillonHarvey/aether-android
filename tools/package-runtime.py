@@ -46,7 +46,10 @@ def main():
         for path in sorted((project / "third_party" / "licenses").glob("*.txt"))
     ]
     payload = bytearray()
-    # Contract 55: queued cache invalidation survives architectural CPU reset;
+    # Contract 58: actual synchronous CPU exception provenance has a separate architectural snapshot;
+    # contract 57: owned writable TLS register state survives same-thread native reentry;
+    # contract 56: direct SVC counter failures retain typed trap origin and detail;
+    # contract 55: queued cache invalidation survives architectural CPU reset;
     # contract 54: preserve the nonfaulting register-prefetch SP boundary;
     # contract 53: actual managed widget selection policy, state20 and setter dirty witnesses;
     # contract 52: genuine collection selection callbacks and authoritative prepared selection projection;
@@ -90,7 +93,7 @@ def main():
     # explicit installed playback consent/routing and per-app sessions;
     # committed historical icon aliases and matching cleanup;
     # catalogue schema 5, package schemas 1-14, stable paths and existing LPAC policy.
-    manifest = bytearray(number(55) + number(len(files)))
+    manifest = bytearray(number(58) + number(len(files)))
     for name, source in files:
         data = source.read_bytes()
         if not 0 < len(data) <= 256 * 1024 * 1024:

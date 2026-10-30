@@ -34,11 +34,28 @@ enum class Fault {
 };
 std::string_view fault_name(Fault fault) noexcept;
 using Vector = std::array<std::uint64_t, 2>;
+enum class CpuExceptionKind {
+    read_abort, write_abort, instruction_abort, undefined_encoding,
+    breakpoint, data_alignment, stack_alignment
+};
+struct ArchitecturalState {
+    std::array<std::uint64_t, 31> registers{};
+    std::array<Vector, 32> vectors{};
+    Address pc = 0, sp = 0;
+    std::uint32_t pstate = 0, fpsr = 0, fpcr = 0;
+};
+struct CpuException {
+    CpuExceptionKind kind = CpuExceptionKind::undefined_encoding;
+    Address address = 0;
+    std::uint32_t access_bytes = 0; // Zero means not an access or width unavailable.
+    std::uint32_t subtype = 0; // Raw source metadata, not a fabricated signal/ESR.
+    ArchitecturalState state;
+};
 struct ExecutionResult {
     bool returned = false;
     Fault fault = Fault::none;
-    Address fault_address = 0;
-    Address pc = 0;
+    Address fault_address = 0; // Fault site/data address, according to fault classification.
+    Address pc = 0; // Stopped CPU snapshot; may be post-boundary, not architectural ELR (ADR0313).
     std::uint32_t detail = 0;
     std::array<std::uint64_t, 31> registers{};
     std::array<Vector, 32> vectors{};
@@ -46,6 +63,8 @@ struct ExecutionResult {
     std::uint32_t pstate = 0;
     std::uint32_t fpsr = 0;
     std::uint32_t fpcr = 0;
+    // Genuine first CPU exception only. No signal delivery or resume is implied.
+    std::optional<CpuException> cpu_exception;
 };
 struct Metrics {
     std::uint64_t compiled_blocks = 0, emitted_bytes = 0, compile_nanoseconds = 0;
@@ -66,10 +85,18 @@ struct ServiceState {
     std::uint64_t invocation = 0;
     Address stack_top = 0;
 };
+// Host-owned architectural data, separate from trusted service/thread identity.
+// Actual owner records retain this state; each active CPU frame pins it.
+struct ThreadRegisterState {
+    std::uint64_t tpidr_el0 = 0, tpidrro_el0 = 0;
+};
 // Traps carry guest values only. Implementations must not throw through generated frames.
 class GuestServices {
   public:
     virtual ~GuestServices() = default;
+    // Called only at validated call entry outside generated frames. Owning
+    // providers reject an invalid trusted binding rather than return a fallback.
+    virtual std::shared_ptr<ThreadRegisterState> thread_register_state(Address) const { return {}; }
     // Sticky terminal value for this logical TLS owner, including nested callbacks.
     virtual std::optional<std::uint64_t> thread_exit_value(Address) const noexcept {return {};}
     // Event polling may halt generated code; delivery runs only after Run returns.
@@ -92,7 +119,8 @@ class GuestCpu {
     ExecutionResult call(Address entry, std::span<const std::uint64_t> arguments, Address stack_top,
                          std::uint64_t instruction_budget = 1'000'000,
                          std::span<const Vector> floating_arguments = {}, std::optional<Address> thread_pointer = {});
-    // Bind an owned logical TLS block before any native call.
+    // Select the trusted default TLS identity while idle. This does not rewrite
+    // an owning provider's saved architectural register values.
     void set_thread_pointer(Address address);
     // Trusted host boundary: preserve the canonical process terminal cause.
     void process_checkpoint() const;

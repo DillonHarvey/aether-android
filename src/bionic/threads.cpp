@@ -20,10 +20,12 @@ void NativeThreads::initialize_tls(a64::Address tls,std::uint32_t id) {
     if(!memory_.write(tls,bytes(tls)) || !memory_.write(tls+8,bytes(id)) || !memory_.write(tls+40,bytes(guard_)))throw a64::GuestError("AETHER_GUEST_TLS","Cannot initialize native TLS");
 }
 void NativeThreads::initialize() {
+    auto registers=std::make_shared<a64::ThreadRegisterState>(a64::ThreadRegisterState{main_tls,0});
     const auto priority=host::current_thread_priority();if(!priority)throw a64::GuestError("AETHER_GUEST_PRIORITY","Cannot capture native owner priority");priority_baseline_=*priority;
     std::array<std::uint8_t,16> random{};if(!host::secure_random_128(random))throw a64::GuestError("AETHER_GUEST_TLS","Native TLS entropy unavailable");
     for(unsigned n=0;n<8;++n)guard_=(guard_<<8)|random[n];guard_&=~std::uint64_t{255};
     memory_.map(main_tls,4096,a64::read_write);main_tls_owned_=true;initialize_tls(main_tls,main_);
+    main_registers_=std::move(registers);
 }
 NativeThreads::~NativeThreads(){if(priority_dirty_ && !managed_priority_ && !host::restore_thread_priority(priority_baseline_))std::terminate();for(auto &thread:threads_)if(thread)release(*thread);if(main_tls_owned_)try{memory_.unmap(main_tls);}catch(...) {}}
 void NativeThreads::release(Thread &thread)noexcept {
@@ -31,6 +33,7 @@ void NativeThreads::release(Thread &thread)noexcept {
     if(thread.stack_owned){try{memory_.unmap(thread.stack);}catch(...) {}thread.stack_owned=false;}
     if(thread.guard_owned){try{memory_.unmap(thread.stack-thread.guard_size);}catch(...) {}thread.guard_owned=false;}
     if(thread.tls_owned){try{memory_.unmap(thread.tls);}catch(...) {}thread.tls_owned=false;}
+    thread.registers.reset();
 }
 void NativeThreads::managed_priority(int baseline,host::PriorityService service) {
     if(std::this_thread::get_id()!=owner_ || priority_dirty_ || created || !service || !host::priority_profile_target(baseline,0))throw a64::GuestError("AETHER_GUEST_PRIORITY","Priority backend requires the idle native owner");
@@ -72,15 +75,49 @@ std::optional<GuestPosixServices::ThreadBinding> NativeThreads::exchange_binding
     return std::exchange(external_,value);
 }
 a64::Address NativeThreads::tls()const noexcept {if(external_)return external_->tls;for(const auto &thread:threads_)if(thread && thread->id==active_)return thread->tls;return main_tls;}
+std::shared_ptr<a64::ThreadRegisterState> NativeThreads::thread_register_state(a64::Address trusted_tls) const noexcept {
+    if(std::this_thread::get_id()!=owner_)return {};
+    if(external_){
+        if(trusted_tls!=external_->tls)return {};
+        for(const auto &state:managed_masks_)if(state.id==external_->id && state.tls==trusted_tls)return state.registers;
+        return {};
+    }
+    if(active_==main_)return trusted_tls==main_tls?main_registers_:nullptr;
+    for(const auto &thread:threads_)if(thread && thread->id==active_ && thread->tls==trusted_tls)return thread->registers;
+    return {};
+}
 a64::Address NativeThreads::error_address()const noexcept{return external_?external_->error:(active_==main_?main_errno_:tls()+0x100);}
 std::uint64_t &NativeThreads::binding_signal_mask(const GuestPosixServices::ThreadBinding &binding) {
-    ManagedMask *empty=nullptr;
+    ManagedMask *selected=nullptr,*empty=nullptr;
     for(auto &mask:managed_masks_){
-        if(mask.tls==binding.tls && mask.id){if(mask.id!=binding.id){if(specific_)specific_->discard(mask.id,mask.tls);mask={binding.id,binding.tls,binding.initial_signal_mask};mask.name=main_name_;}return mask.mask;}
+        if(mask.tls==binding.tls && mask.id){
+            if(mask.id==binding.id){
+                if(binding.prepared_registers && binding.prepared_registers!=mask.registers)
+                    throw a64::GuestError("AETHER_GUEST_TLS","Managed TLS register incarnation changed");
+                return mask.mask;
+            }
+            selected=&mask;break;
+        }
         if(!mask.id && !empty)empty=&mask;
     }
-    if(!empty)throw a64::GuestError("AETHER_GUEST_THREAD_STATE","Managed signal mask slots exhausted");
-    *empty={binding.id,binding.tls,binding.initial_signal_mask};empty->name=main_name_;return empty->mask;
+    if(!selected)selected=empty;
+    if(!selected)throw a64::GuestError("AETHER_GUEST_THREAD_STATE","Managed signal mask slots exhausted");
+    ManagedMask candidate{binding.id,binding.tls,binding.initial_signal_mask};
+    candidate.name=main_name_;
+    candidate.registers=binding.prepared_registers;
+    if(candidate.registers){
+        // A prepared host object belongs to one trusted owner incarnation.
+        // Its guest-written architectural values never select that owner.
+        bool shared=candidate.registers==main_registers_;
+        for(const auto &thread:threads_)if(thread && candidate.registers==thread->registers)shared=true;
+        for(const auto &mask:managed_masks_)if(mask.id && candidate.registers==mask.registers)shared=true;
+        if(shared)throw a64::GuestError("AETHER_GUEST_TLS","TLS owners cannot share architectural register state");
+    }else{
+        candidate.registers=std::make_shared<a64::ThreadRegisterState>(a64::ThreadRegisterState{binding.tls,0});
+    }
+    if(selected->id && specific_)specific_->discard(selected->id,selected->tls);
+    *selected=std::move(candidate);
+    return selected->mask;
 }
 std::uint64_t &NativeThreads::current_locale() {
     if(external_){
@@ -179,6 +216,7 @@ a64::Fault NativeThreads::create(std::array<std::uint64_t,31> &r,const NativeThr
     value.signal_mask=signal_mask();
     if(const auto parent_name=find_name(tid()))value.name=*parent_name;
     try {
+        value.registers=std::make_shared<a64::ThreadRegisterState>(a64::ThreadRegisterState{value.tls,0});
         if(value.guard_size){memory_.map(value.stack-value.guard_size,static_cast<std::size_t>(value.guard_size),a64::Permission::none);value.guard_owned=true;}
         memory_.map(value.stack,static_cast<std::size_t>(value.mapped_size),a64::read_write);value.stack_owned=true;
         memory_.map(value.tls,4096,a64::read_write);value.tls_owned=true;initialize_tls(value.tls,value.id);

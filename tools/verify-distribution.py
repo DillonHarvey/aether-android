@@ -265,7 +265,7 @@ def inspect_bundle(data, expected):
         cursor += length
         return result
 
-    require(number() == 55, "CONTRACT", "Expected current compatibility contract 55")
+    require(number() == 58, "CONTRACT", "Expected current compatibility contract 58")
     count = number()
     require(7 <= count <= 96, "LIMIT", "Invalid manifest file count")
     files = {}
@@ -371,7 +371,7 @@ def verify(project, build, bundle, report):
         executableCount=len(EXECUTABLES),
         noticeCount=len(notices),
         shellLibraryCount=1,
-        compatibilityContract=55,
+        compatibilityContract=58,
         wholeImageDigestMatches=True,
         currentBuildMatches=True,
         retainedNoticeProvenanceMatches=True,

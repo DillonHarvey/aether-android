@@ -26,6 +26,7 @@ class GuestPosixServices final : public a64::GuestServices, public elf::ImportRe
                       std::array<std::uint64_t, 31> &registers) noexcept override;
     a64::Fault invoke_frame(std::uint32_t service, a64::Address instruction, a64::ServiceState &state) noexcept override;
     std::optional<std::uint64_t> thread_exit_value(a64::Address tls) const noexcept override;
+    std::shared_ptr<a64::ThreadRegisterState> thread_register_state(a64::Address trusted_tls) const override;
     bool event_pending() noexcept override;
     a64::Fault checkpoint(a64::ServiceState &) noexcept override;
     void request_thread_exit(std::uint64_t value) noexcept;
@@ -59,7 +60,7 @@ class GuestPosixServices final : public a64::GuestServices, public elf::ImportRe
     // The owner keeps the lookup target alive for all calls; results contain guest metadata only.
     void set_address_lookup(AddressLookup lookup);
     void set_dynamic_linker(DynamicLinkCallbacks callbacks);
-    struct ThreadBinding {std::uint32_t id; a64::Address tls,error;std::uint64_t initial_signal_mask=0;};
+    struct ThreadBinding {std::uint32_t id; a64::Address tls,error;std::uint64_t initial_signal_mask=0;std::shared_ptr<a64::ThreadRegisterState> prepared_registers={};};
     std::optional<ThreadBinding> exchange_thread_binding(std::optional<ThreadBinding> binding);
     void set_thread_runner(ThreadRunner runner);
     void set_managed_priority_service(int baseline,host::PriorityService service);

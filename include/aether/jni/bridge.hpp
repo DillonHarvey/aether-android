@@ -43,6 +43,7 @@ class Bridge final : public dex::NativeInterface, public a64::GuestServices {
     a64::Fault invoke_frame(std::uint32_t service, a64::Address instruction,
                             a64::ServiceState &) noexcept override;
     std::optional<std::uint64_t> thread_exit_value(a64::Address tls) const noexcept override;
+    std::shared_ptr<a64::ThreadRegisterState> thread_register_state(a64::Address trusted_tls) const override;
     bool event_pending() noexcept override;
     a64::Fault checkpoint(a64::ServiceState &) noexcept override;
     const Metrics &metrics() const noexcept;
