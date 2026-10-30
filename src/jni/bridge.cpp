@@ -1,12 +1,14 @@
 #include "aether/jni/bridge.hpp"
+#include "aether/audio/guest.hpp"
 #include "aether/common/thread_exit.hpp"
 #include "aether/host/process_info.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
 #include <map>
-#include <set>
+#include <new>
 #include <thread>
+#include <type_traits>
 #include <utility>
 
 namespace aether::jni {
@@ -96,6 +98,23 @@ std::u16string from_modified_utf8(std::string_view text) {
     }
     return out;
 }
+class Imports final : public elf::ImportResolver {
+    bionic::GuestPosixServices &posix;
+    audio::GuestAudioServices *audio_services;
+  public:
+    Imports(bionic::GuestPosixServices &posix, audio::GuestAudioServices *audio) : posix(posix), audio_services(audio) {}
+    bool has_library(std::string_view library) const noexcept override {
+        return posix.has_library(library) || (audio_services && audio_services->has_library(library));
+    }
+    std::optional<elf::GuestSymbol> resolve(std::string_view library, std::string_view name,
+                                           std::string_view version) const override {
+        // Existing platform libraries retain their exact resolver/version rules.
+        // Audio adds only its own registered library; unknown exports still fail.
+        return audio_services && audio_services->has_library(library)
+                   ? audio_services->resolve(library, name, version)
+                   : posix.resolve(library, name, version);
+    }
+};
 } // namespace
 struct Bridge::Impl {
     Bridge &bridge;
@@ -103,6 +122,8 @@ struct Bridge::Impl {
     a64::GuestMemory &memory;
     std::shared_ptr<ProcessState> process;
     bionic::GuestPosixServices posix;
+    audio::GuestAudioServices *audio_services;
+    Imports imports;
     elf::GuestLoader loader;
     a64::GuestCpu cpu;
     std::string root, error;
@@ -114,38 +135,81 @@ struct Bridge::Impl {
     bool dynamic_poisoned=false;
     const std::thread::id owner_thread = std::this_thread::get_id();
     std::size_t native_depth = 0;
-    bool closed = false;
+    bool closed = false, shutdown_failed = false;
     bool attach_interface = true;
     struct Ref {
         ObjectId object;
-        std::size_t frame;
-        bool global;
+        std::size_t frame, root_slot;
+        bool global, weak = false;
         Address context;
     };
     struct LocalFrame {
-        std::set<Handle> handles;
+        std::vector<Handle> handles;
+        std::size_t guaranteed_capacity = 0;
         bool explicit_frame = false;
+        explicit LocalFrame(bool is_explicit = false) : explicit_frame(is_explicit) {
+            // Every published frame owns reusable backing for its full local
+            // bound. Push may fail here; successful Ensure never allocates.
+            handles.reserve(1024);
+        }
     };
+    static_assert(std::is_nothrow_move_constructible_v<LocalFrame>);
+    static_assert(std::is_nothrow_move_constructible_v<std::pair<Handle, Ref>>);
     struct MethodId {
         dex::Index index;
+        // Owned declarations are canonical by stable DEX index; zero means
+        // their declaring class comes from that metadata. Symbolic adapters
+        // retain the exact lookup Class identity and existing dispatch rules.
         ObjectId owner;
         bool is_static;
     };
     struct Buffer {
-        ObjectId string;
+        ObjectId object;
         bool utf8;
         std::size_t bytes;
         Address context;
+        // Zero denotes a string; otherwise this is the exact primitive descriptor.
+        char component = 0;
+        bool critical = false;
     };
-    std::map<Handle, Ref> refs;
+    // Opaque identities increase monotonically, so this bounded, once-reserved
+    // table remains sorted when appending. Removal only moves trivial records;
+    // GC roots occupy independent stable cells, never vector element addresses.
+    std::vector<std::pair<Handle, Ref>> refs;
+    std::array<ObjectId, 4096> reference_roots{};
+    std::uint64_t reference_roots_token = 0;
+    // Includes guarantees held by suspended logical/native contexts whose
+    // frames are temporarily moved away from this active vector.
+    std::size_t unused_local_capacity = 0, local_frame_count = 0;
+    // A weak argument is promoted only for its current JNI operation. Nested
+    // callbacks keep independent scopes so an inner collection cannot retire
+    // arguments still in use by a suspended outer operation.
+    std::vector<ObjectId> *resolved_weak_roots = nullptr;
+    struct WeakRoots {
+        Impl &owner;
+        std::vector<ObjectId> values;
+        std::vector<ObjectId> *previous;
+        explicit WeakRoots(Impl &impl) : owner(impl), previous(impl.resolved_weak_roots) {
+            owner.resolved_weak_roots = &values;
+        }
+        ~WeakRoots() {
+            owner.resolved_weak_roots = previous;
+            for (const auto id : values)
+                owner.runtime.release(id);
+        }
+    };
     std::vector<LocalFrame> frames;
     std::map<Handle, MethodId> methods;
+    // Field IDs identify runtime declarations, never JNI reference handles.
+    std::map<Handle, dex::Index> fields;
     std::map<dex::Index, Address> registered;
     std::map<Address, Buffer> buffers;
     std::vector<Address> mappings;
+    std::array<bool, 32> stack_owned{};
     Address buffer_next = 0x50000000;
     std::size_t buffer_bytes = 0;
     ObjectId pending = 0;
+    ObjectId allocation_error = 0; // Borrowed runtime-owned OOME; never retained/released as a pending pin.
     Address context=0,current_environment=Bridge::environment;
     bool attached=true;
     struct ManagedBinding {ObjectId thread=0;Address tls=0;bool mapped=false;std::uint32_t tid=0;};
@@ -155,20 +219,35 @@ struct Bridge::Impl {
     std::uint64_t active_execution_token=0;
     Impl(Bridge &bridge, dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
          const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
-         host::FileService *files, bool attach_interface,std::string_view package)
+         host::FileService *files, bool attach_interface,std::string_view package,
+         audio::GuestAudioServices *audio)
         : bridge(bridge), runtime(runtime), memory(memory), process(app.process_state), posix(memory, app, time, 1, files,nullptr,package),
-          loader(memory, posix), cpu(memory, app, &bridge), root(std::move(root)),
+          audio_services(audio), imports(posix, audio), loader(memory, imports), cpu(memory, app, &bridge), root(std::move(root)),
           attach_interface(attach_interface) {
         try {
             runtime.bind_process_state(process);process->checkpoint();
+            allocation_error = runtime.prepare_native_allocation_error();
+            refs.reserve(reference_roots.size());
+            reference_roots_token = runtime.register_native_roots(reference_roots);
             posix.set_managed_priority_service(runtime.thread_priority_baseline(),[this](std::optional<std::int32_t> nice){return this->runtime.thread_priority(nice);});
             cpu.set_thread_pointer(posix.thread_pointer());
             posix.set_once_runner([this](Address entry,Address stack,Address tls,std::uint64_t budget){return cpu.call(entry,{},stack,budget,{},tls);});
+            posix.set_phdr_runner([this](Address entry,std::array<std::uint64_t,3> args,Address stack,Address tls,std::uint64_t budget){
+                const auto before=cpu.metrics().guest_ticks;
+                auto result=cpu.call(entry,args,stack,budget,{},tls);
+                return bionic::GuestPosixServices::PhdrExecution{std::move(result),cpu.metrics().guest_ticks-before};
+            });
+            posix.set_cxa_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget){
+                const auto before=cpu.metrics().guest_ticks;
+                auto result=cpu.call(entry,std::array{argument},stack,budget,{},tls);
+                return bionic::GuestPosixServices::CxaExecution{std::move(result),cpu.metrics().guest_ticks-before};
+            });
             posix.set_signal_runner([this](Address entry,std::uint32_t signal,Address stack,Address tls){return cpu.call(entry,std::array<std::uint64_t,1>{signal},stack,1'000'000,{},tls);});
         posix.set_thread_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
                 return run_worker(entry,argument,stack,tls,budget);
             });
             posix.set_address_lookup([this](Address address){return loader.address_info(address);});
+            posix.set_program_header_lookup([this](std::size_t index){return loader.program_header_info(index);});
             loader.load(modules, this->root);
             posix.set_dynamic_linker({[this](std::string_view name){dynamic_open(name);},
                 [this](std::string_view module,std::string_view name){return loader.lookup(module,name);}});
@@ -190,8 +269,6 @@ struct Bridge::Impl {
             }
             memory.protect(tables, a64::Permission::read);
             memory.protect(trampolines, a64::read_execute);
-            for (unsigned i = 0; i < 32; ++i)
-                map(stacks + i * stride, stack_size);
             if (attach_interface)
                 runtime.set_native_interface(&bridge);
         } catch (...) {
@@ -206,20 +283,23 @@ struct Bridge::Impl {
         mappings.push_back(address);
     }
     void cleanup() noexcept {
+        if (reference_roots_token) {
+            // The runtime must never retain a span into destroyed Bridge
+            // storage, even if later unrelated cleanup fails. Registration is
+            // teardown-safe; an ownership violation cannot safely continue.
+            try { runtime.unregister_native_roots(reference_roots_token); }
+            catch (...) { std::terminate(); }
+            reference_roots_token = 0;
+        }
+        refs.clear();
+        frames.clear();
+        unused_local_capacity = local_frame_count = 0;
+        metrics.local_references = metrics.global_references = 0;
         try {
-            if (pending) {
-                runtime.release(pending);
-                pending = 0;
-            }
-            for (auto &[handle, ref] : refs) {
-                (void)handle;
-                runtime.release(ref.object);
-            }
-            refs.clear();
-            frames.clear();
-            metrics.local_references = metrics.global_references = 0;
+            pending_exception(0);
+            fields.clear();
             for (auto &[address, buffer] : buffers) {
-                runtime.release(buffer.string);
+                runtime.release(buffer.object);
                 memory.unmap(address);
             }
             buffers.clear();
@@ -228,6 +308,7 @@ struct Bridge::Impl {
             for (auto it = mappings.rbegin(); it != mappings.rend(); ++it)
                 memory.unmap(*it);
             mappings.clear();
+            stack_owned.fill(false);
         } catch (...) { /* Destruction cannot unwind; all resources are app-owned. */
         }
     }
@@ -250,6 +331,8 @@ struct Bridge::Impl {
     std::string text(Address address, std::size_t limit = 65536) const {
         std::string out;
         for (std::size_t i = 0; i < limit; ++i) {
+            if (address > UINT64_MAX - i)
+                bad("MEMORY", "Guest C string address overflow");
             const auto value = static_cast<char>(read(address + i, 1));
             if (!value)
                 return out;
@@ -263,29 +346,58 @@ struct Bridge::Impl {
             bad("HANDLE_LIMIT", "JNI identity space exhausted");
         return 0x7000000000000000ull | id;
     }
-    ObjectId resolve(Handle handle) const {
+    auto find_reference(Handle handle) {
+        const auto found = std::lower_bound(refs.begin(), refs.end(), handle,
+                                            [](const auto &entry, Handle value) { return entry.first < value; });
+        return found != refs.end() && found->first == handle ? found : refs.end();
+    }
+    auto find_reference(Handle handle) const {
+        const auto found = std::lower_bound(refs.begin(), refs.end(), handle,
+                                            [](const auto &entry, Handle value) { return entry.first < value; });
+        return found != refs.end() && found->first == handle ? found : refs.end();
+    }
+    // promote_weak=false is restricted to immediate reference publication or
+    // frame retirement/promotion: all intervening steps use preallocated native
+    // backing, perform no managed allocation/callback/collection or scheduling.
+    ObjectId resolve(Handle handle, bool promote_weak = true) const {
         if (!handle)
             return 0;
-        const auto it = refs.find(handle);
+        const auto it = find_reference(handle);
         if (it == refs.end() || (!it->second.global && it->second.context!=context))
             bad("REFERENCE", "Invalid, deleted or foreign JNI reference");
-        return it->second.object;
+        if (!it->second.weak)
+            return it->second.object;
+        const auto object = runtime.native_weak_referent(it->second.object);
+        if (object && promote_weak && resolved_weak_roots &&
+            std::find(resolved_weak_roots->begin(), resolved_weak_roots->end(), object) == resolved_weak_roots->end()) {
+            runtime.retain(object);
+            try { resolved_weak_roots->push_back(object); }
+            catch (...) { runtime.release(object); throw; }
+        }
+        return object;
     }
     Handle reference(ObjectId object, bool global = false) {
         if (!object)
             return 0;
-        if (refs.size() >= 4096 || (!global && (frames.empty() || frames.back().handles.size() >= 1024)))
+        if (refs.size() >= reference_roots.size() ||
+            (!global && (frames.empty() || frames.back().handles.size() >= 1024)))
             bad("REFERENCE_LIMIT", "JNI reference/frame quota exhausted");
+        const bool promised = !global && frames.back().handles.size() < frames.back().guaranteed_capacity;
+        if (!promised && refs.size() + unused_local_capacity >= reference_roots.size())
+            bad("REFERENCE_LIMIT", "JNI unreserved shared reference quota exhausted");
+        const auto cell = std::find(reference_roots.begin(), reference_roots.end(), ObjectId{0});
+        if (cell == reference_roots.end())
+            bad("REFERENCE_LIMIT", "JNI shared root backing exhausted");
+        const auto root_slot = static_cast<std::size_t>(cell - reference_roots.begin());
         const auto handle = identity();
-        runtime.retain(object);
-        try {
-            refs.emplace(handle, Ref{object, frames.size(), global,context});
-            if (!global)
-                frames.back().handles.insert(handle);
-        } catch (...) {
-            refs.erase(handle);
-            runtime.release(object);
-            throw;
+        // Validation and publication allocate nothing and cannot collect. Both
+        // vectors have admitted backing and trivially movable element types.
+        runtime.set_native_root(reference_roots_token, root_slot, object);
+        refs.emplace_back(handle, Ref{object, frames.size(), root_slot, global, false, context});
+        if (!global) {
+            frames.back().handles.push_back(handle);
+            if (promised)
+                --unused_local_capacity;
         }
         ++metrics.references_created;
         if (global)
@@ -294,17 +406,41 @@ struct Bridge::Impl {
             ++metrics.local_references;
         return handle;
     }
-    void erase(Handle handle, bool global) {
+    Handle weak_reference(ObjectId object) {
+        if (!object)
+            return 0;
+        if (refs.size() + unused_local_capacity >= reference_roots.size())
+            bad("REFERENCE_LIMIT", "JNI shared reference quota exhausted");
+        const auto wrapper = runtime.new_native_weak(object);
+        // No managed allocation/collection occurs in reference(): its native
+        // table insertion retains this wrapper immediately. Only the wrapper
+        // is a strong global root; resolve() never exposes it to guest code.
+        const auto handle = reference(wrapper, true);
+        find_reference(handle)->second.weak = true;
+        // global_references counts both strong and weak global handles in the
+        // existing metrics bucket; both use the same shared reference quota.
+        return handle;
+    }
+    void erase(Handle handle, bool global, bool weak = false) {
         if (!handle)
             return;
-        const auto it = refs.find(handle);
-        if (it == refs.end() || it->second.global != global || (!global && it->second.context!=context))
+        const auto it = find_reference(handle);
+        if (it == refs.end() || it->second.global != global || it->second.weak != weak ||
+            (!global && it->second.context!=context))
             bad("REFERENCE", "Reference deletion has wrong kind or stale handle");
-        runtime.release(it->second.object);
+        runtime.set_native_root(reference_roots_token, it->second.root_slot, 0);
         if (global)
             --metrics.global_references;
         else {
-            frames.at(it->second.frame - 1).handles.erase(handle);
+            auto &frame = frames.at(it->second.frame - 1);
+            // Deleting a promised local restores the same reserved capacity;
+            // locals created beyond that guarantee restore no promise.
+            if (frame.handles.size() <= frame.guaranteed_capacity)
+                ++unused_local_capacity;
+            const auto local = std::find(frame.handles.begin(), frame.handles.end(), handle);
+            if (local == frame.handles.end())
+                std::terminate();
+            frame.handles.erase(local);
             --metrics.local_references;
         }
         refs.erase(it);
@@ -312,20 +448,54 @@ struct Bridge::Impl {
     void pop() {
         if (frames.empty())
             bad("FRAME", "No JNI local frame");
+        // Retire the promise before deleting any locals, so their deletion
+        // cannot restore capacity into a frame that is being discarded.
+        const auto count = frames.back().handles.size();
+        if (frames.back().guaranteed_capacity > count)
+            unused_local_capacity -= frames.back().guaranteed_capacity - count;
+        frames.back().guaranteed_capacity = 0;
         while (!frames.back().handles.empty()) {
             erase(*frames.back().handles.begin(), false);
             ++metrics.automatic_local_deletions;
         }
         frames.pop_back();
+        --local_frame_count;
+    }
+    void ensure_local_capacity(std::size_t capacity) {
+        if (frames.empty() || capacity > 1024 - frames.back().handles.size())
+            bad("REFERENCE_LIMIT", "Insufficient JNI local capacity");
+        auto &frame = frames.back();
+        const auto target = frame.handles.size() + capacity;
+        if (target <= frame.guaranteed_capacity)
+            return;
+        const auto previous = frame.guaranteed_capacity > frame.handles.size()
+                                  ? frame.guaranteed_capacity - frame.handles.size() : 0;
+        const auto additional = capacity - previous;
+        if (additional > reference_roots.size() - refs.size() - unused_local_capacity)
+            bad("REFERENCE_LIMIT", "Insufficient JNI shared capacity for local guarantee");
+        frame.guaranteed_capacity = target;
+        unused_local_capacity += additional;
+    }
+    void push_frame(std::size_t capacity, bool is_explicit = false) {
+        if (capacity > 1024 || local_frame_count >= 128 ||
+            capacity > reference_roots.size() - refs.size() - unused_local_capacity)
+            bad("REFERENCE_LIMIT", "Insufficient JNI local frame capacity");
+        LocalFrame frame(is_explicit);
+        frame.guaranteed_capacity = capacity;
+        frames.push_back(std::move(frame));
+        // Only a fully published frame acquires a promise. Vector/backing
+        // allocation failure above leaves every parent/context budget intact.
+        unused_local_capacity += capacity;
+        ++local_frame_count;
     }
     void release_managed_binding(ManagedBinding &binding) {
         if(!binding.thread)return;
         posix.discard_thread(binding.tid,binding.tls);
         for(auto it=buffers.begin();it!=buffers.end();) {
             if(it->second.context!=binding.tls){++it;continue;}
-            memory.unmap(it->first);runtime.release(it->second.string);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
+            memory.unmap(it->first);runtime.release(it->second.object);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
         }
-        metrics.string_buffers=buffers.size();
+        update_buffer_metrics();
         if(binding.mapped)memory.unmap(binding.tls);
         runtime.release(binding.thread);binding={};
     }
@@ -376,10 +546,11 @@ struct Bridge::Impl {
     struct Scope {
         Impl &p;
         std::size_t base;
-        explicit Scope(Impl &p) : p(p), base(p.frames.size()) {
+        explicit Scope(Impl &p, std::size_t capacity = 16) : p(p), base(p.frames.size()) {
             if (p.native_depth >= 32)
                 bad("CALL_DEPTH", "Native stack depth exceeded");
-            p.frames.push_back({});
+            if (!p.allocation_reference([&] { p.push_frame(capacity); return Handle{1}; }))
+                p.check_pending();
             ++p.native_depth;
         }
         ~Scope() {
@@ -387,13 +558,23 @@ struct Bridge::Impl {
                 p.pop();
             --p.native_depth;
         }
-        Address stack() const { return stacks + (p.native_depth - 1) * stride + stack_size - 4096; }
+        Address stack() const {
+            const auto depth = p.native_depth - 1;
+            const auto address = stacks + depth * stride;
+            if (!p.stack_owned[depth]) {
+                // map() records ownership only after a successful, nonoverlapping
+                // allocation. Never adopt an existing guest mapping as a stack.
+                p.map(address, stack_size);
+                p.stack_owned[depth] = true;
+            }
+            return address + stack_size - 4096;
+        }
     };
     void dynamic_open(std::string_view name) try {
         process->checkpoint();
         if(std::this_thread::get_id()!=owner_thread || closed || dynamic_poisoned)
             throw elf::ElfError("AETHER_ELF_LOAD_STATE","Dynamic module owner is unavailable");
-        if(posix.has_library(name))return;
+        if(imports.has_library(name))return;
         for(const auto &module:loader.modules())if(module.image.soname==name && module.initialized)return;
         if(!module_provider)throw elf::ElfError("AETHER_ELF_SOURCE","No authorized module inventory");
         // Do not relax the constructor-time extension guard or expose provisional modules.
@@ -412,9 +593,9 @@ struct Bridge::Impl {
         pending_exception(0);
         for(auto it=buffers.begin();it!=buffers.end();) {
             if(it->second.context!=context){++it;continue;}
-            memory.unmap(it->first);runtime.release(it->second.string);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
+            memory.unmap(it->first);runtime.release(it->second.object);buffer_bytes-=it->second.bytes;it=buffers.erase(it);
         }
-        metrics.string_buffers=buffers.size();attached=false;
+        update_buffer_metrics();attached=false;
     }
     std::uint64_t native_charged_ticks=0;
     bionic::GuestPosixServices::ThreadExecution thread_guest_call(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
@@ -465,11 +646,34 @@ struct Bridge::Impl {
         return {result,cpu.metrics().guest_ticks-before,finalization_failed};
     }
     void pending_exception(ObjectId object) {
-        if (object)
+        if (object && object != allocation_error)
             runtime.retain(object);
-        if (pending)
+        if (pending && pending != allocation_error)
             runtime.release(pending);
         pending = object;
+    }
+    template <class Function> Handle allocation_reference(Function &&function) {
+        const auto exhausted = [&]() -> Handle {
+            // Preparation is mandatory before native execution. Reporting an
+            // exhausted heap/reference/root quota must not allocate another
+            // object, pin or diagnostic string. Cleanup preserves a prior
+            // exception, particularly PopLocalFrame with an exception pending.
+            if (!allocation_error)
+                bad("STATE", "JNI allocation error reserve is unavailable");
+            if (!pending)
+                pending = allocation_error;
+            return 0;
+        };
+        try { return function(); }
+        catch (const std::bad_alloc &) { return exhausted(); }
+        catch (const dex::DexError &failure) {
+            if (failure.code != "AETHER_JNI_REFERENCE_LIMIT" && failure.code != "AETHER_JNI_FIELD_LIMIT" &&
+                failure.code != "AETHER_JNI_METHOD_LIMIT" &&
+                failure.code != "AETHER_DEX_ROOT_LIMIT" &&
+                failure.code != "AETHER_DEX_HEAP_LIMIT")
+                throw;
+            return exhausted();
+        }
     }
     void java_error(std::string_view type, std::u16string_view message = {}) {
         try {
@@ -495,6 +699,8 @@ struct Bridge::Impl {
         if (!result.returned)
             bad("NATIVE_EXECUTION", std::string(a64::fault_name(result.fault)) + ": " + error + "; " +
                                         std::string(posix.last_rejection()));
+        if (critical_active())
+            bad("CRITICAL", "Native return with an unreleased JNI critical copy");
         const auto spent=cpu.metrics().guest_ticks-before;
         const auto thread_fault=posix.run_pending_threads(spent>=1000000?0:1000000-spent);
         if(thread_fault==a64::Fault::process_exit)process->checkpoint();
@@ -507,13 +713,13 @@ struct Bridge::Impl {
         return dex::type_words(type) == 2 ? Value::wide(bits) : Value::word(static_cast<std::uint32_t>(bits));
     }
     std::vector<Value> arguments(const dex::Prototype &prototype, a64::ServiceState &state,
-                                 unsigned variant) {
+                                 unsigned variant, unsigned first_argument = 3) {
         std::vector<Value> result;
-        unsigned gp = 3, fp = 0;
+        unsigned gp = first_argument, fp = 0;
         Address stack = state.stack_pointer, gr_top = 0, vr_top = 0;
         std::int32_t gr_off = 0, vr_off = 0;
         if (variant == 1) {
-            const auto list = state.registers[3];
+            const auto list = state.registers[first_argument];
             stack = read(list, 8);
             gr_top = read(list + 8, 8);
             vr_top = read(list + 16, 8);
@@ -527,7 +733,7 @@ struct Bridge::Impl {
             const bool floating = type == "F" || type == "D";
             std::uint64_t bits = 0;
             if (variant == 2)
-                bits = read(state.registers[3] + i * 8, 8);
+                bits = read(state.registers[first_argument] + i * 8, 8);
             else if (variant == 1) {
                 auto &offset = floating ? vr_off : gr_off;
                 if (offset < 0) {
@@ -554,29 +760,64 @@ struct Bridge::Impl {
         }
         return result;
     }
-    void callback(unsigned slot, a64::ServiceState &state) {
+    bool method_class_compatible(const MethodId &id, ObjectId supplied) {
+        const auto &method = runtime.image().methods.at(id.index);
+        if (!method.declared)
+            return supplied == id.owner; // Preserve symbolic provider/core handling.
+        const auto actual = std::string(runtime.represented_class(supplied));
+        const auto &declaring = runtime.image().types.at(method.owner);
+        const auto *definition = runtime.image().definition(declaring);
+        if (!definition)
+            bad("METHOD_ID", "Owned method ID has no declaring class inventory");
+        // Constructors are never inherited, nor are static interface methods.
+        if (method.name == "<init>" || (id.is_static && (definition->flags & 0x200)))
+            return actual == declaring;
+        // Canonical IDs must still be the exact declaration lookup would
+        // choose through this class. Ancestry alone would admit overridden or
+        // hidden base methods. This shared lookup path never initializes it.
+        return runtime.jni_method_compatible(id.index, actual);
+    }
+    void callback(unsigned slot, a64::ServiceState &state, bool full_frame) {
         const bool stat = slot >= 114;
-        const auto first = stat ? 114u : 34u;
+        const bool nonvirtual = slot >= 64 && slot <= 93;
+        const auto first = stat ? 114u : nonvirtual ? 64u : 34u;
         const auto category = (slot - first) / 3, variant = (slot - first) % 3;
-        const auto it = methods.find(state.registers[2]);
+        const auto it = methods.find(state.registers[nonvirtual ? 3 : 2]);
         if (it == methods.end() || it->second.is_static != stat)
             bad("METHOD_ID", "Invalid JNI method ID/category");
         const auto &id = it->second;
         const auto &method = runtime.image().methods.at(id.index);
         const auto &prototype = runtime.image().prototypes.at(method.prototype);
         const auto &type = runtime.image().types.at(prototype.return_type);
+        if (!full_frame && (type == "F" || type == "D" || (variant == 0 &&
+            std::any_of(prototype.parameters.begin(), prototype.parameters.end(), [this](dex::Index parameter) {
+                const auto &parameter_type = runtime.image().types.at(parameter);
+                return parameter_type == "F" || parameter_type == "D";
+            }))))
+            bad("FRAME", "JNI floating method calls require a full register frame");
         constexpr std::string_view returns = "LZBCSIJFDV";
         if ((category == 0 && !dex::reference_type(type)) ||
             (category != 0 && type != returns.substr(category, 1)))
             bad("SIGNATURE", "JNI Call* return category disagrees with method prototype");
-        auto args = arguments(prototype, state, variant);
+        auto args = arguments(prototype, state, variant, nonvirtual ? 4u : 3u);
         if (stat) {
-            if (resolve(state.registers[1]) != id.owner)
+            if (!method_class_compatible(id, resolve(state.registers[1])))
                 bad("METHOD_ID", "Method ID does not belong to the supplied class");
-        } else
-            args.insert(args.begin(), Value::reference(resolve(state.registers[1])));
+        } else {
+            const auto receiver = resolve(state.registers[1]);
+            if (nonvirtual) {
+                const auto supplied = resolve(state.registers[2]);
+                if (!method_class_compatible(id, supplied))
+                    bad("METHOD_ID", "Nonvirtual method ID is incompatible with the supplied class");
+                if (!runtime.assignable(receiver, runtime.represented_class(supplied)))
+                    bad("METHOD_ID", "Nonvirtual receiver is incompatible with the supplied class");
+            }
+            args.insert(args.begin(), Value::reference(receiver));
+        }
         ++metrics.managed_callbacks;
-        const auto result = stat ? runtime.invoke(id.index, args) : runtime.invoke_virtual(id.index, args);
+        // Explicit-class calls deliberately bypass virtual target selection.
+        const auto result = stat || nonvirtual ? runtime.invoke(id.index, args)
+                                              : runtime.invoke_virtual(id.index, args);
         if (dex::reference_type(type))
             state.registers[0] = reference(result.bits);
         else if (type == "F" || type == "D")
@@ -584,14 +825,63 @@ struct Bridge::Impl {
         else
             state.registers[0] = result.bits;
     }
+    void construct(unsigned slot, a64::ServiceState &state, bool full_frame) {
+        const auto owner = resolve(state.registers[1]);
+        const auto type = std::string(runtime.represented_class(owner));
+        const auto found = methods.find(state.registers[2]);
+        if (found == methods.end() || found->second.is_static)
+            bad("METHOD_ID", "NewObject requires a constructor ID from the supplied class");
+        const auto &method = runtime.image().methods.at(found->second.index);
+        if (!method.declared && found->second.owner != owner)
+            bad("METHOD_ID", "Symbolic constructor ID was not obtained through the supplied class");
+        const auto &prototype = runtime.image().prototypes.at(method.prototype);
+        if (method.name != "<init>" || runtime.image().types.at(method.owner) != type ||
+            runtime.image().types.at(prototype.return_type) != "V")
+            bad("METHOD_ID", "NewObject requires the supplied class's void constructor");
+        if (!full_frame && slot == 28 && std::any_of(prototype.parameters.begin(), prototype.parameters.end(),
+                                      [this](dex::Index parameter) {
+                const auto &parameter_type = runtime.image().types.at(parameter);
+                return parameter_type == "F" || parameter_type == "D";
+            }))
+            bad("FRAME", "JNI floating constructor arguments require a full register frame");
+        auto args = arguments(prototype, state, slot - 28);
+        // Allocation initializes the class but does not run an instance
+        // constructor. Retain its fresh receiver before invoking the exact ID.
+        const auto object = runtime.new_object(type);
+        const auto handle = reference(object);
+        try {
+            args.insert(args.begin(), Value::reference(object));
+            ++metrics.managed_callbacks;
+            (void)runtime.invoke(found->second.index, args);
+        } catch (...) {
+            erase(handle, false);
+            throw;
+        }
+        state.registers[0] = handle;
+    }
+    Handle method_id(dex::Index index, ObjectId lookup_owner, bool stat) {
+        const auto &method = runtime.image().methods.at(index);
+        if (method.declared && bool(method.flags & 8) != stat)
+            bad("METHOD_ID", "Owned method ID static kind differs from its declaration");
+        const auto owner = method.declared ? ObjectId{0} : lookup_owner;
+        if (!method.declared && !owner)
+            bad("METHOD_ID", "Symbolic method ID requires its actual lookup Class");
+        for (const auto &[handle, id] : methods)
+            if (id.index == index && id.owner == owner && id.is_static == stat)
+                return handle;
+        if (methods.size() >= 4096)
+            bad("METHOD_LIMIT", "Too many JNI method IDs");
+        const auto handle = identity();
+        methods.emplace(handle, MethodId{index, owner, stat});
+        return handle;
+    }
     void method_lookup(a64::ServiceState &state, bool stat) {
         const auto owner = resolve(state.registers[1]);
         const auto type = runtime.represented_class(owner);
         const auto name = text(state.registers[2], 1024), signature = text(state.registers[3], 1024);
         dex::Index index;
         try {
-            index = runtime.lookup(type, name, signature, stat);
-            runtime.initialize(type);
+            index = runtime.lookup_jni_method(type, name, signature, stat);
         } catch (const dex::DexError &e) {
             if (e.code != "AETHER_DEX_METHOD_NOT_FOUND" && e.code != "AETHER_DEX_SIGNATURE")
                 throw;
@@ -600,18 +890,144 @@ struct Bridge::Impl {
             state.registers[0] = 0;
             return;
         }
-        for (const auto &[handle, id] : methods)
-            if (id.index == index && id.owner == owner && id.is_static == stat) {
-                state.registers[0] = handle;
-                return;
-            }
-        if (methods.size() >= 4096)
-            bad("METHOD_LIMIT", "Too many JNI method IDs");
-        const auto handle = identity();
-        methods.emplace(handle, MethodId{index, owner, stat});
-        state.registers[0] = handle;
+        state.registers[0] = method_id(index, owner, stat);
     }
-    Address string_buffer(ObjectId id, bool utf8) {
+    Handle field_id(dex::Index index) {
+        for (const auto &[handle, field] : fields)
+            if (field == index)
+                return handle;
+        if (fields.size() >= 4096)
+            bad("FIELD_LIMIT", "Too many JNI field IDs");
+        const auto handle = identity();
+        fields.emplace(handle, index);
+        return handle;
+    }
+    void field_lookup(a64::ServiceState &state, bool stat) {
+        const auto type = std::string(runtime.represented_class(resolve(state.registers[1])));
+        const auto name = text(state.registers[2], 1024);
+        const auto descriptor = text(state.registers[3], 1024);
+        dex::Index index;
+        try {
+            // Runtime initialization precedes semantic signature validation and lookup.
+            index = stat ? runtime.lookup_static_field(type, name, descriptor)
+                         : runtime.lookup_instance_field(type, name, descriptor);
+        } catch (const dex::DexError &e) {
+            if (e.code != "AETHER_DEX_FIELD_NOT_FOUND")
+                throw;
+            error = e.code + ": " + e.what();
+            java_error("Ljava/lang/NoSuchFieldError;");
+            state.registers[0] = 0;
+            return;
+        }
+        state.registers[0] = field_id(index);
+    }
+    void instance_field_access(unsigned slot, a64::ServiceState &state, bool full_frame) {
+        const bool set = slot >= 104;
+        const auto category = slot - (set ? 104u : 95u);
+        constexpr std::string_view categories = "LZBCSIJFD";
+        const auto found = fields.find(state.registers[2]);
+        if (found == fields.end())
+            bad("FIELD_ID", "Invalid or foreign JNI instance field ID");
+        const auto index = found->second;
+        const auto &field = runtime.image().fields.at(index);
+        if (!field.declared || (field.flags & 8))
+            bad("FIELD_ID", "JNI instance accessor requires an owned nonstatic field ID");
+        const auto type = std::string(runtime.image().types.at(field.type));
+        if ((category == 0 && !dex::reference_type(type)) ||
+            (category != 0 && type != categories.substr(category, 1)))
+            bad("SIGNATURE", "JNI instance field category disagrees with declaration");
+        const bool floating = category >= 7;
+        if (floating && !full_frame)
+            bad("FRAME", "JNI floating instance field access requires a full register frame");
+        const auto receiver = resolve(state.registers[1]);
+        if (set) {
+            const auto bits = floating ? state.vectors[0][0] : state.registers[3];
+            runtime.set_instance_field(receiver, index, decode(bits, type));
+        } else {
+            const auto result = runtime.get_instance_field(receiver, index);
+            if (category == 0)
+                state.registers[0] = reference(result.bits);
+            else if (floating)
+                state.vectors[0] = {result.bits, 0};
+            else
+                state.registers[0] = result.bits;
+        }
+    }
+    void static_field_access(unsigned slot, a64::ServiceState &state, bool full_frame) {
+        const bool set = slot >= 154;
+        const auto category = slot - (set ? 154u : 145u);
+        constexpr std::string_view categories = "LZBCSIJFD";
+        const auto found = fields.find(state.registers[2]);
+        if (found == fields.end())
+            bad("FIELD_ID", "Invalid or foreign JNI static field ID");
+        const auto index = found->second;
+        const auto &field = runtime.image().fields.at(index);
+        if (!field.declared || !(field.flags & 8))
+            bad("FIELD_ID", "JNI static accessor requires an owned static field ID");
+        const auto type = std::string(runtime.image().types.at(field.type));
+        if ((category == 0 && !dex::reference_type(type)) ||
+            (category != 0 && type != categories.substr(category, 1)))
+            bad("SIGNATURE", "JNI static field category disagrees with declaration");
+        const auto supplied = std::string(runtime.represented_class(resolve(state.registers[1])));
+        if (!runtime.static_field_compatible(index, supplied))
+            bad("FIELD_ID", "Static field ID is incompatible with the supplied class");
+        const bool floating = category >= 7;
+        if (floating && !full_frame)
+            bad("FRAME", "JNI floating static field access requires a full register frame");
+        if (set) {
+            const auto bits = floating ? state.vectors[0][0] : state.registers[3];
+            runtime.set_static_uninitialized(index, decode(bits, type));
+        } else {
+            const auto result = runtime.get_static_uninitialized(index);
+            if (category == 0)
+                state.registers[0] = reference(result.bits);
+            else if (floating)
+                state.vectors[0] = {result.bits, 0};
+            else
+                state.registers[0] = result.bits;
+        }
+    }
+    void update_buffer_metrics() {
+        metrics.string_buffers = static_cast<std::size_t>(std::count_if(
+            buffers.begin(), buffers.end(), [](const auto &entry) { return !entry.second.component; }));
+    }
+    bool critical_active() const {
+        return std::any_of(buffers.begin(), buffers.end(), [this](const auto &entry) {
+            return entry.second.context == context && entry.second.critical;
+        });
+    }
+    Address copy_buffer(ObjectId id, std::span<const std::uint8_t> bytes,
+                        bool utf8, char component = 0, bool critical = false) {
+        // Strings and primitive copies share the original buffer count, byte and
+        // address budgets. Empty arrays still get a distinct, releasable address.
+        if (bytes.size() > 1024 * 1024)
+            bad("BUFFER_LIMIT", "JNI copy buffer exceeds the shared byte budget");
+        const auto size = (std::max(std::size_t{1}, bytes.size()) + 4095) & ~std::size_t{4095};
+        if (buffers.size() >= 256 || size > 1024 * 1024 - buffer_bytes || buffer_next + size >= 0x60000000)
+            bad("BUFFER_LIMIT", "JNI copy buffer quota exhausted");
+        const auto address = buffer_next;
+        buffer_next += size;
+        memory.map(address, size, a64::read_write);
+        bool retained = false;
+        try {
+            if (!bytes.empty() && !memory.write(address, bytes))
+                bad("MEMORY", "Cannot populate JNI copy buffer");
+            if (!component)
+                memory.protect(address, a64::Permission::read);
+            runtime.retain(id);
+            retained = true;
+            buffers.emplace(address, Buffer{id, utf8, size, context, component, critical});
+        } catch (...) {
+            if (retained)
+                runtime.release(id);
+            memory.unmap(address);
+            throw;
+        }
+        buffer_bytes += size;
+        update_buffer_metrics();
+        return address;
+    }
+    Address string_buffer(ObjectId id, bool utf8, bool critical = false) {
         const auto string = runtime.string(id);
         std::vector<std::uint8_t> bytes;
         if (utf8) {
@@ -626,39 +1042,108 @@ struct Bridge::Impl {
             bytes.push_back(0);
             bytes.push_back(0);
         }
-        const auto size = (bytes.size() + 4095) & ~std::size_t{4095};
-        if (buffers.size() >= 256 || size > 1024 * 1024 - buffer_bytes || buffer_next + size >= 0x60000000)
-            bad("BUFFER_LIMIT", "JNI string buffer quota exhausted");
-        const auto address = buffer_next;
-        buffer_next += size;
-        memory.map(address, size, a64::read_write);
-        bool retained = false;
-        try {
-            if (!memory.write(address, bytes))
-                bad("MEMORY", "Cannot populate JNI string buffer");
-            memory.protect(address, a64::Permission::read);
-            runtime.retain(id);
-            retained = true;
-            buffers.emplace(address, Buffer{id, utf8, size,context});
-        } catch (...) {
-            if (retained)
-                runtime.release(id);
-            memory.unmap(address);
-            throw;
-        }
-        buffer_bytes += size;
-        metrics.string_buffers = buffers.size();
-        return address;
+        return copy_buffer(id, bytes, utf8, 0, critical);
     }
-    void release_string(ObjectId id, Address address, bool utf8) {
+    void release_string(ObjectId id, Address address, bool utf8, bool critical = false) {
         const auto it = buffers.find(address);
-        if (it == buffers.end() || it->second.string != id || it->second.utf8 != utf8 || it->second.context!=context)
+        if (it == buffers.end() || it->second.object != id || it->second.utf8 != utf8 ||
+            it->second.context != context || it->second.component || it->second.critical != critical)
             bad("BUFFER", "Mismatched or double JNI string release");
         memory.unmap(address);
         runtime.release(id);
         buffer_bytes -= it->second.bytes;
         buffers.erase(it);
-        metrics.string_buffers = buffers.size();
+        update_buffer_metrics();
+    }
+    static unsigned primitive_width(char component) {
+        constexpr std::string_view types = "ZBCSIJFD";
+        constexpr std::array<unsigned, 8> widths{1, 1, 2, 2, 4, 8, 4, 8};
+        const auto kind = types.find(component);
+        if (kind == std::string_view::npos)
+            bad("ARRAY_TYPE", "Expected a primitive JNI array");
+        return widths[kind];
+    }
+    char primitive_component(ObjectId id) {
+        const auto type = runtime.object_type(id);
+        if (type.size() != 2 || type[0] != '[')
+            bad("ARRAY_TYPE", "Expected a primitive JNI array");
+        (void)primitive_width(type[1]);
+        return type[1];
+    }
+    Address array_elements(ObjectId id, char component, bool critical) {
+        if (primitive_component(id) != component)
+            bad("ARRAY_TYPE", "JNI array elements have the wrong component type");
+        const auto width = primitive_width(component);
+        const auto length = runtime.array_length(id);
+        if (length > (1024 * 1024) / width)
+            bad("BUFFER_LIMIT", "JNI primitive copy exceeds the shared byte budget");
+        std::vector<std::uint8_t> bytes(length * width);
+        for (std::size_t n = 0; n < length; ++n) {
+            const auto value = runtime.array_get(id, static_cast<std::int32_t>(n)).bits;
+            for (unsigned b = 0; b < width; ++b)
+                bytes[n * width + b] = static_cast<std::uint8_t>(value >> (8 * b));
+        }
+        return copy_buffer(id, bytes, false, component, critical);
+    }
+    void release_array(ObjectId id, Address address, std::int32_t mode, char component, bool critical) {
+        if (mode != 0 && mode != 1 && mode != 2)
+            bad("BUFFER_MODE", "JNI array release mode must be 0, JNI_COMMIT or JNI_ABORT");
+        const auto it = buffers.find(address);
+        if (it == buffers.end() || it->second.object != id || it->second.context != context ||
+            it->second.component != component || it->second.critical != critical)
+            bad("BUFFER", "Mismatched or double JNI array release");
+        if (primitive_component(id) != component)
+            bad("ARRAY_TYPE", "JNI array release has the wrong component type");
+        if (mode != 2) {
+            const auto width = primitive_width(component);
+            const auto length = runtime.array_length(id);
+            // Read the complete copy before changing managed storage, so a bad
+            // guest range cannot leave a partially committed Java array.
+            std::vector<std::uint8_t> bytes(length * width);
+            if (!bytes.empty() && !memory.read(address, bytes))
+                bad("MEMORY", "JNI array copy is no longer readable");
+            for (std::size_t n = 0; n < length; ++n) {
+                std::uint64_t value = 0;
+                for (unsigned b = 0; b < width; ++b)
+                    value |= std::uint64_t(bytes[n * width + b]) << (8 * b);
+                runtime.array_set(id, static_cast<std::int32_t>(n),
+                                  decode(value, std::string_view(&component, 1)));
+            }
+        }
+        // JNI_COMMIT copies back while retaining this exact copy and its root.
+        // Mode 0 copies back and releases; JNI_ABORT releases without copying.
+        if (mode != 1) {
+            memory.unmap(address);
+            runtime.release(id);
+            buffer_bytes -= it->second.bytes;
+            buffers.erase(it);
+            update_buffer_metrics();
+        }
+    }
+    void string_region(a64::ServiceState &state, bool utf8) {
+        const auto value = runtime.string(resolve(state.registers[1]));
+        const auto begin = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(state.registers[2]));
+        const auto count = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(state.registers[3]));
+        if (begin < 0 || count < 0 || static_cast<std::size_t>(begin) > value.size() ||
+            static_cast<std::size_t>(count) > value.size() - begin)
+            runtime.raise("Ljava/lang/StringIndexOutOfBoundsException;");
+        const auto region = value.substr(static_cast<std::size_t>(begin), static_cast<std::size_t>(count));
+        std::vector<std::uint8_t> bytes;
+        if (utf8) {
+            const auto encoded = modified_utf8(region);
+            bytes.assign(encoded.begin(), encoded.end());
+        } else {
+            bytes.reserve(region.size() * 2);
+            for (const auto unit : region) {
+                bytes.push_back(static_cast<std::uint8_t>(unit));
+                bytes.push_back(static_cast<std::uint8_t>(unit >> 8));
+            }
+        }
+        // Region functions write exactly the selected units/encoded bytes and
+        // never append a terminator. Zero-length regions need no guest buffer.
+        if (!bytes.empty() && (!memory.accessible(state.registers[4], bytes.size(), a64::Permission::write) ||
+                               !memory.write(state.registers[4], bytes)))
+            bad("MEMORY", "JNI string region exceeds the writable guest buffer");
     }
     void array_region(unsigned slot, a64::ServiceState &state) {
         const bool set = slot >= 207;
@@ -686,19 +1171,49 @@ struct Bridge::Impl {
                 write(address, runtime.array_get(id, begin + i).bits, widths[kind]);
         }
     }
-    void dispatch(unsigned slot, a64::ServiceState &state) {
+    a64::Fault invoke_service(std::uint32_t service, Address instruction,
+                              a64::ServiceState &state, bool full_frame) noexcept;
+    void dispatch(unsigned slot, a64::ServiceState &state, bool full_frame) {
         auto &r = state.registers;
         if (!attached || r[0] != current_environment)
             bad("ENVIRONMENT", "JNIEnv does not belong to this app/thread");
+        if (critical_active() && slot != 222 && slot != 223 && slot != 224 && slot != 225)
+            bad("CRITICAL", "Only nested critical acquisition/release is allowed while a JNI critical copy is held");
         if (pending && slot != 15 && slot != 17 && slot != 228 && slot != 22 && slot != 23 && slot != 20 &&
-            slot != 166 && slot != 170)
+            slot != 166 && slot != 170 && !(slot >= 191 && slot <= 198) && slot != 223 && slot != 225 && slot != 227)
             bad("PENDING_EXCEPTION", "JNI operation is not allowed with a pending exception");
-        if ((slot >= 34 && slot <= 63) || (slot >= 114 && slot <= 143)) {
-            callback(slot, state);
+        if ((slot >= 34 && slot <= 93) || (slot >= 114 && slot <= 143)) {
+            callback(slot, state, full_frame);
+            return;
+        }
+        if (slot >= 145 && slot <= 162) {
+            static_field_access(slot, state, full_frame);
+            return;
+        }
+        if (slot >= 95 && slot <= 112) {
+            instance_field_access(slot, state, full_frame);
             return;
         }
         if (slot >= 199 && slot <= 214) {
             array_region(slot, state);
+            return;
+        }
+        if (slot >= 183 && slot <= 198) {
+            constexpr std::string_view types = "ZBCSIJFD";
+            const bool release = slot >= 191;
+            const auto component = types[slot - (release ? 191u : 183u)];
+            const auto id = resolve(r[1]);
+            if (release)
+                release_array(id, r[2], std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[3])),
+                              component, false);
+            else {
+                if (r[2] && !memory.accessible(r[2], 1, a64::Permission::write))
+                    bad("MEMORY", "Invalid isCopy address");
+                const auto buffer = array_elements(id, component, false);
+                if (r[2])
+                    write(r[2], 1, 1);
+                r[0] = buffer;
+            }
             return;
         }
         if (slot >= 175 && slot <= 182) {
@@ -728,6 +1243,62 @@ struct Bridge::Impl {
             }
             break;
         }
+        case 7:
+            r[0] = allocation_reference([&] {
+                const auto index = runtime.reflected_method_index(resolve(r[1]));
+                return method_id(index, 0, bool(runtime.image().methods.at(index).flags & 8));
+            });
+            break;
+        case 8:
+            r[0] = allocation_reference([&] {
+                return field_id(runtime.reflected_field_index(resolve(r[1])));
+            });
+            break;
+        case 9:
+            r[0] = allocation_reference([&] {
+                const auto found = methods.find(r[2]);
+                if (found == methods.end())
+                    bad("METHOD_ID", "ToReflectedMethod requires an existing JNI method ID");
+                const auto &id = found->second;
+                const auto &method = runtime.image().methods.at(id.index);
+                if (!method.declared)
+                    bad("METHOD_UNSUPPORTED", "Provider and symbolic methods have no owned reflective declaration");
+                if (id.is_static != (static_cast<std::uint8_t>(r[3]) != 0) ||
+                    !method_class_compatible(id, resolve(r[1])))
+                    bad("METHOD_ID", "ToReflectedMethod class or static kind differs from its declaration");
+                return reference(runtime.new_reflected_method(id.index));
+            });
+            break;
+        case 10: {
+            const auto type = runtime.represented_class(resolve(r[1]));
+            const auto parent = runtime.superclass(type);
+            r[0] = parent ? reference(runtime.class_object(*parent)) : 0;
+            break;
+        }
+        case 11: {
+            const auto from = runtime.represented_class(resolve(r[1]));
+            const auto to = runtime.represented_class(resolve(r[2]));
+            r[0] = runtime.class_assignable(from, to);
+            break;
+        }
+        case 12:
+            r[0] = allocation_reference([&] {
+                const auto found = fields.find(r[2]);
+                if (found == fields.end())
+                    bad("FIELD_ID", "ToReflectedField requires an existing owned JNI field ID");
+                const auto index = found->second;
+                const auto &field = runtime.image().fields.at(index);
+                const bool stat = static_cast<std::uint8_t>(r[3]) != 0;
+                if (!field.declared || bool(field.flags & 8) != stat)
+                    bad("FIELD_ID", "ToReflectedField static kind differs from its declaration");
+                const auto supplied = std::string(runtime.represented_class(resolve(r[1])));
+                if (!runtime.class_assignable(supplied, runtime.image().types.at(field.owner)))
+                    bad("FIELD_ID", "ToReflectedField class is incompatible with its declaration");
+                // Construction may collect before producing the result; its
+                // immediate fixed-cell local publication cannot collect.
+                return reference(runtime.new_reflected_field(index));
+            });
+            break;
         case 13: {
             const auto id = resolve(r[1]);
             if (!id || !runtime.assignable(id, "Ljava/lang/Throwable;"))
@@ -744,38 +1315,47 @@ struct Bridge::Impl {
             break;
         }
         case 15:
-            r[0] = reference(pending);
+            // Reading the pending exception creates a local reference. If its
+            // allocation fails, keep that exception pending and return null;
+            // ExceptionCheck still distinguishes this from no pending error.
+            r[0] = allocation_reference([&] { return reference(pending); });
             break;
         case 17:
             pending_exception(0);
             r[0] = 0;
             break;
-        case 19:
-            if (r[1] > 1024 || frames.size() >= 128)
-                bad("FRAME_LIMIT", "Invalid JNI local frame capacity");
-            frames.push_back({{}, true});
-            r[0] = 0;
+        case 19: {
+            const auto capacity = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[1]));
+            if (capacity <= 0)
+                bad("FRAME_CAPACITY", "PushLocalFrame capacity must be positive");
+            r[0] = allocation_reference([&] {
+                push_frame(static_cast<std::size_t>(capacity), true);
+                return Handle{1};
+            }) ? 0 : static_cast<std::uint32_t>(-1);
             break;
+        }
         case 20: {
             if (frames.empty() || !frames.back().explicit_frame)
                 bad("FRAME", "Cannot pop the native call's automatic frame");
-            const auto object = resolve(r[1]);
-            if (object)
-                runtime.retain(object);
-            pop();
-            try {
-                r[0] = reference(object);
-            } catch (...) {
-                if (object)
-                    runtime.release(object);
-                throw;
-            }
-            if (object)
-                runtime.release(object);
+            r[0] = allocation_reference([&]() -> Handle {
+                struct Pop {
+                    Impl &owner;
+                    bool active = true;
+                    ~Pop() { if (active) owner.pop(); }
+                    void now() { active = false; owner.pop(); }
+                } popped{*this};
+                const auto object = resolve(r[1], false);
+                // Resolution, retirement and fixed-cell parent publication
+                // form one allocation/GC/callback-free interval. This applies
+                // equally to weak referents and does not need an ordinary pin
+                // that could consume or fail outside the promised capacity.
+                popped.now();
+                return reference(object);
+            });
             break;
         }
         case 21:
-            r[0] = reference(resolve(r[1]), true);
+            r[0] = allocation_reference([&] { return reference(resolve(r[1], false), true); });
             break;
         case 22:
             erase(r[1], true);
@@ -789,15 +1369,25 @@ struct Bridge::Impl {
             r[0] = resolve(r[1]) == resolve(r[2]);
             break;
         case 25:
-            r[0] = reference(resolve(r[1]));
+            r[0] = allocation_reference([&] { return reference(resolve(r[1], false)); });
             break;
-        case 26:
-            if (r[1] > 1024 || frames.empty() || r[1] > 1024 - frames.back().handles.size())
-                bad("REFERENCE_LIMIT", "Insufficient JNI local capacity");
-            r[0] = 0;
+        case 26: {
+            const auto capacity = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[1]));
+            if (capacity < 0)
+                bad("FRAME_CAPACITY", "EnsureLocalCapacity capacity must be nonnegative");
+            r[0] = allocation_reference([&] {
+                ensure_local_capacity(static_cast<std::size_t>(capacity));
+                return Handle{1};
+            }) ? 0 : static_cast<std::uint32_t>(-1);
             break;
+        }
         case 27:
             r[0] = reference(runtime.new_object(runtime.represented_class(resolve(r[1]))));
+            break;
+        case 28:
+        case 29:
+        case 30:
+            construct(slot, state, full_frame);
             break;
         case 31:
             r[0] = reference(runtime.class_object(runtime.object_type(resolve(r[1]))));
@@ -810,6 +1400,10 @@ struct Bridge::Impl {
             break;
         case 113:
             method_lookup(state, true);
+            break;
+        case 94:
+        case 144:
+            field_lookup(state, slot == 144);
             break;
         case 163: {
             const auto count = r[2];
@@ -909,6 +1503,38 @@ struct Bridge::Impl {
             write(r[1], Bridge::java_vm, 8);
             r[0] = 0;
             break;
+        case 220:
+        case 221:
+            string_region(state, slot == 221);
+            break;
+        case 222:
+        case 224: {
+            if (r[2] && !memory.accessible(r[2], 1, a64::Permission::write))
+                bad("MEMORY", "Invalid isCopy address");
+            const auto id = resolve(r[1]);
+            const auto buffer = slot == 222 ? array_elements(id, primitive_component(id), true)
+                                             : string_buffer(id, false, true);
+            if (r[2])
+                write(r[2], 1, 1);
+            r[0] = buffer;
+            break;
+        }
+        case 223: {
+            const auto id = resolve(r[1]);
+            release_array(id, r[2], std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[3])),
+                          primitive_component(id), true);
+            break;
+        }
+        case 225:
+            release_string(resolve(r[1]), r[2], false, true);
+            break;
+        case 226:
+            r[0] = allocation_reference([&] { return weak_reference(resolve(r[1])); });
+            break;
+        case 227:
+            erase(r[1], true, true);
+            r[0] = 0;
+            break;
         case 228:
             r[0] = pending != 0;
             break;
@@ -917,8 +1543,12 @@ struct Bridge::Impl {
                 r[0] = 0;
                 break;
             }
-            (void)resolve(r[1]);
-            r[0] = refs.at(r[1]).global ? 2 : 1;
+            const auto found = find_reference(r[1]);
+            if (found == refs.end() || (!found->second.global && found->second.context != context))
+                bad("REFERENCE", "Invalid, deleted or foreign JNI reference");
+            // A cleared weak reference still has weak-global handle type. Do
+            // not infer validity or kind from its nullable resolved referent.
+            r[0] = found->second.weak ? 3 : found->second.global ? 2 : 1;
             break;
         }
         default:
@@ -929,9 +1559,10 @@ struct Bridge::Impl {
 };
 Bridge::Bridge(dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
                const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
-               host::FileService *files, bool attach_interface,std::string_view package)
+               host::FileService *files, bool attach_interface,std::string_view package,
+               audio::GuestAudioServices *audio)
     : impl_(std::make_unique<Impl>(*this, runtime, memory, app, time, modules, std::move(root), files,
-                                   attach_interface,package)) {}
+                                   attach_interface,package,audio)) {}
 Bridge::~Bridge() {
     if (impl_ && impl_->attach_interface)
         impl_->runtime.set_native_interface(nullptr);
@@ -1040,10 +1671,19 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
     Impl::LogicalScope logical_scope(p);
     p.check_pending();
     p.error.clear();
-    Impl::Scope scope(p);
     const auto &method = runtime.image().methods.at(index);
     const auto &prototype = runtime.image().prototypes.at(method.prototype);
     const auto &owner = runtime.image().types.at(method.owner);
+    const auto stat = bool(method.flags & 8);
+    // Reserve argument handles as well as the JNI entry guarantee. Null
+    // arguments create no handles, so the guest starts with at least sixteen
+    // genuinely backed additional locals after marshalling completes.
+    std::size_t argument_handles = 1; // Receiver or nonnull declaring Class.
+    for (std::size_t i = 0; i < prototype.parameters.size(); ++i)
+        if (dex::reference_type(runtime.image().types.at(prototype.parameters[i])) &&
+            arguments[i + (stat ? 0 : 1)].bits)
+            ++argument_handles;
+    Impl::Scope scope(p, argument_handles + 16);
     Address address = 0;
     if (const auto it = p.registered.find(index); it != p.registered.end())
         address = it->second;
@@ -1066,7 +1706,6 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
         }
         if (!address) bad("METHOD_UNSUPPORTED", "No loaded native root exports " + short_name);
     }
-    const auto stat = bool(method.flags & 8);
     std::vector<std::uint64_t> integers{p.current_environment,
                                         p.reference(stat ? runtime.class_object(owner) : arguments[0].bits)};
     std::vector<a64::Vector> floating;
@@ -1112,25 +1751,42 @@ a64::Fault Bridge::invoke(std::uint32_t service, Address instruction,
                           std::array<std::uint64_t, 31> &registers) noexcept {
     a64::ServiceState state;
     state.registers = registers;
-    const auto fault = invoke_frame(service, instruction, state);
+    const auto fault = impl_->invoke_service(service, instruction, state, false);
     registers = state.registers;
     return fault;
 }
 a64::Fault Bridge::invoke_frame(std::uint32_t service, Address instruction,
                                 a64::ServiceState &state) noexcept {
-    auto &p = *impl_;
+    return impl_->invoke_service(service, instruction, state, true);
+}
+a64::Fault Bridge::Impl::invoke_service(std::uint32_t service, Address instruction,
+                                       a64::ServiceState &state, bool full_frame) noexcept {
+    auto &p = *this;
     if(p.process->exit_status())return a64::Fault::process_exit;
-    if (service < first_service)
-        return p.posix.invoke_frame(service, instruction, state);
     try {
-        ++p.metrics.calls;
         if (p.closed)bad("STATE","JNI service in closed bridge");
+        // Critical APIs return rooted guest copies, never managed heap or host
+        // pointers. Guest service calls could block or reenter Java; reject them
+        // until the owning context releases every critical copy. CPU budgeting
+        // and process-exit checks remain active independently of this guard.
+        if (p.critical_active() && !(service >= first_service + 222 && service <= first_service + 225))
+            bad("CRITICAL", "Guest service calls are forbidden while a JNI critical copy is held");
+        if (service < first_service)
+            return p.posix.invoke_frame(service, instruction, state);
+        WeakRoots weak_roots(p);
+        if (p.audio_services && audio::GuestAudioServices::handles_service(service)) {
+            const auto fault = p.audio_services->invoke(service, instruction, state.registers);
+            if (fault != a64::Fault::none)
+                p.error = p.audio_services->last_error();
+            return fault;
+        }
+        ++p.metrics.calls;
         if (service >= first_service && service < first_service + function_count) {
             const auto slot = service - first_service;
             if (instruction != trampolines + slot * 8)
                 bad("TRAMPOLINE", "JNI service called from an unregistered PC");
             if(!p.attached || p.frames.empty())bad("THREAD_UNSUPPORTED","Native thread has no JNI attachment");
-            p.dispatch(slot, state);
+            p.dispatch(slot, state, full_frame);
         } else if (service >= first_vm_service + 3 && service <= first_vm_service + 7) {
             const auto slot = service - first_vm_service;
             if (instruction != trampolines + 0x800 + slot * 8 || state.registers[0] != java_vm)
@@ -1145,7 +1801,13 @@ a64::Fault Bridge::invoke_frame(std::uint32_t service, Address instruction,
             if(slot==4 || slot==7) {
                 if(!p.attached) {
                     if(state.registers[2])bad("THREAD_ATTRIBUTES_UNSUPPORTED","Custom native attachment arguments are not implemented");
-                    p.runtime.current_thread();p.frames.push_back({});p.attached=true;
+                    p.runtime.current_thread();
+                    if (!p.allocation_reference([&] { p.push_frame(16); return Handle{1}; })) {
+                        p.write(state.registers[1], 0, 8);
+                        state.registers[0] = static_cast<std::uint32_t>(-1);
+                        return a64::Fault::none;
+                    }
+                    p.attached=true;
                 }
                 p.write(state.registers[1],p.current_environment,8);state.registers[0]=0;
             } else if(state.registers[2]!=0x10006) {
@@ -1165,8 +1827,19 @@ a64::Fault Bridge::invoke_frame(std::uint32_t service, Address instruction,
     } catch (const dex::JavaException &e) {
         try {
             p.pending_exception(e.object);
-            state.registers[0] = 0;
-            state.vectors[0] = {};
+            const auto slot = service - first_service;
+            if (slot >= 95 && slot <= 112) {
+                if (slot == 102 || slot == 103)
+                    state.vectors[0] = {};
+                else if (slot <= 101)
+                    state.registers[0] = 0;
+            } else if (slot < 144 || slot > 162) {
+                state.registers[0] = 0;
+                state.vectors[0] = {};
+            } else if (slot == 152 || slot == 153)
+                state.vectors[0] = {};
+            else if (slot <= 151)
+                state.registers[0] = 0;
             return a64::Fault::none;
         } catch (...) {
             p.error = "AETHER_JNI_EXCEPTION_ROOT: Cannot retain pending exception";
@@ -1197,13 +1870,34 @@ void Bridge::shutdown() {
     if (p.closed)
         return;
     if(p.process->exit_status()){p.closed=true;if(p.attach_interface)p.runtime.set_native_interface(nullptr);p.cleanup();return;}
+    if(p.shutdown_failed)bad("NATIVE_FINALIZATION","Previous native shutdown failed; guest finalization cannot be retried");
     Impl::LogicalScope logical_scope(p);
     if (p.native_depth)
         bad("STATE", "Cannot shut down an active native call");
     if (p.load_state == 2) {
         Impl::Scope scope(p);
-        try{p.loader.finalize(p.cpu, scope.stack());}
-        catch(const ThreadExit &exit){p.process->checkpoint();p.runtime.exit_current_thread(exit.value);}
+        const auto drain=[&]{
+            a64::ServiceState state;
+            state.stack_pointer=state.stack_top=scope.stack();
+            const auto fault=p.posix.finalize_cxa(state);
+            p.process->checkpoint();
+            if(fault==a64::Fault::thread_exit){
+                const auto value=p.posix.thread_exit_value(p.posix.thread_pointer());
+                if(!value)bad("NATIVE_FINALIZATION","C++ destructor thread exit has no owned terminal value");
+                p.runtime.exit_current_thread(*value);
+            }
+            if(fault!=a64::Fault::none)
+                bad("NATIVE_FINALIZATION",std::string(a64::fault_name(fault))+": "+std::string(p.posix.last_rejection()));
+        };
+        try{
+            // Explicit app-close ordering, not a claim about universal C exit:
+            // drain existing registrations, run the ELF fini arrays, then drain
+            // registrations created by those arrays before detaching JNI/TLS.
+            drain();p.loader.finalize(p.cpu, scope.stack());drain();
+        }catch(const ThreadExit &exit){
+            p.shutdown_failed=true;p.load_state=3;
+            p.process->checkpoint();p.runtime.exit_current_thread(exit.value);
+        }catch(...){p.shutdown_failed=true;p.load_state=3;throw;}
     }
     p.closed = true;
     if (p.attach_interface)

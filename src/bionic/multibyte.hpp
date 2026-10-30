@@ -6,7 +6,8 @@
 namespace aether::bionic {
 class NativeThreads;
 enum class MultibyteOperation {
-    wcsnrtombs,wcsrtombs,wcrtomb,btowc,wctob,mbrtowc,mbrlen,mbsnrtowcs,mbsrtowcs,mbsinit
+    wcsnrtombs,wcsrtombs,wcrtomb,btowc,wctob,mbrtowc,mbrlen,mbsnrtowcs,mbsrtowcs,mbsinit,
+    mbtowc,mblen,wctomb
 };
 // Original guest UTF-32/UTF-8 conversion. No host locale or character API.
 // Each call may consume/produce at most 1 MiB; declared bounds remain full64.
@@ -19,8 +20,9 @@ class NativeMultibyte {
     a64::GuestMemory &memory_;
     NativeThreads &threads_;
     // Underlying function-static states: wcsnrtombs, wcrtomb, mbrtowc,
-    // mbrlen and mbsnrtowcs. Their rt wrappers share the underlying state.
-    std::array<std::array<std::uint8_t,4>,5> private_states_{};
+    // mbrlen, mbsnrtowcs, mbtowc and wctomb. Their rt wrappers share the
+    // underlying state; nonrestartable mblen instead uses a fresh local state.
+    std::array<std::array<std::uint8_t,4>,7> private_states_{};
     std::string_view rejection_;
 };
 }

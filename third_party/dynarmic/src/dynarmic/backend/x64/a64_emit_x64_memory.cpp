@@ -22,6 +22,7 @@
 #include "dynarmic/common/spin_lock_x64.h"
 #include "dynarmic/common/x64_disassemble.h"
 #include "dynarmic/interface/exclusive_monitor.h"
+#include "dynarmic/ir/basic_block.h"
 
 namespace Dynarmic::Backend::X64 {
 
@@ -407,7 +408,7 @@ void A64EmitX64::EmitA64ExclusiveWriteMemory128(A64EmitContext& ctx, IR::Inst* i
     }
 }
 
-void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::Label* end) {
+void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end) {
     if (!conf.check_halt_on_memory_access) {
         return;
     }
@@ -415,6 +416,10 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::La
     Xbyak::Label skip;
 
     const A64::LocationDescriptor current_location{IR::LocationDescriptor{inst->GetArg(0).GetU64()}};
+    const u64 first_pc = ctx.Location().PC();
+    ASSERT(current_location.PC() >= first_pc && (current_location.PC() - first_pc) % 4 == 0);
+    const u64 prefix_cycles = (current_location.PC() - first_pc) / 4 + 1;
+    ASSERT(prefix_cycles <= ctx.block.CycleCount());
 
     code.test(dword[r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::MemoryAbort));
     if (end) {
@@ -424,6 +429,12 @@ void A64EmitX64::EmitCheckMemoryAbort(A64EmitContext&, IR::Inst* inst, Xbyak::La
     }
     code.mov(rax, current_location.PC());
     code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    if (conf.enable_cycle_counting) {
+        // Only the first failing access takes this path. Charge its instruction
+        // once, including earlier instructions but not later unexecuted ones.
+        // The forced return bypasses the normal final full-block charge.
+        EmitAddCycles(prefix_cycles);
+    }
     code.ForceReturnFromRunCode();
     code.L(skip);
 }

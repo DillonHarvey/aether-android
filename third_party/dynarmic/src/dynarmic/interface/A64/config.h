@@ -49,6 +49,11 @@ enum class Exception {
     /// Attempted to execute a code block at an address for which MemoryReadCode returned std::nullopt.
     /// (Intended to be used to emulate memory protection faults.)
     NoExecuteFault,
+    /// Aether Windows x64 integration: an SP-based access used a live SP
+    /// which was not 16-byte aligned. Report before any memory/writeback.
+    StackPointerAlignment,
+    /// Aether x64: an exclusive/ordered access was not naturally aligned.
+    DataAlignment,
 };
 
 enum class DataCacheOperation {
@@ -128,6 +133,11 @@ struct UserCallbacks {
     virtual void CallSVC(std::uint32_t swi) = 0;
 
     virtual void ExceptionRaised(VAddr pc, Exception exception) = 0;
+    // Aether x64 precise alignment callback. The effective address is guest
+    // data, never a host pointer, and SP must not be changed to communicate it.
+    virtual void MemoryAlignmentFault(VAddr pc, VAddr /*address*/) {
+        ExceptionRaised(pc, Exception::DataAlignment);
+    }
     virtual void DataCacheOperationRaised(DataCacheOperation /*op*/, VAddr /*value*/) {}
     virtual void InstructionCacheOperationRaised(InstructionCacheOperation /*op*/, VAddr /*value*/) {}
     virtual void InstructionSynchronizationBarrierRaised() {}

@@ -4,6 +4,7 @@
 #include "aether/host/audio_stream.hpp"
 #include "aether/host/windows/unique_handle.hpp"
 #include "aether/security/activity_session.hpp"
+#include "aether/security/activity_launch.hpp"
 #include "aether/security/worker_progress.hpp"
 #include "aether/security/apk_session.hpp"
 #include "aether/security/audio_session.hpp"
@@ -21,6 +22,7 @@
 #include <dxgi.h>
 #include <exception>
 #include <iostream>
+#include <new>
 #include <userenv.h>
 #include <wrl/client.h>
 
@@ -232,7 +234,13 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
             path = utf16(read_text(boot.payload, offset, 2048));
         require(offset == boot.payload.size(), "Trailing APK boot configuration");
     } else if (scenario == 20) {
-        require(path_size == 0 && boot.payload.size() == 64, "Invalid installed package mapping fields");
+        require(path_size == 0 && (boot.payload.size() == 64 || boot.payload.size() == 72) &&
+                    (boot.payload.size() == 64 || read_u64(boot.payload, 64) <= 1),
+                "Invalid installed package mapping fields");
+    } else if (scenario == installed_intent_scenario) {
+        require(path_size == 0 && boot.payload.size() == 80 && read_u64(boot.payload, 64) <= 1 &&
+                    read_u64(boot.payload, 72) && read_u64(boot.payload, 72) <= activity_launch_limit,
+                "Invalid resolved installed package mapping fields");
     } else if (scenario == 28) {
         require(path_size == 0 && boot.payload.size() == 56, "Invalid compiled native fault fields");
     } else if (scenario == 27) {
@@ -243,6 +251,11 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
         require(boot.payload.size() == 40 + path_size, "Trailing worker fixture configuration");
     }
     write_pipe_frame(writer, {{Operation::boot, 0, boot.header.session, 0, Status::ok}, {}});
+    if (scenario == 32) {
+        require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 76 && allowed == 1,
+                "Invalid compiled allocation failure policy");
+        throw std::bad_alloc{};
+    }
     if (scenario == 29 || scenario == 30 || scenario == 31) {
         require(lpac && path_size == 0 && boot.payload.size() == 40 && app_id == 76 && allowed == 1,
                 "Invalid compiled process exit policy");
@@ -327,7 +340,7 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
                 "Invalid isolated Activity startup policy");
         return run_activity_worker(reader, writer, session, app_id, scenario == 12);
     }
-    if (scenario == 20) {
+    if (scenario == 20 || scenario == installed_intent_scenario) {
         require(lpac && path_size == 0 && (app_id & (std::uint64_t{1} << 63)) && allowed == 1,
                 "Invalid installed Activity startup policy");
         WorkerProgressWriter progress(reinterpret_cast<HANDLE>(read_u64(boot.payload, 56)));
@@ -352,8 +365,20 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
         std::unique_ptr<void, decltype(unmap)> view(
             MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, static_cast<SIZE_T>(size)), unmap);
         require(static_cast<bool>(view), "Cannot map the installed package for read access");
+        std::optional<ActivityLaunch> launch;
+        if (scenario == installed_intent_scenario) {
+            const auto expected = static_cast<std::size_t>(read_u64(boot.payload, 72));
+            ActivityReassembly receiver(Operation::activity_launch, 0, session, expected);
+            while (!receiver.complete())
+                receiver.accept(read_pipe_frame(reader));
+            const auto encoded = receiver.take();
+            require(encoded.size() == expected, "Resolved installed launch size differs from boot configuration");
+            launch = ActivityLaunch::decode(encoded);
+        }
         return run_activity_worker(reader, writer, session, app_id, false, true,
-                            {static_cast<const std::uint8_t *>(view.get()), static_cast<std::size_t>(size)}, &progress);
+                            {static_cast<const std::uint8_t *>(view.get()), static_cast<std::size_t>(size)}, &progress,
+                            boot.payload.size() >= 72 && read_u64(boot.payload, 64) != 0,
+                            launch ? &*launch : nullptr);
     }
     if (scenario == 10) {
         BrokerClient client(reader, writer, session);
@@ -498,6 +523,10 @@ int wmain(int argc, wchar_t **argv) {
                     GetFileType(writer.get()) == FILE_TYPE_PIPE,
                 "Invalid inherited worker channel");
         return run(reader.get(), writer.get(), lpac, session);
+    } catch (const std::bad_alloc &) {
+        if (writer && session)
+            (void)write_worker_allocation_failure(writer.get(), session);
+        return 1;
     } catch (const std::exception &error) {
         if (writer && session) {
             try {

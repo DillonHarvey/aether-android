@@ -50,12 +50,27 @@ void IREmitter::ExceptionRaised(Exception exception) {
     Inst(Opcode::A64ExceptionRaised, Imm64(PC()), Imm64(static_cast<u64>(exception)));
 }
 
+void IREmitter::CheckSPAlignment() {
+    Inst(Opcode::A64CheckSPAlignment, Imm64(PC()), GetSP());
+}
+
+void IREmitter::CheckMemoryAlignment(const IR::U64& address, size_t bytesize) {
+    ASSERT(bytesize == 1 || bytesize == 2 || bytesize == 4 || bytesize == 8 || bytesize == 16);
+    if (bytesize > 1) {
+        Inst(Opcode::A64CheckMemoryAlignment, Imm64(PC()), address, Imm64(bytesize - 1));
+    }
+}
+
 void IREmitter::DataCacheOperationRaised(DataCacheOperation op, const IR::U64& value) {
     Inst(Opcode::A64DataCacheOperationRaised, ImmCurrentLocationDescriptor(), Imm64(static_cast<u64>(op)), value);
+    // Aether: terminate a failed callback before later guest effects commit.
+    Inst(Opcode::A64CheckCacheOperationAbort, ImmCurrentLocationDescriptor());
 }
 
 void IREmitter::InstructionCacheOperationRaised(InstructionCacheOperation op, const IR::U64& value) {
     Inst(Opcode::A64InstructionCacheOperationRaised, Imm64(static_cast<u64>(op)), value);
+    // A failed IC must return before its frontend advances PC by four.
+    Inst(Opcode::A64CheckCacheOperationAbort, ImmCurrentLocationDescriptor());
 }
 
 void IREmitter::DataSynchronizationBarrier() {

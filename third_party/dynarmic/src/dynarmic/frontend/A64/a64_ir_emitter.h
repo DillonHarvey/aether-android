@@ -42,6 +42,9 @@ public:
 
     void CallSupervisor(u32 imm);
     void ExceptionRaised(Exception exception);
+    // Aether x64: captures the instruction PC and live SP before addressing.
+    void CheckSPAlignment();
+    void CheckMemoryAlignment(const IR::U64& address, size_t bytesize);
     void DataCacheOperationRaised(DataCacheOperation op, const IR::U64& value);
     void InstructionCacheOperationRaised(InstructionCacheOperation op, const IR::U64& value);
     void DataSynchronizationBarrier();

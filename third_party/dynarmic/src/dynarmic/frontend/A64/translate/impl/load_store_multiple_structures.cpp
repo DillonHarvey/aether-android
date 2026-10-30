@@ -56,7 +56,7 @@ static bool SharedDecodeAndOperation(TranslatorVisitor& v, bool wback, IR::MemOp
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);

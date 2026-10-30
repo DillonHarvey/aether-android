@@ -269,6 +269,36 @@ void EmitPostProcessNaNs(BlockOfCode& code, Xbyak::Xmm result, Xbyak::Xmm op1, X
     code.jmp(end, code.T_NEAR);
 }
 
+template<size_t fsize>
+void AccumulateInputDenormals(BlockOfCode& code, EmitContext& ctx, std::initializer_list<Xbyak::Xmm> operands, Xbyak::Reg64 scratch) {
+    static_assert(fsize == 32 || fsize == 64);
+    if (!ctx.FPCR().FZ()) {
+        return;
+    }
+
+    // Aether: DAZ supplies signed-zero inputs but does not publish ARM's
+    // cumulative input-denormal flag. Classify the original scalar bits before
+    // arithmetic or NaN normalization, preserving every source register. The
+    // caller admits all scratch registers before these runtime branches.
+    for (const Xbyak::Xmm operand : operands) {
+        Xbyak::Label next;
+        if constexpr (fsize == 32) {
+            code.movd(scratch.cvt32(), operand);
+            code.shl(scratch.cvt32(), 1); // Drop sign; zero has no fraction.
+            code.jz(next);
+            code.shr(scratch.cvt32(), 24); // Isolate the eight exponent bits.
+        } else {
+            code.movq(scratch, operand);
+            code.shl(scratch, 1);
+            code.jz(next);
+            code.shr(scratch, 53); // Isolate the eleven exponent bits.
+        }
+        code.jnz(next);
+        code.or_(code.dword[code.r15 + code.GetJitStateInfo().offsetof_fpsr_exc], 0x80);
+        code.L(next);
+    }
+}
+
 template<size_t fsize, typename Function>
 void FPTwoOp(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
@@ -277,6 +307,10 @@ void FPTwoOp(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn) {
 
     Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(args[0]);
 
+    if (ctx.FPCR().FZ()) {
+        const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+        AccumulateInputDenormals<fsize>(code, ctx, {result}, scratch);
+    }
     if (!ctx.FPCR().DN() && !ctx.HasOptimization(OptimizationFlag::Unsafe_InaccurateNaN)) {
         end = ProcessNaN<fsize>(code, ctx, result);
     }
@@ -307,6 +341,10 @@ void FPThreeOp(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn)
         const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(args[0]);
         const Xbyak::Xmm operand = ctx.reg_alloc.UseScratchXmm(args[1]);
 
+        if (ctx.FPCR().FZ()) {
+            const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+            AccumulateInputDenormals<fsize>(code, ctx, {result, operand}, scratch);
+        }
         if constexpr (std::is_member_function_pointer_v<Function>) {
             (code.*fn)(result, operand);
         } else {
@@ -328,6 +366,8 @@ void FPThreeOp(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, Function fn)
 
     SharedLabel end = GenSharedLabel(), nan = GenSharedLabel();
 
+    // The existing NaN scratch is unused until the deferred correction path.
+    AccumulateInputDenormals<fsize>(code, ctx, {op1, op2}, tmp);
     code.movaps(result, op1);
     if constexpr (std::is_member_function_pointer_v<Function>) {
         (code.*fn)(result, op2);
@@ -433,6 +473,7 @@ static void EmitFPMinMax(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Xmm tmp = ctx.reg_alloc.ScratchXmm();
     const Xbyak::Reg64 gpr_scratch = ctx.reg_alloc.ScratchGpr();
 
+    AccumulateInputDenormals<fsize>(code, ctx, {result, operand}, gpr_scratch);
     DenormalsAreZero<fsize>(code, ctx, {result, operand});
 
     SharedLabel equal = GenSharedLabel(), end = GenSharedLabel();
@@ -482,9 +523,15 @@ static void EmitFPMinMaxNumeric(BlockOfCode& code, EmitContext& ctx, IR::Inst* i
     const Xbyak::Xmm op1 = ctx.reg_alloc.UseScratchXmm(args[0]);
     const Xbyak::Xmm op2 = ctx.reg_alloc.UseScratchXmm(args[1]);  // Result stored here!
 
+    const bool use_range = code.HasHostFeature(HostFeature::AVX512_OrthoFloat);
+    const Xbyak::Reg64 gpr_scratch = (ctx.FPCR().FZ() || !use_range)
+                                       ? ctx.reg_alloc.ScratchGpr() : INVALID_REG;
+    if (ctx.FPCR().FZ()) {
+        AccumulateInputDenormals<fsize>(code, ctx, {op1, op2}, gpr_scratch);
+    }
     DenormalsAreZero<fsize>(code, ctx, {op1, op2});
 
-    if (code.HasHostFeature(HostFeature::AVX512_OrthoFloat)) {
+    if (use_range) {
         // vrangep{s,d} will already correctly handle comparing
         // signed zeros and propagating NaNs similar to ARM
         constexpr FpRangeSelect range_select = is_max ? FpRangeSelect::Max : FpRangeSelect::Min;
@@ -495,7 +542,7 @@ static void EmitFPMinMaxNumeric(BlockOfCode& code, EmitContext& ctx, IR::Inst* i
             FCODE(vmovs)(op2 | k1, code.Const(xword, default_nan));
         }
     } else {
-        Xbyak::Reg tmp = ctx.reg_alloc.ScratchGpr();
+        Xbyak::Reg tmp = gpr_scratch;
         tmp.setBit(fsize);
 
         const auto move_to_tmp = [=, &code](const Xbyak::Xmm& xmm) {
@@ -661,6 +708,10 @@ static void EmitFPMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
             const Xbyak::Xmm operand3 = ctx.reg_alloc.UseXmm(args[2]);
             const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
 
+            if (ctx.FPCR().FZ()) {
+                const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+                AccumulateInputDenormals<fsize>(code, ctx, {operand1, operand2, operand3}, scratch);
+            }
             code.movaps(result, operand1);
             if constexpr (negate_product) {
                 FCODE(vfnmadd231s)(result, operand2, operand3);
@@ -804,6 +855,10 @@ static void EmitFPMulAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
             const Xbyak::Xmm operand2 = ctx.reg_alloc.UseScratchXmm(args[1]);
             const Xbyak::Xmm operand3 = ctx.reg_alloc.UseXmm(args[2]);
 
+            if (ctx.FPCR().FZ()) {
+                const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+                AccumulateInputDenormals<fsize>(code, ctx, {operand1, operand2, operand3}, scratch);
+            }
             if constexpr (negate_product) {
                 code.xorps(operand2, code.Const(xword, FP::FPInfo<FPT>::sign_mask));
             }
@@ -1428,6 +1483,18 @@ void EmitX64::EmitFPSub64(EmitContext& ctx, IR::Inst* inst) {
     FPThreeOp<64>(code, ctx, inst, &Xbyak::CodeGenerator::subsd);
 }
 
+template<size_t fsize>
+static void AccumulateCompareInputDenormals(BlockOfCode& code, EmitContext& ctx, std::initializer_list<Xbyak::Xmm> operands) {
+    if (!ctx.FPCR().FZ()) {
+        return;
+    }
+
+    // RAX cannot conflict with the subsequent NZCV selector's fixed RCX.
+    const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr(HostLoc::RAX);
+    AccumulateInputDenormals<fsize>(code, ctx, operands, scratch);
+    // The real comparison below establishes the final flags used for NZCV.
+}
+
 static Xbyak::Reg64 SetFpscrNzcvFromFlags(BlockOfCode& code, EmitContext& ctx) {
     ctx.reg_alloc.ScratchGpr(HostLoc::RCX);  // shifting requires use of cl
     const Xbyak::Reg64 nzcv = ctx.reg_alloc.ScratchGpr();
@@ -1461,6 +1528,7 @@ void EmitX64::EmitFPCompare32(EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Xmm reg_b = ctx.reg_alloc.UseXmm(args[1]);
     const bool exc_on_qnan = args[2].GetImmediateU1();
 
+    AccumulateCompareInputDenormals<32>(code, ctx, {reg_a, reg_b});
     if (exc_on_qnan) {
         code.comiss(reg_a, reg_b);
     } else {
@@ -1477,6 +1545,7 @@ void EmitX64::EmitFPCompare64(EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Xmm reg_b = ctx.reg_alloc.UseXmm(args[1]);
     const bool exc_on_qnan = args[2].GetImmediateU1();
 
+    AccumulateCompareInputDenormals<64>(code, ctx, {reg_a, reg_b});
     if (exc_on_qnan) {
         code.comisd(reg_a, reg_b);
     } else {
@@ -1545,6 +1614,11 @@ void EmitX64::EmitFPSingleToDouble(EmitContext& ctx, IR::Inst* inst) {
     if (rounding_mode == ctx.FPCR().RMode() && rounding_mode != FP::RoundingMode::ToOdd) {
         const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(args[0]);
 
+        if (ctx.FPCR().FZ()) {
+            const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+            AccumulateInputDenormals<32>(code, ctx, {result}, scratch);
+        }
+
         code.cvtss2sd(result, result);
         if (ctx.FPCR().DN()) {
             ForceToDefaultNaN<64>(code, result);
@@ -1566,6 +1640,11 @@ void EmitX64::EmitFPSingleToHalf(EmitContext& ctx, IR::Inst* inst) {
 
     if (code.HasHostFeature(HostFeature::F16C) && !ctx.FPCR().AHP() && !ctx.FPCR().FZ16()) {
         const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(args[0]);
+
+        if (ctx.FPCR().FZ()) {
+            const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+            AccumulateInputDenormals<32>(code, ctx, {result}, scratch);
+        }
 
         if (ctx.FPCR().DN()) {
             ForceToDefaultNaN<32>(code, result);
@@ -1605,6 +1684,11 @@ void EmitX64::EmitFPDoubleToSingle(EmitContext& ctx, IR::Inst* inst) {
     if (rounding_mode == ctx.FPCR().RMode() && rounding_mode != FP::RoundingMode::ToOdd) {
         const Xbyak::Xmm result = ctx.reg_alloc.UseScratchXmm(args[0]);
 
+        if (ctx.FPCR().FZ()) {
+            const Xbyak::Reg64 scratch = ctx.reg_alloc.ScratchGpr();
+            AccumulateInputDenormals<64>(code, ctx, {result}, scratch);
+        }
+
         code.cvtsd2ss(result, result);
         if (ctx.FPCR().DN()) {
             ForceToDefaultNaN<32>(code, result);
@@ -1635,6 +1719,8 @@ static void EmitFPToFixed(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst) {
         if (round_imm && (truncating || code.HasHostFeature(HostFeature::SSE41))) {
             const Xbyak::Xmm src = ctx.reg_alloc.UseScratchXmm(args[0]);
             const Xbyak::Reg64 result = ctx.reg_alloc.ScratchGpr().cvt64();
+
+            AccumulateInputDenormals<fsize>(code, ctx, {src}, result);
 
             if constexpr (fsize == 64) {
                 if (fbits != 0) {

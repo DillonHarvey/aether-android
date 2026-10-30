@@ -35,7 +35,7 @@ static bool ExclusiveSharedDecodeAndOperation(TranslatorVisitor& v, bool pair, s
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);
@@ -154,7 +154,7 @@ static bool OrderedSharedDecodeAndOperation(TranslatorVisitor& v, size_t size, b
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);

@@ -204,6 +204,10 @@ struct Parser {
             image.relro_begin = page_down(image.relro_begin);
             image.relro_end = page_up(image.relro_end);
         }
+        // Retain the complete original table, including non-LOAD headers used
+        // by guest unwinders. Do not reconstruct it from the PT_LOAD subset.
+        const auto table = file.range(ph, std::uint64_t{count} * 56);
+        image.program_headers.assign(table.begin(), table.end());
     }
     void dynamics() {
         bool terminated = false;

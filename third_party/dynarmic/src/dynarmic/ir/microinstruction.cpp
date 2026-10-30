@@ -159,6 +159,16 @@ bool Inst::ReadsFromCPSR() const {
     case Opcode::A32UpdateUpperLocationDescriptor:
     case Opcode::A64GetCFlag:
     case Opcode::A64GetNZCVRaw:
+    case Opcode::A64CheckSPAlignment:
+    case Opcode::A64CheckMemoryAlignment:
+    case Opcode::A64CheckCacheOperationAbort:
+    case Opcode::A64DataCacheOperationRaised:
+    case Opcode::A64InstructionCacheOperationRaised:
+    case Opcode::A64ReadMemory8:
+    case Opcode::A64ReadMemory16:
+    case Opcode::A64ReadMemory32:
+    case Opcode::A64ReadMemory64:
+    case Opcode::A64ReadMemory128:
     case Opcode::ConditionalSelect32:
     case Opcode::ConditionalSelect64:
     case Opcode::ConditionalSelectNZCV:
@@ -211,6 +221,16 @@ bool Inst::ReadsFromCoreRegister() const {
     case Opcode::A64GetD:
     case Opcode::A64GetQ:
     case Opcode::A64GetSP:
+    case Opcode::A64CheckSPAlignment:
+    case Opcode::A64CheckMemoryAlignment:
+    case Opcode::A64CheckCacheOperationAbort:
+    case Opcode::A64DataCacheOperationRaised:
+    case Opcode::A64InstructionCacheOperationRaised:
+    case Opcode::A64ReadMemory8:
+    case Opcode::A64ReadMemory16:
+    case Opcode::A64ReadMemory32:
+    case Opcode::A64ReadMemory64:
+    case Opcode::A64ReadMemory128:
         return true;
 
     default:
@@ -506,11 +526,24 @@ bool Inst::WritesToFPSRCumulativeSaturationBit() const {
 }
 
 bool Inst::CausesCPUException() const {
+    // Aether: cache callbacks and even unused A64 loads (including WZR/XZR
+    // destinations) can fault. DCE must retain them, and register/CPSR tracking
+    // above must preserve the architectural state observable at that boundary.
     return op == Opcode::Breakpoint
         || op == Opcode::A32CallSupervisor
         || op == Opcode::A32ExceptionRaised
         || op == Opcode::A64CallSupervisor
-        || op == Opcode::A64ExceptionRaised;
+        || op == Opcode::A64ExceptionRaised
+        || op == Opcode::A64CheckSPAlignment
+        || op == Opcode::A64CheckMemoryAlignment
+        || op == Opcode::A64CheckCacheOperationAbort
+        || op == Opcode::A64DataCacheOperationRaised
+        || op == Opcode::A64InstructionCacheOperationRaised
+        || op == Opcode::A64ReadMemory8
+        || op == Opcode::A64ReadMemory16
+        || op == Opcode::A64ReadMemory32
+        || op == Opcode::A64ReadMemory64
+        || op == Opcode::A64ReadMemory128;
 }
 
 bool Inst::AltersExclusiveState() const {

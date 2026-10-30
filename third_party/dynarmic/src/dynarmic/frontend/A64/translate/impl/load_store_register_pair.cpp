@@ -25,7 +25,7 @@ bool TranslatorVisitor::STP_LDP_gen(Imm<2> opc, bool not_postindex, bool wback, 
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        ir.CheckSPAlignment();
         address = SP(64);
     } else {
         address = X(64, Rn);
@@ -93,7 +93,7 @@ bool TranslatorVisitor::STP_LDP_fpsimd(Imm<2> opc, bool not_postindex, bool wbac
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        ir.CheckSPAlignment();
         address = SP(64);
     } else {
         address = X(64, Rn);

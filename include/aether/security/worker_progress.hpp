@@ -29,6 +29,7 @@ class WorkerProgressWriter final:public dex::RuntimeProgressSink {
     WorkerProgressWriter(const WorkerProgressWriter &)=delete;
     WorkerProgressWriter &operator=(const WorkerProgressWriter &)=delete;
     void report(const dex::RuntimeProgress &) noexcept override;
+    void allocation_failure(const dex::RuntimeAllocationFailure &) noexcept override;
     void stage(std::uint32_t numeric,std::string_view label) noexcept;
     bool prepare_native_stack() noexcept override;
   private:

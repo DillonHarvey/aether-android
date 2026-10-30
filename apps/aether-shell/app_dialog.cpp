@@ -53,7 +53,13 @@ std::wstring report_text(const AppDiagnostics &report) {
                             "\nSaved private-files permission: " +
                             ((report.app.permissions & security::installed_files) ? "allowed" : "denied") +
                             "\nSaved wall-clock permission: " +
-                            ((report.app.permissions & security::installed_wall_clock) ? "allowed" : "denied"));
+                            ((report.app.permissions & security::installed_wall_clock) ? "allowed" : "denied") +
+                            "\nSaved sound playback permission: " +
+                            ((report.app.permissions & security::installed_audio_playback) ? "allowed" : "denied") +
+                            "\nSaved notifications permission: " +
+                            ((report.app.permissions & security::installed_notifications) ? "allowed" : "denied") +
+                            "\nSaved clipboard plain-text permission: " +
+                            ((report.app.permissions & security::installed_clipboard) ? "allowed" : "denied"));
 }
 void text(HWND window, int id, const std::wstring &value) {
     const auto control = GetDlgItem(window, id);
@@ -131,6 +137,7 @@ struct TroubleshootingDialog {
     std::string id;
     std::future<Observation> &parent_read;
     bool &parent_collecting;
+    std::optional<AppSessionFailure> session_failure;
     TroubleshootingOptions choices;
     std::optional<TroubleshootingReport> shown;
     std::future<CollectionResult> collection;
@@ -154,12 +161,15 @@ struct TroubleshootingDialog {
         parent_collecting = true;
         try {
             collection = std::async(std::launch::async, [path = root, identity = id, options = choices,
+                                                         failure = session_failure,
                                                          prior = std::move(parent_read)]() mutable {
                 try {
                     if (prior.valid())
                         prior.get();
                     PackageStore store(path);
-                    return CollectionResult{collect_troubleshooting(store, identity, options), {}};
+                    auto report = collect_troubleshooting(store, identity, options);
+                    report.diagnostics.session_failure = failure;
+                    return CollectionResult{std::move(report), {}};
                 } catch (const std::exception &error) {
                     return CollectionResult{{}, error_code(error)};
                 }
@@ -305,6 +315,7 @@ struct TroubleshootingDialog {
 struct AppDialog {
     std::filesystem::path root;
     std::string id;
+    std::optional<AppSessionFailure> session_failure;
     bool settings = false, editing = false, fresh = false, choosing = false, closed = false,
          collecting_bundle = false;
     std::uint32_t draft = 0;
@@ -345,6 +356,12 @@ struct AppDialog {
                            draft & security::installed_files ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(window, IDC_APP_WALL_CLOCK,
                            draft & security::installed_wall_clock ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(window, IDC_APP_AUDIO,
+                           draft & security::installed_audio_playback ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(window, IDC_APP_NOTIFICATIONS,
+                           draft & security::installed_notifications ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(window, IDC_APP_CLIPBOARD,
+                           draft & security::installed_clipboard ? BST_CHECKED : BST_UNCHECKED);
         }
     }
     void render(HWND window) const {
@@ -378,6 +395,9 @@ struct AppDialog {
             EnableWindow(GetDlgItem(window, IDC_APP_CLOCK), !busy && reviewed.has_value());
             EnableWindow(GetDlgItem(window, IDC_APP_FILES), !busy && reviewed.has_value());
             EnableWindow(GetDlgItem(window, IDC_APP_WALL_CLOCK), !busy && reviewed.has_value());
+            EnableWindow(GetDlgItem(window, IDC_APP_AUDIO), !busy && reviewed.has_value());
+            EnableWindow(GetDlgItem(window, IDC_APP_NOTIFICATIONS), !busy && reviewed.has_value());
+            EnableWindow(GetDlgItem(window, IDC_APP_CLIPBOARD), !busy && reviewed.has_value());
             EnableWindow(GetDlgItem(window, IDC_APP_APPLY), can_apply());
             EnableWindow(GetDlgItem(window, IDC_APP_DISCARD), !busy && fresh && editing && shown.has_value());
         }
@@ -410,6 +430,7 @@ struct AppDialog {
             read_error = result.code;
             if (result.report) {
                 shown = std::move(result.report);
+                shown->session_failure = session_failure;
                 if (!editing)
                     adopt(window);
             }
@@ -510,7 +531,7 @@ struct AppDialog {
         choosing = true;
         render(window);
         try {
-            TroubleshootingDialog dialog{root, id, read, collecting_bundle};
+            TroubleshootingDialog dialog{root, id, read, collecting_bundle, session_failure};
             bundles_exported += dialog.show(window);
         } catch (...) {
             choosing = false;
@@ -558,6 +579,9 @@ struct AppDialog {
                 case IDC_APP_CLOCK:
                 case IDC_APP_FILES:
                 case IDC_APP_WALL_CLOCK:
+                case IDC_APP_AUDIO:
+                case IDC_APP_NOTIFICATIONS:
+                case IDC_APP_CLIPBOARD:
                     if (self->settings && self->reviewed && !self->write.valid() && !self->choosing) {
                         self->draft = (IsDlgButtonChecked(window, IDC_APP_CLOCK) == BST_CHECKED
                                            ? security::installed_clock
@@ -567,6 +591,15 @@ struct AppDialog {
                                            : 0) |
                                       (IsDlgButtonChecked(window, IDC_APP_WALL_CLOCK) == BST_CHECKED
                                            ? security::installed_wall_clock
+                                           : 0) |
+                                      (IsDlgButtonChecked(window, IDC_APP_AUDIO) == BST_CHECKED
+                                           ? security::installed_audio_playback
+                                           : 0) |
+                                      (IsDlgButtonChecked(window, IDC_APP_NOTIFICATIONS) == BST_CHECKED
+                                           ? security::installed_notifications
+                                            : 0) |
+                                       (IsDlgButtonChecked(window, IDC_APP_CLIPBOARD) == BST_CHECKED
+                                            ? security::installed_clipboard
                                            : 0);
                         self->editing = true;
                         self->render(window);
@@ -616,7 +649,8 @@ struct AppDialog {
 };
 } // namespace
 
-int show_app_dialog(const std::filesystem::path &root, const std::string &id, bool settings, bool json) {
+int show_app_dialog(const std::filesystem::path &root, const std::string &id, bool settings, bool json,
+                    std::optional<AppSessionFailure> session_failure) {
     const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized))
         throw InstallError("AETHER_SHELL_DIALOG", "Cannot initialize native app controls");
@@ -626,6 +660,9 @@ int show_app_dialog(const std::filesystem::path &root, const std::string &id, bo
     AppDialog state;
     state.root = root;
     state.id = id;
+    state.session_failure = session_failure;
+    if (session_failure)
+        state.action = L"Session failure review. Save report writes only after you choose a new destination.";
     state.settings = settings;
     const auto window = CreateDialogParamW(
         GetModuleHandleW(nullptr), MAKEINTRESOURCEW(settings ? IDD_APP_SETTINGS : IDD_APP_DIAGNOSTICS),

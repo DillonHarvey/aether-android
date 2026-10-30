@@ -1,9 +1,12 @@
 #pragma once
 #include "aether/a64/guest_cpu.hpp"
 #include <array>
+#include <string>
 #include <string_view>
 
 namespace aether::bionic {
+// Same Android descriptions as strerror, without guest storage or errno effects.
+std::string native_error_description(std::int32_t);
 class NativeThreads;
 class NativeErrorStrings {
   public:
@@ -12,6 +15,8 @@ class NativeErrorStrings {
     NativeErrorStrings(const NativeErrorStrings&)=delete;
     NativeErrorStrings &operator=(const NativeErrorStrings&)=delete;
     a64::Fault invoke(std::array<std::uint64_t,31> &) noexcept;
+    // XSI strerror_r returns 0/ERANGE; GNU returns the original caller buffer.
+    a64::Fault invoke_r(bool gnu,std::array<std::uint64_t,31> &) noexcept;
     std::string_view rejection() const noexcept {return rejection_;}
   private:
     struct Slot {a64::Address tls=0;std::uint32_t tid=0;};

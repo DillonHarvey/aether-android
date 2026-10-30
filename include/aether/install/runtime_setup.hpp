@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace aether::install {
-inline constexpr std::uint64_t current_runtime_compatibility = 9;
+inline constexpr std::uint64_t current_runtime_compatibility = 55;
 struct RuntimePayload {
     std::string path;
     std::vector<std::uint8_t> bytes;

@@ -13,7 +13,7 @@ static bool StoreRegister(TranslatorVisitor& v, const size_t datasize, const Imm
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check Stack Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);
@@ -31,7 +31,7 @@ static bool LoadRegister(TranslatorVisitor& v, const size_t datasize, const Imm<
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check Stack Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);
@@ -66,7 +66,7 @@ static bool LoadRegisterSigned(TranslatorVisitor& v, const size_t datasize, cons
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check Stack Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);
@@ -135,7 +135,7 @@ bool TranslatorVisitor::LDTRSW(Imm<9> imm9, Reg Rn, Reg Rt) {
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check Stack Alignment
+        ir.CheckSPAlignment();
         address = SP(64);
     } else {
         address = X(64, Rn);

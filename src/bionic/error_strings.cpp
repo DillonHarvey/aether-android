@@ -84,6 +84,11 @@ constexpr auto offsets=[] {
 }();
 static_assert(offsets.back()+descriptions.back().size()+1<=8192);
 }
+std::string native_error_description(std::int32_t number) {
+    if(number>=0 && static_cast<std::size_t>(number)<descriptions.size() && !descriptions[number].empty())
+        return std::string{descriptions[number]};
+    return "Unknown error "+std::to_string(number);
+}
 NativeErrorStrings::~NativeErrorStrings() {
     if(constants_owned_)try{memory_.unmap_range(constants_base,constants_size);}catch(...){}
     if(unknown_owned_)try{memory_.unmap(unknown_base);}catch(...){}
@@ -132,5 +137,50 @@ a64::Fault NativeErrorStrings::invoke(std::array<std::uint64_t,31> &r) noexcept 
         }
         *slot={tls,tid};r[0]=address;return a64::Fault::none;
     }catch(...){rejection_="strerror: logical thread storage is unavailable";return a64::Fault::unsupported_service;}
+}
+
+a64::Fault NativeErrorStrings::invoke_r(bool gnu,std::array<std::uint64_t,31> &r) noexcept {
+    rejection_={};
+    const auto buffer=r[1],capacity=r[2];
+    // Both Bionic variants preserve errno. A zero-capacity call has no caller
+    // output, so it needs neither storage setup nor message formatting.
+    if(!capacity){r[0]=gnu?buffer:34;return a64::Fault::none;}
+    try {
+        const auto number=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(r[0]));
+        auto description=native_error_description(number);
+        const auto length=description.size();
+        const auto copied=static_cast<std::size_t>(std::min<std::uint64_t>(length,capacity-1));
+        description.resize(copied);description.push_back('\0');
+        // Native ErrnoRestorer restores errno after copying, including when the
+        // caller buffer aliases that object. With no callbacks or concurrent
+        // owner, merge those final bytes before the one atomic output write.
+        // Subtractive comparisons avoid forming an overflowing buffer end.
+        const auto error=threads_.error_address();
+        const bool overlaps=buffer<=error?error-buffer<description.size():buffer-error<4;
+        if(overlaps){
+            std::array<std::uint8_t,4> saved{};
+            if(!memory_.read(error,saved)){
+                rejection_="strerror_r: overlapping logical errno is not readable";return a64::Fault::read;
+            }
+            if(buffer<=error){
+                const auto start=static_cast<std::size_t>(error-buffer);
+                const auto count=std::min(saved.size(),description.size()-start);
+                for(std::size_t i=0;i<count;++i)description[start+i]=static_cast<char>(saved[i]);
+            }else{
+                const auto start=static_cast<std::size_t>(buffer-error);
+                const auto count=std::min(description.size(),saved.size()-start);
+                for(std::size_t i=0;i<count;++i)description[i]=static_cast<char>(saved[start+i]);
+            }
+        }
+        // Inspect only the bytes actually written, not the declared capacity.
+        // GuestMemory validates the complete span before publishing any byte.
+        if(!buffer || !memory_.write(buffer,{reinterpret_cast<const std::uint8_t*>(description.data()),description.size()})){
+            rejection_="strerror_r: caller buffer is not writable";return a64::Fault::write;
+        }
+        r[0]=gnu?buffer:length>=capacity?34:0;
+        return a64::Fault::none;
+    }catch(...){
+        rejection_="strerror_r: host message formatting failed";return a64::Fault::windows_service;
+    }
 }
 }

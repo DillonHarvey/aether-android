@@ -30,14 +30,31 @@ void append_manifest(ManifestInfo &base, const ManifestInfo &split) {
     if (split.enabled.type != manifest_absent_type || split.permission.type != manifest_absent_type ||
         split.label.type || split.icon.type)
         bad("Split application-wide flag, permission or presentation overrides are not implemented");
+    const auto base_metadata = activity_metadata_size(base), split_metadata = activity_metadata_size(split);
+    if (base_metadata > manifest_activity_bytes || split_metadata > manifest_activity_bytes - base_metadata ||
+        base.activities.size() > manifest_activity_count ||
+        split.activities.size() > manifest_activity_count - base.activities.size())
+        bad("Combined Activity metadata is misaligned or exceeds existing package-wide manifest bounds");
+    if (base.activity_config_changes.empty())
+        base.activity_config_changes.resize(base.activities.size());
+    if (split.activity_config_changes.empty())
+        base.activity_config_changes.insert(base.activity_config_changes.end(), split.activities.size(), ManifestInteger{});
+    else
+        base.activity_config_changes.insert(base.activity_config_changes.end(), split.activity_config_changes.begin(),
+                                            split.activity_config_changes.end());
+    if (base.activity_intent_filters.empty())
+        base.activity_intent_filters.resize(base.activities.size());
+    if (split.activity_intent_filters.empty())
+        base.activity_intent_filters.insert(base.activity_intent_filters.end(), split.activities.size(),
+                                             std::vector<ManifestIntentFilter>{});
+    else
+        base.activity_intent_filters.insert(base.activity_intent_filters.end(), split.activity_intent_filters.begin(),
+                                             split.activity_intent_filters.end());
     base.activities.insert(base.activities.end(), split.activities.begin(), split.activities.end());
     for (const auto &permission : split.permissions)
         if (std::find(base.permissions.begin(), base.permissions.end(), permission) == base.permissions.end())
             base.permissions.push_back(permission);
-    std::size_t metadata = 0;
-    for (const auto &a : base.activities)
-        metadata += manifest_activity_record_bytes + a.name.size() + a.target.size() +
-                    a.label.literal.size() + a.icon.literal.size() + a.permission.literal.size();
+    const auto metadata = activity_metadata_size(base);
     if (base.activities.size() > manifest_activity_count || metadata > manifest_activity_bytes ||
         base.permissions.size() > 1024)
         bad("Combined split declarations exceed the existing package-wide manifest bounds");

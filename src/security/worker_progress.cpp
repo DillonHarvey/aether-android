@@ -10,10 +10,16 @@ namespace aether::security {
 namespace {
 constexpr std::size_t mapping_bytes=4096,record_count=16;
 constexpr std::uint64_t magic=0x3152474f52505457ULL;
+struct alignas(8) AllocationWitness {
+    volatile LONG64 commit;
+    std::uint32_t method,pc;
+    std::uint64_t instructions;
+    std::uint32_t phase,opcode,code_units,reserved;
+};
 struct Header {
     std::uint64_t signature;
     std::uint32_t version,header_bytes,record_bytes,capacity;
-    std::array<std::uint8_t,40> reserved;
+    AllocationWitness allocation;
 };
 struct alignas(8) Record {
     volatile LONG64 commit;
@@ -32,11 +38,19 @@ struct alignas(8) NativeFault {
 struct Layout {Header header;std::array<Record,record_count> records;NativeFault fault;};
 static_assert(sizeof(NativeFault)==192 && offsetof(Layout,fault)==3904);
 void *volatile active_fault_writer=nullptr;
-static_assert(sizeof(Header)==64 && sizeof(Record)==240 && sizeof(Layout)<=mapping_bytes);
+static_assert(sizeof(AllocationWitness)==40 && offsetof(Header,allocation)==24);
+static_assert(sizeof(Header)==64 && sizeof(Record)==240 && sizeof(Layout)==mapping_bytes);
 bool valid_header(const Header &header) noexcept {
-    return header.signature==magic && header.version==1 && header.header_bytes==sizeof(Header) &&
-        header.record_bytes==sizeof(Record) && header.capacity==record_count &&
-        std::all_of(header.reserved.begin(),header.reserved.end(),[](auto byte){return byte==0;});
+    return header.signature==magic && header.version==2 && header.header_bytes==sizeof(Header) &&
+        header.record_bytes==sizeof(Record) && header.capacity==record_count;
+}
+bool valid_allocation(std::uint32_t phase,std::uint32_t method,std::uint32_t pc,
+                      std::uint32_t opcode,std::uint32_t code_units) noexcept {
+    if(phase<1 || phase>static_cast<std::uint32_t>(dex::RuntimeAllocationPhase::dex_code_storage_publish) || opcode>256 || code_units>65536)return false;
+    // Verification/setup can know a method's resident size without an executing
+    // instruction. Unknown PC and opcode must remain paired in that case.
+    if(pc==dex::no_index)return opcode==256 && (method!=dex::no_index || !code_units);
+    return method!=dex::no_index && code_units && pc<code_units && opcode<256;
 }
 std::uint32_t copy_label(std::string_view source,std::span<char> output) noexcept {
     const auto count=std::min(source.size(),output.size());
@@ -52,7 +66,7 @@ WorkerProgress::WorkerProgress():mapping_(CreateFileMappingW(INVALID_HANDLE_VALU
     view_=MapViewOfFile(mapping_.get(),FILE_MAP_READ|FILE_MAP_WRITE,0,0,mapping_bytes);
     if(!view_)throw std::runtime_error("AETHER_WORKER_PROGRESS: parent mapping failed");
     std::memset(view_,0,mapping_bytes);
-    static_cast<Layout *>(view_)->header={magic,1,sizeof(Header),sizeof(Record),record_count,{}};
+    static_cast<Layout *>(view_)->header={magic,2,sizeof(Header),sizeof(Record),record_count,{}};
 }
 WorkerProgress::~WorkerProgress(){if(view_)UnmapViewOfFile(view_);}
 WorkerProgressWriter::WorkerProgressWriter(HANDLE owned_duplicated_handle):mapping_(owned_duplicated_handle) {
@@ -149,6 +163,19 @@ void WorkerProgressWriter::report(const dex::RuntimeProgress &progress) noexcept
     if(stage_value>static_cast<std::uint32_t>(dex::RuntimeProgressStage::native_exit))return;
     write(1,stage_value,progress.method,progress.pc,progress.instructions,progress.owner,progress.name,{});
 }
+void WorkerProgressWriter::allocation_failure(const dex::RuntimeAllocationFailure &failure) noexcept {
+    const auto phase=static_cast<std::uint32_t>(failure.phase);
+    if(!view_ || !valid_header(static_cast<Layout *>(view_)->header) ||
+       !valid_allocation(phase,failure.method,failure.pc,failure.opcode,failure.code_units))return;
+    auto &witness=static_cast<Layout *>(view_)->header.allocation;
+    if(InterlockedCompareExchange64(&witness.commit,1,0)!=0)return;
+    witness.method=failure.method;witness.pc=failure.pc;witness.instructions=failure.instructions;
+    witness.phase=phase;witness.opcode=failure.opcode;witness.code_units=failure.code_units;witness.reserved=0;
+    MemoryBarrier();InterlockedExchange64(&witness.commit,2);
+    // Labels are best effort. Later ordinary reports may wrap this ring entry;
+    // they cannot overwrite the independently committed numeric witness.
+    write(3,phase,failure.method,failure.pc,failure.instructions,failure.owner,failure.name,{});
+}
 void WorkerProgressWriter::stage(std::uint32_t numeric,std::string_view label) noexcept {
     refresh_native_stack();
     write(2,numeric,0,0,0,{},{},label);
@@ -160,11 +187,13 @@ std::string WorkerProgress::summary_after_exit() const {
     const auto &layout=*static_cast<const Layout *>(view_);
     for(std::size_t slot=0;slot<record_count;++slot) {
         Record record{};std::memcpy(&record,&layout.records[slot],sizeof(record));
-        if(record.commit<=0 || (record.commit&1) || record.reserved || (record.kind!=1 && record.kind!=2))continue;
+        if(record.commit<=0 || (record.commit&1) || record.reserved ||
+           (record.kind!=1 && record.kind!=2 && record.kind!=3))continue;
         const auto sequence=static_cast<std::uint64_t>(record.commit)/2;
         if((sequence-1)%record_count!=slot || record.owner_length>record.owner.size() || record.name_length>record.name.size() || record.label_length>record.label.size())continue;
         if(record.kind==1 && (record.stage>static_cast<std::uint32_t>(dex::RuntimeProgressStage::native_exit) || record.label_length))continue;
         if(record.kind==2 && (record.owner_length || record.name_length || record.method || record.pc || record.instructions))continue;
+        if(record.kind==3 && (record.stage<1 || record.stage>static_cast<std::uint32_t>(dex::RuntimeAllocationPhase::dex_code_storage_publish) || record.label_length))continue;
         if(!printable(std::span(record.owner).first(record.owner_length)) || !printable(std::span(record.name).first(record.name_length)) || !printable(std::span(record.label).first(record.label_length)))continue;
         records[count++]={sequence,record};
     }
@@ -174,7 +203,7 @@ std::string WorkerProgress::summary_after_exit() const {
         const auto &record=records[n].record;std::array<char,384> line{};std::size_t used=0;
         auto text=[&](std::string_view value){const auto size=std::min(value.size(),line.size()-used);std::memcpy(line.data()+used,value.data(),size);used+=size;};
         auto number=[&](std::uint64_t value){const auto result=std::to_chars(line.data()+used,line.data()+line.size(),value);if(result.ec==std::errc{})used=static_cast<std::size_t>(result.ptr-line.data());};
-        text("#");number(records[n].sequence);text(" stage=");number(record.stage);
+        text("#");number(records[n].sequence);text(record.kind==3?" allocation_label phase=":" stage=");number(record.stage);
         if(record.kind==2){text(" ");text({record.label.data(),record.label_length});}
         else {text(" method=");number(record.method);text(" pc=");number(record.pc);text(" instructions=");number(record.instructions);text(" ");text({record.owner.data(),record.owner_length});text(".");text({record.name.data(),record.name_length});}
         text("\n");if(used>mapping_bytes-output.size())break;output.append(line.data(),used);
@@ -191,6 +220,22 @@ std::string WorkerProgress::summary_after_exit() const {
         text(" rsp=0x");number(fault.rsp);text(" address=0x");number(fault.address);
         text(" stackBase=0x");number(fault.stack_base);text(" stackLimit=0x");number(fault.stack_limit);
         text(" allocationBase=0x");number(fault.allocation_base);text(" imageBase=0x");number(fault.image_base);text("\n");
+        while(used>mapping_bytes-output.size()) {
+            const auto newline=output.find('\n');
+            if(newline==std::string::npos){output.clear();break;}
+            output.erase(0,newline+1);
+        }
+        output.append(line.data(),used);
+    }
+    AllocationWitness witness{};std::memcpy(&witness,&layout.header.allocation,sizeof(witness));
+    if(witness.commit==2 && !witness.reserved &&
+       valid_allocation(witness.phase,witness.method,witness.pc,witness.opcode,witness.code_units)) {
+        std::array<char,256> line{};std::size_t used=0;
+        const auto text=[&](std::string_view value){for(const auto c:value)if(used<line.size())line[used++]=c;};
+        const auto number=[&](std::uint64_t value){const auto result=std::to_chars(line.data()+used,line.data()+line.size(),value);if(result.ec==std::errc{})used=static_cast<std::size_t>(result.ptr-line.data());};
+        text("allocation_failure phase=");number(witness.phase);text(" method=");number(witness.method);
+        text(" pc=");number(witness.pc);text(" opcode=");number(witness.opcode);
+        text(" instructions=");number(witness.instructions);text(" code_units=");number(witness.code_units);text("\n");
         while(used>mapping_bytes-output.size()) {
             const auto newline=output.find('\n');
             if(newline==std::string::npos){output.clear();break;}

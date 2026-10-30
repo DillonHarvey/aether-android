@@ -14,7 +14,7 @@ struct AuditEntry {
     std::uint32_t audio_error = 0;
     std::uint32_t graphics_operation = UINT32_MAX;
 };
-inline constexpr std::uint32_t audit_known_capabilities = 1u | 2u | 4u | 8u | 16u | 32u;
+inline constexpr std::uint32_t audit_known_capabilities = 1u | 2u | 4u | 8u | 16u | 32u | 64u | 128u | 256u;
 struct AuditContext {
     std::uint64_t app_id = 0, session = 0;
     std::uint32_t capabilities = 0, parent_process = 0, worker_process = 0;

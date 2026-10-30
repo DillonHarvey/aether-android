@@ -168,9 +168,14 @@ NativeSelftestReport native_selftest(const std::filesystem::path &fixture_path) 
     check("gnu-relro-read-only", relro);
     check("guest-code-read-execute", code);
     check("all-four-relocation-types", types == std::set<std::uint32_t>{257, 1025, 1026, 1027});
-    const auto unsupported = services.resolve("libc.so", "__cxa_atexit", "LIBC");
+    const auto registration = services.resolve("libc.so", "__cxa_atexit", "LIBC");
+    const auto null_registration = cpu.call(registration->address, std::array<std::uint64_t,3>{0,UINT64_MAX,UINT64_MAX}, stack_top);
+    check("null-destructor-registration-refused",
+          null_registration.returned && null_registration.fault == a64::Fault::none &&
+              null_registration.registers[0] == UINT64_MAX);
+    const auto unsupported = services.resolve("libc.so", "__register_atfork", "LIBC");
     const auto rejected = cpu.call(unsupported->address, {}, stack_top);
-    check("unsupported-callback-registration-fails",
+    check("unsupported-fork-handler-registration-fails",
           !rejected.returned && rejected.fault == a64::Fault::unsupported_service);
     loader.finalize(cpu, stack_top);
     check("reverse-dependency-finalizers",

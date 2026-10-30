@@ -1,4 +1,5 @@
 #include "aether/dex/source.hpp"
+#include "load_diagnostics.hpp"
 #include <array>
 #include <map>
 #include <set>
@@ -19,6 +20,7 @@ struct ClassLoader::Impl {
     std::map<std::string_view, std::size_t, std::less<>> definitions;
     std::set<std::string, std::less<>> complete, active;
     bool failed = false;
+    std::atomic<ClassLoadAllocationPhase> allocation_phase{ClassLoadAllocationPhase::none};
     Impl(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits)
         : image(target), source(std::move(source)), linker(target, limits) {
         if (!this->source)
@@ -29,6 +31,7 @@ struct ClassLoader::Impl {
             bad("STATE", "A failed class loader cannot execute a partial linked image");
     }
     void resolve(std::string_view descriptor) {
+        try {
         if (complete.contains(descriptor))
             return;
         const auto file = source->source_for(descriptor);
@@ -39,16 +42,38 @@ struct ClassLoader::Impl {
         if (active.size() >= 256 || !active.emplace(descriptor).second)
             bad("CLASS", "Cyclic or excessively deep class/interface loading");
         if (!loaded[*file]) {
-            const std::string name(source->source_name(*file));
+            const auto name=[&] {
+                try { return std::string(source->source_name(*file)); }
+                catch(const std::bad_alloc &) {
+                    detail::note_class_load_allocation(ClassLoadAllocationPhase::source);throw;
+                }
+            }();
             const auto previous_classes = image.classes.size();
             try {
-                linker.add(source->load(*file), name);
-                linker.validate();
+                try {
+                    linker.add([&] {
+                        try { return source->load(*file); }
+                        catch(const std::bad_alloc &) {
+                            detail::note_class_load_allocation(ClassLoadAllocationPhase::source);throw;
+                        }
+                    }(), name);
+                }
+                catch(const std::bad_alloc &) {
+                    detail::note_class_load_allocation(ClassLoadAllocationPhase::link_merge);throw;
+                }
+                try { linker.validate(); }
+                catch(const std::bad_alloc &) {
+                    detail::note_class_load_allocation(ClassLoadAllocationPhase::link_validate);throw;
+                }
             } catch (const DexError &error) {
                 throw DexError(error.code, name + ": " + error.what());
             }
-            for (auto n = previous_classes; n < image.classes.size(); ++n)
-                definitions.emplace(image.types.at(image.classes[n].type), n);
+            try {
+                for (auto n = previous_classes; n < image.classes.size(); ++n)
+                    definitions.emplace(image.types.at(image.classes[n].type), n);
+            } catch(const std::bad_alloc &) {
+                detail::note_class_load_allocation(ClassLoadAllocationPhase::definition_index);throw;
+            }
             loaded[*file] = true;
         }
         const auto found = definitions.find(descriptor);
@@ -59,11 +84,22 @@ struct ClassLoader::Impl {
             resolve(image.types.at(definition->superclass));
         for (auto type : definition->interfaces)
             resolve(image.types.at(type));
-        complete.emplace(descriptor);
-        active.erase(std::string(descriptor));
+        try {
+            complete.emplace(descriptor);
+            active.erase(std::string(descriptor));
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::complete);throw;
+        }
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::lookup);throw;
+        }
     }
     void ensure(std::string_view descriptor) {
-        check();
+        detail::ScopedClassLoadAllocation allocation(allocation_phase);
+        try { check(); }
+        catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::lookup);throw;
+        }
         try {
             resolve(descriptor);
         } catch (...) {
@@ -82,4 +118,7 @@ const Class *ClassLoader::definition(std::string_view descriptor) {
     return found == impl_->definitions.end() ? nullptr : &impl_->image.classes.at(found->second);
 }
 void ClassLoader::check() const { impl_->check(); }
+ClassLoadAllocationPhase ClassLoader::allocation_failure_phase() const noexcept {
+    return impl_->allocation_phase.load(std::memory_order_relaxed);
+}
 } // namespace aether::dex

@@ -42,6 +42,19 @@ class GuestPosixServices final : public a64::GuestServices, public elf::ImportRe
     // Same logical thread callback: normal return must not finalize the thread.
     using OnceRunner=std::function<a64::ExecutionResult(a64::Address,a64::Address,a64::Address,std::uint64_t)>;
     void set_once_runner(OnceRunner runner);
+    // Same-app committed metadata is copied by value across guest callback reentry.
+    using ProgramHeaderLookup=std::function<std::optional<elf::ProgramHeaderInfo>(std::size_t)>;
+    // Inclusive guest ticks charge nested callbacks to the enumeration budget.
+    struct PhdrExecution {a64::ExecutionResult result;std::uint64_t ticks=0;};
+    using PhdrRunner=std::function<PhdrExecution(a64::Address,std::array<std::uint64_t,3>,a64::Address,a64::Address,std::uint64_t)>;
+    void set_program_header_lookup(ProgramHeaderLookup lookup);
+    void set_phdr_runner(PhdrRunner runner);
+    // App-owned C++ destructors run on the finalizing caller's live TLS/JNI scope.
+    struct CxaExecution {a64::ExecutionResult result;std::uint64_t ticks=0;};
+    using CxaRunner=std::function<CxaExecution(a64::Address,a64::Address,a64::Address,a64::Address,std::uint64_t)>;
+    void set_cxa_runner(CxaRunner runner);
+    // Trusted host shutdown boundary; registers[0] selects opaque DSO or zero/all.
+    a64::Fault finalize_cxa(a64::ServiceState &) noexcept;
     using AddressLookup = std::function<std::optional<elf::AddressInfo>(a64::Address)>;
     // The owner keeps the lookup target alive for all calls; results contain guest metadata only.
     void set_address_lookup(AddressLookup lookup);

@@ -1,12 +1,17 @@
 #pragma once
 #include "aether/host/file_service.hpp"
+#include "aether/host/document_service.hpp"
+#include "aether/host/drop_text.hpp"
 #include "aether/host/time_service.hpp"
+#include "aether/host/notification_service.hpp"
+#include "aether/host/clipboard_service.hpp"
 #include "aether/security/audio_broker.hpp"
 #include "aether/security/audit.hpp"
 #include "aether/security/graphics_service.hpp"
 #include "aether/security/protocol.hpp"
 #include <chrono>
 #include <map>
+#include <optional>
 #include <vector>
 
 namespace aether::security {
@@ -20,15 +25,22 @@ struct BrokerPolicy {
     bool audio_playback = false;
     bool graphics = false;
     bool wall_time = false;
+    bool notifications = false;
+    bool clipboard = false;
 };
 // Each instance belongs to exactly one parent-verified process and inherited channel.
 // No request supplies an app identity, host path/address or function name.
+// A document provider is a trusted, session-bound injection, absent by default;
+// private-storage permission never creates or expands that separate authority.
 class Broker final {
   public:
     explicit Broker(BrokerPolicy policy, std::shared_ptr<AuditTrail> journal,
                     std::unique_ptr<host::FileService> files = {}, std::vector<std::uint8_t> package = {},
                     std::unique_ptr<host::AudioService> audio = {}, bool retain_fixture_pcm = false,
-                    std::unique_ptr<GraphicsService> graphics = {});
+                    std::unique_ptr<GraphicsService> graphics = {},
+                    std::unique_ptr<host::NotificationService> notifications = {},
+                    std::shared_ptr<host::DocumentService> documents = {},
+                    std::unique_ptr<host::ClipboardService> clipboard = {});
     ~Broker();
     Frame dispatch(const Frame &request);
     Frame dispatch_idle(const Frame &request); // Interactive only; independent absolute one-second quota.
@@ -36,6 +48,16 @@ class Broker final {
     void bind_worker_thread(const WorkerProcess &worker); // Trusted setup, before any request.
     void close() noexcept;
     void revoke_storage() noexcept;
+    void revoke_documents() noexcept;
+    // Trusted I/O-owner admission after native document/recipient approval.
+    // Staging exposes metadata only; the worker's real permission request claims it.
+    host::FileResult stage_drop_document(const host::DocumentInfo &info,
+                                        std::shared_ptr<host::DocumentService> service, std::uint64_t drop_id);
+    void discard_drop_document(std::uint64_t drop_id) noexcept;
+    void finish_drop_document(std::uint64_t drop_id) noexcept; // Discard only an unclaimed stage.
+    // Separate immutable native text selection. No URI, stream or clipboard grant.
+    host::FileResult stage_drop_text(const host::DropTextInfo &info, std::u16string text, std::uint64_t drop_id);
+    void discard_drop_text(std::uint64_t drop_id) noexcept;
     void revoke_audio() noexcept { audio_.revoke(); }
     void revoke_graphics() noexcept;
     const AudioBroker &audio() const noexcept { return audio_; }
@@ -58,14 +80,51 @@ class Broker final {
     std::chrono::steady_clock::time_point idle_window_start_{};
     std::unique_ptr<host::FileService> files_;
     std::map<std::uint64_t, int> descriptors_;
+    std::shared_ptr<host::DocumentService> documents_;
+    struct DocumentDescriptor {
+        std::shared_ptr<host::DocumentService> provider;
+        int descriptor = -1;
+        std::uint64_t drop_id = 0; // Zero belongs to the independently admitted startup source.
+    };
+    struct DropDocument {
+        host::DocumentInfo info;
+        std::shared_ptr<host::DocumentService> provider;
+        bool active = false;
+    };
+    std::map<std::uint64_t, DocumentDescriptor> document_descriptors_;
+    std::map<std::uint64_t, DropDocument> drop_documents_;
+    struct DropText {
+        host::DropTextInfo info;
+        std::u16string text;
+        std::uint64_t next_offset = 0;
+        bool info_read = false;
+    };
+    std::map<std::uint64_t, DropText> drop_texts_;
+    std::uint64_t last_drop_id_ = 0;
+    bool documents_revoked_ = false;
+    bool drop_texts_revoked_ = false;
     struct FilePathLedger;
     std::unique_ptr<FilePathLedger> file_paths_;
     const std::vector<std::uint8_t> package_;
     const std::string package_hash_;
     AudioBroker audio_;
     std::unique_ptr<GraphicsService> graphics_;
+    std::unique_ptr<host::NotificationService> notifications_;
+    std::unique_ptr<host::ClipboardService> clipboard_;
+    struct ClipboardTransfer {
+        std::uint64_t id = 0, epoch = 0;
+        host::DropTextInfo info;
+        std::u16string text;
+        std::uint64_t next_offset = 0;
+    };
+    std::optional<ClipboardTransfer> clipboard_read_, clipboard_write_;
+    std::uint64_t next_clipboard_id_ = 1;
+    Frame notification_request(const Frame &request, Frame response);
+    Frame clipboard_request(const Frame &request, Frame response);
     void revoke_all() noexcept;
     Frame execute(const Frame &request, AuditTicket ticket);
     host::FileResult file_request(const Frame &request, Frame &response);
+    host::FileResult document_request(const Frame &request, Frame &response);
+    host::FileResult drop_text_request(const Frame &request, Frame &response);
 };
 } // namespace aether::security

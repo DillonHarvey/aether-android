@@ -2,6 +2,8 @@
 #include "aether/apk/bytes.hpp"
 #include "aether/dex/limits.hpp"
 #include "annotations.hpp"
+#include "error_context.hpp"
+#include "load_diagnostics.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -24,6 +26,7 @@ std::string ascii(std::u16string_view value) {
     std::string out;
     if (value.empty() || value.size() > 1024)
         bad("NAME", "Empty or oversized identifier");
+    out.reserve(value.size());
     for (const auto c : value) {
         if (c < 0x21 || c > 0x7e)
             bad("NAME_UNSUPPORTED", "Non-ASCII identifiers are not yet supported");
@@ -118,6 +121,7 @@ struct Parser {
         bad("LEB128", "Unterminated SLEB128");
     }
     void map() {
+        try {
         const auto at = view.u32(52), count = view.u32(at);
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto p = std::size_t{at} + 4 + std::size_t{i} * 12;
@@ -131,17 +135,38 @@ struct Parser {
                        end = i + 1 == count ? static_cast<std::uint32_t>(view.size()) : view.u32(p + 20);
             sections.emplace(type, std::pair{begin, end});
         }
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::parse_map);throw;
+        }
     }
     void strings() {
+        try {
         const auto count = view.u32(56), table = view.u32(60);
         if (count > 1'048'576)
             bad("LIMIT", "More than 1048576 DEX strings");
         charge(std::uint64_t{count} * sizeof(std::u16string));
-        std::set<std::uint32_t> offsets;
+        auto duplicate_id=no_index;
+        {
+            // inspect_dex has already bounded the entire immutable ID table.
+            // Keep this flat scratch only until the earliest repeated ID is
+            // known, before any decoded string storage is constructed.
+            struct Offset {std::uint32_t raw,id;};
+            static_assert(sizeof(Offset)==8);
+            std::vector<Offset> offsets;
+            offsets.reserve(count);
+            for(std::uint32_t i=0;i<count;++i)
+                offsets.push_back({view.u32(table+i*4),i});
+            std::sort(offsets.begin(),offsets.end(),[](const auto &left,const auto &right) {
+                return std::tie(left.raw,left.id)<std::tie(right.raw,right.id);
+            });
+            for(std::size_t i=1;i<offsets.size();++i)
+                if(offsets[i-1].raw==offsets[i].raw)
+                    duplicate_id=(std::min)(duplicate_id,offsets[i].id);
+        }
         for (std::uint32_t i = 0; i < count; ++i) {
             record("string_id", i, table + i * 4);
             auto at = view.u32(table + i * 4);
-            if (!offsets.insert(at).second)
+            if (i==duplicate_id)
                 bad("STRING", "Duplicate string-data offset");
             const auto length = leb(at, 0x2002);
             if (length > 1024 * 1024 || length > 8 * 1024 * 1024 - decoded_characters)
@@ -185,6 +210,9 @@ struct Parser {
             image.strings.push_back(std::move(value));
         }
         record_kind = {};
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::parse_strings);throw;
+        }
     }
     std::string name(Index index) const {
         if (index >= image.strings.size())
@@ -208,6 +236,7 @@ struct Parser {
         charge(std::uint64_t{count} * sizeof(Index));
         range(at, 4 + std::size_t{count} * 2, 0x1001);
         std::vector<Index> result;
+        result.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto index = view.u16(at + 4 + i * 2);
             descriptor(type(index), false);
@@ -216,6 +245,8 @@ struct Parser {
         return result;
     }
     void identifiers() {
+        auto allocation_phase=ClassLoadAllocationPhase::parse_types;
+        try {
         const auto types = view.u32(64), type_table = view.u32(68);
         if (types > 65535)
             bad("LIMIT", "Too many DEX types");
@@ -233,6 +264,7 @@ struct Parser {
             previous = index;
         }
         record_kind = {};
+        allocation_phase=ClassLoadAllocationPhase::parse_prototypes;
         const auto protos = view.u32(72), proto_table = view.u32(76);
         if (protos > 65535)
             bad("LIMIT", "Too many DEX prototypes");
@@ -245,14 +277,21 @@ struct Parser {
             p.return_type = view.u32(at + 4);
             type(p.return_type);
             p.parameters = type_list(view.u32(at + 8));
+            // Types are already validated and limited to 1024 bytes, and the
+            // parameter list to 255 entries: this sum is at most 262146 bytes.
+            std::size_t descriptor_size=2+type(p.return_type).size();
+            for(const auto index:p.parameters)descriptor_size+=type(index).size();
             std::string expected(1, reference_type(type(p.return_type)) ? 'L' : type(p.return_type).front());
             p.descriptor = "(";
+            p.descriptor.reserve(descriptor_size);
+            expected.reserve(p.parameters.size()+1);
             for (const auto index : p.parameters) {
                 p.descriptor += type(index);
                 p.argument_words += type_words(type(index));
                 expected += reference_type(type(index)) ? 'L' : type(index).front();
             }
-            p.descriptor += ")" + type(p.return_type);
+            p.descriptor.push_back(')');
+            p.descriptor += type(p.return_type);
             charge(p.descriptor.size());
             if (p.argument_words > 255 || shorty != expected)
                 bad("PROTOTYPE", "Invalid shorty or argument word count");
@@ -264,6 +303,7 @@ struct Parser {
             image.prototypes.push_back(std::move(p));
         }
         record_kind = {};
+        allocation_phase=ClassLoadAllocationPhase::parse_fields;
         const auto fields = view.u32(80), field_table = view.u32(84);
         if (fields > 65535)
             bad("LIMIT", "Too many DEX fields");
@@ -287,10 +327,11 @@ struct Parser {
             image.fields.push_back(std::move(f));
         }
         record_kind = {};
+        allocation_phase=ClassLoadAllocationPhase::parse_methods;
         const auto methods = view.u32(88), method_table = view.u32(92);
         if (methods > 65535)
             bad("LIMIT", "Too many DEX methods");
-        charge(std::uint64_t{methods} * sizeof(Method));
+        charge(std::uint64_t{methods} * method_metadata_charge);
         std::tuple<Index, Index, Index> last_method{};
         for (Index i = 0; i < methods; ++i) {
             const auto at = method_table + i * 8;
@@ -312,8 +353,12 @@ struct Parser {
             image.methods.push_back(std::move(m));
         }
         record_kind = {};
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(allocation_phase);throw;
+        }
     }
     Code code(std::uint32_t start, const Method &method) {
+        try {
         if (start % 4)
             bad("ALIGNMENT", "Misaligned code item");
         range(start, 16, 0x2001);
@@ -338,7 +383,10 @@ struct Parser {
         if (debug)
             range(debug, 1, 0x2003); // Debug metadata is not executed.
         range(start, 16 + std::size_t{count} * 2, 0x2001);
-        result.units.reserve(count);
+        try { result.units.reserve(count); }
+        catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::code_units);throw;
+        }
         for (std::uint32_t i = 0; i < count; ++i)
             result.units.push_back(view.u16(start + 16 + i * 2));
         if (!tries)
@@ -356,7 +404,12 @@ struct Parser {
         const auto handlers_count = leb(at, 0x2001);
         if (!handlers_count || handlers_count > 4096)
             bad("LIMIT", "Code item requires 1 through 4096 catch-handler lists");
-        std::map<std::uint32_t, std::vector<CatchHandler>> handlers;
+        auto handlers=[] {
+            try { return std::map<std::uint32_t,std::vector<CatchHandler>>{}; }
+            catch(const std::bad_alloc &) {
+                detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_index);throw;
+            }
+        }();
         std::uint32_t handler_items = 0;
         for (std::uint32_t i = 0; i < handlers_count; ++i) {
             const auto offset = at - handlers_start;
@@ -368,12 +421,30 @@ struct Parser {
             if (items > 65536 - handler_items)
                 bad("LIMIT", "Code item exceeds 65536 temporary catch-handler entries");
             handler_items += items;
-            std::vector<CatchHandler> list;
-            list.reserve(items);
-            std::set<Index> catch_types;
+            auto list=[] {
+                try { return std::vector<CatchHandler>{}; }
+                catch(const std::bad_alloc &) {
+                    detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_list);throw;
+                }
+            }();
+            try { list.reserve(items); }
+            catch(const std::bad_alloc &) {
+                detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_list);throw;
+            }
+            auto catch_types=[] {
+                try { return std::set<Index>{}; }
+                catch(const std::bad_alloc &) {
+                    detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_types);throw;
+                }
+            }();
             for (std::uint32_t j = 0; j < typed; ++j) {
                 const auto index = leb(at, 0x2001), target = leb(at, 0x2001);
-                if (type(index).front() != 'L' || target >= count || !catch_types.insert(index).second)
+                if (type(index).front() != 'L' || target >= count || ![&] {
+                        try { return catch_types.insert(index).second; }
+                        catch(const std::bad_alloc &) {
+                            detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_types);throw;
+                        }
+                    }())
                     bad("CODE", "Invalid catch type or target");
                 list.push_back({index, target});
             }
@@ -383,10 +454,16 @@ struct Parser {
                     bad("CODE", "Invalid catch-all target");
                 list.push_back({no_index, target});
             }
-            handlers.emplace(offset, std::move(list));
+            try { handlers.emplace(offset, std::move(list)); }
+            catch(const std::bad_alloc &) {
+                detail::note_class_load_allocation(ClassLoadAllocationPhase::code_handler_index);throw;
+            }
         }
         std::uint32_t previous_end = 0;
-        result.tries.reserve(tries);
+        try { result.tries.reserve(tries); }
+        catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::code_try_regions);throw;
+        }
         for (std::uint32_t i = 0; i < tries; ++i) {
             const auto p = try_start + i * 8;
             const auto begin = view.u32(p);
@@ -395,10 +472,16 @@ struct Parser {
                 !handlers.contains(handler))
                 bad("CODE", "Invalid, overlapping or unbound try region");
             charge(handlers.at(handler).size() * sizeof(CatchHandler));
-            result.tries.push_back({begin, length, handlers.at(handler)});
+            try { result.tries.push_back({begin, length, handlers.at(handler)}); }
+            catch(const std::bad_alloc &) {
+                detail::note_class_load_allocation(ClassLoadAllocationPhase::code_try_publish);throw;
+            }
             previous_end = begin + length;
         }
         return result;
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::parse_code);throw;
+        }
     }
     EncodedValue value(std::uint32_t &at) const {
         range(at, 1, 0x2005);
@@ -438,6 +521,7 @@ struct Parser {
         return result;
     }
     void classes() {
+        try {
         const auto count = view.u32(96), table = view.u32(100);
         if (count > 16384)
             bad("LIMIT", "Too many class definitions");
@@ -471,6 +555,7 @@ struct Parser {
                     bad("LIMIT", "Class-data item counts exceed identifier tables");
                 charge((std::uint64_t{statics} + instances + direct + virtuals) * sizeof(Index));
                 const auto fields = [&](std::uint32_t n, bool is_static, std::vector<Index> &out) {
+                    out.reserve(n);
                     Index index = 0;
                     for (Index j = 0; j < n; ++j) {
                         const auto delta = leb(at, 0x2000), flags = leb(at, 0x2000);
@@ -489,6 +574,7 @@ struct Parser {
                 fields(statics, true, c.static_fields);
                 fields(instances, false, c.instance_fields);
                 const auto methods = [&](std::uint32_t n, bool is_direct, std::vector<Index> &out) {
+                    out.reserve(n);
                     Index index = 0;
                     for (Index j = 0; j < n; ++j) {
                         const auto delta = leb(at, 0x2000), flags = leb(at, 0x2000),
@@ -510,7 +596,11 @@ struct Parser {
                         m.flags = flags;
                         if (code_offset) {
                             record("code_item", index, code_offset);
-                            m.code = code(code_offset, m);
+                            try {
+                                m.code = code(code_offset, m);
+                            } catch(const std::bad_alloc &) {
+                                detail::note_class_load_allocation(ClassLoadAllocationPhase::code_storage_publish);throw;
+                            }
                             record_kind = {};
                         }
                         out.push_back(index);
@@ -525,6 +615,7 @@ struct Parser {
                 if (n > c.static_fields.size())
                     bad("VALUE", "More static values than static fields");
                 charge(std::uint64_t{n} * sizeof(EncodedValue));
+                c.static_values.reserve(n);
                 for (std::uint32_t j = 0; j < n; ++j)
                     c.static_values.push_back(value(values));
             }
@@ -543,10 +634,15 @@ struct Parser {
                 index = image.classes[definitions.at(index)].superclass;
             }
         }
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::parse_classes);throw;
+        }
     }
 };
 } // namespace
 DexImage parse(std::span<const std::uint8_t> bytes) {
+    auto allocation_phase=ClassLoadAllocationPhase::parse_header;
+    try {
     if (bytes.size() > source_file_bytes)
         bad("LIMIT", "DEX input exceeds 64 MiB");
     Parser p(bytes);
@@ -555,19 +651,31 @@ DexImage parse(std::span<const std::uint8_t> bytes) {
         if (inventory.version != "035" && inventory.version != "037" && inventory.version != "038")
             bad("VERSION_UNSUPPORTED", "Executable DEX loading supports versions 035, 037 and 038");
         p.image.version = inventory.version == "038" ? 38 : (inventory.version == "037" ? 37 : 35);
+        allocation_phase=ClassLoadAllocationPhase::parse_map;
         p.map();
+        allocation_phase=ClassLoadAllocationPhase::parse_strings;
         p.strings();
+        allocation_phase=ClassLoadAllocationPhase::parse_types;
         p.identifiers();
+        allocation_phase=ClassLoadAllocationPhase::parse_classes;
         p.classes();
+        allocation_phase=ClassLoadAllocationPhase::parse_annotations;
         validate_annotations(bytes, p.image);
+        allocation_phase=ClassLoadAllocationPhase::archive_hash;
         p.image.sha256 = apk::sha256(bytes);
         return std::move(p.image);
+    } catch(const std::bad_alloc &) {
+        detail::note_class_load_allocation(allocation_phase);throw;
     } catch (const DexError &error) {
         if (p.record_kind.empty())
             throw;
-        throw DexError(error.code, p.context() + error.what());
+        detail::throw_dex_error_context(error,[&] { return p.context(); });
+        throw;
     } catch (const apk::InspectError &error) {
         throw DexError(error.diagnostic.code, p.context() + error.what());
+    }
+    } catch(const std::bad_alloc &) {
+        detail::note_class_load_allocation(allocation_phase);throw;
     }
 }
 Index DexImage::method(std::string_view owner, std::string_view name, std::string_view signature) const {

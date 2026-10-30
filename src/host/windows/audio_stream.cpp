@@ -3,6 +3,7 @@
 #include "aether/host/windows/unique_handle.hpp"
 #include <Windows.h>
 #include <algorithm>
+#include <array>
 #include <audioclient.h>
 #include <audiopolicy.h>
 #include <chrono>
@@ -63,6 +64,62 @@ struct Property {
     PROPVARIANT value{};
     ~Property() { PropVariantClear(&value); }
 };
+struct ComText {
+    wchar_t *value = nullptr;
+    ~ComText() { CoTaskMemFree(value); }
+};
+struct InstalledSession {
+    GUID guid{};
+    std::wstring name, icon;
+};
+InstalledSession installed_session(const AudioSessionIdentity &identity) {
+    const auto &id = identity.installed_id;
+    if (id.size() != 32 || !std::all_of(id.begin(), id.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }))
+        failed(AudioFailure::argument, "Installed audio requires an exact opaque app identity");
+    if (identity.display_name.empty() || identity.display_name.size() > 128 ||
+        std::any_of(identity.display_name.begin(), identity.display_name.end(),
+                    [](unsigned char c) { return c < 32; }))
+        failed(AudioFailure::argument, "Installed audio requires a bounded literal display name");
+    InstalledSession session;
+    session.icon = identity.icon_path.native();
+    const auto &icon = session.icon;
+    if (icon.size() < 4 || icon.size() >= 32768 || icon[1] != L':' || icon[2] != L'\\' ||
+        !((icon[0] >= L'A' && icon[0] <= L'Z') || (icon[0] >= L'a' && icon[0] <= L'z')) ||
+        icon.find(L':', 2) != std::wstring::npos || icon.find(L'\0') != std::wstring::npos ||
+        std::any_of(icon.begin(), icon.end(), [](wchar_t c) { return c < 32; }) ||
+        identity.icon_path.lexically_normal().native() != icon || identity.icon_path.filename().empty())
+        failed(AudioFailure::argument, "Installed audio requires a canonical local icon path");
+    try {
+        session.name = utf16(identity.display_name);
+        (void)utf8(icon); // Reject malformed UTF-16 before handing the path to Windows.
+    } catch (const std::invalid_argument &) {
+        failed(AudioFailure::argument, "Installed audio attribution contains invalid Unicode");
+    }
+    // Persistent mapping: all 128 opaque-ID bits participate without truncation
+    // or forced UUID version bits. Keep this domain and byte order stable.
+    constexpr std::array<std::uint8_t, 16> domain{
+        0x41, 0x65, 0x74, 0x68, 0x65, 0x72, 0x2e, 0x41,
+        0x75, 0x64, 0x69, 0x6f, 0x2e, 0x76, 0x31, 0x00};
+    std::array<std::uint8_t, 16> bytes{};
+    const auto nibble = [](char c) { return static_cast<unsigned>(c <= '9' ? c - '0' : c - 'a' + 10); };
+    for (std::size_t i = 0; i < bytes.size(); ++i)
+        bytes[i] = static_cast<std::uint8_t>(((nibble(id[i * 2]) << 4) | nibble(id[i * 2 + 1])) ^ domain[i]);
+    static_assert(sizeof(GUID) == 16);
+    std::memcpy(&session.guid, bytes.data(), bytes.size());
+    if (IsEqualGUID(session.guid, GUID_NULL))
+        failed(AudioFailure::argument, "Installed audio identity maps to the reserved default session");
+    return session;
+}
+bool same_session_text(const wchar_t *actual, std::wstring_view expected) noexcept {
+    if (!actual)
+        return false;
+    for (std::size_t i = 0; i <= expected.size(); ++i)
+        if (actual[i] != (i == expected.size() ? L'\0' : expected[i]))
+            return false;
+    return true;
+}
 } // namespace
 struct HostAudioStream::Impl {
     const std::thread::id owner = std::this_thread::get_id();
@@ -74,15 +131,17 @@ struct HostAudioStream::Impl {
     ComPtr<IAudioRenderClient> render;
     ComPtr<IAudioClock> clock;
     ComPtr<ISimpleAudioVolume> volume;
+    ComPtr<IAudioSessionControl> session_control;
     AudioInfo info;
     AudioMetrics stats;
     AudioState state = AudioState::open;
     bool running = false;
     std::optional<Steady::time_point> drained_at;
-    explicit Impl(AudioConfig config) {
+    explicit Impl(AudioConfig config, const std::optional<AudioSessionIdentity> &identity) {
         if (config.sample_rate < 8000 || config.sample_rate > 192000 || config.channels < 1 ||
             config.channels > 2)
             failed(AudioFailure::argument, "Audio requires 8-192 kHz mono/stereo PCM16");
+        const auto attribution = identity ? std::optional(installed_session(*identity)) : std::nullopt;
         check(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
                                IID_PPV_ARGS(&enumerator)),
               "Create audio endpoint enumerator");
@@ -123,15 +182,35 @@ struct HostAudioStream::Impl {
         format.nBlockAlign = static_cast<WORD>(config.channels * 2);
         format.nAvgBytesPerSec = config.sample_rate * format.nBlockAlign;
         GUID session{};
-        check(CoCreateGuid(&session), "Create private audio session identity");
+        if (attribution)
+            session = attribution->guid;
+        else
+            check(CoCreateGuid(&session), "Create private audio session identity");
         event.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
         if (!event)
             failed(AudioFailure::windows, "Create audio buffer event", HRESULT_FROM_WIN32(GetLastError()));
-        constexpr DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST |
-                                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY |
+                            (attribution ? AUDCLNT_STREAMFLAGS_CROSSPROCESS : AUDCLNT_STREAMFLAGS_NOPERSIST);
         check(client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format, &session),
               "Initialize shared PCM16 WASAPI stream");
         check(client->SetEventHandle(event.get()), "Bind audio buffer event");
+        if (attribution) {
+            check(client->GetService(IID_PPV_ARGS(&session_control)), "Acquire installed audio session control");
+            check(session_control->SetDisplayName(attribution->name.c_str(), nullptr),
+                  "Set installed audio session display name");
+            check(session_control->SetIconPath(attribution->icon.c_str(), nullptr),
+                  "Set installed audio session icon");
+            check(session_control->SetGroupingParam(&session, nullptr), "Group installed app audio sessions");
+            ComText session_name, session_icon;
+            GUID grouping{};
+            check(session_control->GetDisplayName(&session_name.value), "Read installed audio session display name");
+            check(session_control->GetIconPath(&session_icon.value), "Read installed audio session icon");
+            check(session_control->GetGroupingParam(&grouping), "Read installed audio session grouping");
+            if (!same_session_text(session_name.value, attribution->name) ||
+                !same_session_text(session_icon.value, attribution->icon) || !IsEqualGUID(grouping, session))
+                failed(AudioFailure::windows, "Installed audio session attribution failed readback");
+        }
         check(client->GetBufferSize(&info.buffer_frames), "Query WASAPI buffer capacity");
         if (!info.buffer_frames || info.buffer_frames > 65536)
             failed(AudioFailure::windows, "WASAPI buffer exceeds the 65,536-frame bound");
@@ -146,11 +225,12 @@ struct HostAudioStream::Impl {
         check(clock->GetFrequency(&info.clock_frequency), "Query audio clock frequency");
         if (!info.clock_frequency)
             failed(AudioFailure::windows, "Audio clock frequency is zero");
-        check(volume->SetMute(config.muted ? TRUE : FALSE, nullptr), "Set private session mute");
+        if (!attribution)
+            check(volume->SetMute(config.muted ? TRUE : FALSE, nullptr), "Set private session mute");
         BOOL muted = FALSE;
         check(volume->GetMute(&muted), "Verify private session mute");
         info.muted = muted != FALSE;
-        if (info.muted != config.muted)
+        if (!attribution && info.muted != config.muted)
             failed(AudioFailure::windows, "Audio session mute does not match the requested state");
     }
     ~Impl() { cleanup(); }
@@ -210,6 +290,7 @@ struct HostAudioStream::Impl {
         if (client && running && FAILED(client->Stop()))
             ++stats.cleanup_failures;
         running = false;
+        session_control.Reset();
         volume.Reset();
         clock.Reset();
         render.Reset();
@@ -221,7 +302,8 @@ struct HostAudioStream::Impl {
         state = AudioState::closed;
     }
 };
-HostAudioStream::HostAudioStream(AudioConfig config) : impl_(std::make_unique<Impl>(config)) {}
+HostAudioStream::HostAudioStream(AudioConfig config, std::optional<AudioSessionIdentity> identity)
+    : impl_(std::make_unique<Impl>(config, identity)) {}
 HostAudioStream::~HostAudioStream() = default;
 const AudioInfo &HostAudioStream::info() const noexcept { return impl_->info; }
 const AudioMetrics &HostAudioStream::metrics() const noexcept { return impl_->stats; }

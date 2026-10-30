@@ -1,5 +1,6 @@
 #pragma once
 #include "aether/diagnostics/diagnostic.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -51,14 +52,25 @@ struct ManifestBoolean {
     std::uint16_t type = manifest_absent_type;
     std::uint32_t data = 0;
 };
+// Compact typed integer metadata. References and unknown types stay distinct
+// from absence until the consuming execution profile can interpret them.
+struct ManifestInteger {
+    std::uint16_t type = manifest_absent_type;
+    std::uint32_t data = 0;
+};
+inline constexpr std::size_t manifest_activity_config_bytes = 8;
+static_assert(sizeof(ManifestInteger) == manifest_activity_config_bytes);
+// Public Android 15 configChanges flags; recognizing a bit does not implement
+// the corresponding device change or Activity recreation behavior.
+inline constexpr std::uint32_t manifest_config_changes_mask = 0x5000ffff;
 struct Activity {
     std::string name;
     std::string target;
-    bool launcher = false;
+    bool launcher = false, intent_filter = false;
     DisplayValue label, icon;
     ManifestBoolean enabled, exported;
+    ManifestInteger screen_orientation;
     DisplayValue permission{manifest_absent_type, 0, {}};
-    bool intent_filter = false;
 };
 // Manifest inventory is independent of the single launcher selected for execution.
 // Charge a fixed record allowance plus all retained UTF-8 strings, consistently
@@ -67,6 +79,29 @@ inline constexpr std::size_t manifest_activity_count = 8192;
 inline constexpr std::size_t manifest_activity_bytes = 4 * 1024 * 1024;
 inline constexpr std::size_t manifest_activity_record_bytes = 256;
 static_assert(sizeof(Activity) <= manifest_activity_record_bytes);
+// Retain the original filter subtree without treating it as a routing policy.
+// Node order and parent indices preserve relative-filter groups and unknown
+// extensions. Attribute namespaces and typed resource references stay distinct.
+struct ManifestFilterAttribute {
+    std::string ns, name;
+    DisplayValue value;
+};
+struct ManifestFilterNode {
+    std::string ns, name;
+    std::optional<std::size_t> parent;
+    std::vector<ManifestFilterAttribute> attributes;
+};
+struct ManifestIntentFilter {
+    std::vector<ManifestFilterNode> nodes;
+};
+inline constexpr std::size_t manifest_activity_filters_bytes = 32;
+inline constexpr std::size_t manifest_filter_record_bytes = 32;
+inline constexpr std::size_t manifest_filter_node_bytes = 128;
+inline constexpr std::size_t manifest_filter_attribute_bytes = 128;
+static_assert(sizeof(std::vector<ManifestIntentFilter>) <= manifest_activity_filters_bytes);
+static_assert(sizeof(ManifestIntentFilter) <= manifest_filter_record_bytes);
+static_assert(sizeof(ManifestFilterNode) <= manifest_filter_node_bytes);
+static_assert(sizeof(ManifestFilterAttribute) <= manifest_filter_attribute_bytes);
 struct ManifestInfo {
     std::string package_id;
     // Empty only when android:name is absent; otherwise package-qualified.
@@ -89,7 +124,19 @@ struct ManifestInfo {
     DisplayValue label, icon, round_icon;
     ManifestBoolean enabled;
     DisplayValue permission{manifest_absent_type, 0, {}};
+    // Parsed manifests retain one compact value per Activity/alias. An empty
+    // vector also represents all-absent values in hand-constructed metadata.
+    std::vector<ManifestInteger> activity_config_changes;
+    // One filter inventory per Activity/alias; alias filters belong to the alias,
+    // independently of its executable target. Empty outer storage represents
+    // all-empty inventories in hand-constructed metadata, as with configChanges.
+    std::vector<std::vector<ManifestIntentFilter>> activity_intent_filters;
 };
+// Fixed record allowances plus all retained activity/filter text. Misaligned
+// side metadata and arithmetic/budget overflow return 4 MiB + 1.
+// Empty side vectors represent all-absent metadata and receive the same fixed
+// per-Activity allowance as parsed/padded inventories. No routing is performed.
+std::size_t activity_metadata_size(const ManifestInfo &manifest) noexcept;
 struct PackageFile {
     std::string path;
     std::uint64_t compressed_bytes = 0;

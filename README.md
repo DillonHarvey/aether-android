@@ -10,7 +10,9 @@ Aether is a project working towards a simple idea: install an Android app on you
 
 This page explains the project in everyday language. No programming knowledge needed.
 
-**Project snapshot · 27 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
+Latest source work adds IME conversion-target queries and more accurate composition events for screen readers. It compiles, with explicit limits on retained event history. Broader app compatibility and runtime checks remain unfinished.
+
+**Project snapshot · 29 October 2026 · Windows 11 on Intel or AMD PCs (64-bit)**
 
 [The idea](#the-idea) · [Where we are](#where-we-are) · [What works](#what-works-today) · [Progress counts](#progress-counts) · [Trying Aether](#can-i-try-it)
 
@@ -44,7 +46,7 @@ You can choose Aether to open APK files when you double-click them. Opening an A
 | **Distinct working test apps** | **3 / 3 required scenarios recorded:** HelloAether, PlainAether and Pocket Tally |
 | **Owner-supplied app files** | **9 inspected · 9 with Explorer icons · 6 installed · 0 verified functional apps** |
 | **Compatibility checklist** | **3,589 planning entries** in **13 categories / 43 areas** |
-| **Catalogue implementation** | **894 of 3,589 implemented (24.91%)** |
+| **Catalogue implementation** | **904 of 3,589 implemented (25.19%)** |
 | **Remaining catalogue work** | **2,695 entries: 749 partial and 1,946 not started** |
 | **Public release** | Still in development; release requirements remain open |
 
@@ -80,9 +82,11 @@ These are **demonstrated capabilities within a limited scope**, updated from loc
 
 Current source adds Android launch information that app code can read and update, preserves the selected app component through startup and screen recreation, and implements seven more individual framework methods in the catalogue.
 
-Supported link-routing conditions can now be decoded and matched to eligible app screens. An internal launch path carries the supplied request into a genuine Android Intent, with the worker checking the selected component against the held APK before app initialization. Unknown policy/resources, competing screens and unsupported task or file-access flags are refused. Selected Release/Debug library builds and worker compilation are recorded as passing; running-app behavior remains unverified.
+Current source offers an open-link command and native chooser for matching installed app screens. It requires an explicit choice, keeps link text out of command output and rechecks the chosen screen against the original request before app initialization. Automatic reads preserve the draft and selection; changed targets need review again. Selected Release/Debug library and entry-point compilation pass; running-app and chooser behavior remain unverified.
 
-Windows request forwarding and its permission choices, resource-backed routing, Android preference selection, broader task delivery and notification actions remain unfinished. These partial routing additions do not increase the implemented count beyond **894 / 3,589**.
+Current source also offers explicitly chosen link schemes for an installed app through Windows, with owned registration repair/removal and custom-store lookup. Native link activation opens the same explicit chooser; ambiguous quoting is refused. Source runtime contract 21 protects the saved activation commands. These additions compile but have not been exercised through Windows associations or running apps.
+
+File associations for opening documents, file grants, resource-backed routing, Android preference selection, broader task delivery and notification actions remain unfinished. These partial routing additions do not increase the implemented count beyond **894 / 3,589**.
 
 The current goal retains **all 3,589 catalogue entries**. Within that goal, the historical five-category subset covers 1,277 requirements across Windows integration, ARM64 translation, JNI, DEX/Java and security: **638 are source-implemented (49.96%); 639 remain.** All five remain incomplete. Windows integration has the highest implemented share at **53/65 (81.54%)**, with **12 entries remaining**. Recent source additions include ARM64 scheduling/cache operations and a bounded scalar atomic-instruction fallback; JNI primitive-array copies, string regions, ordinary constructors and nonvirtual calls; and Java string comparison, literal replacement and weak interning. Each retains explicit limits and unsupported cases. Recent source work also adds array copying, backed JNI local-reference capacity, precise cache-operation failures and a bounded vertical scrolling layout with Windows accessibility actions. These changes have compiled; running-app behavior remains unverified.
 
@@ -133,7 +137,7 @@ The tables count **implemented catalogue requirements**. Partial work and unsupp
 
 <!-- aether:compatibility-progress:start -->
 
-**894 / 3,589 entries implemented (24.91%)**
+**904 / 3,589 entries implemented (25.19%)**
 
 Implementation means the catalogue requirement exists within its recorded scope. It does not mean full acceptance testing or app compatibility.
 
@@ -152,9 +156,9 @@ The denominator retains overlapping parents and refinements; this is the impleme
 | Media & devices | 236 | 0 | 0.00% |
 | App engines | 128 | 0 | 0.00% |
 | Security & permissions | 88 | 31 | 35.23% |
-| Windows integration | 65 | 53 | 81.54% |
+| Windows integration | 65 | 63 | 96.92% |
 | Quality & reproducibility | 60 | 11 | 18.33% |
-| **Total** | **3,589** | **894** | **24.91%** |
+| **Total** | **3,589** | **904** | **25.19%** |
 
 Only **Implemented** entries count. Partial, not-started, blocked and unassessed entries contribute zero.
 
@@ -202,8 +206,8 @@ Only **Implemented** entries count. Partial, not-started, blocked and unassessed
 | Embedded application engines detailed | 97 | 0 | 0.00% |
 | Windows isolation and Android permission security | 43 | 15 | 34.88% |
 | Permissions and defensive compatibility | 45 | 16 | 35.56% |
-| Windows native install / shell / lifecycle | 35 | 30 | 85.71% |
-| Windows product integration detailed | 30 | 23 | 76.67% |
+| Windows native install / shell / lifecycle | 35 | 34 | 97.14% |
+| Windows product integration detailed | 30 | 29 | 96.67% |
 | Reproducibility and test coverage | 30 | 5 | 16.67% |
 | QA and progress evidence systems | 30 | 6 | 20.00% |
 

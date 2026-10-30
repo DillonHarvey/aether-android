@@ -1,6 +1,8 @@
 #include "install_dialog.hpp"
 #include "aether/apk/artwork.hpp"
 #include "aether/common/text.hpp"
+#include "aether/host/window.hpp"
+#include "aether/install/shell.hpp"
 #include "aether/install/store.hpp"
 #include "aether/security/metadata_process.hpp"
 #include "dialog_style.hpp"
@@ -11,10 +13,12 @@
 #include <commctrl.h>
 #include <future>
 #include <iostream>
+#include <thread>
 
 namespace aether::install {
 namespace {
-constexpr int action_id = 100, permissions_id = 102, private_files_id = 201, wall_clock_id = 202, privacy_id = 220;
+constexpr int action_id = 100, permissions_id = 102, private_files_id = 201, wall_clock_id = 202,
+              audio_playback_id = 203, notifications_id = 204, clipboard_id = 205, privacy_id = 220;
 using namespace dialog_style;
 std::wstring display(std::string_view text, std::string_view fallback = "Android app") {
     return utf16(apk::clean_display_name(text, fallback));
@@ -51,22 +55,27 @@ struct Observation {
     std::shared_ptr<const apk::PackagePreview> package;
     std::optional<shell::IconDigest> identity;
     std::optional<InstalledApp> current;
+    std::optional<UninstallReview> uninstall_review;
     std::string code, message;
-    bool available = false;
+    bool available = false, app_busy = false;
 };
 struct Outcome {
     std::optional<InstalledApp> app;
     std::string hash, code, message;
+    bool cancelled = false;
 };
+enum class UninstallGate { preparing, cancelled, committing };
+enum class UninstallStage { checking, closing, waiting, removing };
 struct Installer {
     std::filesystem::path source, root;
     std::string uninstall_id;
-    HWND keep_check = nullptr;
+    HWND keep_check = nullptr, close_app_check = nullptr;
     bool uninstalling = false, keep_data = true;
     HWND window = nullptr, permission_window = nullptr;
     HWND picture = nullptr, title = nullptr, subtitle = nullptr, status = nullptr, progress = nullptr;
     HWND action = nullptr, cancel = nullptr, permissions = nullptr, close = nullptr;
-    HWND wall_clock_check = nullptr, files_check = nullptr, declarations = nullptr, permission_app = nullptr;
+    HWND wall_clock_check = nullptr, files_check = nullptr, audio_check = nullptr, notifications_check = nullptr, clipboard_check = nullptr,
+         declarations = nullptr, permission_app = nullptr;
     HFONT normal = nullptr, heading = nullptr, small = nullptr;
     HBRUSH brush = CreateSolidBrush(background);
     int dpi = 96;
@@ -78,12 +87,15 @@ struct Installer {
     Observation shown;
     Outcome outcome;
     std::atomic<InstallStage> stage{InstallStage::verifying};
+    std::atomic<UninstallGate> uninstall_gate{UninstallGate::preparing};
+    std::atomic<UninstallStage> uninstall_stage{UninstallStage::checking};
     std::uint32_t grants = security::installed_clock;
     bool visible = false, busy = false, finished = false, cancelled = true, was_failed = false;
     bool permission_minimized = false;
     unsigned reads = 0, extractions = 0, failures = 0, recoveries = 0, attempts = 0;
     ULONGLONG started = GetTickCount64(), last_read = 0, ready_ms = 0, install_ms = 0, commit_started = 0;
     std::optional<InstalledApp> selected_current;
+    std::optional<UninstallReview> selected_uninstall_review;
 
     Installer(std::filesystem::path input, std::filesystem::path store, std::string identity = {})
         : source(std::move(input)), root(std::move(store)), uninstall_id(std::move(identity)),
@@ -138,7 +150,8 @@ struct Installer {
         cls.lpszClassName = L"Aether.Installation";
         if (!RegisterClassW(&cls) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
             throw InstallError("AETHER_SHELL_DIALOG", "Cannot register the installer window");
-        window = make_window(uninstalling ? L"Aether - App uninstaller" : L"Aether - App installer", 640, 344);
+        window = make_window(uninstalling ? L"Aether - App uninstaller" : L"Aether - App installer", 640,
+                             uninstalling ? 384 : 344);
         if (!window)
             throw InstallError("AETHER_SHELL_DIALOG", "Cannot create the installer window");
         control(window, L"STATIC", uninstalling ? L"AETHER  /  APP UNINSTALLER" : L"AETHER  /  APP INSTALLER", 0, 36, 22, 520, 22, 0, small);
@@ -161,6 +174,11 @@ struct Installer {
             keep_check = control(window, L"BUTTON", L"Keep private data and diagnostic history",
                                  BS_AUTOCHECKBOX | WS_TABSTOP, 36, 254, 568, 24);
             SendMessageW(keep_check, BM_SETCHECK, BST_CHECKED, 0);
+            close_app_check = control(window, L"BUTTON", L"Close this app before uninstalling (unsaved work may be lost)",
+                                      BS_AUTOCHECKBOX | WS_TABSTOP, 36, 282, 568, 24);
+            SendMessageW(close_app_check, BM_SETCHECK, BST_UNCHECKED, 0);
+            MoveWindow(cancel, px(372), px(320), px(104), px(42), TRUE);
+            MoveWindow(action, px(488), px(320), px(116), px(42), TRUE);
             set_text(action, L"Uninstall");
         }
         EnableWindow(action, FALSE);
@@ -172,7 +190,10 @@ struct Installer {
         try {
             if (uninstalling) {
                 PackageStore store(root);
-                result.current = store.info(uninstall_id);
+                const auto removal = store.review_uninstall(uninstall_id);
+                result.current = removal.app;
+                result.uninstall_review = removal.review;
+                result.app_busy = removal.busy;
                 const auto state = result.current->state;
                 result.available = state == State::installed || state == State::data_retained;
                 // Artwork is optional for removal. Decode package resources only in
@@ -301,7 +322,9 @@ struct Installer {
         }
         set_text(action, uninstalling ? L"Uninstall" : value.current ? L"Update" : L"Install");
         set_text(status, value.available
-                             ? (uninstalling ? L"Remove this app. Other apps and Aether will stay installed."
+                             ? (uninstalling ? (value.app_busy
+                                    ? L"This app is in use. Choose to close it before uninstalling."
+                                    : L"Remove this app. Other apps and Aether will stay installed.")
                                 : value.current ? L"Update this app. Your data and permissions will be kept."
                                               : L"Install this app on your PC.")
                              : display(value.message, "Checking again automatically."));
@@ -326,7 +349,7 @@ struct Installer {
     void show_permissions() {
         if (permission_window || !shown.package || busy || finished)
             return;
-        permission_window = make_window(L"Aether - Permissions", 600, 640, window);
+        permission_window = make_window(L"Aether - Permissions", 600, 704, window);
         if (!permission_window)
             throw InstallError("AETHER_SHELL_DIALOG", "Cannot open permissions");
         SendMessageW(permission_window, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon->value));
@@ -343,38 +366,59 @@ struct Installer {
                      0);
         EnableWindow(clock, FALSE);
         control(permission_window, L"STATIC", L"Required to run the app. No personal information is shared.",
-                0, 57, 152, 510, 24, 0, small);
+                0, 57, 148, 510, 24, 0, small);
         files_check = control(permission_window, L"BUTTON", L"Private app files",
-                              BS_AUTOCHECKBOX | WS_TABSTOP, 32, 194, 520, 26, private_files_id);
+                              BS_AUTOCHECKBOX | WS_TABSTOP, 32, 172, 520, 26, private_files_id);
         SendMessageW(files_check, BM_SETCHECK,
                      choices & security::installed_files ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(files_check, !shown.current);
         control(permission_window, L"STATIC",
-                L"Only this app's private storage. Your other files stay private.", 0, 57, 226, 510, 24, 0,
+                L"Only this app's private storage. Your other files stay private.", 0, 57, 200, 510, 24, 0,
                 small);
         wall_clock_check = control(permission_window, L"BUTTON", L"Wall-clock date and time",
-                                   BS_AUTOCHECKBOX | WS_TABSTOP, 32, 264, 520, 26, wall_clock_id);
+                                   BS_AUTOCHECKBOX | WS_TABSTOP, 32, 224, 520, 26, wall_clock_id);
         SendMessageW(wall_clock_check, BM_SETCHECK,
                      choices & security::installed_wall_clock ? BST_CHECKED : BST_UNCHECKED, 0);
         EnableWindow(wall_clock_check, !shown.current);
         control(permission_window, L"STATIC", L"Current calendar date and time. Optional; denied unless selected.",
-                0, 57, 296, 510, 24, 0, small);
+                0, 57, 252, 510, 24, 0, small);
+        audio_check = control(permission_window, L"BUTTON", L"Sound playback",
+                              BS_AUTOCHECKBOX | WS_TABSTOP, 32, 276, 520, 26, audio_playback_id);
+        SendMessageW(audio_check, BM_SETCHECK,
+                     choices & security::installed_audio_playback ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(audio_check, !shown.current);
+        control(permission_window, L"STATIC", L"Play sound. Optional; denied unless selected.",
+                0, 57, 304, 510, 24, 0, small);
+        notifications_check = control(permission_window, L"BUTTON", L"Windows notifications",
+                                      BS_AUTOCHECKBOX | WS_TABSTOP, 32, 328, 520, 26, notifications_id);
+        SendMessageW(notifications_check, BM_SETCHECK,
+                     choices & security::installed_notifications ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(notifications_check, !shown.current);
+        control(permission_window, L"STATIC", L"Show app messages in Notification Center. Optional; denied unless selected.",
+                0, 57, 356, 510, 24, 0, small);
+        clipboard_check = control(permission_window, L"BUTTON", L"Read and replace Windows clipboard plain text",
+                                  BS_AUTOCHECKBOX | WS_TABSTOP, 32, 380, 520, 26, clipboard_id);
+        SendMessageW(clipboard_check, BM_SETCHECK,
+                     choices & security::installed_clipboard ? BST_CHECKED : BST_UNCHECKED, 0);
+        EnableWindow(clipboard_check, !shown.current);
+        control(permission_window, L"STATIC", L"May read sensitive copied text or replace it. Optional; denied unless selected.",
+                0, 57, 408, 510, 24, 0, small);
         control(permission_window, L"STATIC",
                 shown.package->format == apk::PreviewFormat::xapk ? L"BASE APK DECLARATIONS"
                                                                   : L"REQUESTED BY THE APP",
-                0, 32, 352, 536, 22, 0, small);
+                0, 32, 444, 536, 22, 0, small);
         control(permission_window, L"STATIC", L"Android declarations do not grant Windows access.", 0, 32,
-                377, 536, 23, 0, small);
+                470, 536, 23, 0, small);
         declarations = control(permission_window, L"EDIT", L"",
-                               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 32, 414,
-                               536, 112, 230, small);
+                               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, 32, 504,
+                               536, 82, 230, small);
         control(permission_window, L"STATIC",
                 shown.current ? L"Existing choices are preserved. Edit them in App settings."
                               : L"Other device and personal-data access stays blocked.",
-                0, 32, 538, 536, 22, 0, small);
-        control(permission_window, L"BUTTON", L"Privacy", BS_OWNERDRAW | WS_TABSTOP, 20, 580, 100, 40,
+                0, 32, 600, 536, 24, 0, small);
+        control(permission_window, L"BUTTON", L"Privacy", BS_OWNERDRAW | WS_TABSTOP, 20, 644, 100, 40,
                 privacy_id);
-        auto done = control(permission_window, L"BUTTON", L"Done", BS_OWNERDRAW | WS_TABSTOP, 456, 580, 112,
+        auto done = control(permission_window, L"BUTTON", L"Done", BS_OWNERDRAW | WS_TABSTOP, 456, 644, 112,
                             40, IDOK);
         permission_text();
         permission_minimized = IsIconic(window) != FALSE;
@@ -393,6 +437,12 @@ struct Installer {
                 grants |= security::installed_files;
             if (SendMessageW(wall_clock_check, BM_GETCHECK, 0, 0) == BST_CHECKED)
                 grants |= security::installed_wall_clock;
+            if (SendMessageW(audio_check, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                grants |= security::installed_audio_playback;
+            if (SendMessageW(notifications_check, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                grants |= security::installed_notifications;
+            if (SendMessageW(clipboard_check, BM_GETCHECK, 0, 0) == BST_CHECKED)
+                grants |= security::installed_clipboard;
         }
         auto previous = permission_window;
         permission_window = nullptr;
@@ -404,23 +454,128 @@ struct Installer {
             SetFocus(permissions);
         }
     }
+    Outcome remove_reviewed(bool close_consent) {
+        Outcome result;
+        const auto cancelled_now = [&] {
+            return uninstall_gate.load() == UninstallGate::cancelled;
+        };
+        const auto check_cancelled = [&] {
+            if (cancelled_now())
+                throw InstallError("AETHER_UNINSTALL_CANCELLED", "Uninstall cancelled. The app remains installed.");
+        };
+        try {
+            if (!selected_uninstall_review)
+                throw InstallError("AETHER_UNINSTALL_REVIEW", "Review the current app before uninstalling.");
+            const auto expected = *selected_uninstall_review;
+            const auto observe_target = [&] {
+                PackageStore store(root);
+                auto current = store.review_uninstall(uninstall_id);
+                if (current.review != expected)
+                    throw InstallError("AETHER_UNINSTALL_CHANGED",
+                                       "The app changed after review. Open uninstall again to review the current app.");
+                return current;
+            };
+            check_cancelled();
+            auto current = observe_target();
+            if (current.busy) {
+                if (!close_consent)
+                    throw InstallError("AETHER_INSTALL_BUSY",
+                                       "The app is in use. Close it or explicitly choose to close it before uninstalling.");
+                if (current.app.shell != ShellState::ready || current.app.launcher.empty())
+                    throw InstallError("AETHER_UNINSTALL_CLOSE_UNAVAILABLE",
+                                       "This session cannot be closed here. Close the app, then open uninstall again.");
+                const auto relaunch = shell_relaunch(current.app, root);
+                check_cancelled();
+                uninstall_stage.store(UninstallStage::closing);
+                const auto request = host::request_installed_window_close(
+                    current.app.id, std::filesystem::path(utf16(current.app.launcher)), relaunch);
+                if (request.status != host::InstalledCloseStatus::requested || request.requested != 1)
+                    throw InstallError("AETHER_UNINSTALL_CLOSE_UNAVAILABLE",
+                                       "A close request could not be confirmed for this app. Nothing was uninstalled. "
+                                       "Close the app, then open uninstall again.");
+                uninstall_stage.store(UninstallStage::waiting);
+                const auto deadline = GetTickCount64() + 30000;
+                for (;;) {
+                    check_cancelled();
+                    bool ready = false;
+                    try {
+                        current = observe_target();
+                        ready = !current.busy;
+                    } catch (const InstallError &error) {
+                        if (error.code == "AETHER_UNINSTALL_CHANGED")
+                            throw;
+                        // Recover reads only, never resend close or retry removal.
+                    }
+                    if (ready)
+                        break;
+                    if (GetTickCount64() >= deadline)
+                        throw InstallError("AETHER_INSTALL_BUSY",
+                                           "The app has not finished closing. Nothing was uninstalled. "
+                                           "Close the app, then open uninstall again.");
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+            // This gate arbitrates cancellation against the one mutation attempt.
+            // Every read scope has ended before requesting exclusive store access.
+            auto gate = UninstallGate::preparing;
+            if (!uninstall_gate.compare_exchange_strong(gate, UninstallGate::committing)) {
+                check_cancelled();
+                throw InstallError("AETHER_UNINSTALL_STATE", "Uninstall already has a mutation decision.");
+            }
+            uninstall_stage.store(UninstallStage::removing);
+            ++attempts;
+            PackageStore store(root, PackageStore::Access::write);
+            result.app = store.uninstall(uninstall_id, keep_data, expected);
+        } catch (const std::exception &error) {
+            result.code = error_code(error);
+            result.message = error.what();
+            result.cancelled = result.code == "AETHER_UNINSTALL_CANCELLED";
+        }
+        return result;
+    }
+    void cancel_uninstall() {
+        if (!uninstalling || !busy)
+            return;
+        auto gate = UninstallGate::preparing;
+        if (uninstall_gate.compare_exchange_strong(gate, UninstallGate::cancelled)) {
+            set_text(status, L"Cancelling uninstall. A close request in progress may still close the app.");
+            EnableWindow(cancel, FALSE);
+            EnableWindow(close, FALSE);
+        }
+    }
     void start_install() {
         if (busy || finished || !shown.available || (!uninstalling && !shown.identity))
             return;
+        const bool close_consent = uninstalling && SendMessageW(close_app_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        if (uninstalling && shown.app_busy && !close_consent) {
+            set_text(status, L"Select the close-app choice, or close the app before uninstalling.");
+            SetFocus(close_app_check);
+            return;
+        }
         busy = true;
         cancelled = false;
-        ++attempts;
+        if (!uninstalling)
+            ++attempts;
         selected_current = shown.current;
+        selected_uninstall_review = shown.uninstall_review;
         const auto expected_identity = shown.identity.value_or(shell::IconDigest{});
         if (uninstalling) {
             keep_data = SendMessageW(keep_check, BM_GETCHECK, 0, 0) == BST_CHECKED;
             ShowWindow(keep_check, SW_HIDE);
+            ShowWindow(close_app_check, SW_HIDE);
         }
         const auto permissions_value = shown.current ? shown.current->permissions : grants;
         commit_started = GetTickCount64();
         for (const auto item : {permissions, cancel, action, subtitle})
             ShowWindow(item, SW_HIDE);
         EnableWindow(close, FALSE);
+        if (uninstalling) {
+            set_text(cancel, L"Cancel uninstall");
+            MoveWindow(cancel, px(444), px(320), px(160), px(42), TRUE);
+            ShowWindow(cancel, SW_SHOW);
+            EnableWindow(close, TRUE);
+            SetFocus(cancel);
+        }
         MoveWindow(picture, px(276), px(58), px(88), px(88), TRUE);
         SetWindowLongPtrW(title, GWL_STYLE, GetWindowLongPtrW(title, GWL_STYLE) | SS_CENTER);
         MoveWindow(title, px(36), px(160), px(568), px(40), TRUE);
@@ -432,15 +587,13 @@ struct Installer {
         SendMessageW(progress, PBM_SETMARQUEE, TRUE, 20);
         // Freeze the displayed source identity and update target. No timer result
         // may silently change what the user just selected; one write attempt only.
-        write = std::async(std::launch::async, [this, expected_identity, permissions_value] {
+        write = std::async(std::launch::async, [this, expected_identity, permissions_value, close_consent] {
             Outcome result;
             try {
                 if (read.valid())
                     read.wait();
                 if (uninstalling) {
-                    PackageStore store(root, PackageStore::Access::write);
-                    result.app = store.uninstall(uninstall_id, keep_data);
-                    return result;
+                    return remove_reviewed(close_consent);
                 }
                 shell::IconSource input(source, true);
                 if (input.identity() != expected_identity)
@@ -462,12 +615,15 @@ struct Installer {
     }
     void complete(Outcome value) {
         outcome = std::move(value);
+        if (outcome.cancelled)
+            cancelled = true;
         busy = false;
         finished = true;
         install_ms = GetTickCount64() - commit_started;
         SendMessageW(progress, PBM_SETMARQUEE, FALSE, 0);
         ShowWindow(progress, SW_HIDE);
-        set_text(title, uninstalling ? (outcome.app ? L"App uninstalled" : L"Couldn't uninstall app")
+        set_text(title, uninstalling ? (outcome.cancelled ? L"Uninstall cancelled"
+                                        : outcome.app ? L"App uninstalled" : L"Couldn't uninstall app")
                                     : outcome.app ? (selected_current ? L"App updated" : L"App installed")
                                                   : L"Couldn't install app");
         MoveWindow(status, px(36), px(212), px(568), px(62), TRUE);
@@ -478,6 +634,7 @@ struct Installer {
                                      : display(outcome.message, uninstalling ? "Uninstallation failed."
                                                                            : "Installation failed."));
         set_text(action, L"Close");
+        ShowWindow(cancel, SW_HIDE);
         ShowWindow(action, SW_SHOW);
         EnableWindow(action, TRUE);
         EnableWindow(close, TRUE);
@@ -500,7 +657,22 @@ struct Installer {
             default:
                 break;
             }
-            set_text(status, uninstalling ? L"Removing app files and Windows entries" : label);
+            if (uninstalling) {
+                const auto gate = uninstall_gate.load();
+                if (gate == UninstallGate::committing) {
+                    ShowWindow(cancel, SW_HIDE);
+                    EnableWindow(close, FALSE);
+                }
+                if (gate != UninstallGate::cancelled) {
+                    switch (uninstall_stage.load()) {
+                    case UninstallStage::checking: label = L"Checking the reviewed app"; break;
+                    case UninstallStage::closing: label = L"Requesting the app to close"; break;
+                    case UninstallStage::waiting: label = L"Waiting for the app to finish closing"; break;
+                    case UninstallStage::removing: label = L"Removing app files and Windows entries"; break;
+                    }
+                    set_text(status, label);
+                }
+            } else set_text(status, label);
             if (!write.valid() || write.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
                 return;
             complete(write.get());
@@ -566,14 +738,20 @@ struct Installer {
                         self->start_install();
                 } else if (LOWORD(wparam) == permissions_id)
                     self->show_permissions();
-                else if ((LOWORD(wparam) == IDCANCEL || LOWORD(wparam) == close_id) && !self->busy)
-                    DestroyWindow(hwnd);
+                else if (LOWORD(wparam) == IDCANCEL || LOWORD(wparam) == close_id) {
+                    if (!self->busy)
+                        DestroyWindow(hwnd);
+                    else
+                        self->cancel_uninstall();
+                }
                 return 0;
             case WM_CLOSE:
                 if (hwnd == self->permission_window)
                     self->close_permissions();
                 else if (!self->busy)
                     DestroyWindow(hwnd);
+                else
+                    self->cancel_uninstall();
                 return 0;
             case WM_DESTROY:
                 if (hwnd == self->window)

@@ -33,6 +33,29 @@ Status metadata_file_status(host::FileError error) noexcept {
     default: return Status::invalid;
     }
 }
+Status clipboard_wire_status(host::ClipboardStatus status) {
+    switch (status) {
+    case host::ClipboardStatus::ok: return Status::ok;
+    case host::ClipboardStatus::denied: return Status::denied;
+    case host::ClipboardStatus::unsupported:
+    case host::ClipboardStatus::unavailable: return Status::unsupported;
+    case host::ClipboardStatus::invalid: return Status::invalid;
+    case host::ClipboardStatus::quota: return Status::quota;
+    }
+    throw ProtocolError("AETHER_IPC_CLIPBOARD: unknown typed status");
+}
+host::ClipboardStatus clipboard_reply(const Frame &response) {
+    if (response.payload.size() < 8)
+        throw ProtocolError("AETHER_IPC_CLIPBOARD: incomplete typed reply");
+    const auto value = read_u64(response.payload, 0);
+    if (value > static_cast<std::uint64_t>(host::ClipboardStatus::unavailable))
+        throw ProtocolError("AETHER_IPC_CLIPBOARD: unknown typed status");
+    const auto status = static_cast<host::ClipboardStatus>(value);
+    if (response.header.status != clipboard_wire_status(status) ||
+        (status != host::ClipboardStatus::ok && response.payload.size() != 8))
+        throw ProtocolError("AETHER_IPC_CLIPBOARD: inconsistent typed reply");
+    return status;
+}
 } // namespace
 struct BrokerClient::Impl {
     HANDLE reader, writer;
@@ -40,9 +63,15 @@ struct BrokerClient::Impl {
     std::uint64_t next = 1;
     const std::uint64_t request_limit;
     bool broken = false;
+    bool documents_revoked = false;
     const bool activity_commands;
-    std::optional<std::chrono::steady_clock::time_point> activity_deadline;
+    std::optional<AwakeDeadlineClock::time_point> activity_deadline;
     std::uint64_t activity_next = 1;
+    std::uint64_t text_edit_next = 1, text_edit_revision = 0;
+    bool text_edit_sending = false;
+    std::uint64_t soft_input_next = 1, soft_input_revision = 0;
+    bool soft_input_sending = false;
+    bool terminal_activation_attempted = false;
     std::optional<ActivityReassembly> activity_inbox;
     std::unique_ptr<PipeFramePoller> activity_poller;
     const std::thread::id owner = std::this_thread::get_id();
@@ -50,8 +79,15 @@ struct BrokerClient::Impl {
         int guest = 0;
         std::uint64_t token = 0;
         file_transport::Position position;
+        bool document = false;
+        std::uint64_t document_drop_id = 0;
     };
     std::array<Descriptor, 16> files{};
+    struct DropClaim {
+        std::uint64_t id = 0;
+        std::string uri;
+    };
+    std::array<DropClaim, host::document_drop_limit> drop_claims{};
     int next_descriptor = 3;
     Impl(HANDLE input, HANDLE output, std::uint64_t identity, bool interactive, bool activity_commands)
         : reader(input), writer(output), session(identity),
@@ -60,7 +96,7 @@ struct BrokerClient::Impl {
             throw ProtocolError("AETHER_IPC_CLIENT: invalid channel");
     }
     void check_activity_deadline() const {
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = AwakeDeadlineClock::now();
         if (activity_deadline && now >= *activity_deadline)
             throw ProtocolError("AETHER_IPC_CLIENT: activity command reassembly timed out");
         if (activity_poller) {
@@ -75,13 +111,13 @@ struct BrokerClient::Impl {
             throw ProtocolError("AETHER_IPC_CLIENT: activity mailbox is unavailable");
         if (!activity_inbox) {
             activity_inbox.emplace(Operation::activity_command, activity_next, session, activity_command_limit);
-            activity_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            activity_deadline = AwakeDeadlineClock::now() + std::chrono::seconds(15);
         }
         activity_inbox->accept(frame);
         if (activity_inbox->complete()) activity_deadline.reset();
     }
     Frame request(Operation operation, std::vector<std::uint8_t> payload) {
-        if (std::this_thread::get_id() != owner || broken || next > request_limit)
+        if (std::this_thread::get_id() != owner || broken || terminal_activation_attempted || next > request_limit)
             throw ProtocolError("AETHER_IPC_CLIENT: wrong thread, closed channel or request quota");
         Frame message{{operation, next++, session, static_cast<std::uint32_t>(payload.size()), Status::ok},
                       std::move(payload)};
@@ -130,9 +166,19 @@ struct BrokerClient::Impl {
         if (std::this_thread::get_id() != owner || broken || descriptor < 3)
             return nullptr;
         for (auto &entry : files)
-            if (entry.guest == descriptor)
+            if (entry.guest == descriptor && !entry.document)
                 return &entry;
         return nullptr;
+    }
+    Descriptor *find_document(int descriptor) noexcept {
+        if (std::this_thread::get_id() != owner || broken || descriptor < 3) return nullptr;
+        for (auto &entry : files) if (entry.guest == descriptor && entry.document) return &entry;
+        return nullptr;
+    }
+    void document_failure() noexcept {
+        broken = true;
+        for (auto &entry : files) if (entry.document) entry = {};
+        for (auto &claim : drop_claims) claim = {};
     }
 };
 BrokerClient::BrokerClient(HANDLE reader, HANDLE writer, std::uint64_t session, bool interactive,
@@ -142,11 +188,159 @@ BrokerClient::~BrokerClient() = default; // The broker owns cleanup even after a
 Frame BrokerClient::request(Operation operation, std::vector<std::uint8_t> payload) {
     return impl_->request(operation, std::move(payload));
 }
+void BrokerClient::send_text_edit_observation(const android::TextEditObservation &observation, std::uint64_t context) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner || p.broken || p.terminal_activation_attempted || !p.activity_commands || p.text_edit_sending || p.soft_input_sending ||
+        p.text_edit_next == UINT64_MAX || context == UINT64_MAX ||
+        (context && context + 1 != p.activity_next) || observation.event.revision <= p.text_edit_revision)
+        throw ProtocolError("AETHER_IPC_TEXT_EDIT: wrong owner, closed stream or invalid sequence");
+    p.text_edit_sending = true;
+    struct Reset { bool &active; ~Reset() { active = false; } } reset{p.text_edit_sending};
+    try {
+        const auto encoded = encode_activity_text_edit_observation(observation);
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(8 + encoded.size());
+        append_u64(bytes, context);
+        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        const auto ordinal = p.text_edit_next++;
+        const auto deadline = AwakeDeadlineClock::now() + std::chrono::seconds(15);
+        const auto check = [&] {
+            p.check_activity_deadline();
+            if (AwakeDeadlineClock::now() >= deadline)
+                throw ProtocolError("AETHER_IPC_TEXT_EDIT: acknowledgement deadline expired");
+        };
+        check();
+        for (std::size_t offset = 0; offset < bytes.size(); offset += maximum_payload - 16) {
+            write_pipe_frame(p.writer, activity_fragment(bytes, offset, Operation::activity_text_edit, ordinal, p.session));
+            check();
+        }
+        if (!p.activity_poller)
+            p.activity_poller = std::make_unique<PipeFramePoller>(p.reader, std::chrono::milliseconds{15000});
+        for (;;) {
+            check();
+            const auto response = p.activity_poller->poll();
+            if (!response) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            check();
+            if (response->header.operation == Operation::activity_command) {
+                p.accept_activity(*response);
+                continue;
+            }
+            if (response->header.operation != Operation::activity_text_edit_ack ||
+                response->header.session != p.session || response->header.sequence != ordinal ||
+                response->header.status != Status::ok || response->payload.size() != 16 ||
+                read_u64(response->payload, 0) != context || read_u64(response->payload, 8) != observation.event.revision)
+                throw ProtocolError("AETHER_IPC_TEXT_EDIT: acknowledgement identity mismatch");
+            p.text_edit_revision = observation.event.revision;
+            return;
+        }
+    } catch (...) { p.broken = true; throw; }
+}
+bool BrokerClient::send_soft_input_observation(const android::SoftInputObservation &observation, std::uint64_t context) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner || p.broken || p.terminal_activation_attempted || !p.activity_commands || p.text_edit_sending || p.soft_input_sending ||
+        p.soft_input_next == UINT64_MAX || context == UINT64_MAX ||
+        (context && context + 1 != p.activity_next) || observation.request.revision <= p.soft_input_revision)
+        throw ProtocolError("AETHER_IPC_SOFT_INPUT: wrong owner, closed stream or invalid sequence");
+    p.soft_input_sending = true;
+    struct Reset { bool &active; ~Reset() { active = false; } } reset{p.soft_input_sending};
+    try {
+        const auto encoded = encode_activity_soft_input_observation(observation);
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(8 + encoded.size());
+        append_u64(bytes, context);
+        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        const auto ordinal = p.soft_input_next++;
+        const auto deadline = AwakeDeadlineClock::now() + std::chrono::seconds(15);
+        const auto check = [&] {
+            p.check_activity_deadline();
+            if (AwakeDeadlineClock::now() >= deadline)
+                throw ProtocolError("AETHER_IPC_SOFT_INPUT: acknowledgement deadline expired");
+        };
+        check();
+        for (std::size_t offset = 0; offset < bytes.size(); offset += maximum_payload - 16) {
+            write_pipe_frame(p.writer, activity_fragment(bytes, offset, Operation::activity_soft_input, ordinal, p.session));
+            check();
+        }
+        if (!p.activity_poller)
+            p.activity_poller = std::make_unique<PipeFramePoller>(p.reader, std::chrono::milliseconds{15000});
+        for (;;) {
+            check();
+            const auto response = p.activity_poller->poll();
+            if (!response) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            check();
+            if (response->header.operation == Operation::activity_command) {
+                p.accept_activity(*response);
+                continue;
+            }
+            if (response->header.operation != Operation::activity_soft_input_ack ||
+                response->header.session != p.session || response->header.sequence != ordinal ||
+                response->header.status != Status::ok || response->payload.size() != 24 ||
+                read_u64(response->payload, 0) != context || read_u64(response->payload, 8) != observation.request.revision ||
+                read_u64(response->payload, 16) > 1)
+                throw ProtocolError("AETHER_IPC_SOFT_INPUT: acknowledgement identity mismatch");
+            p.soft_input_revision = observation.request.revision;
+            return read_u64(response->payload, 16) != 0;
+        }
+    } catch (...) { p.broken = true; throw; }
+}
+void BrokerClient::send_terminal_view_activations(const ActivityTerminalActivations &batch, std::uint64_t context) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner || p.broken || !p.activity_commands ||
+        p.terminal_activation_attempted || p.text_edit_sending || p.soft_input_sending ||
+        context == UINT64_MAX || (context && context + 1 != p.activity_next))
+        throw ProtocolError("AETHER_IPC_ACTIVATION_TERMINAL: wrong owner, closed stream or invalid context");
+    // Retire public broker/observation/poll entry points before encoding/writing.
+    // An interrupted or failed terminal transfer is never attempted again.
+    p.terminal_activation_attempted = true;
+    auto deadline = AwakeDeadlineClock::now() + std::chrono::seconds(15);
+    if (p.activity_deadline) deadline = (std::min)(deadline, *p.activity_deadline);
+    try {
+        const auto encoded = encode_activity_terminal_activations(batch);
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(8 + encoded.size());
+        append_u64(bytes, context);
+        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+        const auto check = [&] {
+            p.check_activity_deadline();
+            if (AwakeDeadlineClock::now() >= deadline)
+                throw ProtocolError("AETHER_IPC_ACTIVATION_TERMINAL: custody acknowledgement deadline expired");
+        };
+        check();
+        for (std::size_t offset = 0; offset < bytes.size(); offset += maximum_payload - 16) {
+            write_pipe_frame(p.writer,
+                activity_fragment(bytes, offset, Operation::activity_activation_terminal, 1, p.session));
+            check();
+        }
+        if (!p.activity_poller)
+            p.activity_poller = std::make_unique<PipeFramePoller>(p.reader, std::chrono::milliseconds{15000});
+        for (;;) {
+            check();
+            const auto response = p.activity_poller->poll();
+            if (!response) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            check();
+            if (response->header.operation == Operation::activity_command) {
+                p.accept_activity(*response); // Validate/retain only; never resume guest execution.
+                continue;
+            }
+            if (response->header.operation != Operation::activity_activation_terminal_ack ||
+                response->header.session != p.session || response->header.sequence != 1 ||
+                response->header.status != Status::ok || response->payload.size() != 16 ||
+                read_u64(response->payload, 0) != context ||
+                read_u64(response->payload, 8) != batch.through_revision)
+                throw ProtocolError("AETHER_IPC_ACTIVATION_TERMINAL: custody acknowledgement identity mismatch");
+            return;
+        }
+    } catch (...) { p.broken = true; throw; }
+}
+void BrokerClient::retire_activity_channel() noexcept {
+    if (std::this_thread::get_id() == impl_->owner)
+        impl_->terminal_activation_attempted = true;
+}
 std::optional<std::vector<std::uint8_t>> BrokerClient::poll_activity_command(std::uint64_t sequence) {
     auto &p = *impl_;
     if (std::this_thread::get_id() != p.owner)
         throw ProtocolError("AETHER_IPC_CLIENT: activity poll requires the owner thread");
-    if (p.broken)
+    if (p.broken || p.terminal_activation_attempted)
         throw ProtocolError("AETHER_IPC_CLIENT: activity poll on closed channel");
     try {
         p.check_activity_deadline();
@@ -177,7 +371,7 @@ void BrokerClient::verify_package(std::span<const std::uint8_t> bytes) {
         read_u64(info.payload, 0) != bytes.size() || bytes.empty())
         throw ProtocolError("AETHER_IPC_PACKAGE: mapped package size differs from broker metadata");
     std::size_t offset = 8;
-    const auto digest = read_text(info.payload, offset, 64);
+    const auto digest = security::read_text(info.payload, offset, 64);
     if (digest.size() != 64 || offset != info.payload.size() || apk::sha256(bytes) != digest)
         throw ProtocolError("AETHER_IPC_PACKAGE: mapped package digest differs from broker metadata");
 }
@@ -189,7 +383,7 @@ std::vector<std::uint8_t> BrokerClient::read_package() {
     if (!size || size > 64 * 1024 * 1024)
         throw ProtocolError("AETHER_IPC_PACKAGE: package size exceeds limit");
     std::size_t offset = 8;
-    const auto digest = read_text(info.payload, offset, 64);
+    const auto digest = security::read_text(info.payload, offset, 64);
     if (digest.size() != 64 || offset != info.payload.size())
         throw ProtocolError("AETHER_IPC_PACKAGE: invalid package digest");
     std::vector<std::uint8_t> bytes;
@@ -305,7 +499,12 @@ host::FileResult BrokerClient::open(std::string_view name, host::FileOpen option
         append_text(payload, name);
         const auto response = request(Operation::file_open, std::move(payload));
         const auto result = file_result(response);
-        if (response.payload.size() != 16 || (result.error == host::FileError::none && result.value <= 0))
+        const auto token = static_cast<std::uint64_t>(result.value);
+        if (response.payload.size() != 16 || (result.error == host::FileError::none &&
+            ((token & 0xffffffff00000000ULL) != 0x2ee3000000000000ULL || !(token & 0xffffffffULL) ||
+             std::any_of(impl_->files.begin(), impl_->files.end(), [&](const auto &entry) {
+                 return entry.guest && entry.token == token;
+             }))))
             throw ProtocolError("AETHER_IPC_FILE_RESULT: invalid open response");
         if (result.error != host::FileError::none)
             return result;
@@ -376,7 +575,7 @@ host::FileResult BrokerClient::path_request(unsigned action,host::FileAccessScop
                 action==4?(result.value<=0 || result.value>4096):result.value!=0)))throw ProtocolError("AETHER_IPC_FILE_PATH: invalid path reply");
         if(result.error!=host::FileError::none){if(result.error==host::FileError::io)impl_->broken=true;return result;}
         if(opening){position->directory=action==1;*slot={impl_->next_descriptor++,token,std::move(*position)};return {slot->guest,host::FileError::none};}
-        if(action==4)for(auto &entry:impl_->files)if(entry.guest)file_transport::removed(entry.position,*position,static_cast<std::uint64_t>(result.value));
+        if(action==4)for(auto &entry:impl_->files)if(entry.guest && !entry.document)file_transport::removed(entry.position,*position,static_cast<std::uint64_t>(result.value));
         return result;
     }catch(...){impl_->broken=true;return {-1,host::FileError::io};}
 }
@@ -421,7 +620,7 @@ host::FileResult BrokerClient::rename_path(const host::FilePathRef &source,const
         if(const auto error=endpoint(source,endpoints[0]);error!=host::FileError::none)return {-1,error};
         if(const auto error=endpoint(destination,endpoints[1]);error!=host::FileError::none)return {-1,error};
         std::array<std::optional<ft::Candidate>,ft::descriptor_limit> candidates;
-        try{for(std::size_t i=0;i<impl_->files.size();++i)if(impl_->files[i].guest)candidates[i]=ft::candidate(impl_->files[i].position,endpoints[0],endpoints[1]);}
+        try{for(std::size_t i=0;i<impl_->files.size();++i)if(impl_->files[i].guest && !impl_->files[i].document)candidates[i]=ft::candidate(impl_->files[i].position,endpoints[0],endpoints[1]);}
         catch(const ProtocolError &){return {-1,host::FileError::invalid};}
         host::FileRenameInfo prepared;
         const auto response=request(Operation::file_rename,std::move(payload));const auto result=file_result(response);
@@ -505,7 +704,7 @@ host::FileResult BrokerClient::list_directory(std::vector<host::DirectoryEntry> 
             entry.inode = read_u64(response.payload, offset); offset += 8;
             if (offset == response.payload.size()) throw ProtocolError("AETHER_IPC_DIRECTORY: missing type");
             entry.type = response.payload.at(offset++);
-            entry.name = read_text(response.payload, offset, host::directory_name_limit);
+            entry.name = security::read_text(response.payload, offset, host::directory_name_limit);
             if (!host::valid_directory_entry(entry) ||
                 std::any_of(entries.begin(), entries.end(), [&](const auto &prior) { return prior.name == entry.name; }))
                 throw ProtocolError("AETHER_IPC_DIRECTORY: invalid entry");
@@ -616,7 +815,7 @@ host::FileResult BrokerClient::remove(host::FileAccessScope scope, std::string_v
             (result.error == host::FileError::none && (result.value <= 0 || result.value > 4096)))
             throw ProtocolError("AETHER_IPC_FILE_REMOVE: invalid removal reply");
         if (result.error == host::FileError::io) impl_->broken = true; // An ambiguous completed mutation is never replayed.
-        if(result.error==host::FileError::none)for(auto &entry:impl_->files)if(entry.guest)file_transport::removed(entry.position,*position,static_cast<std::uint64_t>(result.value));
+        if(result.error==host::FileError::none)for(auto &entry:impl_->files)if(entry.guest && !entry.document)file_transport::removed(entry.position,*position,static_cast<std::uint64_t>(result.value));
         return result;
     } catch (...) {
         impl_->broken = true;
@@ -689,5 +888,356 @@ host::FileResult BrokerClient::close(int descriptor) noexcept {
         impl_->broken = true;
         return {-1, host::FileError::io};
     }
+}
+host::FileResult BrokerClient::describe(std::string_view uri, host::DocumentInfo &output) noexcept {
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return {-1, host::FileError::io};
+    if (impl_->documents_revoked) return {-1, host::FileError::denied};
+    if (!host::valid_document_uri(uri)) return {-1, host::FileError::invalid};
+    try {
+        std::vector<std::uint8_t> payload;
+        append_text(payload, uri);
+        const auto response = request(Operation::document_info, std::move(payload));
+        const auto result = file_result(response);
+        if (response.header.status != metadata_file_status(result.error))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: inconsistent description status");
+        if (result.error != host::FileError::none) {
+            if (response.payload.size() != 16)
+                throw ProtocolError("AETHER_IPC_DOCUMENT: description failure has trailing data");
+            if (result.error == host::FileError::io) impl_->document_failure();
+            return result;
+        }
+        std::size_t offset = 16;
+        host::DocumentInfo value;
+        value.uri = security::read_text(response.payload, offset, host::document_uri_prefix.size() + 32);
+        value.mime_type = security::read_text(response.payload, offset, 255);
+        value.display_name = security::read_text(response.payload, offset, 255);
+        value.size = read_u64(response.payload, offset); offset += 8;
+        if (result.value != 0 || offset != response.payload.size() || !host::valid_document_info(value) || value.uri != uri)
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid description");
+        output = std::move(value);
+        return result;
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::open_document(std::string_view uri) noexcept {
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return {-1, host::FileError::io};
+    if (impl_->documents_revoked) return {-1, host::FileError::denied};
+    if (!host::valid_document_uri(uri)) return {-1, host::FileError::invalid};
+    const auto slot = std::find_if(impl_->files.begin(), impl_->files.end(), [](const auto &entry) { return !entry.guest; });
+    if (slot == impl_->files.end() || impl_->next_descriptor == INT_MAX) return {-1, host::FileError::descriptor_limit};
+    try {
+        std::vector<std::uint8_t> payload;
+        append_text(payload, uri);
+        const auto response = request(Operation::document_open, std::move(payload));
+        const auto result = file_result(response);
+        const auto token = static_cast<std::uint64_t>(result.value);
+        if (response.header.status != metadata_file_status(result.error) || response.payload.size() != 16 ||
+            (result.error == host::FileError::none &&
+             ((token & 0xffffffff00000000ULL) != 0x2ee4000000000000ULL || !(token & 0xffffffffULL) ||
+              std::any_of(impl_->files.begin(), impl_->files.end(), [&](const auto &entry) {
+                  return entry.guest && entry.token == token;
+              }))))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid open reply");
+        if (result.error != host::FileError::none) {
+            if (result.error == host::FileError::io) impl_->document_failure();
+            return result;
+        }
+        std::uint64_t drop_id = 0;
+        for (const auto &claim : impl_->drop_claims) if (claim.id && claim.uri == uri) { drop_id = claim.id; break; }
+        *slot = {impl_->next_descriptor++, token, {}, true, drop_id};
+        return {slot->guest, host::FileError::none};
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::read_document(int descriptor, std::span<std::uint8_t> output) noexcept {
+    if (std::this_thread::get_id() != impl_->owner) return {-1, host::FileError::bad_descriptor};
+    if (impl_->documents_revoked) return {-1, host::FileError::bad_descriptor};
+    const auto file = impl_->find_document(descriptor);
+    if (!file) return {-1, host::FileError::bad_descriptor};
+    try {
+        const auto count = std::min(output.size(), transfer_limit);
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, file->token); append_u64(payload, count);
+        const auto response = request(Operation::document_read, std::move(payload));
+        const auto result = file_result(response);
+        const auto bytes = result.error == host::FileError::none ? result.value : 0;
+        if (response.header.status != metadata_file_status(result.error) || bytes < 0 ||
+            static_cast<std::uint64_t>(bytes) > count || response.payload.size() != 16 + static_cast<std::size_t>(bytes))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid read reply");
+        if (result.error == host::FileError::none)
+            std::copy(response.payload.begin() + 16, response.payload.end(), output.begin());
+        else if (result.error == host::FileError::io) impl_->document_failure();
+        return result;
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::close_document(int descriptor) noexcept {
+    if (std::this_thread::get_id() != impl_->owner) return {-1, host::FileError::bad_descriptor};
+    const auto file = std::find_if(impl_->files.begin(), impl_->files.end(), [&](const auto &entry) {
+        return entry.guest == descriptor && entry.document;
+    });
+    if (file == impl_->files.end()) return {-1, host::FileError::bad_descriptor};
+    const auto token = file->token;
+    *file = {}; // Retire before one close attempt, including a broken channel.
+    if (impl_->broken) return {-1, host::FileError::io};
+    try {
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, token);
+        const auto response = request(Operation::document_close, std::move(payload));
+        const auto result = file_result(response);
+        if (response.header.status != metadata_file_status(result.error) || response.payload.size() != 16 ||
+            (result.error == host::FileError::none && result.value != 0))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid close reply");
+        if (result.error == host::FileError::io) impl_->document_failure();
+        return result;
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::claim_drop(std::string_view uri, std::uint64_t drop_id) noexcept {
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return {-1, host::FileError::io};
+    if (impl_->documents_revoked) return {-1, host::FileError::denied};
+    if (!drop_id || !host::valid_document_uri(uri)) return {-1, host::FileError::invalid};
+    auto slot = std::find_if(impl_->drop_claims.begin(), impl_->drop_claims.end(), [&](const auto &claim) {
+        return claim.id == drop_id || (claim.id && claim.uri == uri);
+    });
+    if (slot != impl_->drop_claims.end()) {
+        if (slot->id != drop_id || slot->uri != uri) return {-1, host::FileError::invalid};
+    } else {
+        slot = std::find_if(impl_->drop_claims.begin(), impl_->drop_claims.end(), [](const auto &claim) { return !claim.id; });
+        if (slot == impl_->drop_claims.end()) return {-1, host::FileError::quota};
+    }
+    try {
+        // Allocate local ownership before the once-only host claim. Moving the
+        // accepted record into its reserved fixed slot cannot allocate afterward.
+        Impl::DropClaim claim{drop_id, std::string(uri)};
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, drop_id); append_text(payload, uri);
+        const auto response = request(Operation::document_drop_claim, std::move(payload));
+        const auto result = file_result(response);
+        if (response.header.status != metadata_file_status(result.error) || response.payload.size() != 16 ||
+            (result.error == host::FileError::none && result.value != 0))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid drop claim reply");
+        if (result.error == host::FileError::none) *slot = std::move(claim);
+        else if (result.error == host::FileError::io) impl_->document_failure();
+        return result;
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::release_drop(std::string_view uri, std::uint64_t drop_id) noexcept {
+    if (std::this_thread::get_id() != impl_->owner) return {-1, host::FileError::io};
+    if (!drop_id || !host::valid_document_uri(uri)) return {-1, host::FileError::invalid};
+    const auto claimed = std::find_if(impl_->drop_claims.begin(), impl_->drop_claims.end(), [&](const auto &claim) {
+        return claim.id == drop_id && claim.uri == uri;
+    });
+    if (claimed != impl_->drop_claims.end()) {
+        *claimed = {};
+        for (auto &entry : impl_->files)
+            if (entry.document && entry.document_drop_id == drop_id) entry = {};
+    }
+    // Consume the local exact-source ownership before one release attempt. No
+    // private-file or startup-document descriptor is affected or sent again.
+    if (impl_->broken) return {-1, host::FileError::io};
+    if (impl_->documents_revoked) return {-1, host::FileError::denied};
+    try {
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, drop_id); append_text(payload, uri);
+        const auto response = request(Operation::document_drop_release, std::move(payload));
+        const auto result = file_result(response);
+        if (response.header.status != metadata_file_status(result.error) || response.payload.size() != 16 ||
+            (result.error == host::FileError::none && result.value != 0))
+            throw ProtocolError("AETHER_IPC_DOCUMENT: invalid drop release reply");
+        if (result.error == host::FileError::io) impl_->document_failure();
+        return result;
+    } catch (...) {
+        impl_->document_failure();
+        return {-1, host::FileError::io};
+    }
+}
+host::FileResult BrokerClient::read_drop_text(std::uint64_t drop_id, const host::DropTextInfo &info,
+                                            std::u16string &output) noexcept {
+    using host::FileError;
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return {-1, FileError::io};
+    if (!drop_id || !host::valid_drop_text_info(info)) return {-1, FileError::invalid};
+    try {
+        // Reserve the entire bounded result before consuming the one-shot info
+        // record, including the distinct present-but-empty text selection.
+        std::u16string selected(static_cast<std::size_t>(info.units), u'\0');
+        std::vector<std::uint8_t> query;
+        append_u64(query, drop_id);
+        const auto metadata = request(Operation::drop_text_info, std::move(query));
+        const auto description = file_result(metadata);
+        if (metadata.header.status != metadata_file_status(description.error))
+            throw ProtocolError("AETHER_IPC_DROP_TEXT: inconsistent metadata status");
+        if (description.error != FileError::none) {
+            if (metadata.payload.size() != 16)
+                throw ProtocolError("AETHER_IPC_DROP_TEXT: metadata failure has trailing data");
+            if (description.error == FileError::io) impl_->broken = true;
+            return description;
+        }
+        std::size_t at = 16;
+        host::DropTextInfo actual;
+        actual.units = read_u64(metadata.payload, at); at += 8;
+        actual.utf16le_sha256 = security::read_text(metadata.payload, at, 64);
+        if (description.value != 0 || at != metadata.payload.size() || !host::valid_drop_text_info(actual) || actual != info)
+            throw ProtocolError("AETHER_IPC_DROP_TEXT: metadata differs from the reviewed selection");
+        for (std::uint64_t offset = 0; offset < info.units;) {
+            const auto count = std::min<std::uint64_t>(host::drop_text_chunk_limit, info.units - offset);
+            std::vector<std::uint8_t> payload;
+            append_u64(payload, drop_id); append_u64(payload, offset); append_u64(payload, count);
+            const auto response = request(Operation::drop_text_read, std::move(payload));
+            const auto result = file_result(response);
+            if (response.header.status != metadata_file_status(result.error))
+                throw ProtocolError("AETHER_IPC_DROP_TEXT: inconsistent chunk status");
+            if (result.error != FileError::none) {
+                if (response.payload.size() != 16)
+                    throw ProtocolError("AETHER_IPC_DROP_TEXT: chunk failure has trailing data");
+                if (result.error == FileError::io) impl_->broken = true;
+                return result;
+            }
+            if (result.value != static_cast<std::int64_t>(count) ||
+                response.payload.size() != 16 + static_cast<std::size_t>(count) * 2)
+                throw ProtocolError("AETHER_IPC_DROP_TEXT: invalid bounded chunk extent");
+            for (std::uint64_t index = 0; index < count; ++index) {
+                const auto byte = 16 + static_cast<std::size_t>(index) * 2;
+                selected[static_cast<std::size_t>(offset + index)] = static_cast<char16_t>(
+                    static_cast<std::uint16_t>(response.payload[byte]) |
+                    (static_cast<std::uint16_t>(response.payload[byte + 1]) << 8));
+            }
+            offset += count;
+        }
+        if (!host::matches_drop_text(info, selected))
+            throw ProtocolError("AETHER_IPC_DROP_TEXT: readback differs from the reviewed selection");
+        output = std::move(selected); // No partial text was ever exposed to the caller.
+        return {0, FileError::none};
+    } catch (...) {
+        impl_->broken = true;
+        return {-1, FileError::io};
+    }
+}
+host::ClipboardStatus BrokerClient::has_text(bool &value) noexcept {
+    using host::ClipboardStatus;
+    value = false;
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return ClipboardStatus::unavailable;
+    try {
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, 0);
+        const auto response = request(Operation::clipboard, std::move(payload));
+        const auto status = clipboard_reply(response);
+        if (status != ClipboardStatus::ok) return status;
+        if (response.payload.size() != 16 || read_u64(response.payload, 8) > 1)
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: invalid availability reply");
+        value = read_u64(response.payload, 8) != 0;
+        return ClipboardStatus::ok;
+    } catch (...) { impl_->broken = true; return ClipboardStatus::unavailable; }
+}
+host::ClipboardStatus BrokerClient::read_text(std::optional<std::u16string> &value) noexcept {
+    using host::ClipboardStatus;
+    value.reset(); // A denied or unavailable query never returns earlier clipboard content.
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return ClipboardStatus::unavailable;
+    try {
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, 1);
+        const auto response = request(Operation::clipboard, std::move(payload));
+        const auto status = clipboard_reply(response);
+        if (status != ClipboardStatus::ok) return status;
+        const auto id = read_u64(response.payload, 8), present = read_u64(response.payload, 16);
+        if (present > 1 || (!present && (id || response.payload.size() != 24)) || (present && !id))
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: invalid snapshot identity or presence");
+        if (!present) return ClipboardStatus::ok;
+        std::size_t at = 24;
+        host::DropTextInfo info;
+        info.units = read_u64(response.payload, at); at += 8;
+        info.utf16le_sha256 = security::read_text(response.payload, at, 64);
+        if (at != response.payload.size() || !host::valid_drop_text_info(info))
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: invalid snapshot metadata");
+        std::u16string selected(static_cast<std::size_t>(info.units), u'\0');
+        for (std::uint64_t offset = 0; offset < info.units;) {
+            const auto count = std::min<std::uint64_t>(host::drop_text_chunk_limit, info.units - offset);
+            std::vector<std::uint8_t> query;
+            append_u64(query, 2); append_u64(query, id); append_u64(query, offset); append_u64(query, count);
+            const auto chunk = request(Operation::clipboard, std::move(query));
+            const auto chunk_status = clipboard_reply(chunk);
+            if (chunk_status != ClipboardStatus::ok) return chunk_status;
+            if (chunk.payload.size() != 16 + static_cast<std::size_t>(count) * 2 || read_u64(chunk.payload, 8) != count)
+                throw ProtocolError("AETHER_IPC_CLIPBOARD: invalid snapshot chunk");
+            for (std::uint64_t index = 0; index < count; ++index) {
+                const auto byte = 16 + static_cast<std::size_t>(index) * 2;
+                selected[static_cast<std::size_t>(offset + index)] = static_cast<char16_t>(
+                    static_cast<std::uint16_t>(chunk.payload[byte]) |
+                    (static_cast<std::uint16_t>(chunk.payload[byte + 1]) << 8));
+            }
+            offset += count;
+        }
+        if (!host::matches_drop_text(info, selected))
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: snapshot readback differs from its metadata");
+        value.emplace(std::move(selected));
+        return ClipboardStatus::ok;
+    } catch (...) { impl_->broken = true; return ClipboardStatus::unavailable; }
+}
+host::ClipboardStatus BrokerClient::write_text(std::u16string_view value) noexcept {
+    using host::ClipboardStatus;
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return ClipboardStatus::unavailable;
+    if (!host::valid_drop_text(value)) return ClipboardStatus::invalid;
+    try {
+        const auto info = host::describe_drop_text(value);
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, 3); append_u64(payload, info.units); append_text(payload, info.utf16le_sha256);
+        const auto begun = request(Operation::clipboard, std::move(payload));
+        const auto status = clipboard_reply(begun);
+        if (status != ClipboardStatus::ok) return status;
+        if (begun.payload.size() != 16 || !read_u64(begun.payload, 8))
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: invalid upload identity");
+        const auto id = read_u64(begun.payload, 8);
+        for (std::uint64_t offset = 0; offset < info.units;) {
+            const auto count = std::min<std::uint64_t>(host::drop_text_chunk_limit, info.units - offset);
+            std::vector<std::uint8_t> part;
+            append_u64(part, 4); append_u64(part, id); append_u64(part, offset); append_u64(part, count);
+            for (std::uint64_t index = 0; index < count; ++index) {
+                const auto unit = value[static_cast<std::size_t>(offset + index)];
+                part.push_back(static_cast<std::uint8_t>(unit)); part.push_back(static_cast<std::uint8_t>(unit >> 8));
+            }
+            const auto response = request(Operation::clipboard, std::move(part));
+            const auto chunk_status = clipboard_reply(response);
+            if (chunk_status != ClipboardStatus::ok) return chunk_status;
+            if (response.payload.size() != 8) throw ProtocolError("AETHER_IPC_CLIPBOARD: upload has trailing data");
+            offset += count;
+        }
+        std::vector<std::uint8_t> commit;
+        append_u64(commit, 5); append_u64(commit, id);
+        const auto response = request(Operation::clipboard, std::move(commit));
+        const auto committed = clipboard_reply(response);
+        if (committed == ClipboardStatus::ok && response.payload.size() != 8)
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: commit has trailing data");
+        return committed;
+    } catch (...) { impl_->broken = true; return ClipboardStatus::unavailable; }
+}
+host::ClipboardStatus BrokerClient::clear() noexcept {
+    using host::ClipboardStatus;
+    if (std::this_thread::get_id() != impl_->owner || impl_->broken) return ClipboardStatus::unavailable;
+    try {
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, 6);
+        const auto response = request(Operation::clipboard, std::move(payload));
+        const auto status = clipboard_reply(response);
+        if (status == ClipboardStatus::ok && response.payload.size() != 8)
+            throw ProtocolError("AETHER_IPC_CLIPBOARD: clear has trailing data");
+        return status;
+    } catch (...) { impl_->broken = true; return ClipboardStatus::unavailable; }
+}
+void BrokerClient::revoke_documents() noexcept {
+    if (std::this_thread::get_id() != impl_->owner) return;
+    impl_->documents_revoked = true;
+    for (auto &entry : impl_->files) if (entry.guest && entry.document) (void)close_document(entry.guest);
+    for (auto &claim : impl_->drop_claims) claim = {};
 }
 } // namespace aether::security

@@ -485,8 +485,8 @@
       "version": "16.0.0",
       "license": "Unicode-3.0",
       "scope": "runtime-data",
-      "reason": "Pinned Bionic wide classification and simple case mapping; no host Unicode API.",
-      "transformation": "ADR0295: nonASCII classifier bit intervals and simple UnicodeData mappings; original lookup implementation.",
+      "reason": "Pinned Bionic wide classification/simple case mapping and Java char-based numeric parsing; no host Unicode API.",
+      "transformation": "ADR0295 nonASCII classifier bit intervals/simple mappings, additionally reused by original Java Integer/Long digit lookup under ADR0347; no new Unicode payload.",
       "upstreamFiles": [
         {
           "source": "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt",
@@ -515,6 +515,14 @@
           "path": "third_party/licenses/unicode-16-Unicode-3.0.txt",
           "source": "https://www.unicode.org/license.txt",
           "sha256": "e7a93b009565cfce55919a381437ac4db883e9da2126fa28b91d12732bc53d96"
+        }
+      ],
+      "compatibilityAudits": [
+        {
+          "profile": "Java Integer/Long Character.digit(char,radix) BMP decimal ranges",
+          "source": "https://www.unicode.org/Public/15.1.0/ucd/UnicodeData.txt",
+          "sha256": "2fc713e6a31a87c4850a37fe2caffa4218180fadb5de86b43a143ddb4581fb86",
+          "result": "Same37BMP decimal ten-digit ranges as retained16.0.0 classification; supplementary code points are not single Java chars."
         }
       ]
     }

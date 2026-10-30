@@ -6,10 +6,21 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <ratio>
 #include <string>
 
 namespace aether::security {
 class WorkerProgress;
+// Transport deadlines measure awake Windows time, excluding system sleep and
+// hibernation. This is independent of guest-visible clocks and timeout values.
+struct AwakeDeadlineClock {
+    using rep = std::int64_t;
+    using period = std::ratio<1, 10'000'000>;
+    using duration = std::chrono::duration<rep, period>;
+    using time_point = std::chrono::time_point<AwakeDeadlineClock>;
+    static constexpr bool is_steady = true;
+    static time_point now() noexcept;
+};
 enum class WorkerRole { guest, graphics, metadata };
 struct WorkerOptions {
     std::filesystem::path executable;
@@ -53,13 +64,15 @@ class PipeFramePoller final {
     PipeFramePoller &operator=(const PipeFramePoller &) = delete;
     std::optional<Frame> poll();
     void reset(); // After a successful blocking read consumed the same channel.
-    std::optional<std::chrono::steady_clock::time_point> partial_deadline() const;
+    std::optional<AwakeDeadlineClock::time_point> partial_deadline() const;
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 Frame read_pipe_frame(HANDLE reader);
 void write_pipe_frame(HANDLE writer, const Frame &frame);
+// Fixed terminal diagnostic for a caught host std::bad_alloc; no heap allocation.
+bool write_worker_allocation_failure(HANDLE writer, std::uint64_t session) noexcept;
 // Parent-owned, synchronous single-request channel. A separate hard-deadline thread
 // terminates the job even if the worker blocks a pipe operation. No full-trust fallback.
 class WorkerProcess final {
@@ -73,6 +86,7 @@ class WorkerProcess final {
     Frame receive();
     std::optional<Frame> try_receive_idle(); // Guest interactive idle only; arms exchange on a full frame.
     void begin_exchange();
+    AwakeDeadlineClock::time_point exchange_deadline() const;
     void end_exchange();
     std::uint32_t wait();
     void terminate();

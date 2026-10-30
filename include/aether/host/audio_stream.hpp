@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -19,6 +21,12 @@ enum class AudioState { open, started, paused, flushed, stopping, stopped, close
 struct AudioConfig {
     std::uint32_t sample_rate = 48000, channels = 2;
     bool muted = false; // Trusted-host choice; never the endpoint/master mute.
+};
+// Trusted host context only; never accepted in a worker audio request. The
+// installation owner validates and retains the selected icon's path identity.
+struct AudioSessionIdentity {
+    std::string installed_id, display_name;
+    std::filesystem::path icon_path;
 };
 struct AudioInfo {
     std::string endpoint;
@@ -61,7 +69,7 @@ class AudioService {
 };
 class HostAudioStream final : public AudioStream {
   public:
-    explicit HostAudioStream(AudioConfig config);
+    explicit HostAudioStream(AudioConfig config, std::optional<AudioSessionIdentity> identity = {});
     ~HostAudioStream() override;
     HostAudioStream(const HostAudioStream &) = delete;
     HostAudioStream &operator=(const HostAudioStream &) = delete;
@@ -82,16 +90,19 @@ class HostAudioStream final : public AudioStream {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-// Muting is chosen by the trusted owner and is never supplied by a worker request.
+// Without identity, muting is a trusted fixture choice. Installed sessions use
+// Windows-owned persistent volume/mute controls and never reset their values.
 class HostAudioService final : public AudioService {
   public:
     explicit HostAudioService(bool muted = false) : muted_(muted) {}
+    explicit HostAudioService(AudioSessionIdentity identity) : muted_(false), identity_(std::move(identity)) {}
     std::unique_ptr<AudioStream> open(AudioConfig config) override {
         config.muted = muted_;
-        return std::make_unique<HostAudioStream>(config);
+        return std::make_unique<HostAudioStream>(config, identity_);
     }
 
   private:
     bool muted_;
+    std::optional<AudioSessionIdentity> identity_;
 };
 } // namespace aether::host

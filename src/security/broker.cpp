@@ -1,3 +1,4 @@
+#include "aether/common/text.hpp"
 #include "local_calendar.hpp"
 #include "file_transport.hpp"
 #include "aether/security/broker.hpp"
@@ -28,6 +29,21 @@ Status file_status(host::FileError error) {
     }
 }
 constexpr std::size_t file_transfer_limit = maximum_payload - 16;
+constexpr std::size_t drop_text_stage_limit = 16;
+static_assert(host::drop_text_chunk_limit * 2 <= maximum_payload - 16);
+static_assert(host::drop_text_chunk_limit * 2 + 32 <= maximum_payload);
+static_assert(host::clipboard_text_limit == host::drop_text_limit);
+Status clipboard_status(host::ClipboardStatus status) {
+    switch (status) {
+    case host::ClipboardStatus::ok: return Status::ok;
+    case host::ClipboardStatus::denied: return Status::denied;
+    case host::ClipboardStatus::unsupported:
+    case host::ClipboardStatus::unavailable: return Status::unsupported;
+    case host::ClipboardStatus::invalid: return Status::invalid;
+    case host::ClipboardStatus::quota: return Status::quota;
+    }
+    throw ProtocolError("AETHER_BROKER_CLIPBOARD: invalid provider status");
+}
 std::string package_hash(const std::vector<std::uint8_t> &bytes) {
     return bytes.empty() ? std::string{} : apk::sha256(bytes);
 }
@@ -39,23 +55,233 @@ struct Broker::FilePathLedger {
 Broker::Broker(BrokerPolicy policy, std::shared_ptr<AuditTrail> journal,
                std::unique_ptr<host::FileService> files, std::vector<std::uint8_t> package,
                std::unique_ptr<host::AudioService> audio, bool retain_fixture_pcm,
-               std::unique_ptr<GraphicsService> graphics)
-    : policy_(policy), journal_(std::move(journal)), files_(std::move(files)), file_paths_(std::make_unique<FilePathLedger>()), package_(std::move(package)),
+               std::unique_ptr<GraphicsService> graphics,
+               std::unique_ptr<host::NotificationService> notifications,
+               std::shared_ptr<host::DocumentService> documents,
+               std::unique_ptr<host::ClipboardService> clipboard)
+    : policy_(policy), journal_(std::move(journal)), files_(std::move(files)), documents_(std::move(documents)), file_paths_(std::make_unique<FilePathLedger>()), package_(std::move(package)),
       package_hash_(package_hash(package_)),
-      audio_(policy.audio_playback, std::move(audio), retain_fixture_pcm), graphics_(std::move(graphics)) {
+      audio_(policy.audio_playback, std::move(audio), retain_fixture_pcm), graphics_(std::move(graphics)),
+      notifications_(std::move(notifications)), clipboard_(std::move(clipboard)) {
     if (!policy_.app_id || !policy_.session || !policy_.request_limit || policy_.request_limit > 256)
         throw ProtocolError("AETHER_BROKER_POLICY: invalid identity or quota");
     if (policy_.private_storage && !files_)
         throw ProtocolError("AETHER_BROKER_POLICY: missing storage");
     if (policy_.graphics && !graphics_)
         throw ProtocolError("AETHER_BROKER_POLICY: missing graphics provider");
+    if (policy_.notifications && !notifications_)
+        throw ProtocolError("AETHER_BROKER_POLICY: missing notification provider");
+    if (policy_.clipboard && !clipboard_)
+        throw ProtocolError("AETHER_BROKER_POLICY: missing clipboard provider");
     if (!journal_)
         throw ProtocolError("AETHER_BROKER_POLICY: missing mandatory audit trail");
     journal_->configure(policy.app_id, policy.session,
                         (policy.monotonic_time ? 1u : 0u) | (policy.private_storage ? 2u : 0u) |
                             (policy.interactive ? 4u : 0u) | (policy.audio_playback ? 8u : 0u) |
-                            (policy.graphics ? 16u : 0u) | (policy.wall_time ? 32u : 0u));
+                            (policy.graphics ? 16u : 0u) | (policy.wall_time ? 32u : 0u) |
+                            (policy.notifications ? 64u : 0u) | (documents_ ? 128u : 0u) |
+                            (policy.clipboard ? 256u : 0u));
     audit_.reserve(policy_.request_limit + 1);
+}
+Frame Broker::notification_request(const Frame &request, Frame response) {
+    // Validate the whole request before invoking the app-bound provider once.
+    // No request text is copied into AuditEntry or a diagnostic message.
+    response.header.status = Status::invalid;
+    std::uint64_t action = 4;
+    host::NotificationText value;
+    try {
+        action = read_u64(request.payload, 0);
+        std::size_t offset = 8;
+        if (action == 1 || action == 2) {
+            const auto id = read_u64(request.payload, offset); offset += 8;
+            if (id > UINT32_MAX) return response;
+            value.id = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(id));
+        }
+        if (action == 1) {
+            value.channel = read_text(request.payload, offset, 128);
+            value.title = read_text(request.payload, offset, 256);
+            value.text = read_text(request.payload, offset, 2048);
+            if (value.channel.empty()) return response;
+            const auto valid_text = [](std::string_view text, bool channel) {
+                const auto wide = utf16(text);
+                return std::all_of(wide.begin(), wide.end(), [channel](wchar_t c) {
+                    return c != 0xfffe && c != 0xffff &&
+                        (c >= 0x20 || (!channel && (c == L'\t' || c == L'\n' || c == L'\r')));
+                });
+            };
+            if (!valid_text(value.channel, true) || !valid_text(value.title, false) || !valid_text(value.text, false))
+                return response;
+        }
+        if (action > 3 || offset != request.payload.size()) return response;
+    } catch (const ProtocolError &) { return response; }
+      catch (const std::invalid_argument &) { return response; }
+    if (!policy_.notifications || !notifications_) {
+        // Enabled queries are readonly and report denial as false. Mutations
+        // retain explicit denied status; neither branch touches the provider.
+        response.header.status = action == 0 ? Status::ok : Status::denied;
+        if (action == 0) append_u64(response.payload, 0);
+        return response;
+    }
+    bool enabled = false;
+    const auto result = action == 0 ? notifications_->enabled(enabled) :
+        action == 1 ? notifications_->post(value) :
+        action == 2 ? notifications_->cancel(value.id) : notifications_->cancel_all();
+    switch (result) {
+    case host::NotificationStatus::ok: response.header.status = Status::ok; break;
+    case host::NotificationStatus::denied: response.header.status = Status::denied; break;
+    case host::NotificationStatus::unsupported: response.header.status = Status::unsupported; break;
+    case host::NotificationStatus::invalid: response.header.status = Status::invalid; break;
+    case host::NotificationStatus::quota: response.header.status = Status::quota; break;
+    default: throw ProtocolError("AETHER_BROKER_NOTIFICATION: invalid provider result");
+    }
+    if (action == 0 && result == host::NotificationStatus::ok)
+        append_u64(response.payload, enabled ? 1u : 0u);
+    return response;
+}
+
+Frame Broker::clipboard_request(const Frame &request, Frame response) {
+    using host::ClipboardStatus;
+    const auto answer = [&](ClipboardStatus status) {
+        response.header.status = clipboard_status(status);
+        if (status != ClipboardStatus::ok) response.payload.clear();
+        std::vector<std::uint8_t> payload;
+        append_u64(payload, static_cast<std::uint64_t>(status));
+        payload.insert(payload.end(), response.payload.begin(), response.payload.end());
+        response.payload = std::move(payload);
+        return response;
+    };
+    // Validate a whole typed action before either authority checks or native I/O.
+    std::uint64_t action = 0, id = 0, offset = 0, count = 0;
+    host::DropTextInfo info;
+    std::u16string chunk;
+    try {
+        action = read_u64(request.payload, 0);
+        if (action == 0 || action == 1 || action == 6) {
+            if (request.payload.size() != 8) return answer(ClipboardStatus::invalid);
+        } else if (action == 2 || action == 4) {
+            if (request.payload.size() < 32) return answer(ClipboardStatus::invalid);
+            id = read_u64(request.payload, 8); offset = read_u64(request.payload, 16); count = read_u64(request.payload, 24);
+            if (!id || !count || count > host::drop_text_chunk_limit ||
+                request.payload.size() != (action == 2 ? 32u : 32u + static_cast<std::size_t>(count) * 2))
+                return answer(ClipboardStatus::invalid);
+            if (action == 4) {
+                chunk.resize(static_cast<std::size_t>(count));
+                for (std::size_t index = 0; index < chunk.size(); ++index)
+                    chunk[index] = static_cast<char16_t>(static_cast<std::uint16_t>(request.payload[32 + index * 2]) |
+                        (static_cast<std::uint16_t>(request.payload[33 + index * 2]) << 8));
+            }
+        } else if (action == 3) {
+            std::size_t at = 8;
+            info.units = read_u64(request.payload, at); at += 8;
+            info.utf16le_sha256 = read_text(request.payload, at, 64);
+            if (at != request.payload.size() || !host::valid_drop_text_info(info)) return answer(ClipboardStatus::invalid);
+        } else if (action == 5) {
+            if (request.payload.size() != 16 || !(id = read_u64(request.payload, 8)))
+                return answer(ClipboardStatus::invalid);
+        } else return answer(ClipboardStatus::invalid);
+    } catch (const ProtocolError &) { return answer(ClipboardStatus::invalid); }
+    if (!policy_.clipboard || !clipboard_) {
+        clipboard_read_.reset(); clipboard_write_.reset();
+        return answer(ClipboardStatus::denied);
+    }
+    const auto check = [&](std::uint64_t expected, std::uint64_t &actual) {
+        actual = 0;
+        const auto status = clipboard_->check_access(actual);
+        (void)clipboard_status(status); // Unknown native statuses are a terminal provider failure.
+        if (status != ClipboardStatus::ok || !actual || (expected && actual != expected)) {
+            clipboard_read_.reset(); clipboard_write_.reset();
+            return status == ClipboardStatus::ok ? ClipboardStatus::denied : status;
+        }
+        return ClipboardStatus::ok;
+    };
+    std::uint64_t epoch = 0;
+    const auto access = check(0, epoch);
+    if (access != ClipboardStatus::ok) return answer(access);
+    // A complete loss/regain cycle must not resume an old snapshot or upload.
+    if (clipboard_read_ && clipboard_read_->epoch != epoch) clipboard_read_.reset();
+    if (clipboard_write_ && clipboard_write_->epoch != epoch) clipboard_write_.reset();
+    if (action == 0) {
+        bool available = false;
+        const auto status = clipboard_->has_text(available);
+        if (status != ClipboardStatus::ok) return answer(status);
+        std::uint64_t current = 0;
+        const auto still_allowed = check(epoch, current);
+        if (still_allowed != ClipboardStatus::ok) return answer(still_allowed);
+        append_u64(response.payload, available);
+        return answer(ClipboardStatus::ok);
+    }
+    if (action == 1) {
+        if (clipboard_read_) return answer(ClipboardStatus::quota);
+        if (next_clipboard_id_ == UINT64_MAX) return answer(ClipboardStatus::quota);
+        const auto selected_id = next_clipboard_id_++;
+        std::optional<std::u16string> selected;
+        const auto status = clipboard_->read_text(selected); // Exactly one native clipboard snapshot.
+        if (status != ClipboardStatus::ok) return answer(status);
+        std::uint64_t current = 0;
+        const auto still_allowed = check(epoch, current);
+        if (still_allowed != ClipboardStatus::ok) return answer(still_allowed);
+        if (!selected) {
+            append_u64(response.payload, 0); append_u64(response.payload, 0);
+            return answer(ClipboardStatus::ok);
+        }
+        if (!host::valid_drop_text(*selected)) return answer(ClipboardStatus::invalid);
+        auto selected_info = host::describe_drop_text(*selected);
+        append_u64(response.payload, selected_id); append_u64(response.payload, 1);
+        append_u64(response.payload, selected_info.units); append_text(response.payload, selected_info.utf16le_sha256);
+        if (!selected->empty())
+            clipboard_read_.emplace(ClipboardTransfer{selected_id, epoch, std::move(selected_info), std::move(*selected), 0});
+        return answer(ClipboardStatus::ok);
+    }
+    if (action == 2) {
+        if (!clipboard_read_ || clipboard_read_->id != id) return answer(ClipboardStatus::denied);
+        auto &selected = *clipboard_read_;
+        if (offset != selected.next_offset || offset > selected.info.units || count > selected.info.units - offset) {
+            clipboard_read_.reset(); return answer(ClipboardStatus::invalid);
+        }
+        append_u64(response.payload, count);
+        for (std::uint64_t index = 0; index < count; ++index) {
+            const auto unit = selected.text[static_cast<std::size_t>(offset + index)];
+            response.payload.push_back(static_cast<std::uint8_t>(unit));
+            response.payload.push_back(static_cast<std::uint8_t>(unit >> 8));
+        }
+        std::uint64_t current = 0;
+        const auto still_allowed = check(epoch, current);
+        if (still_allowed != ClipboardStatus::ok) return answer(still_allowed);
+        selected.next_offset += count;
+        if (selected.next_offset == selected.info.units) clipboard_read_.reset();
+        return answer(ClipboardStatus::ok);
+    }
+    if (action == 3) {
+        if (clipboard_write_ || next_clipboard_id_ == UINT64_MAX) return answer(ClipboardStatus::quota);
+        ClipboardTransfer selected{next_clipboard_id_++, epoch, info,
+            std::u16string(static_cast<std::size_t>(info.units), u'\0'), 0};
+        const auto selected_id = selected.id;
+        clipboard_write_.emplace(std::move(selected));
+        append_u64(response.payload, selected_id);
+        return answer(ClipboardStatus::ok);
+    }
+    if (action == 4) {
+        if (!clipboard_write_ || clipboard_write_->id != id) return answer(ClipboardStatus::denied);
+        auto &selected = *clipboard_write_;
+        if (offset != selected.next_offset || offset > selected.info.units || count > selected.info.units - offset) {
+            clipboard_write_.reset(); return answer(ClipboardStatus::invalid);
+        }
+        std::copy(chunk.begin(), chunk.end(), selected.text.begin() + static_cast<std::ptrdiff_t>(offset));
+        selected.next_offset += count;
+        return answer(ClipboardStatus::ok);
+    }
+    if (action == 5) {
+        if (!clipboard_write_ || clipboard_write_->id != id) return answer(ClipboardStatus::denied);
+        auto selected = std::move(*clipboard_write_);
+        clipboard_write_.reset(); // Consume before validation and one non-replayable native write.
+        if (selected.next_offset != selected.info.units || !host::matches_drop_text(selected.info, selected.text))
+            return answer(ClipboardStatus::invalid);
+        std::uint64_t current = 0;
+        const auto still_allowed = check(selected.epoch, current); // Arm the captured tenure immediately before the native attempt.
+        if (still_allowed != ClipboardStatus::ok) return answer(still_allowed);
+        return answer(clipboard_->write_text(selected.text));
+    }
+    return answer(clipboard_->clear()); // Action6: one native clear, never an implicit write retry.
 }
 Broker::~Broker() { revoke_all(); }
 void Broker::bind_worker_thread(const WorkerProcess &worker) {
@@ -70,10 +296,17 @@ void Broker::close() noexcept {
     revoke_all();
 }
 void Broker::revoke_all() noexcept {
+    policy_.clipboard = false;
+    clipboard_read_.reset(); clipboard_write_.reset(); clipboard_.reset();
+    drop_texts_revoked_ = true;
+    drop_texts_.clear();
     time_.unbind_thread();
     revoke_storage();
+    revoke_documents();
     revoke_audio();
     revoke_graphics();
+    policy_.notifications = false;
+    notifications_.reset(); // Release local resources, never implicitly clear persistent user history.
 }
 void Broker::revoke_graphics() noexcept {
     policy_.graphics = false;
@@ -93,6 +326,218 @@ void Broker::revoke_storage() noexcept {
     }
     descriptors_.clear();
     file_paths_->positions.clear();
+}
+void Broker::revoke_documents() noexcept {
+    documents_revoked_ = true;
+    while (!document_descriptors_.empty()) {
+        auto node = document_descriptors_.extract(document_descriptors_.begin());
+        (void)node.mapped().provider->close_document(node.mapped().descriptor);
+    }
+    while (!drop_documents_.empty()) discard_drop_document(drop_documents_.begin()->first);
+    const auto startup = std::move(documents_);
+    if (startup) startup->revoke_documents();
+}
+host::FileResult Broker::stage_drop_document(const host::DocumentInfo &info,
+                                            std::shared_ptr<host::DocumentService> service,
+                                            std::uint64_t drop_id) {
+    using host::FileError;
+    if (closed_ || executing_ || idle_dispatch_ || !policy_.interactive || documents_revoked_)
+        return {-1, FileError::denied};
+    if (!drop_id || drop_id <= last_drop_id_) return {-1, FileError::invalid};
+    last_drop_id_ = drop_id; // An unsuccessful admission cannot reuse its identity.
+    if (!service || !host::valid_document_info(info) || service == documents_) return {-1, FileError::invalid};
+    if (drop_documents_.size() >= host::document_drop_limit) return {-1, FileError::quota};
+    for (const auto &[id, existing] : drop_documents_) {
+        (void)id;
+        if (existing.info.uri == info.uri || existing.provider == service) return {-1, FileError::invalid};
+    }
+    // The launch provider remains independent. A nonce collision must not let a
+    // drop shadow its URI or later revoke the startup source.
+    if (documents_) {
+        host::DocumentInfo startup;
+        const auto result = documents_->describe(info.uri, startup);
+        if (result.error == FileError::none || startup != host::DocumentInfo{}) return {-1, FileError::invalid};
+        if (result.value != -1 || static_cast<unsigned>(result.error) > static_cast<unsigned>(FileError::not_empty))
+            throw ProtocolError("AETHER_BROKER_DOCUMENT: invalid startup description result");
+        if (result.error != FileError::denied && result.error != FileError::missing) return result;
+    }
+    host::DocumentInfo actual;
+    const auto result = service->describe(info.uri, actual);
+    if (result.error != FileError::none) {
+        if (result.value != -1 || actual != host::DocumentInfo{} ||
+            static_cast<unsigned>(result.error) > static_cast<unsigned>(FileError::not_empty))
+            throw ProtocolError("AETHER_BROKER_DOCUMENT: invalid staged description result");
+        return result;
+    }
+    if (result.value != 0 || actual != info)
+        throw ProtocolError("AETHER_BROKER_DOCUMENT: staged source differs from the reviewed document");
+    drop_documents_.emplace(drop_id, DropDocument{info, std::move(service), false});
+    return {0, FileError::none};
+}
+void Broker::discard_drop_document(std::uint64_t drop_id) noexcept {
+    const auto found = drop_documents_.find(drop_id);
+    if (found == drop_documents_.end()) return;
+    const auto source = found->second.provider;
+    drop_documents_.erase(found); // Consume authority before provider calls.
+    for (auto at = document_descriptors_.begin(); at != document_descriptors_.end();) {
+        if (at->second.drop_id != drop_id) { ++at; continue; }
+        const auto descriptor = at->second.descriptor;
+        at = document_descriptors_.erase(at);
+        (void)source->close_document(descriptor);
+    }
+    source->revoke_documents();
+}
+void Broker::finish_drop_document(std::uint64_t drop_id) noexcept {
+    const auto found = drop_documents_.find(drop_id);
+    if (found != drop_documents_.end() && !found->second.active) discard_drop_document(drop_id);
+}
+host::FileResult Broker::stage_drop_text(const host::DropTextInfo &info, std::u16string text,
+                                        std::uint64_t drop_id) {
+    using host::FileError;
+    if (closed_ || executing_ || idle_dispatch_ || !policy_.interactive || drop_texts_revoked_)
+        return {-1, FileError::denied};
+    if (!drop_id || drop_id <= last_drop_id_) return {-1, FileError::invalid};
+    last_drop_id_ = drop_id; // File and text drops share one non-replayed native identity sequence.
+    if (!host::matches_drop_text(info, text)) return {-1, FileError::invalid};
+    if (drop_texts_.size() >= drop_text_stage_limit) return {-1, FileError::quota};
+    drop_texts_.emplace(drop_id, DropText{info, std::move(text), 0, false});
+    return {0, FileError::none};
+}
+void Broker::discard_drop_text(std::uint64_t drop_id) noexcept { drop_texts_.erase(drop_id); }
+host::FileResult Broker::drop_text_request(const Frame &request, Frame &response) {
+    using host::FileError;
+    if (drop_texts_revoked_) return {-1, FileError::denied};
+    const bool information = request.header.operation == Operation::drop_text_info;
+    if (request.payload.size() != (information ? 8u : 24u)) return {-1, FileError::invalid};
+    const auto drop_id = read_u64(request.payload, 0);
+    if (!drop_id) return {-1, FileError::invalid};
+    const auto found = drop_texts_.find(drop_id);
+    if (found == drop_texts_.end()) return {-1, FileError::denied};
+    auto &selected = found->second;
+    if (information) {
+        if (selected.info_read) return {-1, FileError::denied};
+        append_u64(response.payload, selected.info.units);
+        append_text(response.payload, selected.info.utf16le_sha256);
+        selected.info_read = true; // Includes the genuine empty selection; never replay intake.
+        return {0, FileError::none};
+    }
+    const auto offset = read_u64(request.payload, 8), count = read_u64(request.payload, 16);
+    if (!selected.info_read || !count || count > host::drop_text_chunk_limit ||
+        offset != selected.next_offset || offset > selected.info.units || count > selected.info.units - offset)
+        return {-1, FileError::invalid};
+    response.payload.reserve(static_cast<std::size_t>(count) * 2);
+    for (std::uint64_t index = 0; index < count; ++index) {
+        const auto unit = selected.text[static_cast<std::size_t>(offset + index)];
+        response.payload.push_back(static_cast<std::uint8_t>(unit));
+        response.payload.push_back(static_cast<std::uint8_t>(unit >> 8));
+    }
+    selected.next_offset += count; // Consume only after the complete bounded chunk is retained.
+    return {static_cast<std::int64_t>(count), FileError::none};
+}
+host::FileResult Broker::document_request(const Frame &request, Frame &response) {
+    using host::FileError;
+    if (documents_revoked_) return {-1, FileError::denied};
+    const auto valid_result = [](const host::FileResult &result) {
+        return static_cast<unsigned>(result.error) <= static_cast<unsigned>(FileError::not_empty) &&
+               (result.error == FileError::none || result.value == -1);
+    };
+    if (request.header.operation == Operation::document_drop_claim ||
+        request.header.operation == Operation::document_drop_release) {
+        std::uint64_t drop_id = 0;
+        std::string uri;
+        try {
+            drop_id = read_u64(request.payload, 0);
+            std::size_t offset = 8;
+            uri = read_text(request.payload, offset, host::document_uri_prefix.size() + 32);
+            if (!drop_id || offset != request.payload.size() || !host::valid_document_uri(uri))
+                return {-1, FileError::invalid};
+        } catch (const ProtocolError &) { return {-1, FileError::invalid}; }
+        const auto found = drop_documents_.find(drop_id);
+        if (found == drop_documents_.end() || found->second.info.uri != uri) return {-1, FileError::denied};
+        if (request.header.operation == Operation::document_drop_claim) found->second.active = true;
+        else discard_drop_document(drop_id);
+        return {0, FileError::none};
+    }
+    if (request.header.operation == Operation::document_info || request.header.operation == Operation::document_open) {
+        std::string uri;
+        try {
+            std::size_t offset = 0;
+            uri = read_text(request.payload, offset, host::document_uri_prefix.size() + 32);
+            if (offset != request.payload.size() || !host::valid_document_uri(uri)) return {-1, FileError::invalid};
+        } catch (const ProtocolError &) { return {-1, FileError::invalid}; }
+        auto source = documents_;
+        std::uint64_t drop_id = 0;
+        bool active = true;
+        const host::DocumentInfo *reviewed = nullptr;
+        for (const auto &[id, drop] : drop_documents_) {
+            if (drop.info.uri != uri) continue;
+            source = drop.provider; drop_id = id; active = drop.active; reviewed = &drop.info;
+            break;
+        }
+        if (!source) return {-1, FileError::denied};
+        if (request.header.operation == Operation::document_info) {
+            host::DocumentInfo info;
+            const auto result = source->describe(uri, info);
+            if (!valid_result(result) || (result.error == FileError::none &&
+                (result.value != 0 || !host::valid_document_info(info) || info.uri != uri ||
+                 (reviewed && info != *reviewed))) ||
+                (result.error != FileError::none && info != host::DocumentInfo{}))
+                throw std::runtime_error("AETHER_BROKER_DOCUMENT: invalid description result");
+            if (result.error == FileError::none) {
+                append_text(response.payload, info.uri);
+                append_text(response.payload, info.mime_type);
+                append_text(response.payload, info.display_name);
+                append_u64(response.payload, info.size);
+            }
+            return result;
+        }
+        if (!active) return {-1, FileError::denied};
+        if (descriptors_.size() + document_descriptors_.size() >= host::document_stream_limit)
+            return {-1, FileError::descriptor_limit};
+        const auto identity = next_descriptor.fetch_add(1);
+        if (!identity || identity > UINT32_MAX) return {-1, FileError::quota};
+        const auto token = 0x2ee4000000000000ULL | identity;
+        const auto inserted = document_descriptors_.emplace(token, DocumentDescriptor{source, -1, drop_id});
+        if (!inserted.second) throw std::runtime_error("AETHER_BROKER_DOCUMENT: token collision");
+        const auto result = source->open_document(uri);
+        const bool success = result.error == FileError::none;
+        const bool duplicate = success && std::any_of(document_descriptors_.begin(), document_descriptors_.end(),
+            [&](const auto &entry) { return entry.first != token && entry.second.provider == source &&
+                entry.second.descriptor == result.value; });
+        if (!valid_result(result) || (success && (result.value < 0 || result.value > INT_MAX)) || duplicate) {
+            document_descriptors_.erase(inserted.first);
+            if (success && !duplicate && result.value >= 0 && result.value <= INT_MAX)
+                (void)source->close_document(static_cast<int>(result.value));
+            throw std::runtime_error("AETHER_BROKER_DOCUMENT: invalid open result");
+        }
+        if (!success) { document_descriptors_.erase(inserted.first); return result; }
+        inserted.first->second.descriptor = static_cast<int>(result.value);
+        return {static_cast<std::int64_t>(token), FileError::none};
+    }
+    const auto reading = request.header.operation == Operation::document_read;
+    if (request.payload.size() != (reading ? 16u : 8u) ||
+        (reading && read_u64(request.payload, 8) > file_transfer_limit)) return {-1, FileError::invalid};
+    const auto token = read_u64(request.payload, 0);
+    const auto found = document_descriptors_.find(token);
+    if (found == document_descriptors_.end()) return {-1, FileError::bad_descriptor};
+    const auto descriptor = found->second;
+    if (!reading) {
+        document_descriptors_.erase(found); // Invalidate before one provider close attempt.
+        const auto result = descriptor.provider->close_document(descriptor.descriptor);
+        if (!valid_result(result) || (result.error == FileError::none && result.value != 0))
+            throw std::runtime_error("AETHER_BROKER_DOCUMENT: invalid close result");
+        return result;
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(read_u64(request.payload, 8)));
+    const auto result = descriptor.provider->read_document(descriptor.descriptor, bytes);
+    if (!valid_result(result) || (result.error == FileError::none &&
+        (result.value < 0 || static_cast<std::uint64_t>(result.value) > bytes.size())))
+        throw std::runtime_error("AETHER_BROKER_DOCUMENT: invalid read result");
+    if (result.error == FileError::none) {
+        bytes.resize(static_cast<std::size_t>(result.value));
+        response.payload = std::move(bytes);
+    }
+    return result;
 }
 host::FileResult Broker::file_request(const Frame &request, Frame &response) {
     using host::FileError;
@@ -201,7 +646,7 @@ host::FileResult Broker::file_request(const Frame &request, Frame &response) {
         }
         const bool opening=action==1 || action==2;std::uint64_t token=0;
         if(opening){
-            if(descriptors_.size()>=16)return {-1,FileError::descriptor_limit};
+            if(descriptors_.size()+document_descriptors_.size()>=16)return {-1,FileError::descriptor_limit};
             const auto identity=next_descriptor.fetch_add(1);if(!identity || identity>UINT32_MAX)return {-1,FileError::quota};
             token=0x2ee3000000000000ULL|identity;
             if(!descriptors_.emplace(token,-1).second)throw std::runtime_error("AETHER_BROKER_STORAGE: directory token collision");
@@ -311,7 +756,7 @@ host::FileResult Broker::file_request(const Frame &request, Frame &response) {
             !host::valid_file_access(scope, name, 0) || flags > 31 || !(flags & 3) ||
             ((flags & 8) && !(flags & 4)) || ((flags & 16) && !(flags & 2)))
             return {-1, FileError::invalid};
-        if (descriptors_.size() >= 16) return {-1, FileError::descriptor_limit};
+        if (descriptors_.size() + document_descriptors_.size() >= 16) return {-1, FileError::descriptor_limit};
         const auto identity = next_descriptor.fetch_add(1);
         if (!identity || identity > UINT32_MAX) return {-1, FileError::quota};
         const auto token = 0x2ee3000000000000ULL | identity;
@@ -348,7 +793,7 @@ host::FileResult Broker::file_request(const Frame &request, Frame &response) {
         if (offset != request.payload.size() || name.find('/')!=std::string::npos || !host::valid_file_path(name) || flags > 31 || !(flags & 3) || ((flags & 8) && !(flags & 4)) ||
             ((flags & 16) && !(flags & 2)))
             return {-1, FileError::invalid};
-        if (descriptors_.size() >= 16)
+        if (descriptors_.size() + document_descriptors_.size() >= 16)
             return {-1, FileError::descriptor_limit};
         const auto identity = next_descriptor.fetch_add(1);
         if (!identity || identity > UINT32_MAX)
@@ -521,6 +966,13 @@ Frame Broker::execute(const Frame &request, AuditTicket ticket) {
         revoke_all();
         throw ProtocolError("AETHER_BROKER_IDENTITY: invalid session, sequence or envelope");
     }
+    if (header.operation == Operation::activity_activation_terminal ||
+        header.operation == Operation::activity_activation_terminal_ack) {
+        closed_ = true;
+        record(Status::invalid);
+        revoke_all();
+        throw ProtocolError("AETHER_BROKER_ACTIVITY_ONLY: terminal activation records are not delegated services");
+    }
     if (idle_dispatch_) {
         const auto now = std::chrono::steady_clock::now();
         if (!idle_requests_ || now - idle_window_start_ >= std::chrono::seconds(1)) {
@@ -582,6 +1034,28 @@ Frame Broker::execute(const Frame &request, AuditTicket ticket) {
             if(status==host::TimeStatus::ok){if(!host::local_time_matches_epoch(value,std::bit_cast<std::int64_t>(read_u64(request.payload,0))))throw ProtocolError("AETHER_BROKER_TIME: inconsistent local calendar");append_local_calendar(response.payload,value);response.header.status=Status::ok;}
             else response.header.status=status==host::TimeStatus::out_of_range?Status::invalid:Status::unsupported;
         }
+    } else if (header.operation == Operation::drop_text_info || header.operation == Operation::drop_text_read) {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(16);
+        const auto result = drop_text_request(request, response);
+        file_error = result.error;
+        response.header.status = file_status(result.error);
+        append_u64(payload, std::bit_cast<std::uint64_t>(result.value));
+        append_u64(payload, static_cast<std::uint64_t>(result.error));
+        payload.insert(payload.end(), response.payload.begin(), response.payload.end());
+        response.payload = std::move(payload);
+    } else if ((header.operation >= Operation::document_info && header.operation <= Operation::document_close) ||
+               header.operation == Operation::document_drop_claim || header.operation == Operation::document_drop_release) {
+        std::vector<std::uint8_t> payload;
+        payload.reserve(16); // Allocate the result envelope before opening a provider stream.
+        const auto result = document_request(request, response);
+        if (result.error == host::FileError::io) revoke_documents();
+        file_error = result.error;
+        response.header.status = file_status(result.error);
+        append_u64(payload, std::bit_cast<std::uint64_t>(result.value));
+        append_u64(payload, static_cast<std::uint64_t>(result.error));
+        payload.insert(payload.end(), response.payload.begin(), response.payload.end());
+        response.payload = std::move(payload);
     } else if ((header.operation >= Operation::file_open && header.operation <= Operation::file_close) ||
                header.operation == Operation::file_root || header.operation == Operation::file_flush || header.operation == Operation::file_lock || header.operation == Operation::file_access ||
                header.operation == Operation::file_metadata || header.operation == Operation::file_seek || header.operation == Operation::file_remove ||
@@ -608,6 +1082,22 @@ Frame Broker::execute(const Frame &request, AuditTicket ticket) {
         append_u64(payload, static_cast<std::uint64_t>(result.error));
         payload.insert(payload.end(), response.payload.begin(), response.payload.end());
         response.payload = std::move(payload);
+    } else if (header.operation == Operation::clipboard) {
+        try { response = clipboard_request(request, std::move(response)); }
+        catch (...) {
+            closed_ = true;
+            record(Status::invalid);
+            revoke_all();
+            throw;
+        }
+    } else if (header.operation == Operation::notification) {
+        try { response = notification_request(request, std::move(response)); }
+        catch (...) {
+            closed_ = true;
+            record(Status::invalid);
+            revoke_all();
+            throw;
+        }
     } else if (header.operation >= Operation::audio_open && header.operation <= Operation::audio_close) {
         try {
             response = audio_.dispatch(request);

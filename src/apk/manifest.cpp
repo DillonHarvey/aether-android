@@ -1,6 +1,8 @@
 #include "aether/apk/xml.hpp"
 #include "aether/common/text.hpp"
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <map>
 #include <set>
 
@@ -49,6 +51,68 @@ DisplayValue display_value(const Value *value) {
 ManifestBoolean boolean_value(const Value *value) {
     return value ? ManifestBoolean{value->type, value->data} : ManifestBoolean{};
 }
+ManifestInteger orientation_value(const Value *value) {
+    if (!value)
+        return {};
+    if (value->type == 3) {
+        constexpr std::array<std::string_view, 16> names{
+            "unspecified", "landscape", "portrait", "user", "behind", "sensor", "nosensor",
+            "sensorLandscape", "sensorPortrait", "reverseLandscape", "reversePortrait",
+            "fullSensor", "userLandscape", "userPortrait", "fullUser", "locked"};
+        const auto found = std::find(names.begin(), names.end(), value->text);
+        if (found == names.end())
+            throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                               "Activity screenOrientation is not a recognized Android enum name");
+        const auto orientation = static_cast<std::int32_t>(found - names.begin()) - 1;
+        return {0x10, std::bit_cast<std::uint32_t>(orientation)};
+    }
+    if (value->type == 0x10 || value->type == 0x11) {
+        const auto orientation = std::bit_cast<std::int32_t>(value->data);
+        if (orientation < -1 || orientation > 14)
+            throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                               "Activity screenOrientation integer is outside Android's -1 through 14 enum range");
+    }
+    return {value->type, value->data};
+}
+ManifestInteger config_changes_value(const Value *value) {
+    if (!value)
+        return {};
+    if (value->type == 3) {
+        struct Flag { std::string_view name; std::uint32_t value; };
+        constexpr std::array flags{
+            Flag{"mcc", 0x0001}, Flag{"mnc", 0x0002}, Flag{"locale", 0x0004},
+            Flag{"touchscreen", 0x0008}, Flag{"keyboard", 0x0010}, Flag{"keyboardHidden", 0x0020},
+            Flag{"navigation", 0x0040}, Flag{"orientation", 0x0080}, Flag{"screenLayout", 0x0100},
+            Flag{"uiMode", 0x0200}, Flag{"screenSize", 0x0400}, Flag{"smallestScreenSize", 0x0800},
+            Flag{"density", 0x1000}, Flag{"layoutDirection", 0x2000}, Flag{"colorMode", 0x4000},
+            Flag{"grammaticalGender", 0x8000}, Flag{"fontWeightAdjustment", 0x10000000},
+            Flag{"fontScale", 0x40000000}};
+        if (value->text.size() > 4096)
+            bad("Activity configChanges string length limit exceeded");
+        std::string_view remaining = value->text;
+        std::uint32_t mask = 0;
+        for (;;) {
+            const auto separator = remaining.find('|');
+            auto name = remaining.substr(0, separator);
+            const auto first = name.find_first_not_of(" \t\r\n");
+            if (first != std::string_view::npos)
+                name = name.substr(first, name.find_last_not_of(" \t\r\n") - first + 1);
+            const auto found = std::find_if(flags.begin(), flags.end(),
+                                            [&](const auto &flag) { return flag.name == name; });
+            if (found == flags.end())
+                throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                                   "Activity configChanges contains an empty or unknown Android flag name");
+            mask |= found->value;
+            if (separator == std::string_view::npos)
+                return {0x11, mask};
+            remaining.remove_prefix(separator + 1);
+        }
+    }
+    if ((value->type == 0x10 || value->type == 0x11) && (value->data & ~manifest_config_changes_mask))
+        throw InspectError("AETHER_AXML_UNSUPPORTED_VALUE", "manifest",
+                           "Activity configChanges integer contains unsupported Android flag bits");
+    return {value->type, value->data};
+}
 DisplayValue permission_value(const Value *value) {
     return value ? display_value(value) : DisplayValue{manifest_absent_type, 0, {}};
 }
@@ -68,14 +132,57 @@ struct Element {
     bool extension = false;
     bool application = false;
     bool filter = false;
+    std::optional<std::size_t> inventory_activity, inventory_filter, inventory_node;
 };
 } // namespace
+
+std::size_t activity_metadata_size(const ManifestInfo &manifest) noexcept {
+    constexpr auto exceeded = manifest_activity_bytes + 1;
+    if (manifest.activities.size() > manifest_activity_count ||
+        (!manifest.activity_config_changes.empty() &&
+         manifest.activity_config_changes.size() != manifest.activities.size()) ||
+        (!manifest.activity_intent_filters.empty() &&
+         manifest.activity_intent_filters.size() != manifest.activities.size()))
+        return exceeded;
+    std::size_t total = 0;
+    const auto charge = [&](std::size_t amount) {
+        if (amount > manifest_activity_bytes - total) return false;
+        total += amount;
+        return true;
+    };
+    for (std::size_t index = 0; index < manifest.activities.size(); ++index) {
+        const auto &activity = manifest.activities[index];
+        if (!charge(manifest_activity_record_bytes + manifest_activity_config_bytes + manifest_activity_filters_bytes) ||
+            !charge(activity.name.size()) || !charge(activity.target.size()) ||
+            !charge(activity.label.literal.size()) || !charge(activity.icon.literal.size()) ||
+            !charge(activity.permission.literal.size()))
+            return exceeded;
+        if (manifest.activity_intent_filters.empty()) continue;
+        for (const auto &filter : manifest.activity_intent_filters[index]) {
+            if (!charge(manifest_filter_record_bytes)) return exceeded;
+            for (const auto &node : filter.nodes) {
+                if (!charge(manifest_filter_node_bytes) || !charge(node.ns.size()) || !charge(node.name.size()))
+                    return exceeded;
+                for (const auto &attribute : node.attributes)
+                    if (!charge(manifest_filter_attribute_bytes) || !charge(attribute.ns.size()) ||
+                        !charge(attribute.name.size()) || !charge(attribute.value.literal.size()))
+                        return exceeded;
+            }
+        }
+    }
+    return total;
+}
 
 ManifestInfo parse_manifest(Bytes bytes) {
     ManifestInfo result;
     bool have_root = false, have_app = false, have_sdk = false;
     std::vector<Element> stack;
     std::size_t activity_bytes = 0;
+    const auto charge = [&](std::size_t amount) {
+        if (amount > manifest_activity_bytes - activity_bytes)
+            bad("Activity/filter inventory exceeds 4 MiB of accounted metadata");
+        activity_bytes += amount;
+    };
     walk_binary_xml(bytes, [&](const XmlElement &node, bool start) {
         if (start) {
             Element element{node.ns, node.name, {}, false, false};
@@ -160,18 +267,24 @@ ManifestInfo parse_manifest(Bytes bytes) {
                     activity.icon = display_value(attribute(attrs, "icon"));
                     activity.enabled = boolean_value(attribute(attrs, "enabled"));
                     activity.exported = boolean_value(attribute(attrs, "exported"));
+                    if (element.name == "activity")
+                        activity.screen_orientation = orientation_value(attribute(attrs, "screenOrientation"));
+                    const auto config_changes = element.name == "activity"
+                        ? config_changes_value(attribute(attrs, "configChanges")) : ManifestInteger{};
                     activity.permission = permission_value(attribute(attrs, "permission"));
                     activity.name = qualify(string_value(attribute(attrs, "name"), true), result.package_id);
                     if (element.name == "activity-alias")
                         activity.target = qualify(string_value(attribute(attrs, "targetActivity"), true),
                                                   result.package_id);
-                    const auto charge = manifest_activity_record_bytes + activity.name.size() +
-                                        activity.target.size() + activity.label.literal.size() +
-                                        activity.icon.literal.size() + activity.permission.literal.size();
-                    if (charge > manifest_activity_bytes - activity_bytes)
-                        bad("Activity inventory exceeds 4 MiB of accounted metadata");
-                    activity_bytes += charge;
+                    charge(manifest_activity_record_bytes + manifest_activity_config_bytes + manifest_activity_filters_bytes);
+                    charge(activity.name.size());
+                    charge(activity.target.size());
+                    charge(activity.label.literal.size());
+                    charge(activity.icon.literal.size());
+                    charge(activity.permission.literal.size());
                     result.activities.push_back(std::move(activity));
+                    result.activity_config_changes.push_back(config_changes);
+                    result.activity_intent_filters.emplace_back();
                     element.activity = result.activities.size() - 1;
                 } else if (element.name == "intent-filter" &&
                            (parent == "activity" || parent == "activity-alias") && stack.back().activity) {
@@ -187,6 +300,37 @@ ManifestInfo parse_manifest(Bytes bytes) {
                 }
             }
 
+            if (element.filter) {
+                const auto activity = *element.activity;
+                auto &filters = result.activity_intent_filters[activity];
+                charge(manifest_filter_record_bytes);
+                filters.emplace_back();
+                element.inventory_activity = activity;
+                element.inventory_filter = filters.size() - 1;
+            } else if (!stack.empty() && stack.back().inventory_filter) {
+                element.inventory_activity = stack.back().inventory_activity;
+                element.inventory_filter = stack.back().inventory_filter;
+            }
+            if (element.inventory_filter) {
+                auto &filter = result.activity_intent_filters[*element.inventory_activity][*element.inventory_filter];
+                charge(manifest_filter_node_bytes);
+                charge(node.ns.size());
+                charge(node.name.size());
+                ManifestFilterNode retained;
+                retained.ns = node.ns;
+                retained.name = node.name;
+                if (!element.filter) retained.parent = stack.back().inventory_node;
+                for (const auto &[identity, value] : attrs) {
+                    charge(manifest_filter_attribute_bytes);
+                    charge(identity.first.size());
+                    charge(identity.second.size());
+                    charge(value.text.size());
+                    retained.attributes.push_back({identity.first, identity.second,
+                                                   {value.type, value.data, value.text}});
+                }
+                filter.nodes.push_back(std::move(retained));
+                element.inventory_node = filter.nodes.size() - 1;
+            }
             stack.push_back(std::move(element));
         } else {
             const auto &element = stack.back();
@@ -195,6 +339,8 @@ ManifestInfo parse_manifest(Bytes bytes) {
             stack.pop_back();
         }
     });
+    if (activity_metadata_size(result) != activity_bytes)
+        bad("Activity/filter metadata accounting is inconsistent");
     return result;
 }
 } // namespace aether::apk

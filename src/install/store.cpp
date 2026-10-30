@@ -1,4 +1,5 @@
 #include "aether/install/store.hpp"
+#include "aether/apk/artwork.hpp"
 #include "aether/apk/compatibility.hpp"
 #include "aether/apk/launcher.hpp"
 #include "aether/apk/package.hpp"
@@ -8,8 +9,11 @@
 #include "aether/dex/fixture_hash.hpp"
 #include "aether/host/windows/unique_handle.hpp"
 #include "aether/install/diagnostics.hpp"
+#include "aether/install/open_link.hpp"
+#include "aether/install/link_registration.hpp"
 #include "aether/install/runtime.hpp"
 #include "aether/install/shell.hpp"
+#include "aether/security/activity_launch.hpp"
 #include "aether/security/storage.hpp"
 #include "aether/security/worker_image.hpp"
 #include "private.hpp"
@@ -21,6 +25,8 @@
 #include <cstring>
 #include <future>
 #include <map>
+#include <limits>
+#include <set>
 #include <sddl.h>
 #include <shlobj.h>
 #include <sstream>
@@ -477,6 +483,10 @@ struct AppLease {
     std::vector<UniqueHandle> ancestors;
     UniqueHandle directory, lock, package;
 };
+UninstallReview removal_review(const InstalledApp &app) {
+    return {app.id, app.package_id, app.sha256, app.launcher, app.package_generation,
+            app.version_code, app.permissions, app.state, app.shell};
+}
 } // namespace
 
 host::UniqueHandle detail::hold_directory(const std::filesystem::path &path, bool create,
@@ -577,6 +587,15 @@ std::string InstalledApp::json() const {
         out << ((effective & security::installed_clock) ? "," : "") << "\"private-files\"";
     if (effective & security::installed_wall_clock)
         out << ((effective & (security::installed_clock | security::installed_files)) ? "," : "") << "\"wall-clock\"";
+    if (effective & security::installed_audio_playback)
+        out << ((effective & (security::installed_clock | security::installed_files | security::installed_wall_clock)) ? "," : "")
+            << "\"audio-playback\"";
+    if (effective & security::installed_notifications)
+        out << ((effective & (security::installed_clock | security::installed_files |
+                              security::installed_wall_clock | security::installed_audio_playback)) ? "," : "")
+            << "\"notifications\"";
+    if (effective & security::installed_clipboard)
+        out << ((effective & ~security::installed_clipboard) ? "," : "") << "\"clipboard\"";
     out << "],\"declaredPermissions\":[";
     bool first = true;
     for (const auto &permission : declared_permissions) {
@@ -649,6 +668,8 @@ struct PackageStore::Impl {
         InstalledApp previous, candidate;
     };
     std::map<std::string, Update> updates;
+    // Reconstructed projections only: journal frames remain the authority.
+    std::map<std::string, ShellIconAliases> icon_history;
     std::string digest = std::string(64, '0');
     std::size_t records = 0, tail = 0;
     std::uint64_t registry_schema = 0;
@@ -695,7 +716,7 @@ struct PackageStore::Impl {
         registry =
             open_file(journal_path, GENERIC_READ | (mode == Access::read ? 0 : GENERIC_WRITE),
                       (mode == Access::read || mode == Access::existing_write) ? OPEN_EXISTING : OPEN_ALWAYS,
-                      maximum_records * frame_size);
+                      maximum_records * frame_size, mode == Access::read ? FILE_SHARE_READ : 0);
         load();
         if (tail && mode != Access::recover)
             throw InstallError(
@@ -710,6 +731,29 @@ struct PackageStore::Impl {
         writable();
         require(updates.empty(), "AETHER_UPDATE_RECOVERY_REQUIRED",
                 "An update needs explicit repair before another store write");
+    }
+    const ShellIconAliases &aliases_for(const std::string &id) const noexcept {
+        static const ShellIconAliases empty;
+        const auto found = icon_history.find(id);
+        return found == icon_history.end() ? empty : found->second;
+    }
+    void remember_committed_icon(const InstalledApp &app, bool legacy_generation) {
+        if (app.shell != ShellState::ready || app.icon_sha256.empty() ||
+            (app.state != State::installed && app.state != State::update_committed))
+            return;
+        auto &history = icon_history[app.id];
+        const auto insert = [](auto &values, const auto &value) {
+            const auto at = std::lower_bound(values.begin(), values.end(), value);
+            if (at == values.end() || *at != value) {
+                // Each validated frame can contribute at most one value to
+                // either vector, across all applications in this store.
+                corrupt(values.size() < maximum_records);
+                values.insert(at, value);
+            }
+        };
+        if (legacy_generation)
+            insert(history.generations, app.icon_generation);
+        insert(history.committed_sha256, app.icon_sha256);
     }
     void transition(const InstalledApp &app, bool apply = true, bool legacy_icons = false,
                     bool legacy_artwork = false, bool legacy_compiled = false) {
@@ -869,6 +913,7 @@ struct PackageStore::Impl {
                                 frame.begin() + digest_offset, [](auto value) { return value == 0; }));
             corrupt(schema >= 14 || app.icon_renderer <= 2);
             transition(app, true, schema < 8, schema < 13, schema < 14);
+            remember_committed_icon(app, schema >= 4 && schema <= 7);
             digest = stored;
             registry_schema = schema;
             ++records;
@@ -910,6 +955,7 @@ struct PackageStore::Impl {
         poisoned = true;
         write_durable(registry.get(), out.bytes);
         transition(app);
+        remember_committed_icon(app, false);
         digest = next;
         registry_schema = 14;
         ++records;
@@ -995,8 +1041,10 @@ struct PackageStore::Impl {
             auto projection = current;
             projection.shell = ShellState::pending;
             apply_shell_update(projection, retired, path);
+            if (committed)
+                (void)apply_shell_icon_aliases(current, path, aliases_for(current.id));
         }
-        retire_shell_update(retired, current, path);
+        retire_shell_update(retired, current, path, &aliases_for(current.id));
         const auto obsolete = package_path(retired, path);
         if (!missing(obsolete)) {
             auto file = open_file(obsolete, GENERIC_READ | DELETE, OPEN_EXISTING, retired.package_bytes);
@@ -1035,6 +1083,12 @@ struct PackageStore::Impl {
     }
     void cleanup(const InstalledApp &app, AppLease &lease) {
         auto shell_lease = hold_shell_registration();
+        // Retire only validated opt-in offers before their app/store locator.
+        // An interrupted removal retains its existing explicit recovery path.
+        (void)link_registration(LinkRegistrationOperation::remove, app, path);
+        const auto &aliases = aliases_for(app.id);
+        validate_shell_icon_aliases(app, path, aliases);
+        remove_shell_icon_aliases(app, path, aliases);
         remove_shell_registration(app, path);
         const auto app_path = path / app.id;
         if (missing(app_path))
@@ -1294,6 +1348,11 @@ InstalledApp PackageStore::update_bytes(apk::Bytes bytes, const InstallPreview &
             "The proposed version's final path is occupied; unrelated material is preserved");
     if (previous.shell != ShellState::none)
         plan_shell_update(previous, next, *candidate.inspection.presentation, impl_->path);
+    // Finish only known aliases of the settled previous version, after all
+    // candidate preflight and locks but before recording a new update intent.
+    // A short explicit-repair write must not become unknown to a later version.
+    if (previous.shell != ShellState::none)
+        (void)apply_shell_icon_aliases(previous, impl_->path, impl_->aliases_for(previous.id));
     try {
         impl_->append(next);
         {
@@ -1498,9 +1557,47 @@ InstalledApp PackageStore::install_windows_bytes(apk::Bytes bytes, const apk::In
         throw;
     }
 }
-InstalledApp PackageStore::uninstall(std::string_view id, bool keep_data) {
+UninstallStatus PackageStore::review_uninstall(std::string_view id) const {
+    const auto app = impl_->find(id);
+    require(app.state == State::installed || app.state == State::data_retained || app.state == State::removed,
+            "AETHER_INSTALL_STATE", "Interrupted operation needs repair before uninstall review");
+    UninstallStatus status{app, removal_review(app), false};
+    const auto app_path = impl_->path / app.id;
+    if (missing(app_path))
+        return status; // Damaged/missing package material must remain removable.
+    auto directory = open_directory(app_path, false, true);
+    // Observe the existing exact lease only. Full sharing does not loosen the
+    // active owner's exclusive handle; any sharing conflict remains busy.
+    UniqueHandle file(CreateFileW((app_path / L"session.lock").c_str(), GENERIC_READ | READ_CONTROL,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    if (!file) {
+        const auto error = GetLastError();
+        if (error == ERROR_SHARING_VIOLATION) {
+            status.busy = true;
+            return status;
+        }
+        if (error == ERROR_FILE_NOT_FOUND)
+            return status; // Legacy installations may not have a lease file yet.
+        throw InstallError("AETHER_UNINSTALL_LEASE", "Cannot observe the selected app's session lease");
+    }
+    verify_file(file.get(), 0);
+    return status;
+}
+InstalledApp PackageStore::uninstall(std::string_view id, bool keep_data,
+                                      const std::optional<UninstallReview> &review) {
     impl_->settled();
     auto app = impl_->find(id);
+    if (review) {
+        require(valid_app_id(review->id) && package_name(review->package_id) && hex(review->sha256, 64) &&
+                    review->package_generation <= maximum_records &&
+                    !(review->permissions & ~security::installed_permission_mask) &&
+                    (review->state == State::installed || review->state == State::data_retained || review->state == State::removed) &&
+                    review->shell <= ShellState::ready && review->launcher.size() <= 512,
+                "AETHER_UNINSTALL_REVIEW", "The frozen uninstall review is invalid");
+        require(removal_review(app) == *review, "AETHER_UNINSTALL_CHANGED",
+                "The app version, identity, permissions or Windows launch target changed after review");
+    }
     require(app.state == State::installed || app.state == State::data_retained || app.state == State::removed,
             "AETHER_INSTALL_STATE", "Interrupted operation needs repair before uninstall");
     if (app.state == State::removed || (app.state == State::data_retained && keep_data))
@@ -1508,6 +1605,9 @@ InstalledApp PackageStore::uninstall(std::string_view id, bool keep_data) {
     require(impl_->records + 2 <= maximum_records, "AETHER_INSTALL_LIMIT",
             "Insufficient registry capacity for removal");
     auto lease = impl_->hold_app(app, true);
+    if (review)
+        require(removal_review(impl_->find(id)) == *review, "AETHER_UNINSTALL_CHANGED",
+                "The app changed before the exclusive removal lease was acquired");
     auto shell_lease = hold_shell_registration();
     app.state = State::removing;
     app.keep_data = keep_data;
@@ -1559,7 +1659,11 @@ InstalledApp PackageStore::register_windows(std::string_view id) {
             "An interrupted Windows registration requires repair --yes");
     auto lease = impl_->hold_app(app);
     auto shell_lease = hold_shell_registration();
-    if (app.shell == ShellState::ready && inspect_shell_registration(app, impl_->path))
+    // A settled legacy shortcut/uninstall entry can match the original Shell
+    // projection without carrying the notification activator. Explicit register
+    // must converge both projections through the existing journaled repair path.
+    if (app.shell == ShellState::ready && inspect_shell_registration(app, impl_->path) &&
+        inspect_notification_registration(app, impl_->path))
         return app;
     validate_shell_ownership(app, impl_->path);
     require(impl_->records + 6 <= maximum_records, "AETHER_INSTALL_LIMIT",
@@ -1604,6 +1708,32 @@ security::InstalledActivity PackageStore::prepare_launch(std::string_view id) {
     const auto data = impl_->path / app.id / L"data", audit = impl_->path / app.id / L"audit";
     lease->ancestors.push_back(open_directory(data, false, true));
     lease->ancestors.push_back(open_directory(audit, true, true));
+    std::string audio_name;
+    std::filesystem::path audio_icon;
+    if (app.permissions & security::installed_audio_playback) {
+        audio_name = apk::clean_display_name(
+            app.display_name.empty() && inspection.presentation ? inspection.presentation->label : app.display_name,
+            app.package_id);
+        audio_icon = shell_launcher(); // Trusted runtime icon fallback, never an APK-supplied path.
+        if (!app.icon_sha256.empty()) {
+            const auto candidate = app_icon_path(app, impl_->path);
+            if (!missing(candidate)) {
+                auto icon = open_file(candidate, GENERIC_READ, OPEN_EXISTING, 512 * 1024, FILE_SHARE_READ);
+                if (apk::sha256(read_all(icon.get())) == app.icon_sha256)
+                    audio_icon = candidate;
+            }
+        }
+    }
+    std::string notification_aumid;
+    if (app.permissions & security::installed_notifications) {
+        // The held app lease keeps this exact package and grant current. Verify
+        // its owned Windows projection under the existing store -> Shell order;
+        // a legacy or missing projection supplies no notification authority.
+        const auto shell_lease = hold_shell_registration();
+        const bool registered = inspect_notification_registration(app, impl_->path);
+        if (registered && app.launcher == utf8(shell_launcher().wstring()))
+            notification_aumid = "Aether.App." + app.id;
+    }
     return {app.id,
             app.permissions,
             data,
@@ -1612,7 +1742,243 @@ security::InstalledActivity PackageStore::prepare_launch(std::string_view id) {
             lease,
             lease->package.get(),
             shell_relaunch(app, impl_->path),
-            app.icon_renderer};
+            app.icon_renderer,
+            std::move(audio_name),
+            std::move(audio_icon),
+            {},
+            std::move(notification_aumid),
+            {}};
+}
+security::InstalledActivity PackageStore::prepare_launch(std::string_view id, const apk::IntentValue &intent,
+                                                        const apk::ActivityIntentPolicy &policy,
+                                                        std::optional<std::size_t> chosen_declaration) {
+    // Reuse all ordinary installed admission, consent and held-file checks.
+    // The retained immutable bytes are the exact package this lease authorized.
+    auto application = prepare_launch(id);
+    const auto inspection = apk::inspect_package(*application.package, {}, {}, apk::ScanScope::installation);
+    require(intent.accounted_bytes() <= apk::manifest_activity_bytes, "AETHER_INTENT_VALUE_LIMIT",
+            "Intent value exceeds the existing metadata profile");
+    auto value = intent;
+    apk::canonicalize_intent_categories(value);
+    application.launch = std::make_shared<const security::ActivityLaunch>(security::resolve_activity_launch(
+        inspection.manifest, apk::sha256(*application.package), std::move(value), policy, chosen_declaration));
+    return application;
+}
+namespace {
+class LinkReviewBudget {
+    std::size_t remaining_ = apk::manifest_activity_bytes;
+  public:
+    void charge(std::size_t count, std::size_t width = 1) {
+        require(count <= remaining_ / width, "AETHER_LINK_REVIEW_LIMIT",
+                "Link review exceeds the existing metadata storage bound; no alternatives were truncated");
+        remaining_ -= count * width;
+    }
+    void text(const std::string &value) {
+        require(value.capacity() < std::numeric_limits<std::size_t>::max(), "AETHER_LINK_REVIEW_LIMIT",
+                "Link review text capacity exceeds its bound");
+        charge(value.capacity() + 1);
+    }
+    explicit LinkReviewBudget(const LinkReview &review) {
+        charge(sizeof(review));
+        charge(review.intent.accounted_bytes());
+        if (review.app_id) text(*review.app_id);
+    }
+    void append(LinkReview &review, LinkReviewRow row) {
+        for (const auto *value : {&row.app_id, &row.display_name, &row.package_id, &row.apk_hash,
+                                  &row.component_name, &row.target_name, &row.code}) text(*value);
+        if (review.rows.size() == review.rows.capacity()) {
+            const auto previous = review.rows.capacity();
+            const auto available = remaining_ / sizeof(LinkReviewRow);
+            require(available != 0, "AETHER_LINK_REVIEW_LIMIT",
+                    "Link review has no space for another alternative");
+            const auto growth = previous ? previous : std::size_t{1};
+            review.rows.reserve(previous + std::min(available, growth));
+            charge(review.rows.capacity() - previous, sizeof(LinkReviewRow));
+        }
+        review.rows.push_back(std::move(row));
+    }
+};
+std::string link_display_name(const InstalledApp &app) {
+    return app.display_name.empty() ? app.package_id : app.display_name;
+}
+LinkReviewRow link_row(const InstalledApp &app) {
+    LinkReviewRow row;
+    row.app_id = app.id;
+    row.display_name = link_display_name(app);
+    row.package_id = app.package_id;
+    row.apk_hash = app.sha256;
+    row.package_generation = app.package_generation;
+    row.permissions = app.permissions;
+    row.target_sdk = app.target_sdk;
+    row.state = app.state;
+    row.shell = app.shell;
+    row.shell_verified = app.shell_verified.value_or(false);
+    return row;
+}
+std::u16string link_units(std::string_view value) {
+    const auto wide = utf16(value);
+    return {wide.begin(), wide.end()};
+}
+} // namespace
+LinkReview PackageStore::review_link(const apk::IntentValue &intent, const apk::ActivityIntentPolicy &policy,
+                                    const std::optional<std::string> &app_id) const {
+    require(!app_id || valid_app_id(*app_id), "AETHER_INSTALL_ID", "Invalid link-review application identity");
+    require(intent.accounted_bytes() <= apk::manifest_activity_bytes, "AETHER_INTENT_VALUE_LIMIT",
+            "Intent value exceeds the existing metadata profile");
+    require((intent.flags & ~std::uint32_t{0x10000000}) == 0, "AETHER_ACTIVITY_LAUNCH_UNSUPPORTED",
+            "Task, grant or other launch flags are not implemented");
+    LinkReview result;
+    result.intent = intent;
+    apk::canonicalize_intent_categories(result.intent);
+    result.policy = policy;
+    result.app_id = app_id;
+    LinkReviewBudget budget(result);
+    bool found = false;
+    for (const auto &[id, app] : impl_->apps) {
+        if ((app_id && id != *app_id) || (!app_id && app.state == State::removed)) continue;
+        found = true;
+        auto row = link_row(app);
+        if (!installed_state(app.state)) {
+            row.disposition = LinkDisposition::ineligible;
+            row.code = "AETHER_INSTALL_STATE";
+            budget.append(result, std::move(row));
+            continue;
+        }
+        if (app.shell == ShellState::pending || !(app.permissions & security::installed_clock)) {
+            row.disposition = LinkDisposition::ineligible;
+            row.code = app.shell == ShellState::pending ? "AETHER_SHELL_STATE" : "AETHER_INSTALL_PERMISSION_REQUIRED";
+            result.complete = false;
+            budget.append(result, std::move(row));
+            continue;
+        }
+        try {
+            // A short read holds the registry/package identities, not the app
+            // session lease. No runtime registration or repair occurs here.
+            apk::InspectResult inspection;
+            (void)impl_->validate_package(app, &inspection);
+            ++result.inspected;
+            const auto compatibility = apk::execution_compatibility(inspection);
+            if (!compatibility.installable) {
+                row.disposition = LinkDisposition::unsupported;
+                row.code = "AETHER_INSTALL_UNSUPPORTED";
+                result.complete = false;
+                budget.append(result, std::move(row));
+                continue;
+            }
+            const auto &manifest = inspection.manifest;
+            const auto resolution = apk::resolve_intent_value(manifest, result.intent, policy);
+            if ((resolution.status == apk::LauncherStatus::selected ||
+                 resolution.status == apk::LauncherStatus::ambiguous) && !resolution.matches.empty()) {
+                std::set<std::pair<std::size_t, std::size_t>> choices;
+                for (const auto &match : resolution.matches) choices.emplace(match.declaration, match.target);
+                for (const auto &[declaration, target] : choices) {
+                    require(declaration < manifest.activities.size() && target < manifest.activities.size(),
+                            "AETHER_LINK_RESOLUTION_INVALID", "Resolved link component index is invalid");
+                    auto candidate = row;
+                    candidate.declaration = declaration;
+                    candidate.target = target;
+                    candidate.component_name = manifest.activities[declaration].name;
+                    candidate.target_name = manifest.activities[target].name;
+                    candidate.target_sdk = manifest.target_sdk.value_or(manifest.min_sdk.value_or(1));
+                    candidate.disposition = LinkDisposition::candidate;
+                    try {
+                        (void)apk::requested_orientation(manifest, declaration);
+                        (void)apk::handled_configuration_changes(manifest, declaration);
+                    } catch (const apk::InspectError &) {
+                        candidate.disposition = LinkDisposition::unsupported;
+                        candidate.code = "AETHER_LINK_COMPONENT_UNSUPPORTED";
+                        result.complete = false;
+                    }
+                    budget.append(result, std::move(candidate));
+                }
+                continue;
+            }
+            row.disposition = resolution.status == apk::LauncherStatus::none ? LinkDisposition::no_match
+                                                                            : LinkDisposition::unsupported;
+            row.code = row.disposition == LinkDisposition::no_match ? "AETHER_LINK_NO_MATCH"
+                                                                   : "AETHER_LINK_RESOLUTION_UNSUPPORTED";
+            if (row.disposition == LinkDisposition::unsupported) result.complete = false;
+        } catch (const std::bad_alloc &) {
+            throw;
+        } catch (const InstallError &error) {
+            if (error.code == "AETHER_LINK_REVIEW_LIMIT") throw;
+            row.disposition = LinkDisposition::unavailable;
+            row.code = error.code;
+            result.complete = false;
+        } catch (const apk::InspectError &error) {
+            row.disposition = LinkDisposition::unsupported;
+            row.code = error.diagnostic.code;
+            result.complete = false;
+        } catch (const std::exception &) {
+            row.disposition = LinkDisposition::unavailable;
+            row.code = "AETHER_LINK_INSPECTION_UNAVAILABLE";
+            result.complete = false;
+        }
+        budget.append(result, std::move(row));
+    }
+    if (app_id && !found) {
+        LinkReviewRow row;
+        row.app_id = *app_id;
+        row.code = "AETHER_INSTALL_NOT_FOUND";
+        result.complete = false;
+        budget.append(result, std::move(row));
+    }
+    return result;
+}
+security::InstalledActivity PackageStore::prepare_link(const LinkReview &review, std::size_t index) {
+    require(index < review.rows.size(), "AETHER_LINK_REVIEW_INVALID", "No reviewed link alternative was selected");
+    const auto &row = review.rows[index];
+    require(row.disposition == LinkDisposition::candidate && row.declaration && row.target &&
+                (!review.app_id || *review.app_id == row.app_id),
+            "AETHER_LINK_REVIEW_INVALID", "The selected reviewed alternative is not launchable");
+    review.intent.validate();
+    const auto current = impl_->apps.find(row.app_id);
+    require(current != impl_->apps.end(), "AETHER_LINK_REVIEW_STALE",
+            "The selected installation no longer exists after link review");
+    const auto &app = current->second;
+    require(app.id == row.app_id && app.package_id == row.package_id && app.sha256 == row.apk_hash &&
+                app.package_generation == row.package_generation && app.permissions == row.permissions &&
+                app.state == row.state && app.shell == row.shell &&
+                app.shell_verified.value_or(false) == row.shell_verified && link_display_name(app) == row.display_name,
+            "AETHER_LINK_REVIEW_STALE", "The selected installation changed after link review");
+    auto application = prepare_launch(row.app_id, review.intent, review.policy, row.declaration);
+    require(application.launch && application.launch->user_selected && application.launch->apk_hash == row.apk_hash &&
+                application.launch->package == link_units(row.package_id) &&
+                application.launch->component_name == link_units(row.component_name) &&
+                application.launch->target_name == link_units(row.target_name) &&
+                application.launch->declaration == *row.declaration && application.launch->target == *row.target &&
+                application.launch->policy.filters.target_sdk == row.target_sdk &&
+                application.launch->policy.filters.relative_reference_groups == review.policy.filters.relative_reference_groups &&
+                application.launch->policy.enforce_explicit_filters == review.policy.enforce_explicit_filters &&
+                application.launch->policy.block_null_action == review.policy.block_null_action,
+            "AETHER_LINK_REVIEW_STALE", "The selected request no longer resolves to its reviewed component");
+    return application;
+}
+security::InstalledActivity PackageStore::prepare_file(const LinkReview &review, std::size_t index,
+                                                        const host::PreparedDocumentSource &document) {
+    // This entry is called only after the native review approved both the held
+    // document and recipient. URI values, generic launch flags and private-file
+    // permission never produce or select a provider here.
+    require(document.service && host::valid_document_info(document.info) &&
+                review.intent.flags == 0x10000000u &&
+                review.intent.action == std::optional<std::u16string>{u"android.intent.action.VIEW"} &&
+                review.intent.data == std::optional<std::u16string>{link_units(document.info.uri)} &&
+                review.intent.mime_type == std::optional<std::u16string>{link_units(document.info.mime_type)} &&
+                review.intent.resolved_mime_type == review.intent.mime_type &&
+                review.intent.mime_state == apk::IntentMimeState::resolved,
+            "AETHER_FILE_REVIEW_INVALID", "The approved document differs from the reviewed VIEW request");
+    host::DocumentInfo actual;
+    const auto result = document.service->describe(document.info.uri, actual);
+    require(result.error == host::FileError::none && result.value == 0 && actual == document.info,
+            "AETHER_FILE_REVIEW_STALE", "The approved held document is no longer available as reviewed");
+    auto application = prepare_link(review, index); // Retain all stale-choice, APK and grant checks.
+    auto launch = std::make_shared<security::ActivityLaunch>(*application.launch);
+    launch->read_document = document.info;
+    launch->intent.flags |= 1u; // READ_URI_PERMISSION describes only this separately supplied service.
+    launch->validate();
+    application.launch = std::move(launch);
+    application.read_document = document;
+    return application;
 }
 std::size_t PackageStore::recover() {
     require(impl_->access == Access::recover, "AETHER_INSTALL_STATE",
@@ -1661,8 +2027,15 @@ std::size_t PackageStore::recover() {
             if (app.shell != ShellState::none) {
                 auto lease = impl_->hold_app(app);
                 auto shell_lease = hold_shell_registration();
-                if (app.shell == ShellState::ready && inspect_shell_registration(app, impl_->path))
+                if (app.shell == ShellState::ready && inspect_shell_registration(app, impl_->path) &&
+                    inspect_notification_registration(app, impl_->path)) {
+                    if (apply_shell_icon_aliases(app, impl_->path, impl_->aliases_for(app.id)))
+                        ++repaired;
+                    // Explicit recovery can repair a stale Shell cache even
+                    // when every authoritative/derived byte is already intact.
+                    notify_shell_repair(app, impl_->path);
                     continue;
+                }
                 validate_shell_ownership(app, impl_->path);
                 require(impl_->records + 6 <= maximum_records, "AETHER_INSTALL_LIMIT",
                         "Insufficient journal capacity for Windows repair and removal");
@@ -1673,6 +2046,7 @@ std::size_t PackageStore::recover() {
                 apply_shell_registration(app, impl_->path);
                 app.shell = ShellState::ready;
                 impl_->append(app);
+                (void)apply_shell_icon_aliases(app, impl_->path, impl_->aliases_for(app.id));
                 ++repaired;
             }
         }

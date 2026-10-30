@@ -26,12 +26,15 @@ struct ResourceBagItem {
     std::uint32_t key = 0;
     ResourceValue value;
 };
-enum class ResourceSelectionPolicy { frozen_artwork, neutral_runtime };
+enum class ResourceSelectionPolicy { frozen_artwork, neutral_runtime, runtime_display };
 struct ResourceConfiguration {
     // Neutral locale/device selection. These defaults and the artwork policy
     // are frozen; runtime callers provide their explicit virtual target.
     std::uint16_t density = 640, sdk = 35;
     ResourceSelectionPolicy policy = ResourceSelectionPolicy::frozen_artwork;
+    // Explicit virtual-display targets; unused by the two retained policies.
+    std::uint8_t orientation = 0; // Android configuration: 1 portrait, 2 landscape.
+    std::uint16_t width_dp = 0, height_dp = 0, smallest_width_dp = 0;
     bool operator==(const ResourceConfiguration &) const = default;
 };
 struct ResourceEntry {
@@ -39,6 +42,8 @@ struct ResourceEntry {
     std::uint8_t value_type = 0;
     std::string type, name, container;
     std::uint16_t density = 0, sdk = 0;
+    std::uint8_t orientation = 0;
+    std::uint16_t width_dp = 0, height_dp = 0, smallest_width_dp = 0;
 };
 class ResourceTable {
   public:

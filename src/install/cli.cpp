@@ -5,12 +5,18 @@
 #include "aether/install/diagnostics.hpp"
 #include "aether/install/explorer.hpp"
 #include "aether/install/privacy.hpp"
+#include "aether/install/open_link.hpp"
+#include "aether/install/open_file.hpp"
+#include "aether/install/link_registration.hpp"
+#include "aether/security/activity_launch.hpp"
 #include "aether/install/runtime.hpp"
 #include "aether/install/shell.hpp"
 #include "aether/install/store.hpp"
 #include "aether/install/troubleshooting.hpp"
 #include <array>
+#include <algorithm>
 #include <iostream>
+#include <exception>
 #include <set>
 
 namespace aether::install {
@@ -26,6 +32,138 @@ void output(const InstalledApp &app, std::string_view operation, bool json) {
     else
         std::cout << app.package_id << " (" << app.version_name << ")\nApp ID: " << app.id << "\n"
                   << app.json() << "\n";
+}
+int open_link_cli(const OpenLinkOptions &options, bool json, const AppLaunchObserver &observer,
+                  const OpenLinkHandler &handler) {
+    if (!handler) {
+        const auto review = [&] {
+            PackageStore store(options.store);
+            if (options.registered_activation) {
+                usage(options.app_id.has_value(), "Registered opening requires an app identity");
+                require_registered_link_offer(store, *options.app_id, options.uri);
+            }
+            return store.review_link(make_open_link_intent(options.uri), open_link_policy(), options.app_id);
+        }();
+        // A headless query is read-only. URI text, guest result text and raw
+        // errors never become output or an implicit launch confirmation.
+        if (json) {
+            std::cout << "{\"schemaVersion\":1,\"operation\":\"open-link\",\"launched\":false,\"complete\":"
+                      << (review.complete ? "true" : "false") << ",\"choices\":[";
+            bool first = true;
+            for (const auto &row : review.rows) {
+                if (!first) std::cout << ',';
+                first = false;
+                std::cout << "{\"appId\":" << json_quote(row.app_id) << ",\"package\":" << json_quote(row.package_id)
+                          << ",\"component\":" << json_quote(row.component_name) << ",\"target\":" << json_quote(row.target_name)
+                          << ",\"sha256\":" << json_quote(row.apk_hash) << ",\"selectable\":"
+                          << (row.disposition == LinkDisposition::candidate ? "true" : "false")
+                          << ",\"code\":" << json_quote(row.code) << '}';
+            }
+            std::cout << "]}\n";
+        } else {
+            std::size_t choices = 0;
+            for (const auto &row : review.rows) if (row.disposition == LinkDisposition::candidate) ++choices;
+            std::cout << choices << " matching Activity choices. No app launched. Use the Aether shell open-link review to select one.\n";
+            if (!review.complete) std::cout << "Some installed alternatives could not be admitted or checked.\n";
+        }
+        return 0;
+    }
+    auto application = handler(options);
+    if (!application) {
+        if (json) std::cout << "{\"schemaVersion\":1,\"operation\":\"open-link\",\"cancelled\":true,\"launched\":false}\n";
+        return 0;
+    }
+    if (!application->launch || !application->launch->user_selected)
+        throw InstallError("AETHER_OPEN_LINK_REVIEW_INVALID", "The review did not produce a bound matching Activity choice");
+    AppLaunchFailure failure{application->data_root.parent_path().parent_path(), application->id};
+    const auto notify = [&]() noexcept {
+        if (observer) try { observer(failure); } catch (...) { /* Preserve the session result. */ }
+    };
+    bool passed = false;
+    try { passed = host::run_installed_window(std::move(*application)).passed(); }
+    catch (...) {
+        application.reset();
+        notify();
+        // Preserve the original exception for trusted inspection while the
+        // outward diagnostic cannot echo a URI through an app's error text.
+        std::throw_with_nested(std::runtime_error("AETHER_OPEN_LINK_SESSION_FAILED: The selected app session failed; review local diagnostics."));
+    }
+    application.reset();
+    if (!passed) { failure.failure = AppSessionFailure::incomplete; notify(); }
+    if (json)
+        std::cout << "{\"schemaVersion\":1,\"operation\":\"open-link\",\"launched\":true,\"passed\":"
+                  << (passed ? "true" : "false") << "}\n";
+    else std::cout << (passed ? "Selected app session completed.\n" : "Selected app session did not complete.\n");
+    return passed ? 0 : 1;
+}
+int open_file_cli(const OpenFileOptions &options, bool json, const AppLaunchObserver &observer,
+                  const FileOpenHandler &handler) {
+    if (!handler) {
+        // Holding the source is metadata preparation, never guest authority.
+        // A headless query cannot approve a document or start an Activity.
+        const auto source = host::prepare_document_source(options.file, options.mime_type);
+        const auto review = [&] {
+            PackageStore store(options.store);
+            if (options.registered_activation) {
+                usage(options.app_id.has_value(), "Registered file opening requires an app identity");
+                require_registered_file_offer(store, *options.app_id, options.file, options.mime_type);
+            }
+            return store.review_link(make_open_file_intent(source.info), open_file_policy(), options.app_id);
+        }();
+        if (json) {
+            std::cout << "{\"schemaVersion\":1,\"operation\":\"open-file\",\"launched\":false,\"readAccessGranted\":false,\"complete\":"
+                      << (review.complete ? "true" : "false") << ",\"choices\":[";
+            bool first = true;
+            for (const auto &row : review.rows) {
+                if (!first) std::cout << ',';
+                first = false;
+                std::cout << "{\"appId\":" << json_quote(row.app_id) << ",\"package\":" << json_quote(row.package_id)
+                          << ",\"component\":" << json_quote(row.component_name) << ",\"target\":" << json_quote(row.target_name)
+                          << ",\"sha256\":" << json_quote(row.apk_hash) << ",\"selectable\":"
+                          << (row.disposition == LinkDisposition::candidate ? "true" : "false")
+                          << ",\"code\":" << json_quote(row.code) << '}';
+            }
+            std::cout << "]}\n";
+        } else {
+            const auto count = std::count_if(review.rows.begin(), review.rows.end(), [](const auto &row) {
+                return row.disposition == LinkDisposition::candidate;
+            });
+            std::cout << count << " matching Activity choices. No app launched or document access granted. "
+                         "Use the Aether shell open-file review to approve read-only access.\n";
+            if (!review.complete) std::cout << "Some installed alternatives could not be admitted or checked.\n";
+        }
+        return 0;
+    }
+    auto application = handler(options);
+    if (!application) {
+        if (json) std::cout << "{\"schemaVersion\":1,\"operation\":\"open-file\",\"cancelled\":true,\"launched\":false}\n";
+        return 0;
+    }
+    if (!application->launch || !application->launch->user_selected || !application->read_document ||
+        !application->read_document->service || !application->launch->read_document ||
+        *application->launch->read_document != application->read_document->info ||
+        application->launch->intent.flags != 0x10000001u ||
+        (options.app_id && application->id != *options.app_id))
+        throw InstallError("AETHER_OPEN_FILE_REVIEW_INVALID", "The review did not produce a bound read-only document and Activity choice");
+    application->launch->validate();
+    AppLaunchFailure failure{application->data_root.parent_path().parent_path(), application->id};
+    const auto notify = [&]() noexcept {
+        if (observer) try { observer(failure); } catch (...) { /* Preserve the original session result. */ }
+    };
+    bool passed = false;
+    try { passed = host::run_installed_window(std::move(*application)).passed(); }
+    catch (...) {
+        application.reset();
+        notify();
+        std::throw_with_nested(std::runtime_error("AETHER_OPEN_FILE_SESSION_FAILED: The selected app session failed; review local diagnostics."));
+    }
+    application.reset();
+    if (!passed) { failure.failure = AppSessionFailure::incomplete; notify(); }
+    if (json)
+        std::cout << "{\"schemaVersion\":1,\"operation\":\"open-file\",\"launched\":true,\"passed\":"
+                  << (passed ? "true" : "false") << "}\n";
+    else std::cout << (passed ? "Selected app session completed.\n" : "Selected app session did not complete.\n");
+    return passed ? 0 : 1;
 }
 int explorer_cli(const std::vector<std::string> &arguments, bool json) {
     std::set<std::string> seen;
@@ -75,8 +213,88 @@ int explorer_cli(const std::vector<std::string> &arguments, bool json) {
                   << "\nExisting .apk defaults and UserChoice are unchanged.\n";
     return 0;
 }
+int link_handlers_cli(const std::vector<std::string> &arguments, bool json) {
+    std::set<std::string> seen;
+    std::vector<std::string> schemes;
+    std::vector<FileAssociation> files;
+    std::string action, id, path;
+    bool command = false, yes = false;
+    for (std::size_t index = 0; index < arguments.size(); ++index) {
+        const auto &arg = arguments[index];
+        if (arg == "--scheme") {
+            usage(index + 1 < arguments.size() && !arguments[index + 1].empty() &&
+                      !arguments[index + 1].starts_with('-'), "--scheme requires a lowercase URI scheme");
+            usage(schemes.size() < 32, "At most 32 schemes may be offered");
+            schemes.push_back(arguments[++index]);
+        } else if (arg == "--file-type") {
+            usage(index + 1 < arguments.size() && !arguments[index + 1].empty() &&
+                      !arguments[index + 1].starts_with('-'), "--file-type requires .extension=type/subtype");
+            usage(files.size() < 32, "At most 32 file types may be offered");
+            const auto &pair = arguments[++index];
+            const auto equals = pair.find('=');
+            usage(equals != std::string::npos && equals > 0 && equals + 1 < pair.size(),
+                  "--file-type requires .extension=type/subtype");
+            files.push_back({pair.substr(0, equals), pair.substr(equals + 1)});
+        } else if (arg == "--json" || arg == "--verbose" || arg == "--yes" ||
+                   arg == "--app-id" || arg == "--store") {
+            usage(seen.insert(arg).second, "A link-handlers option was specified more than once");
+            if (arg == "--yes") yes = true;
+            if (arg == "--app-id" || arg == "--store") {
+                usage(index + 1 < arguments.size() && !arguments[index + 1].empty() &&
+                          !arguments[index + 1].starts_with('-'), "The link-handlers option requires a value");
+                (arg == "--app-id" ? id : path) = arguments[++index];
+            }
+        } else if (!command && arg == "link-handlers") command = true;
+        else {
+            usage(command && action.empty() &&
+                      (arg == "status" || arg == "register" || arg == "repair" || arg == "remove"),
+                  "Use link-handlers status|register|repair|remove --app-id ID; changes require --yes");
+            action = arg;
+        }
+    }
+    usage(!action.empty() && valid_app_id(id), "link-handlers requires an action and a valid --app-id");
+    usage((action == "register") == (!schemes.empty() || !files.empty()),
+          "Only register accepts and requires --scheme and/or --file-type values");
+    usage(action != "status" || !yes, "Read-only link-handlers status does not accept --yes");
+    if (action != "status" && !yes)
+        throw InstallError("AETHER_INSTALL_CONFIRMATION_REQUIRED",
+                           "Link handler changes require --yes; Windows defaults and UserChoice are preserved");
+    const auto root = path.empty() ? registered_shell_store(id) : std::filesystem::path(utf16(path));
+    usage(root.is_absolute(), "--store requires an absolute local path");
+    RuntimeUseLease runtime(root);
+    PackageStore store(root);
+    const auto app = [&] {
+        if (action != "remove") return store.info(id);
+        // Removing an owned offer must not require damaged package bytes to
+        // become readable again. The held journal remains authoritative.
+        const auto apps = store.list();
+        const auto found = std::find_if(apps.begin(), apps.end(), [&](const auto &item) { return item.id == id; });
+        // list() omits removed rows, but their journal identity still permits
+        // explicit cleanup of an owned orphan offer without reviving the app.
+        if (found == apps.end()) return store.info(id);
+        return *found;
+    }();
+    const auto operation = action == "status" ? LinkRegistrationOperation::status
+                         : action == "register" ? LinkRegistrationOperation::register_handler
+                         : action == "repair" ? LinkRegistrationOperation::repair : LinkRegistrationOperation::remove;
+    const auto result = link_registration(operation, app, store.root(), schemes, true, files);
+    if (json) std::cout << result.json() << '\n';
+    else std::cout << "Link offers: " << result.state << "\nVerified: " << (result.verified ? "yes" : "no")
+                   << "\nWindows defaults and UserChoice remain user-controlled.\n";
+    return 0;
+}
 } // namespace
-std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool json) {
+int dispatch_open_link(const OpenLinkOptions &options, bool json,
+                       const AppLaunchObserver &observer, const OpenLinkHandler &handler) {
+    return open_link_cli(options, json, observer, handler);
+}
+int dispatch_open_file(const OpenFileOptions &options, bool json,
+                       const AppLaunchObserver &observer, const FileOpenHandler &handler) {
+    return open_file_cli(options, json, observer, handler);
+}
+std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool json,
+                              const AppLaunchObserver &launch_observer, const OpenLinkHandler &open_link_handler,
+                              const FileOpenHandler &open_file_handler) {
     std::string command;
     for (const auto &arg : arguments) {
         if (arg == "--json" || arg == "--verbose")
@@ -86,8 +304,18 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
     }
     if (command == "explorer")
         return explorer_cli(arguments, json);
+    if (command == "link-handlers")
+        return link_handlers_cli(arguments, json);
     if (command == "runtime")
         return runtime_cli(arguments, json);
+    if (command == "open-link") {
+        const auto options = parse_open_link_options(arguments);
+        return open_link_cli(options, json || options.json, launch_observer, open_link_handler);
+    }
+    if (command == "open-file") {
+        const auto options = parse_open_file_options(arguments);
+        return open_file_cli(options, json || options.json, launch_observer, open_file_handler);
+    }
     if (command == "privacy") {
         std::set<std::string> seen;
         for (const auto &arg : arguments) {
@@ -148,8 +376,14 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
                 continue;
             }
             if (arg == "--allow-clock" || arg == "--deny-clock" || arg == "--allow-private-files" ||
-                arg == "--deny-private-files" || arg == "--allow-wall-clock" || arg == "--deny-wall-clock") {
+                arg == "--deny-private-files" || arg == "--allow-wall-clock" || arg == "--deny-wall-clock" ||
+                arg == "--allow-audio-playback" || arg == "--deny-audio-playback" ||
+                arg == "--allow-notifications" || arg == "--deny-notifications" ||
+                arg == "--allow-clipboard" || arg == "--deny-clipboard") {
                 const auto bit =
+                    arg.ends_with("clipboard") ? security::installed_clipboard :
+                    arg.ends_with("notifications") ? security::installed_notifications :
+                    arg.ends_with("audio-playback") ? security::installed_audio_playback :
                     arg.ends_with("wall-clock") ? security::installed_wall_clock :
                     arg.ends_with("clock") ? security::installed_clock : security::installed_files;
                 (arg.starts_with("--allow-") ? allow : deny) |= bit;
@@ -205,7 +439,10 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
                 const auto name = remaining.substr(0, comma);
                 const auto bit = name == "monotonic-clock" ? security::installed_clock
                                : name == "private-files" ? security::installed_files
-                               : name == "wall-clock" ? security::installed_wall_clock : 0;
+                               : name == "wall-clock" ? security::installed_wall_clock
+                               : name == "audio-playback" ? security::installed_audio_playback
+                               : name == "notifications" ? security::installed_notifications
+                               : name == "clipboard" ? security::installed_clipboard : 0;
                 usage(bit && !(mask & bit), "Expected permissions contain an unknown or duplicate grant");
                 mask |= bit;
                 if (comma == std::string_view::npos)
@@ -352,8 +589,27 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
             PackageStore store(root);
             return store.prepare_launch(id);
         }(); // Release the global registry lock before entering the window message loop.
-        const auto report = host::run_installed_window(std::move(application));
+        // The prepared app supplies the authoritative store, including relaunch
+        // from a custom store. Never guess that a registered pin uses the default.
+        AppLaunchFailure failure{application.data_root.parent_path().parent_path(), application.id};
+        const auto notify = [&]() noexcept {
+            if (launch_observer)
+                try {
+                    launch_observer(failure);
+                } catch (...) { /* Reporting must preserve the original launch outcome. */ }
+        };
+        host::WindowReport report;
+        try {
+            report = host::run_installed_window(std::move(application));
+        } catch (...) {
+            notify();
+            throw;
+        }
         std::cout << (json ? report.json() : report.text(options.contains("--verbose"))) << '\n';
+        if (!report.passed()) {
+            failure.failure = AppSessionFailure::incomplete;
+            notify();
+        }
         return report.passed() ? 0 : 1;
     }
     const auto access = command == "list" || command == "info" || (command == "settings" && !(allow || deny))

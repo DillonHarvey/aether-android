@@ -221,6 +221,11 @@ void TranslatorVisitor::Vpart_scalar(size_t bitsize, Vec vec, size_t part, IR::U
 }
 
 IR::UAnyU128 TranslatorVisitor::Mem(IR::U64 address, size_t bytesize, IR::AccType acc_type) {
+    // Aether baseline A64: ordered accesses require natural alignment. Ordinary
+    // NORMAL/VEC/STREAM/UNPRIV accesses retain their unaligned behavior.
+    if (acc_type == IR::AccType::ORDERED || acc_type == IR::AccType::LIMITEDORDERED) {
+        ir.CheckMemoryAlignment(address, bytesize);
+    }
     switch (bytesize) {
     case 1:
         return ir.ReadMemory8(address, acc_type);
@@ -238,6 +243,9 @@ IR::UAnyU128 TranslatorVisitor::Mem(IR::U64 address, size_t bytesize, IR::AccTyp
 }
 
 void TranslatorVisitor::Mem(IR::U64 address, size_t bytesize, IR::AccType acc_type, IR::UAnyU128 value) {
+    if (acc_type == IR::AccType::ORDERED || acc_type == IR::AccType::LIMITEDORDERED) {
+        ir.CheckMemoryAlignment(address, bytesize);
+    }
     switch (bytesize) {
     case 1:
         ir.WriteMemory8(address, value, acc_type);
@@ -260,6 +268,8 @@ void TranslatorVisitor::Mem(IR::U64 address, size_t bytesize, IR::AccType acc_ty
 }
 
 IR::UAnyU128 TranslatorVisitor::ExclusiveMem(IR::U64 address, size_t bytesize, IR::AccType acc_type) {
+    // Pair accesses use the full packed width (8 or 16), not one lane's width.
+    ir.CheckMemoryAlignment(address, bytesize);
     switch (bytesize) {
     case 1:
         return ir.ExclusiveReadMemory8(address, acc_type);
@@ -277,6 +287,7 @@ IR::UAnyU128 TranslatorVisitor::ExclusiveMem(IR::U64 address, size_t bytesize, I
 }
 
 IR::U32 TranslatorVisitor::ExclusiveMem(IR::U64 address, size_t bytesize, IR::AccType acc_type, IR::UAnyU128 value) {
+    ir.CheckMemoryAlignment(address, bytesize);
     switch (bytesize) {
     case 1:
         return ir.ExclusiveWriteMemory8(address, value, acc_type);

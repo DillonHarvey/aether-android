@@ -24,6 +24,9 @@ std::uint64_t binary(std::uint64_t bits,unsigned precision,unsigned exponent_bit
         (significand&((std::uint64_t{1}<<(precision-1))-1));
 }
 }
+std::uint64_t integral_floating_bits(std::uint64_t bits, bool wide) noexcept {
+    return wide ? binary(bits,53,11,1023) : binary(bits,24,8,127);
+}
 std::optional<HostClass> integral_class(std::string_view type) {
     static constexpr std::array<std::string_view,2> interfaces{"Ljava/lang/Comparable;","Ljava/io/Serializable;"};
     if(type==long_type || type==short_type)return HostClass{"Ljava/lang/Number;",interfaces};

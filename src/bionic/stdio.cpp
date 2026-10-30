@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <limits>
 #include <bit>
+#include <new>
 namespace aether::bionic {
 namespace {
 constexpr std::size_t transfer_limit=1024*1024;
@@ -29,14 +30,83 @@ bool NativeStdio::sync_standard(){
     }
     return true;
 }
+bool NativeStdio::preflight_standard() const {
+    if(standard_owned_)for(unsigned i=0;i<3;++i)
+        if(!memory_.accessible(standard_base+i*152+16,8,a64::Permission::write))return false;
+    return true;
+}
 a64::Fault NativeStdio::invoke(unsigned op,a64::Address error,std::array<std::uint64_t,31>&r){
+    // Bionic checks the int argument before it inspects even the FILE pointer.
+    if(op==14 && static_cast<std::uint32_t>(r[0])==UINT32_MAX){r[0]=UINT64_MAX;return a64::Fault::none;}
     // The public layout carries metadata only. Descriptor authority stays in streams_.
     // Preflight every metadata destination before a provider read or write can occur.
-    if(standard_owned_)for(unsigned i=0;i<3;++i)if(!memory_.accessible(standard_base+i*152+16,8,a64::Permission::write))return a64::Fault::write;
+    if(!preflight_standard())return a64::Fault::write;
     const auto fault=operate(op,error,r);
     if(standard_owned_ && !sync_standard())return a64::Fault::write;
     return fault;
 }
+a64::Fault NativeStdio::prepare_formatted(a64::Address handle,a64::Address error,
+                                          std::array<std::uint64_t,31>&r,bool &ready){
+    ready=false;
+    if(!preflight_standard())return a64::Fault::write;
+    auto result=r;
+    const auto finish=[&](a64::Fault fault){
+        if(standard_owned_ && !sync_standard())return a64::Fault::write;
+        if(fault==a64::Fault::none)r[0]=result[0];
+        return fault;
+    };
+    const auto found=streams_.find(handle);
+    if(found==streams_.end())return finish(fail(error,result,9,UINT64_MAX));
+    auto &stream=found->second;
+    // Retain the existing checked update-stream direction profile. A permitted
+    // transition prepares the stream even when the eventual format is empty.
+    if(!stream.write || (stream.direction==1 && !stream.eof)){
+        stream.error=true;
+        return finish(fail(error,result,9,UINT64_MAX));
+    }
+    stream.direction=2;stream.eof=false;
+    std::vector<std::uint8_t>{}.swap(stream.pushed);
+    const auto fault=finish(a64::Fault::none);
+    ready=fault==a64::Fault::none;
+    return fault;
+}
+
+a64::Fault NativeStdio::write_formatted(a64::Address handle,a64::Address error,
+                                        std::span<const std::uint8_t> bytes,
+                                        std::array<std::uint64_t,31>&r){
+    bool ready=false;
+    const auto prepared=prepare_formatted(handle,error,r,ready);
+    if(prepared!=a64::Fault::none || !ready)return prepared;
+    auto result=r;
+    const auto finish=[&](a64::Fault fault){
+        if(standard_owned_ && !sync_standard())return a64::Fault::write;
+        if(fault==a64::Fault::none)r[0]=result[0];
+        return fault;
+    };
+    auto &stream=streams_.find(handle)->second;
+    if(bytes.size()>transfer_limit){
+        stream.error=true;return finish(fail(error,result,75,UINT64_MAX));
+    }
+    std::size_t done=0;
+    while(done<bytes.size()){
+        const auto remaining=bytes.size()-done;
+        const auto written=files_->write(stream.fd,bytes.subspan(done));
+        if(written.error!=host::FileError::none || written.value<=0 ||
+           static_cast<std::uint64_t>(written.value)>remaining){
+            stream.error=true;
+            // Accepted prefixes stay committed. A failure never replays them,
+            // and an errno fault must not publish a new return value.
+            const auto number=written.error==host::FileError::none?5:code(written.error);
+            return finish(fail(error,result,number,UINT64_MAX));
+        }
+        done+=static_cast<std::size_t>(written.value);
+    }
+    // fprintf preserves an earlier error indicator and returns -1 for it,
+    // including an empty current output, without inventing a new errno value.
+    result[0]=stream.error?UINT64_MAX:static_cast<std::uint64_t>(done);
+    return finish(a64::Fault::none);
+}
+
 a64::Fault NativeStdio::fail(a64::Address error,std::array<std::uint64_t,31>&r,unsigned value,std::uint64_t result){std::array<std::uint8_t,4> bytes{};for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(value>>(8*i));if(!memory_.write(error,bytes))return a64::Fault::write;r[0]=result;return a64::Fault::none;}
 a64::Fault NativeStdio::operate(unsigned op,a64::Address error,std::array<std::uint64_t,31>&r){
     constexpr auto eof=~std::uint64_t{0};
@@ -61,7 +131,7 @@ a64::Fault NativeStdio::operate(unsigned op,a64::Address error,std::array<std::u
         it->second.fd=static_cast<int>(opened.value);files_->set_close_on_exec(it->second.fd,cloexec);next_+=4096;r[0]=address;return a64::Fault::none;
     }
     if(op==10 && !r[0]){for(auto &[address,stream]:streams_){(void)address;if(stream.direction==2)stream.direction=0;}r[0]=0;return a64::Fault::none;}
-    const auto handle=(op==2 || op==3)?r[3]:op==5?r[2]:r[0];
+    const auto handle=(op==2 || op==3)?r[3]:op==5?r[2]:(op==14 || op==15)?r[1]:r[0];
     const auto found=streams_.find(handle);
     const bool pointer_result=op==5;
     if(found==streams_.end()){
@@ -69,6 +139,21 @@ a64::Fault NativeStdio::operate(unsigned op,a64::Address error,std::array<std::u
         if(op==11)r[0]=original;return fault;
     }
     auto &stream=found->second;
+    if(op==14){
+        // Write-only streams reject pushback without setting errno or ferror.
+        if(!stream.read){r[0]=eof;return a64::Fault::none;}
+        if(stream.pushed.size()==pushback_limit)return fail(error,r,12,eof);
+        const auto byte=static_cast<std::uint8_t>(r[0]);
+        try{
+            // Grow lazily within the same one-MiB profile as stream transfers.
+            if(stream.pushed.size()==stream.pushed.capacity())
+                stream.pushed.reserve(std::min(pushback_limit,std::max<std::size_t>(3,stream.pushed.capacity()*2)));
+            stream.pushed.push_back(byte);
+        }catch(const std::bad_alloc &){return fail(error,r,12,eof);}
+        // Unbuffered update streams have no pending output to flush. ungetc
+        // itself switches writing to reading; it is not a direction error.
+        stream.direction=1;stream.eof=false;r[0]=byte;return a64::Fault::none;
+    }
     if(op==1){const auto fd=stream.fd;streams_.erase(found);if(handle<standard_base || handle>=standard_base+456)memory_.unmap(handle);const auto result=files_->close(fd);if(result.error!=host::FileError::none || result.value!=0)return fail(error,r,result.error==host::FileError::none?5:code(result.error),eof);r[0]=0;return a64::Fault::none;}
     if(op==6){r[0]=stream.eof;return a64::Fault::none;}
     if(op==7){r[0]=stream.error;return a64::Fault::none;}
@@ -77,33 +162,54 @@ a64::Fault NativeStdio::operate(unsigned op,a64::Address error,std::array<std::u
     if(op==10){if(!stream.write)return fail(error,r,9,eof);stream.direction=0;r[0]=0;return a64::Fault::none;}
     if(op>=11 && op<=13){
         const bool rewinding=op==11,telling=op==13;
-        const auto whence=rewinding?0U:telling?1U:static_cast<std::uint32_t>(r[2]);
-        const auto offset=rewinding||telling?std::int64_t{0}:std::bit_cast<std::int64_t>(r[1]);
-        const auto result=whence>2?host::FileResult{-1,host::FileError::invalid}:files_->seek(stream.fd,offset,whence);
+        auto whence=rewinding?0U:telling?1U:static_cast<std::uint32_t>(r[2]);
+        auto offset=rewinding||telling?std::int64_t{0}:std::bit_cast<std::int64_t>(r[1]);
+        host::FileResult result;
+        if(!telling && whence==1 && stream.pushed.size()){
+            result=files_->seek(stream.fd,0,1);
+            if(result.error==host::FileError::none && result.value>=0){
+                const auto current=result.value-static_cast<std::int64_t>(stream.pushed.size());
+                // Bionic treats an effective -1 current position as failure,
+                // even if it came from pushback rather than a failed seek.
+                if(current==-1){r[0]=eof;return a64::Fault::none;}
+                if((offset>0 && current>INT64_MAX-offset) || (offset<0 && current<INT64_MIN-offset))
+                    return fail(error,r,75,eof);
+                offset+=current;whence=0;result=files_->seek(stream.fd,offset,whence);
+            }
+        } else result=whence>2?host::FileResult{-1,host::FileError::invalid}:files_->seek(stream.fd,offset,whence);
         if(result.error!=host::FileError::none || result.value<0 || (whence==0 && result.value!=offset)){
             const auto original=r[0];const auto fault=fail(error,r,result.error==host::FileError::none?5:code(result.error),eof);
             if(rewinding){r[0]=original;if(fault==a64::Fault::none){stream.eof=false;stream.error=false;}}
             return fault;
         }
-        if(!telling){stream.eof=false;stream.direction=0;}
+        if(!telling){stream.eof=false;stream.direction=0;std::vector<std::uint8_t>{}.swap(stream.pushed);}
         if(rewinding)stream.error=false;
-        else r[0]=telling?static_cast<std::uint64_t>(result.value):0;
+        else r[0]=telling?static_cast<std::uint64_t>(result.value-static_cast<std::int64_t>(stream.pushed.size())):0;
         return a64::Fault::none;
     }
-    if(op>10)return a64::Fault::unsupported_service;
-    const bool writing=op==3;
+    if(op>10 && op!=15)return a64::Fault::unsupported_service;
+    const bool writing=op==3 || op==15;
     std::uint64_t size=1,count=1;auto destination=r[0];
     if(op==2 || op==3){size=r[1];count=r[2];if(!size || !count){r[0]=0;return a64::Fault::none;}if(size>transfer_limit || count>transfer_limit/size){stream.error=true;return fail(error,r,75,0);}}
     if(op==5){const auto length=static_cast<std::int32_t>(r[1]);if(length<=0)return a64::Fault::invalid_call;count=static_cast<std::uint32_t>(length)-1;if(count>=transfer_limit)return fail(error,r,75,0);}
 
     const auto total=static_cast<std::size_t>(size*count);
-    if(op!=4 && !memory_.accessible(destination,total+(op==5?1:0),writing?a64::Permission::read:a64::Permission::write)){stream.error=true;return fail(error,r,14,0);}
+    if(op!=4 && op!=15 && !memory_.accessible(destination,total+(op==5?1:0),writing?a64::Permission::read:a64::Permission::write)){stream.error=true;return fail(error,r,14,0);}
     if(op==5 && !total){const std::array<std::uint8_t,1> zero{};if(!memory_.write(destination,zero))return fail(error,r,14,0);r[0]=destination;return a64::Fault::none;}
-    if((writing && (!stream.write || (stream.direction==1 && !stream.eof))) || (!writing && (!stream.read || stream.direction==2))){stream.error=true;return fail(error,r,9,(op==4)?eof:0);}
+    if((writing && (!stream.write || (stream.direction==1 && !stream.eof))) || (!writing && (!stream.read || stream.direction==2))){stream.error=true;return fail(error,r,9,(op==4 || op==15)?eof:0);}
     stream.direction=writing?2U:1U;
-    std::vector<std::uint8_t> bytes(op==4?1:total);if(writing && !memory_.read(destination,bytes))return fail(error,r,14,0);
+    std::vector<std::uint8_t> bytes(op==4?1:total);
+    if(op==15)bytes[0]=static_cast<std::uint8_t>(r[0]);
+    else if(writing && !memory_.read(destination,bytes))return fail(error,r,14,0);
+    if(writing){stream.eof=false;std::vector<std::uint8_t>{}.swap(stream.pushed);}
     std::size_t done=0;unsigned failure=0;
     while(done<bytes.size()){
+        if(!writing && stream.pushed.size()){
+            bytes[done++]=stream.pushed.back();stream.pushed.pop_back();
+            if(stream.pushed.empty())std::vector<std::uint8_t>{}.swap(stream.pushed);
+            if(op==5 && bytes[done-1]=='\n')break;
+            continue;
+        }
         const auto request=op==5?std::size_t{1}:bytes.size()-done;
         const auto result=writing?files_->write(stream.fd,std::span<const std::uint8_t>{bytes}.subspan(done,request)):files_->read(stream.fd,std::span<std::uint8_t>{bytes}.subspan(done,request));
         if(result.error!=host::FileError::none){failure=code(result.error);stream.error=true;break;}
@@ -114,7 +220,7 @@ a64::Fault NativeStdio::operate(unsigned op,a64::Address error,std::array<std::u
     }
     if(!writing && op!=4 && done && !memory_.write(destination,std::span<const std::uint8_t>{bytes}.first(done)))return fail(error,r,14,0);
     std::uint64_t value=done/size;
-    if(op==4)value=done?bytes[0]:eof;
+    if(op==4 || op==15)value=done?bytes[0]:eof;
     if(op==5){value=done?destination:0;if(value){const std::array<std::uint8_t,1> zero{};if(!memory_.write(destination+done,zero))return fail(error,r,14,0);}}
     if(failure)return fail(error,r,failure,value);
     r[0]=value;return a64::Fault::none;

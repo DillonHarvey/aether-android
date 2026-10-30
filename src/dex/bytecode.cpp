@@ -5,6 +5,18 @@
 #include <set>
 
 namespace aether::dex {
+namespace {
+// Shared library-startup containers, including any fixed Debug iterator proxy.
+// Accessors never construct an empty container on the calling/guest path.
+const std::vector<std::int32_t> empty_switch_keys;
+const std::vector<std::uint32_t> empty_switch_targets;
+}
+const std::vector<std::int32_t> &Instruction::switch_keys() const noexcept {
+    return switch_payload ? switch_payload->keys : empty_switch_keys;
+}
+const std::vector<std::uint32_t> &Instruction::switch_targets() const noexcept {
+    return switch_payload ? switch_payload->targets : empty_switch_targets;
+}
 const std::array<Opcode, 256> &opcode_registry() noexcept {
     static const auto table = [] {
         std::array<Opcode, 256> t{};
@@ -448,16 +460,18 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             if (count > 65536 - switch_edges)
                 invalid(method_index, ins.pc, "Switch case edge budget exceeded", "VERIFY_LIMIT");
             switch_edges += count;
+            auto decoded = std::make_shared<SwitchPayload>();
             if (sparse) {
-                ins.switch_keys.reserve(count);
+                decoded->keys.reserve(count);
                 for (std::uint32_t i = 0; i < count; ++i)
-                    ins.switch_keys.push_back(signed32(payload + 2 + i * 2));
+                    decoded->keys.push_back(signed32(payload + 2 + i * 2));
             } else
                 ins.switch_first = signed32(payload + 2);
-            ins.switch_targets.reserve(count);
+            decoded->targets.reserve(count);
             const auto targets = payload + (sparse ? 2 + count * 2 : 4);
             for (std::uint32_t i = 0; i < count; ++i)
-                ins.switch_targets.push_back(branch_target(ins.pc, signed32(targets + i * 2)));
+                decoded->targets.push_back(branch_target(ins.pc, signed32(targets + i * 2)));
+            ins.switch_payload = std::move(decoded);
         }
         if (op >= 0x0a && op <= 0x0c) {
             if (!n)

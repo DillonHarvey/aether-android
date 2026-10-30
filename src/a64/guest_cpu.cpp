@@ -6,11 +6,44 @@
 #include <dynarmic/interface/A64/a64.h>
 #include <dynarmic/interface/A64/config.h>
 #include <dynarmic/interface/exclusive_monitor.h>
+#include <dynarmic/interface/halt_reason.h>
 #include <limits>
 #include <windows.h>
 
 namespace aether::a64 {
 namespace {
+// Match CTR_EL0's 16-word minimum cache lines. Guest bytes are ordinary,
+// coherent host data; translated x86 code has its own checked W^X cache.
+constexpr std::size_t guest_cache_line_size = 64;
+enum class ScalarAtomic { compare, add, clear, exclusive_or, set, swap };
+struct ScalarLse {
+    ScalarAtomic operation;
+    unsigned bytes, source, base, destination;
+};
+std::optional<ScalarLse> decode_scalar_lse(std::uint32_t instruction) noexcept {
+    // Encoding reference: disabled ARMv8.1 patterns in the pinned Dynarmic
+    // frontend/A64/decoder/a64.inc. This is an Aether-owned scalar fallback,
+    // not a claim that the vendor JIT translates the optional LSE extension.
+    const auto bytes = 1u << (instruction >> 30);
+    const auto source = (instruction >> 16) & 31u;
+    const auto base = (instruction >> 5) & 31u;
+    const auto destination = instruction & 31u;
+    if ((instruction & 0x3fa07c00u) == 0x08a07c00u)
+        return ScalarLse{ScalarAtomic::compare, bytes, source, base, destination};
+    if ((instruction & 0x3f200c00u) != 0x38200000u)
+        return {};
+    ScalarAtomic operation;
+    switch ((instruction >> 12) & 15u) {
+    case 0: operation = ScalarAtomic::add; break;
+    case 1: operation = ScalarAtomic::clear; break;
+    case 2: operation = ScalarAtomic::exclusive_or; break;
+    case 3: operation = ScalarAtomic::set; break;
+    case 8: operation = ScalarAtomic::swap; break;
+    default: return {}; // No min/max, LDAPR, CASP, or reserved encodings.
+    }
+    return ScalarLse{operation, bytes, source, base, destination};
+}
+struct ScalarLseFallback { Address pc; std::uint32_t instruction; ScalarLse decoded; };
 std::atomic<std::uint64_t> invocation_sequence{1};
 std::uint64_t next_invocation() noexcept {
     auto value=invocation_sequence.load(std::memory_order_relaxed);
@@ -48,6 +81,8 @@ std::string_view fault_name(Fault fault) noexcept {
         return "AETHER_GUEST_PROCESS_EXIT";
     case Fault::thread_exit:
         return "AETHER_GUEST_THREAD_EXIT";
+    case Fault::alignment:
+        return "AETHER_GUEST_ALIGNMENT_FAULT";
     }
     return "AETHER_GUEST_UNKNOWN_FAULT";
 }
@@ -63,6 +98,9 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
     std::uint64_t tpidr = 0, tpidr_read_only = 0, default_tpidr = 0;
     const DWORD owner_thread = GetCurrentThreadId();
     bool service_pending = false, dispatching_service = false;
+    bool yield_pending = false;
+    std::optional<Address> instruction_cache_pending;
+    std::optional<ScalarLseFallback> scalar_lse_pending;
     std::uint32_t pending_service = 0, call_depth = 0;
     Address service_instruction = 0;
     std::uint64_t active_invocation = 0;
@@ -90,6 +128,10 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         config.check_halt_on_memory_access = true;
         config.hook_data_cache_operations = true;
         config.hook_hint_instructions = true;
+        config.ctr_el0 = 0x8444c004;
+        // DC ZVA has no implementation here. Report it prohibited instead of
+        // advertising a usable instruction which the hook would reject.
+        config.dczid_el0 = 0x14;
         config.cntfrq_el0 = static_cast<std::uint32_t>(frequency);
         // Keep safe IR optimizations, but observe every dispatched block in this
         // correctness baseline. No linking, return predictor, or fast dispatcher.
@@ -104,7 +146,14 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
             result.detail = detail;
             if(fault!=Fault::process_exit && fault!=Fault::thread_exit)++stats.faults;
         }
-        jit->HaltExecution();
+        auto reason = Dynarmic::HaltReason::UserDefined1;
+        if (result.fault == Fault::read || result.fault == Fault::write || result.fault == Fault::alignment)
+            reason |= Dynarmic::HaltReason::MemoryAbort;
+        // check_halt_on_memory_access checks this specific bit immediately
+        // after each callback. It restores that access's instruction PC and
+        // returns before a failed load/result or base writeback can commit.
+        // A generic user halt alone is only observed at a later block boundary.
+        jit->HaltExecution(reason);
     }
     template <class T> T read(Address address) noexcept {
         T value{};
@@ -160,7 +209,78 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
     bool MemoryWriteExclusive128(Address a, Vector v, Vector e) override { return exclusive(a, v, e); }
     void InterpreterFallback(Address pc, std::size_t count) override {
         ++stats.interpreter_fallbacks;
+        if (count == 1) {
+            const auto instruction = MemoryReadCode(pc);
+            if (!instruction) {
+                stop(Fault::execute, pc);
+                return;
+            }
+            if (const auto decoded = decode_scalar_lse(*instruction)) {
+                scalar_lse_pending = ScalarLseFallback{pc, *instruction, *decoded};
+                jit->HaltExecution();
+                return;
+            }
+        }
         stop(Fault::unsupported_instruction, pc, static_cast<std::uint32_t>(count));
+    }
+    void execute_scalar_lse(const ScalarLseFallback &pending) {
+        const auto &decoded = pending.decoded;
+        jit->SetPC(pending.pc);
+        const auto address = decoded.base == 31 ? jit->GetSP() : jit->GetRegister(decoded.base);
+        if ((decoded.base == 31 && address % 16) || address % decoded.bytes) {
+            stop(Fault::alignment, address, pending.instruction);
+            return;
+        }
+        if (!memory.accessible(address, decoded.bytes, Permission::read)) {
+            stop(Fault::read, address, pending.instruction);
+            return;
+        }
+        // An atomic is a read/write access, including a failed CAS comparison.
+        // Preflight the entire range before reading or modifying guest state.
+        if (!memory.accessible(address, decoded.bytes, Permission::write)) {
+            stop(Fault::write, address, pending.instruction);
+            return;
+        }
+        const auto mask = decoded.bytes == 8 ? UINT64_MAX : (std::uint64_t{1} << (decoded.bytes * 8)) - 1;
+        const auto source = decoded.source == 31 ? 0 : jit->GetRegister(decoded.source) & mask;
+        const auto replacement = decoded.destination == 31 ? 0 : jit->GetRegister(decoded.destination) & mask;
+        std::uint64_t observed = 0;
+        // GuestMemory and its CPU have one owner. No callback, allocation, or
+        // scheduler handoff is allowed inside this checked read/modify/write;
+        // this gives indivisibility against every supported logical guest.
+        // Stronger host fences implement all relaxed/acquire/release variants.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        ++stats.memory_reads;
+        if (!memory.read(address, {reinterpret_cast<std::uint8_t *>(&observed), decoded.bytes})) {
+            stop(Fault::read, address, pending.instruction);
+            return;
+        }
+        auto changed = observed;
+        bool store = true;
+        switch (decoded.operation) {
+        case ScalarAtomic::compare: store = observed == source; changed = replacement; break;
+        case ScalarAtomic::add: changed = (observed + source) & mask; break;
+        case ScalarAtomic::clear: changed = observed & ~source; break;
+        case ScalarAtomic::exclusive_or: changed = observed ^ source; break;
+        case ScalarAtomic::set: changed = observed | source; break;
+        case ScalarAtomic::swap: changed = source; break;
+        }
+        if (store) {
+            ++stats.memory_writes;
+            if (!memory.write(address, {reinterpret_cast<const std::uint8_t *>(&changed), decoded.bytes})) {
+                stop(Fault::write, address, pending.instruction);
+                return;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // CAS returns the observed value through Rs; other atomics use Rt.
+        // Byte/half/word results zero-extend, and register31 discards the result.
+        const auto output = decoded.operation == ScalarAtomic::compare ? decoded.source : decoded.destination;
+        if (output != 31) jit->SetRegister(output, observed);
+        jit->ClearExclusiveState();
+        monitor.Clear();
+        jit->SetPC(pending.pc + 4);
+        ++stats.interpreted_lse_instructions;
     }
     std::uint64_t counter() noexcept {
         if (!app.monotonic_time_allowed) {
@@ -194,17 +314,64 @@ struct GuestCpu::Impl final : Dynarmic::A64::UserCallbacks {
         } else
             stop(Fault::unsupported_service, jit->GetPC() - 4, service);
     }
+    void MemoryAlignmentFault(Address pc, Address address) override {
+        // The typed callback preserves SP and identifies the actual effective
+        // address. No load, store or exclusive-monitor operation has run yet.
+        jit->SetPC(pc);
+        stop(Fault::alignment, address, static_cast<std::uint32_t>(Dynarmic::A64::Exception::DataAlignment));
+    }
     void ExceptionRaised(Address pc, Dynarmic::A64::Exception exception) override {
+        if (exception == Dynarmic::A64::Exception::StackPointerAlignment) {
+            // The backend has materialized the exact captured live SP and PC,
+            // before any effective-address offset, memory access or writeback.
+            stop(Fault::alignment, jit->GetSP(), static_cast<std::uint32_t>(exception));
+            return;
+        }
+        if (exception == Dynarmic::A64::Exception::Yield) {
+            // The frontend already advanced PC by four. Perform the host
+            // scheduling hint only after returning out of generated frames.
+            yield_pending = true;
+            jit->HaltExecution();
+            return;
+        }
         stop(exception == Dynarmic::A64::Exception::NoExecuteFault ? Fault::execute
                                                                    : Fault::unsupported_instruction,
              pc, static_cast<std::uint32_t>(exception));
     }
     void DataCacheOperationRaised(Dynarmic::A64::DataCacheOperation op, Address value) override {
+        if (op == Dynarmic::A64::DataCacheOperation::CleanByVAToPoU) {
+            if (!memory.accessible(value, 1, Permission::read)) {
+                stop(Fault::read, value);
+                return;
+            }
+            // There is no separate dirty guest data cache. A real host fence
+            // publishes prior guest stores; IC IVAU separately retires any
+            // translations of the corresponding guest instruction line.
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            ++stats.data_cache_cleans;
+            return;
+        }
         stop(Fault::unsupported_instruction, value, static_cast<std::uint32_t>(op));
+        // The post-callback IR guard handles every cache fault immediately,
+        // including unsupported operations, before later instruction effects.
+        jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
     }
     void InstructionCacheOperationRaised(Dynarmic::A64::InstructionCacheOperation op,
                                          Address value) override {
+        if (op == Dynarmic::A64::InstructionCacheOperation::InvalidateByVAToPoU) {
+            if (!memory.accessible(value, 1, Permission::read)) {
+                stop(Fault::read, value);
+                return;
+            }
+            // IC IVAU terminates this translated block and advances PC. Never
+            // release its executable allocation while its generated frame is
+            // still on the host stack. One line is pending per Run boundary.
+            instruction_cache_pending = value & ~(Address{guest_cache_line_size} - 1);
+            jit->HaltExecution();
+            return;
+        }
         stop(Fault::unsupported_instruction, value, static_cast<std::uint32_t>(op));
+        jit->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
     }
     void AddTicks(std::uint64_t ticks) override {
         stats.guest_ticks += ticks;
@@ -300,6 +467,9 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
             --p.call_depth;
             p.dispatching_service = dispatching;
             p.service_pending = false;
+            p.yield_pending = false;
+            p.instruction_cache_pending.reset();
+            p.scalar_lse_pending.reset();
             p.tpidr=tpidr;p.tpidr_read_only=tpidr_read_only;p.active_invocation=invocation;
             if (!nested)
                 return;
@@ -338,6 +508,9 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         ++p.stats.nested_calls;
     p.dispatching_service = false;
     p.service_pending = false;
+    p.yield_pending = false;
+    p.instruction_cache_pending.reset();
+    p.scalar_lse_pending.reset();
     p.result = {};
     p.jit->Reset();
     p.monitor.Clear();
@@ -378,6 +551,35 @@ ExecutionResult GuestCpu::call(Address entry, std::span<const std::uint64_t> arg
         p.stats.execution_nanoseconds += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                 .count());
+        if (p.result.fault == Fault::none && !p.result.returned) {
+            if (p.scalar_lse_pending) {
+                const auto pending = *p.scalar_lse_pending;
+                p.scalar_lse_pending.reset();
+                // The frontend counts this one instruction in block.CycleCount;
+                // EmitAddCycles and ReturnFromRunCode already charged AddTicks.
+                // Do not charge it again or reset the enclosing call's budget.
+                p.execute_scalar_lse(pending);
+                if (p.result.fault == Fault::none) continue;
+            }
+            if (p.instruction_cache_pending) {
+                const auto line = *p.instruction_cache_pending;
+                p.instruction_cache_pending.reset();
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                p.jit->InvalidateCacheRange(line, guest_cache_line_size);
+                ++p.stats.cache_invalidations;
+                ++p.stats.instruction_cache_invalidations;
+                continue;
+            }
+            if (p.yield_pending) {
+                p.yield_pending = false;
+                ++p.stats.host_calls;
+                ++p.stats.scheduling_yields;
+                // SwitchToThread is an advisory yield: a false result simply
+                // means no eligible thread was ready on this processor.
+                SwitchToThread();
+                continue;
+            }
+        }
         if(!p.service_pending && p.result.fault==Fault::none && !p.result.returned && p.services && p.services->event_pending())continue;
         if (!p.service_pending || p.result.fault != Fault::none || p.result.returned)
             break;

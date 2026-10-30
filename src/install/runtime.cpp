@@ -1,6 +1,7 @@
 #include "aether/install/runtime.hpp"
 #include "aether/common/text.hpp"
 #include "aether/install/explorer.hpp"
+#include "aether/install/link_registration.hpp"
 #include "aether/install/runtime_setup.hpp"
 #include "aether/install/shell.hpp"
 #include "aether/install/store.hpp"
@@ -253,7 +254,8 @@ struct Catalogue {
     Catalogue(const std::filesystem::path &root, bool write, bool create = false, bool repair = false,
               bool allow_tail = false) {
         file = detail::private_file(root / record_file, GENERIC_READ | (write ? GENERIC_WRITE | DELETE : 0),
-                                    create ? CREATE_NEW : OPEN_EXISTING, max_frames * frame_size);
+                                    create ? CREATE_NEW : OPEN_EXISTING, max_frames * frame_size,
+                                    write ? 0 : FILE_SHARE_READ);
         record.root = root;
         const auto all = detail::read_contents(file.get());
         tail = all.size() % frame_size;
@@ -385,7 +387,8 @@ struct Catalogue {
                 }
                 if (next.phase == Phase::upgrading)
                     corrupt(record.phase == Phase::ready &&
-                            (next.files != next.pending || next.icon_library != next.pending_icon_library));
+                            (next.files != next.pending || next.icon_library != next.pending_icon_library ||
+                             next.compatibility > record.compatibility));
                 if (next.schema != record.schema && next.schema >= 3)
                     corrupt(next.phase == Phase::upgrading);
             } else
@@ -723,6 +726,7 @@ std::vector<UniqueHandle> payload_directories(const std::filesystem::path &root,
 }
 struct Dependencies {
     std::vector<std::string> apps, blockers;
+    bool link_offers = false;
     // Keep inspected journals locked until removal finishes. Another runtime
     // must not introduce a dependency after this preflight.
     std::vector<std::unique_ptr<PackageStore>> stores;
@@ -746,12 +750,16 @@ struct Dependencies {
                 out += ',';
             out += json_quote(blocker);
         }
-        return out + ']';
+        return out + "],\"linkOffersPresent\":" + (link_offers ? "true" : "false");
     }
-    bool empty() const { return apps.empty() && blockers.empty(); }
+    bool empty() const { return apps.empty() && blockers.empty() && !link_offers; }
 };
 Dependencies dependencies(const Record &record, bool native_removal = false) {
     Dependencies result;
+    try { result.link_offers = link_registration_present(record.root); }
+    catch (const std::exception &) {
+        result.blockers.push_back("Link handler ownership cannot be verified; inspect its recorded offers before runtime removal.");
+    }
     auto paths = record.stores;
     const auto default_root = default_store_root();
     if (std::none_of(paths.begin(), paths.end(),
@@ -1043,12 +1051,15 @@ RuntimeSetupStatus inspect_runtime_setup(const std::filesystem::path &root, bool
         if (!uses.empty()) {
             std::string message =
                 "Remove installed Android apps and retained app data before removing Aether.";
+            if (uses.link_offers)
+                message += "\nThis runtime still owns link offers. Remove each with link-handlers remove "
+                           "--app-id ID --store ROOT --yes before removing Aether.";
             for (const auto &blocker : uses.blockers)
                 message += "\n" + blocker;
             return {"blocked", message, false};
         }
         return {state.record.phase == Phase::ready ? "ready" : "incomplete",
-                "No installed apps or retained app data require this runtime. Package journals will be kept.",
+                "No installed apps, retained app data or link offers require this runtime. Package journals will be kept.",
                 true};
     } catch (const std::exception &error) {
         return {"unavailable", error.what(), false};
@@ -1177,7 +1188,7 @@ RuntimeSetupStatus inspect_runtime_upgrade(const std::filesystem::path &root) {
     try {
         upgrade_location(root);
         Root target(root, false);
-        Catalogue state(root, false);
+        Catalogue state(root, false, false, false, true);
         require(state.record.phase == Phase::ready || state.record.phase == Phase::upgrading,
                 "AETHER_RUNTIME_STATE",
                 "Only a ready runtime or its recorded interrupted upgrade can be upgraded");
@@ -1281,7 +1292,7 @@ std::string repair_runtime(const std::filesystem::path &root, const RuntimeBundl
 std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBundle &bundle) {
     PendingShellNotice notice;
     require(bundle.compatibility == current_runtime_compatibility, "AETHER_RUNTIME_COMPATIBILITY",
-            "Upgrade requires runtime compatibility contract 9 (catalogue schema 5; package schemas 1-14); older or incompatible "
+            "Upgrade requires runtime compatibility contract 27 (native conversion target state schema 11 and IME metadata command schema 10; actual TextEdit operation history and actual input connection; edit events and text reveal; text-bound selection; bounded read-only document provider operations; owned link offers and native activation cleanup; reviewed original-Intent choice startup schema 2; catalogue schema 5; package schemas 1-14; same-event Unicode key metadata, editable text/value actions, scroll geometry/actions, view descriptions, checked/semantic view publication, owned toast activation, consented playback and historical icons); older or incompatible "
             "distributions are "
             "refused");
     auto candidate = native_inventory(bundle.files);
@@ -1290,7 +1301,7 @@ std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBund
     RuntimeUseLease executing;
     stop_owned_icon_broker(root);
     Root target(root, true);
-    Catalogue state(root, true);
+    Catalogue state(root, true, false, false, true);
     require(state.record.phase == Phase::ready || state.record.phase == Phase::upgrading,
             "AETHER_RUNTIME_STATE",
             "Only a ready runtime or its recorded interrupted upgrade can be upgraded");
@@ -1335,7 +1346,11 @@ std::string upgrade_runtime(const std::filesystem::path &root, const RuntimeBund
     auto files = payload_inventory(root, &state.record.files, false, &bundle, resuming, &candidate);
     require(files.complete, "AETHER_RUNTIME_PAYLOAD",
             "A required runtime file is missing; it is not recreated");
-    if (!resuming && state.record.files == candidate && state.record.icon_library == candidate_icon)
+    // Complete frames, the exact pending distribution and all held existing
+    // identities must pass preflight before discarding an interrupted append.
+    state.repair_tail();
+    if (!resuming && state.record.compatibility == bundle.compatibility &&
+        state.record.files == candidate && state.record.icon_library == candidate_icon)
         return "{\"schemaVersion\":1,\"operation\":\"runtime-upgrade\",\"state\":\"unchanged\","
                "\"packageStoresPreserved\":true,\"launcherPathsPreserved\":true}";
     if (!resuming) {
@@ -1395,8 +1410,8 @@ std::string remove_runtime(const std::filesystem::path &root, DWORD controller_p
     detail::verify_runtime_registration(root, state.record.native_id, true);
     const auto uses = dependencies(state.record, true);
     require(uses.empty(), "AETHER_RUNTIME_DEPENDENCIES",
-            "Installed apps, retained data or unreadable stores still require Aether. Resolve them before "
-            "removal.");
+            "Installed apps, retained data, link offers or unreadable ownership records still require Aether. "
+            "Remove owned offers with link-handlers remove --app-id ID --store ROOT --yes before runtime removal.");
     auto files = payload_inventory(root, &state.record.files, true);
     auto own = files.files.size();
     for (std::size_t n = 0; n < files.payload.size(); ++n)
@@ -1462,12 +1477,26 @@ void remember_runtime_store(const std::filesystem::path &store) {
     if (missing(root / record_file))
         return;
     RuntimeUseLease active;
+    const auto validate_store = [&] {
+        validate_path(store);
+        require(!below(store, root) && !below(root, store), "AETHER_RUNTIME_STORE",
+                "Runtime binaries and package stores must use separate directory trees");
+    };
+    {
+        // Ordinary launches already belong to an enrolled store. Shared reads
+        // let independent preparations coexist without requesting a journal write.
+        Catalogue current(root, false);
+        require(current.record.phase == Phase::ready, "AETHER_RUNTIME_STATE",
+                "Runtime is not ready for package changes");
+        validate_store();
+        if (std::any_of(current.record.stores.begin(), current.record.stores.end(),
+                        [&](const auto &known) { return same_path(known, store); }))
+            return;
+    } // Close the shared catalogue handle before acquiring exclusive write access.
     Catalogue state(root, true);
     require(state.record.phase == Phase::ready, "AETHER_RUNTIME_STATE",
             "Runtime is not ready for package changes");
-    validate_path(store);
-    require(!below(store, root) && !below(root, store), "AETHER_RUNTIME_STORE",
-            "Runtime binaries and package stores must use separate directory trees");
+    validate_store();
     if (std::any_of(state.record.stores.begin(), state.record.stores.end(),
                     [&](const auto &known) { return same_path(known, store); }))
         return;

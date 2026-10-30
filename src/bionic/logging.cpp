@@ -1,16 +1,28 @@
 #include "logging.hpp"
+#include "error_strings.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdio>
 #include <limits>
 #include <locale.h>
+#include <vector>
 #include <windows.h>
 namespace aether::bionic {
 namespace {
 using a64::Fault;
 struct Failure {Fault fault;const char *message;};
 [[noreturn]] void unsupported(const char *message){throw Failure{Fault::unsupported_service,message};}
+unsigned descriptor_error(host::FileError error){
+    // Keep the guest ABI mapping identical to NativeStdio's descriptor errors.
+    using E=host::FileError;
+    switch(error){case E::none:return 0;case E::missing:return 2;case E::denied:return 13;
+    case E::exists:return 17;case E::bad_descriptor:return 9;case E::invalid:return 22;
+    case E::unsupported:return 95;case E::descriptor_limit:return 24;case E::quota:return 28;
+    case E::io:return 5;case E::would_block:return 11;case E::is_directory:return 21;
+    case E::not_directory:return 20;case E::not_empty:return 39;case E::not_seekable:return 29;}
+    return 5;
+}
 std::uint64_t read_word(a64::GuestMemory &memory,std::uint64_t address) {
     std::array<std::uint8_t,8> bytes{};if(!memory.read(address,bytes))throw Failure{Fault::read,"liblog: unreadable argument slot"};
     std::uint64_t value=0;for(unsigned n=0;n<8;++n)value|=static_cast<std::uint64_t>(bytes[n])<<(n*8);return value;
@@ -64,9 +76,8 @@ _locale_t c_locale() {
     static const Locale locale;if(!locale.value)throw Failure{Fault::windows_service,"printf: C locale unavailable"};return locale.value;
 }
 template<class Reader>
-std::string format(a64::GuestMemory &memory,std::uint64_t pointer,Reader &arguments) {
-    if(!pointer)unsupported("liblog: null format");
-    const auto source=text(memory,pointer,1024);std::string result;unsigned conversions=0;
+std::string format_source(a64::GuestMemory &memory,std::string_view source,Reader &arguments,a64::Address error=0) {
+    std::string result;unsigned conversions=0;
     const auto append=[&](std::string_view value){result.append(value);};
     for(std::size_t at=0;at<source.size();) {
         if(source[at]!='%'){append(std::string_view(source).substr(at++,1));continue;}
@@ -86,6 +97,18 @@ std::string format(a64::GuestMemory &memory,std::uint64_t pointer,Reader &argume
         if(at<source.size() && std::string_view("hljztL").find(source[at])!=std::string_view::npos){length.push_back(source[at++]);if(at<source.size() && (length=="h" || length=="l") && source[at]==length[0])length.push_back(source[at++]);}
         if(at==source.size())unsupported("liblog: incomplete conversion");
         const char conversion=source[at++];
+        if(conversion=='m') {
+            if(!error || !length.empty() || flags.find('#')!=std::string::npos)
+                unsupported("syslog: unsupported errno conversion profile");
+            std::array<std::uint8_t,4> bytes{};
+            if(!memory.read(error,bytes))throw Failure{Fault::read,"syslog: unreadable logical errno"};
+            std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{bytes[i]}<<(8*i);
+            auto description=native_error_description(std::bit_cast<std::int32_t>(value));
+            if(precision>=0 && description.size()>static_cast<std::size_t>(precision))description.resize(precision);
+            const auto padding=width>static_cast<int>(description.size())?static_cast<std::size_t>(width)-description.size():0;
+            if(flags.find('-')!=std::string::npos)description.append(padding,' ');else description.insert(0,padding,' ');
+            append(description);continue;
+        }
         if(std::string_view("diuoxXcspfFeEgGaA").find(conversion)==std::string_view::npos || length=="L")unsupported("liblog: unsupported printf conversion");
         const bool floating=std::string_view("fFeEgGaA").find(conversion)!=std::string_view::npos;
         if((floating && !length.empty() && length!="l") || ((conversion=='s' || conversion=='c' || conversion=='p') && !length.empty()))unsupported("liblog: wide or invalid conversion is unsupported");
@@ -167,6 +190,141 @@ std::string format(a64::GuestMemory &memory,std::uint64_t pointer,Reader &argume
     }
     return result;
 }
+template<class Reader>
+std::string format(a64::GuestMemory &memory,std::uint64_t pointer,Reader &arguments,a64::Address error=0) {
+    if(!pointer)unsupported("liblog: null format");
+    return format_source(memory,text(memory,pointer,1024),arguments,error);
+}
+struct WideError {unsigned value;};
+constexpr std::size_t wide_render_limit=1024*1024/4-1;
+bool scalar(std::uint32_t value){return value<=0x10ffff && (value<0xd800 || value>0xdfff);}
+// Bionic's wide encoder accepts this larger domain; final conversion back to
+// wchar_t uses the strict decoder. Keep those two stages distinct.
+bool wide_encodable(std::uint32_t value){return value<=0x1fffff;}
+std::uint32_t wide_unit(a64::GuestMemory &memory,a64::Address pointer,std::size_t index){
+    if(pointer>a64::GuestMemory::address_limit-4 || index>(a64::GuestMemory::address_limit-4-pointer)/4)
+        throw Failure{Fault::read,"swprintf: wide source address overflow"};
+    std::array<std::uint8_t,4> bytes{};
+    if(!pointer || !memory.read(pointer+index*4,bytes))throw Failure{Fault::read,"swprintf: unreadable wide source"};
+    std::uint32_t value=0;for(unsigned i=0;i<4;++i)value|=std::uint32_t{bytes[i]}<<(8*i);return value;
+}
+std::uint32_t utf8_unit(a64::GuestMemory &memory,a64::Address pointer,std::size_t &offset){
+    const auto byte=[&](){
+        if(pointer>=a64::GuestMemory::address_limit || offset>=a64::GuestMemory::address_limit-pointer)
+            throw Failure{Fault::read,"swprintf: UTF-8 source address overflow"};
+        std::array<std::uint8_t,1> data{};
+        if(!pointer || !memory.read(pointer+offset,data))throw Failure{Fault::read,"swprintf: unreadable UTF-8 source"};
+        ++offset;return data[0];
+    };
+    const auto first=byte();if(first<0x80)return first;
+    unsigned extra=0;std::uint32_t value=0,minimum=0;
+    if(first>=0xc2 && first<=0xdf){extra=1;value=first&31;minimum=0x80;}
+    else if(first>=0xe0 && first<=0xef){extra=2;value=first&15;minimum=0x800;}
+    else if(first>=0xf0 && first<=0xf4){extra=3;value=first&7;minimum=0x10000;}
+    else throw WideError{84};
+    for(unsigned i=0;i<extra;++i){const auto next=byte();if((next&0xc0)!=0x80)throw WideError{84};value=(value<<6)|(next&63);}
+    if(value<minimum || !scalar(value))throw WideError{84};return value;
+}
+void wide_append(std::vector<std::uint32_t> &output,std::span<const std::uint32_t> value){
+    for(const auto unit:value)if(!wide_encodable(unit))throw WideError{84};
+    if(value.size()>wide_render_limit-output.size())unsupported("swprintf: render exceeds 262143 wchar profile");
+    output.insert(output.end(),value.begin(),value.end());
+}
+void wide_append(std::vector<std::uint32_t> &output,std::uint32_t value){
+    if(!wide_encodable(value))throw WideError{84};
+    if(output.size()==wide_render_limit)unsupported("swprintf: render exceeds 262143 wchar profile");
+    output.push_back(value);
+}
+template<class Reader>
+std::vector<std::uint32_t> wide_format(a64::GuestMemory &memory,a64::Address pointer,Reader &arguments,a64::Address error){
+    // Independent ceilings: 1024 format units including NUL, 4096 source
+    // characters including NUL, 64 conversions, width/precision <=512.
+    // UTF-32 is never passed to a host wchar/locale/varargs implementation.
+    std::vector<std::uint32_t> source,output;
+    for(std::size_t i=0;;++i){
+        if(i==1024)unsupported("swprintf: format exceeds 1024 wchar profile");
+        const auto value=wide_unit(memory,pointer,i);if(!value)break;
+        source.push_back(value);
+    }
+    unsigned conversions=0;bool have_error=false;std::string error_description;
+    for(std::size_t at=0;at<source.size();){
+        if(source[at]!='%'){wide_append(output,source[at++]);continue;}
+        ++at;if(at<source.size() && source[at]=='%'){wide_append(output,'%');++at;continue;}
+        if(++conversions>64)unsupported("swprintf: conversion limit 64 exceeded");
+        std::string flags;
+        while(at<source.size() && source[at]<128 && std::string_view("-+ #0").find(static_cast<char>(source[at]))!=std::string_view::npos){
+            if(flags.size()==5)unsupported("swprintf: excessive format flags");flags.push_back(static_cast<char>(source[at++]));
+        }
+        const auto number=[&](bool precision){
+            int value=0;
+            if(at<source.size() && source[at]=='*'){++at;value=std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(arguments.take()));}
+            else while(at<source.size() && source[at]>='0' && source[at]<='9'){
+                if(value>512)unsupported("swprintf: width/precision exceeds 512 profile");value=value*10+static_cast<int>(source[at++]-'0');
+            }
+            if(value < -512 || value>512)unsupported("swprintf: width/precision exceeds 512 profile");
+            if(!precision && value<0){if(flags.find('-')==std::string::npos)flags.push_back('-');value=-value;}return value;
+        };
+        const auto width=number(false);int precision=-1;
+        if(at<source.size() && source[at]=='.'){++at;precision=number(true);}
+        std::string length;
+        if(at<source.size() && source[at]<128 && std::string_view("hljztL").find(static_cast<char>(source[at]))!=std::string_view::npos){
+            length.push_back(static_cast<char>(source[at++]));
+            if(at<source.size() && (length=="h" || length=="l") && source[at]==static_cast<unsigned char>(length[0]))length.push_back(static_cast<char>(source[at++]));
+        }
+        if(at==source.size() || source[at]>=128)unsupported("swprintf: incomplete or unsupported conversion");
+        const auto conversion=static_cast<char>(source[at++]);
+        std::vector<std::uint32_t> value;
+        if(conversion=='s' || conversion=='S'){
+            if((conversion=='s' && !length.empty() && length!="l") || (conversion=='S' && !length.empty()))unsupported("swprintf: invalid string conversion length");
+            const auto address=arguments.take();const bool wide=conversion=='S' || length=="l";
+            if(!address){
+                constexpr std::string_view null="(null)";
+                for(std::size_t i=0;i<null.size() && (precision<0 || i<static_cast<std::size_t>(precision));++i)value.push_back(null[i]);
+            }else{
+                std::size_t offset=0;
+                for(std::size_t i=0;precision<0 || i<static_cast<std::size_t>(precision);++i){
+                    if(i==4096)unsupported("swprintf: string exceeds 4096 character profile");
+                    const auto unit=wide?wide_unit(memory,address,i):utf8_unit(memory,address,offset);
+                    if(!unit)break;if(!wide_encodable(unit))throw WideError{84};value.push_back(unit);
+                }
+            }
+        }else if(conversion=='c' || conversion=='C'){
+            if((conversion=='c' && !length.empty() && length!="l") || (conversion=='C' && !length.empty()))unsupported("swprintf: invalid character conversion length");
+            auto unit=static_cast<std::uint32_t>(arguments.take());
+            if(conversion=='c' && length.empty()){
+                if(unit==UINT32_MAX)throw WideError{84};unit=static_cast<std::uint8_t>(unit);if(unit>=128)throw WideError{84};
+            }
+            if(!wide_encodable(unit))throw WideError{84};value.push_back(unit);
+        }else if(conversion=='m'){
+            if(!length.empty() || flags.find('#')!=std::string::npos)unsupported("swprintf: unsupported errno conversion profile");
+            if(!have_error){
+                std::array<std::uint8_t,4> bytes{};if(!memory.read(error,bytes))throw Failure{Fault::read,"swprintf: unreadable logical errno"};
+                std::uint32_t error_number=0;for(unsigned i=0;i<4;++i)error_number|=std::uint32_t{bytes[i]}<<(8*i);
+                error_description=native_error_description(std::bit_cast<std::int32_t>(error_number));have_error=true;
+            }
+            for(std::size_t i=0;i<error_description.size() && (precision<0 || i<static_cast<std::size_t>(precision));++i)value.push_back(static_cast<unsigned char>(error_description[i]));
+        }else{
+            if(std::string_view("diuoxXpfFeEgGaA").find(conversion)==std::string_view::npos)unsupported("swprintf: unsupported conversion profile");
+            std::string spec="%"+flags;if(width)spec+=std::to_string(width);if(precision>=0)spec+="."+std::to_string(precision);spec+=length;spec+=conversion;
+            // A single normalized ASCII numeric conversion shares all integer,
+            // pointer and floating behavior, and the original GP/FP cursor.
+            const auto rendered=format_source(memory,spec,arguments);
+            for(const unsigned char byte:rendered)wide_append(output,byte);
+            continue;
+        }
+        const auto padding=width>static_cast<int>(value.size())?static_cast<std::size_t>(width)-value.size():0;
+        if(padding>wide_render_limit-output.size() || value.size()>wide_render_limit-output.size()-padding)unsupported("swprintf: render exceeds 262143 wchar profile");
+        if(flags.find('-')==std::string::npos)output.insert(output.end(),padding,' ');
+        wide_append(output,value);
+        if(flags.find('-')!=std::string::npos)output.insert(output.end(),padding,' ');
+    }
+    return output;
+}
+void wide_error(a64::GuestMemory &memory,a64::Address error,a64::ServiceState &state,unsigned value){
+    std::array<std::uint8_t,4> bytes{};for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(value>>(i*8));
+    if(!memory.write(error,bytes))throw Failure{Fault::write,"swprintf: unwritable logical errno"};
+    state.registers[0]=UINT64_MAX;
+}
 class WindowsLog final:public host::NativeLogSink {
     bool write(const host::NativeLogMessage &message) noexcept override {
         try {
@@ -181,7 +339,8 @@ class WindowsLog final:public host::NativeLogSink {
 WindowsLog default_sink;
 }
 bool native_log_symbol(std::string_view name) noexcept {return name=="__android_log_write" || name=="__android_log_print" || name=="__android_log_assert";}
-NativeLogging::NativeLogging(a64::GuestMemory &memory,host::NativeLogSink *sink):memory_(memory),sink_(sink?sink:&default_sink){}
+NativeLogging::NativeLogging(a64::GuestMemory &memory,host::NativeLogSink *sink,std::string_view program_tag)
+    :memory_(memory),sink_(sink?sink:&default_sink),syslog_default_(program_tag.empty()?"Aether":program_tag){}
 bool NativeLogging::write_stream(int fd,std::span<const std::uint8_t> bytes) noexcept {
     if((fd!=1 && fd!=2) || bytes.size()>1024*1024)return false;
     const std::string_view message{reinterpret_cast<const char*>(bytes.data()),bytes.size()};
@@ -203,6 +362,99 @@ a64::Fault NativeLogging::invoke(std::string_view name,a64::ServiceState &state,
     }catch(const Failure &failure){rejection_view_=failure.message;return failure.fault;}
     catch(...){rejection_view_="liblog: host formatting or logging failure";return Fault::windows_service;}
 }
+a64::Fault NativeLogging::invoke_syslog(unsigned operation,a64::ServiceState &state,bool full,
+                                      a64::Address error,host::FileService &descriptors) noexcept {
+    try {
+        auto &r=state.registers;
+        if(operation>4)unsupported("syslog: invalid operation");
+        if(operation==2){syslog_tag_=r[0];syslog_options_=static_cast<std::uint32_t>(r[1]);return Fault::none;}
+        if(operation==3){syslog_tag_=0;syslog_options_=0;return Fault::none;}
+        if(operation==4){const auto previous=syslog_mask_;const auto next=static_cast<std::uint32_t>(r[0]);if(next)syslog_mask_=next;r[0]=previous;return Fault::none;}
+        const auto priority=static_cast<std::uint32_t>(r[0])&7;
+        // Bionic's mask test precedes every tag/format/argument access.
+        if(!(syslog_mask_&(std::uint32_t{1}<<priority)))return Fault::none;
+        const auto tag=syslog_tag_?text(memory_,syslog_tag_,128):syslog_default_;
+        std::string rendered;
+        if(operation==1){VaArguments arguments{memory_,r[2]};rendered=format(memory_,r[1],arguments,error);}
+        else {Arguments arguments{memory_,state,full,2,0,state.stack_pointer};rendered=format(memory_,r[1],arguments,error);}
+        const auto count=rendered.size();
+        const bool have_newline=count>0 && count<1024 && rendered[count-1]=='\n';
+        if(rendered.size()>1023)rendered.resize(1023);
+        // The Bionic logcat and stderr paths print the snprintf buffer with %s.
+        if(const auto nul=rendered.find('\0');nul!=std::string::npos)rendered.resize(nul);
+        const int android_priority=priority<=3?6:priority==4?5:priority<=6?4:3;
+        if(sink_->write({android_priority,tag,rendered,false}))++messages_;
+        if(syslog_options_&0x20){
+            auto stderr_text=tag+": "+rendered;if(!have_newline)stderr_text+='\n';
+            // Use only this app's logical descriptor; no host standard handle.
+            std::size_t written=0;
+            while(written<stderr_text.size()){
+                const auto remaining=stderr_text.size()-written;
+                const auto result=descriptors.write(2,{reinterpret_cast<const std::uint8_t*>(stderr_text.data()+written),remaining});
+                if(result.error!=host::FileError::none || result.value<=0 ||
+                   static_cast<std::uint64_t>(result.value)>remaining){
+                    const auto value=result.error==host::FileError::none?5:descriptor_error(result.error);
+                    std::array<std::uint8_t,4> bytes{};for(unsigned i=0;i<4;++i)bytes[i]=static_cast<std::uint8_t>(value>>(8*i));
+                    // Failure occurs after already accepted output. Never
+                    // preflight, roll back, or replay either observable output.
+                    if(!memory_.write(error,bytes))throw Failure{Fault::write,"syslog: failed stderr write and unwritable logical errno"};
+                    break;
+                }
+                // Only positive progress permits another write, of the suffix.
+                // At most one call per output byte; failed writes never retry.
+                written+=static_cast<std::size_t>(result.value);
+            }
+        }
+        return Fault::none;
+    }catch(const Failure &failure){rejection_view_=failure.message;return failure.fault;}
+    catch(...){rejection_view_="syslog: host formatting or logging failure";return Fault::windows_service;}
+}
+a64::Fault NativeFormatting::render_allocated(bool variadic_list,a64::Address error,a64::ServiceState &state,
+                                             bool full,std::string &output,bool &allocation_failed) noexcept {
+    rejection_={};allocation_failed=false;
+    try {
+        std::string rendered;
+        if(variadic_list){
+            VaArguments arguments{memory_,state.registers[2]};
+            rendered=format(memory_,state.registers[1],arguments,error);
+        }else{
+            Arguments arguments{memory_,state,full,2,0,state.stack_pointer};
+            rendered=format(memory_,state.registers[1],arguments,error);
+        }
+        // Preserve embedded NULs and the complete count. The allocator adapter
+        // adds the final terminator and owns all guest publication and cleanup.
+        output.swap(rendered);
+        return Fault::none;
+    }catch(const Failure &failure){rejection_=failure.message;return failure.fault;}
+    catch(const std::bad_alloc &){
+        rejection_="asprintf: host rendering allocation failed";allocation_failed=true;return Fault::none;
+    }catch(...){rejection_="asprintf: host formatting failure";return Fault::windows_service;}
+}
+
+a64::Fault NativeFormatting::render_stream(bool variadic_list,bool standard,a64::Address error,
+                                          a64::ServiceState &state,bool full,std::string &output,
+                                          bool &allocation_failed) noexcept {
+    rejection_={};allocation_failed=false;
+    try {
+        const unsigned first=standard?1U:2U;
+        std::string rendered;
+        if(variadic_list){
+            VaArguments arguments{memory_,state.registers[first]};
+            rendered=format(memory_,state.registers[first-1],arguments,error);
+        }else{
+            Arguments arguments{memory_,state,full,first,0,state.stack_pointer};
+            rendered=format(memory_,state.registers[first-1],arguments,error);
+        }
+        // The stream owner writes the complete byte sequence, including any
+        // embedded NULs, after its own FILE permission and direction checks.
+        output.swap(rendered);
+        return Fault::none;
+    }catch(const Failure &failure){rejection_=failure.message;return failure.fault;}
+    catch(const std::bad_alloc &){
+        rejection_="printf: host rendering allocation failed";allocation_failed=true;return Fault::none;
+    }catch(...){rejection_="printf: host formatting failure";return Fault::windows_service;}
+}
+
 a64::Fault NativeFormatting::invoke(unsigned operation,a64::ServiceState &state,bool full) noexcept {
     try {
         auto &r=state.registers;const bool sprintf_checked=operation==4;
@@ -225,6 +477,40 @@ a64::Fault NativeFormatting::invoke(unsigned operation,a64::ServiceState &state,
         r[0]=full_count;return Fault::none;
     }catch(const Failure &failure){rejection_=failure.message;return failure.fault;}
     catch(...){rejection_="printf: host formatting failure";return Fault::windows_service;}
+}
+
+a64::Fault NativeFormatting::invoke_wide(bool variadic_list,a64::Address error,a64::ServiceState &state,bool full) noexcept {
+    try {
+        try {
+            auto &r=state.registers;const auto destination=r[0],capacity=r[1],pointer=r[2];
+            // Bionic rejects zero capacity before touching any caller input.
+            if(!capacity)throw WideError{22};
+            std::vector<std::uint32_t> rendered;
+            if(variadic_list){VaArguments arguments{memory_,r[3]};rendered=wide_format(memory_,pointer,arguments,error);}
+            else {Arguments arguments{memory_,state,full,3,0,state.stack_pointer};rendered=wide_format(memory_,pointer,arguments,error);}
+            const auto full_count=rendered.size();
+            std::size_t prefix=0;
+            while(prefix<rendered.size() && prefix<capacity && rendered[prefix] && scalar(rendered[prefix]))++prefix;
+            const bool truncated=prefix>=capacity;
+            const bool decoding_error=!truncated && prefix<rendered.size() && rendered[prefix] && !scalar(rendered[prefix]);
+            const auto copied=truncated?prefix-1:prefix;
+            // All emitted units passed the encoder first. Final decoding can
+            // stop at capacity or NUL before reaching an encodable non-scalar.
+            // A decoding error publishes its valid prefix without a terminator.
+            const auto written=copied+(decoding_error?0U:1U);
+            std::vector<std::uint8_t> bytes(written*4);
+            for(std::size_t i=0;i<copied;++i)for(unsigned b=0;b<4;++b)bytes[i*4+b]=static_cast<std::uint8_t>(rendered[i]>>(b*8));
+            // Only the actual write span is inspected, never capacity*4. A huge
+            // declared capacity with a short output remains a bounded operation.
+            if(written && (!destination || !memory_.write(destination,bytes)))throw Failure{Fault::write,"swprintf: unwritable destination"};
+            if(decoding_error)wide_error(memory_,error,state,84);
+            else if(truncated)wide_error(memory_,error,state,75);
+            else r[0]=full_count;
+            return Fault::none;
+        }catch(const WideError &failure){wide_error(memory_,error,state,failure.value);return Fault::none;}
+        catch(const std::bad_alloc &){wide_error(memory_,error,state,12);return Fault::none;}
+    }catch(const Failure &failure){rejection_=failure.message;return failure.fault;}
+    catch(...){rejection_="swprintf: host formatting failure";return Fault::windows_service;}
 }
 
 }

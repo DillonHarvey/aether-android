@@ -35,18 +35,26 @@ target_link_options(aether_options INTERFACE /DYNAMICBASE /NXCOMPAT /HIGHENTROPY
 configure_file(include/aether/build_info.hpp.in generated/aether/build_info.hpp @ONLY)
 add_library(aether_core STATIC
     src/common/text.cpp
+    src/common/uri.cpp
+    src/common/java_char.cpp
     src/common/prefix_strings.cpp
     src/diagnostics/diagnostic.cpp
     src/host/windows/doctor.cpp
     src/host/windows/package_io.cpp
     src/host/windows/time_service.cpp
     src/host/windows/file_service.cpp
+    src/host/windows/document_service.cpp
     src/apk/archive.cpp
     src/apk/manifest.cpp
     src/apk/xml.cpp
     src/apk/package_set.cpp
     src/apk/package.cpp
     src/apk/launcher.cpp
+    src/apk/intent_pattern.cpp
+    src/apk/intent_filter_compile.cpp
+    src/apk/intent_filter_match.cpp
+    src/apk/intent_resolver.cpp
+    src/apk/intent_value.cpp
     src/apk/string_pool.cpp
     src/apk/resources.cpp
     src/apk/dex.cpp
@@ -82,7 +90,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_
         --output "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_content.hpp"
     DEPENDS tools/compile-privacy.py src/install/privacy_guide.txt
     VERBATIM)
-add_library(aether_install STATIC src/install/store.cpp src/install/cli.cpp src/install/shell.cpp src/install/explorer.cpp src/install/runtime.cpp
+add_library(aether_install STATIC src/install/store.cpp src/install/cli.cpp src/install/open_link.cpp src/install/open_file.cpp src/install/file_activation.cpp src/install/link_activation.cpp src/install/link_registration.cpp src/install/shell.cpp src/install/explorer.cpp src/install/runtime.cpp
     src/install/runtime_bundle.cpp src/install/runtime_registration.cpp src/install/diagnostics.cpp
     src/install/troubleshooting.cpp src/install/privacy.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_content.hpp")
@@ -90,7 +98,7 @@ file(READ "${CMAKE_CURRENT_SOURCE_DIR}/apps/aether-setup/uninstall-controller.ps
 configure_file(src/install/uninstall_controller.hpp.in generated/aether/uninstall_controller.hpp @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS apps/aether-setup/uninstall-controller.ps1)
 target_include_directories(aether_install PUBLIC include)
-target_link_libraries(aether_install PUBLIC aether_core PRIVATE aether_apk_signing aether_runtime_permissions aether_window aether_icon_cache shell32 ole32 advapi32 bcrypt userenv)
+target_link_libraries(aether_install PUBLIC aether_core PRIVATE aether_apk_signing aether_runtime_permissions aether_window aether_icon_cache aether_host_notifications shell32 ole32 advapi32 bcrypt userenv)
 
 add_library(aether_a64 STATIC src/a64/guest_memory.cpp src/a64/guest_cpu.cpp src/a64/selftest.cpp)
 target_include_directories(aether_a64 PUBLIC include)
@@ -100,13 +108,16 @@ add_library(aether_elf STATIC src/elf/image.cpp src/elf/guest_loader.cpp src/elf
 target_include_directories(aether_elf PUBLIC include)
 target_link_libraries(aether_elf PUBLIC aether_a64 PRIVATE aether_core)
 
-add_library(aether_bionic STATIC src/bionic/guest_posix.cpp src/bionic/logging.cpp src/bionic/access.cpp src/bionic/executing.cpp src/bionic/string_memory.cpp src/bionic/file_metadata.cpp src/bionic/removing.cpp src/bionic/opening.cpp src/bionic/creating.cpp src/bionic/renaming.cpp src/bionic/error_strings.cpp src/bionic/properties.cpp src/bionic/dynamic_linker.cpp src/bionic/mappings.cpp src/bionic/threads.cpp src/bionic/thread_specific.cpp src/bionic/thread_attributes.cpp src/bionic/zlib.cpp src/bionic/mutexes.cpp src/bionic/rwlocks.cpp src/bionic/stdio.cpp src/bionic/integers.cpp src/bionic/scanning.cpp src/bionic/locale.cpp src/bionic/ctype.cpp src/bionic/unicode.cpp src/bionic/once.cpp src/bionic/multibyte.cpp src/bionic/signals.cpp src/bionic/conditions.cpp src/bionic/calendar.cpp src/bionic/calendar_format.cpp src/bionic/descriptors.cpp src/bionic/polling.cpp src/bionic/sleeping.cpp src/bionic/jumps.cpp)
-target_include_directories(aether_bionic PUBLIC include)
+add_library(aether_bionic STATIC src/bionic/guest_posix.cpp src/bionic/logging.cpp src/bionic/access.cpp src/bionic/executing.cpp src/bionic/string_memory.cpp src/bionic/file_metadata.cpp src/bionic/removing.cpp src/bionic/opening.cpp src/bionic/creating.cpp src/bionic/renaming.cpp src/bionic/error_strings.cpp src/bionic/properties.cpp src/bionic/dynamic_linker.cpp src/bionic/mappings.cpp src/bionic/threads.cpp src/bionic/thread_specific.cpp src/bionic/thread_attributes.cpp src/bionic/zlib.cpp src/bionic/mutexes.cpp src/bionic/rwlocks.cpp src/bionic/stdio.cpp src/bionic/integers.cpp src/bionic/floating.cpp src/bionic/float_conversion.cpp src/bionic/scanning.cpp src/bionic/locale.cpp src/bionic/ctype.cpp src/bionic/unicode.cpp src/bionic/collation.cpp src/bionic/wide_memory.cpp src/bionic/once.cpp src/bionic/phdr.cpp src/bionic/cxa_destructors.cpp src/bionic/abort_message.cpp src/bionic/multibyte.cpp src/bionic/signals.cpp src/bionic/conditions.cpp src/bionic/calendar.cpp src/bionic/calendar_format.cpp src/bionic/descriptors.cpp src/bionic/polling.cpp src/bionic/sleeping.cpp src/bionic/jumps.cpp)
+target_include_directories(aether_bionic PUBLIC include PRIVATE third_party/boost)
 target_link_libraries(aether_bionic PUBLIC aether_elf PRIVATE aether_core aether_host_entropy aether_host_process aether_angle_zlib)
 
 add_library(aether_native STATIC src/elf/selftest.cpp)
 target_link_libraries(aether_native PUBLIC aether_bionic PRIVATE aether_core)
 
+add_library(aether_host_notifications STATIC src/host/windows/notification_service.cpp)
+target_include_directories(aether_host_notifications PUBLIC include)
+target_link_libraries(aether_host_notifications PUBLIC aether_options PRIVATE aether_core runtimeobject ole32)
 add_library(aether_host_audio STATIC src/host/windows/audio_stream.cpp)
 target_include_directories(aether_host_audio PUBLIC include)
 target_link_libraries(aether_host_audio PUBLIC aether_options PRIVATE aether_core ole32 uuid)
@@ -134,24 +145,26 @@ add_library(aether_host_regex STATIC src/host/windows/regex.cpp)
 target_include_directories(aether_host_regex PUBLIC include)
 target_link_libraries(aether_host_regex PUBLIC aether_options)
 
-add_library(aether_dex STATIC src/dex/scheduler.cpp src/dex/image.cpp src/dex/annotations.cpp src/dex/bytecode.cpp src/dex/runtime.cpp src/dex/collections.cpp src/dex/unmodifiable_lists.cpp src/dex/synchronized_lists.cpp src/dex/deque.cpp src/dex/array_views.cpp src/dex/class_names.cpp src/dex/atomics.cpp src/dex/integers.cpp src/dex/literal_metadata.cpp src/dex/bytes.cpp src/dex/floating_values.cpp src/dex/integral_values.cpp src/dex/regex.cpp src/dex/thread_locals.cpp src/dex/booleans.cpp src/dex/uuids.cpp src/dex/random.cpp src/dex/streams.cpp src/dex/maps.cpp src/dex/empty_maps.cpp src/dex/enums.cpp src/dex/execution_policy.cpp src/dex/time_units.cpp src/dex/thread_pool.cpp src/dex/futures.cpp src/dex/async_task.cpp src/dex/references.cpp src/dex/sets.cpp src/dex/linker.cpp src/dex/source.cpp src/dex/archive_source.cpp)
+add_library(aether_dex STATIC src/dex/scheduler.cpp src/dex/image.cpp src/dex/code_storage.cpp src/dex/annotations.cpp src/dex/bytecode.cpp src/dex/runtime.cpp src/dex/math.cpp src/dex/collections.cpp src/dex/unmodifiable_lists.cpp src/dex/synchronized_lists.cpp src/dex/deque.cpp src/dex/array_views.cpp src/dex/class_names.cpp src/dex/atomics.cpp src/dex/integers.cpp src/dex/characters.cpp src/dex/literal_metadata.cpp src/dex/bytes.cpp src/dex/floating_values.cpp src/dex/integral_values.cpp src/dex/regex.cpp src/dex/thread_locals.cpp src/dex/booleans.cpp src/dex/uuids.cpp src/dex/random.cpp src/dex/streams.cpp src/dex/maps.cpp src/dex/empty_maps.cpp src/dex/enums.cpp src/dex/execution_policy.cpp src/dex/time_units.cpp src/dex/thread_pool.cpp src/dex/futures.cpp src/dex/async_task.cpp src/dex/references.cpp src/dex/sets.cpp src/dex/linker.cpp src/dex/source.cpp src/dex/archive_source.cpp)
 target_include_directories(aether_dex PUBLIC include)
 target_link_libraries(aether_dex PUBLIC aether_options PRIVATE aether_core aether_host_process aether_host_entropy aether_host_regex)
 
 add_library(aether_jni STATIC src/jni/bridge.cpp)
 target_include_directories(aether_jni PUBLIC include)
-target_link_libraries(aether_jni PUBLIC aether_dex aether_bionic)
+target_link_libraries(aether_jni PUBLIC aether_dex aether_bionic PRIVATE aether_audio)
 
 add_library(aether_managed STATIC src/dex/selftest.cpp)
 target_link_libraries(aether_managed PUBLIC aether_jni PRIVATE aether_core)
 
-add_library(aether_android STATIC src/android/bundle.cpp src/android/framework.cpp src/android/preferences.cpp src/android/registry.cpp src/android/selftest.cpp)
+add_library(aether_android STATIC src/android/bundle.cpp src/android/component_names.cpp src/android/intent_categories.cpp src/android/intents.cpp src/android/uris.cpp src/android/framework.cpp src/android/preferences.cpp src/android/registry.cpp src/android/selftest.cpp)
 target_include_directories(aether_android PUBLIC include)
 target_link_libraries(aether_android PUBLIC aether_jni PRIVATE aether_core)
 
-add_library(aether_window STATIC src/host/windows/window.cpp src/host/windows/input.cpp)
+add_library(aether_window STATIC src/host/windows/window.cpp src/host/windows/input.cpp
+    src/host/windows/accessibility.cpp src/host/windows/text_layout.cpp src/host/windows/native_ime.cpp src/host/windows/input_pane.cpp src/host/windows/file_drop.cpp)
 target_include_directories(aether_window PUBLIC include)
-target_link_libraries(aether_window PUBLIC aether_android PRIVATE aether_core user32 gdi32 ole32 windowscodecs shell32 propsys)
+target_link_libraries(aether_window PUBLIC aether_android PRIVATE aether_core user32 gdi32 imm32 ole32 oleaut32
+    UIAutomationCore windowscodecs shell32 propsys dwrite d2d1 icu runtimeobject)
 
 add_executable(aether apps/aether-cli/main.cpp)
 target_link_libraries(aether PRIVATE aether_apk_signing aether_core aether_a64 aether_native aether_managed aether_android aether_window aether_graphics_selftest aether_audio_selftest aether_install)
@@ -181,8 +194,8 @@ target_link_options(aether_shell_icons PRIVATE /guard:cf "/MAP:${CMAKE_CURRENT_B
 add_library(aether_privacy_ui STATIC apps/common/privacy_dialog.cpp)
 target_include_directories(aether_privacy_ui PUBLIC apps/common)
 target_link_libraries(aether_privacy_ui PUBLIC aether_install PRIVATE user32 gdi32)
-add_executable(aether_shell WIN32 apps/aether-shell/main.cpp apps/aether-shell/install_dialog.cpp
-    apps/aether-shell/app_dialog.cpp apps/aether-shell/app_dialog.rc apps/common/privacy.rc)
+add_executable(aether_shell WIN32 apps/aether-shell/main.cpp apps/aether-shell/notification_activation.cpp apps/aether-shell/install_dialog.cpp
+    apps/aether-shell/app_dialog.cpp apps/aether-shell/link_dialog.cpp apps/aether-shell/app_dialog.rc apps/common/privacy.rc)
 set_target_properties(aether_shell PROPERTIES OUTPUT_NAME "aether-shell")
 target_link_libraries(aether_shell PRIVATE aether_privacy_ui comctl32)
 add_executable(aether_setup WIN32 apps/aether-setup/main.cpp apps/common/privacy.rc)
@@ -203,17 +216,18 @@ add_custom_target(aether_distribution ALL
 
 add_library(aether_security STATIC src/security/worker_progress.cpp src/security/protocol.cpp src/security/broker.cpp src/security/worker.cpp
     src/security/audit.cpp src/security/audit_file.cpp
-    src/security/client.cpp src/security/audio_protocol.cpp src/security/audio_broker.cpp src/security/audio_client.cpp
-    src/security/storage.cpp src/security/apk_result.cpp src/security/activity_protocol.cpp)
+    src/security/client.cpp src/security/notification_client.cpp src/security/audio_protocol.cpp src/security/audio_broker.cpp src/security/audio_client.cpp
+    src/security/storage.cpp src/security/apk_result.cpp src/security/activity_protocol.cpp src/security/activity_launch.cpp)
 target_include_directories(aether_security PUBLIC include)
 target_link_libraries(aether_security PUBLIC aether_core PRIVATE aether_runtime_permissions userenv advapi32 OneCoreUAP)
 add_library(aether_isolated_apk STATIC src/security/apk_runtime.cpp src/security/apk_selftest.cpp)
 target_link_libraries(aether_isolated_apk PUBLIC aether_security PRIVATE aether_android)
 target_link_libraries(aether PRIVATE aether_isolated_apk)
-add_library(aether_activity_host STATIC src/security/activity_host.cpp src/security/activity_dispatcher.cpp)
-target_link_libraries(aether_activity_host PUBLIC aether_security)
+add_library(aether_activity_host STATIC src/security/activity_host.cpp src/security/activity_dispatcher.cpp
+    src/host/windows/clipboard_service.cpp)
+target_link_libraries(aether_activity_host PUBLIC aether_security PRIVATE aether_host_audio aether_host_notifications user32)
 add_library(aether_activity_runtime STATIC src/security/activity_runtime.cpp)
-target_link_libraries(aether_activity_runtime PUBLIC aether_security PRIVATE aether_android)
+target_link_libraries(aether_activity_runtime PUBLIC aether_security PRIVATE aether_android aether_audio)
 target_link_libraries(aether_window PRIVATE aether_activity_host)
 add_library(aether_isolated_audio STATIC src/security/audio_result.cpp src/security/audio_selftest.cpp)
 target_link_libraries(aether_isolated_audio PUBLIC aether_security PRIVATE aether_audio_selftest)
@@ -444,6 +458,9 @@ if(BUILD_TESTING)
     add_test(NAME aether.security.process_exit COMMAND aether_activity_tests
         "$<TARGET_FILE:aether_worker>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hello-aether.apk" --exit-only)
     set_tests_properties(aether.security.process_exit PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+    add_test(NAME aether.security.allocation_failure COMMAND aether_activity_tests
+        "$<TARGET_FILE:aether_worker>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hello-aether.apk" --allocation-only)
+    set_tests_properties(aether.security.allocation_failure PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
     add_test(NAME aether.security.activity COMMAND "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/security/activity_tests.py" "$<TARGET_FILE:aether_activity_tests>"
         "$<TARGET_FILE:aether_worker>" "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hello-aether.apk")
@@ -520,7 +537,7 @@ if(BUILD_TESTING)
     set_tests_properties(aether.integration.angle_host PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
     add_library(aether_doctest INTERFACE)
     target_include_directories(aether_doctest SYSTEM INTERFACE third_party/doctest)
-    add_executable(aether_security_tests tests/unit/security_tests.cpp tests/unit/security_flush_tests.cpp tests/unit/worker_progress_tests.cpp tests/unit/security_storage_tests.cpp
+    add_executable(aether_security_tests tests/unit/security_tests.cpp tests/unit/security_flush_tests.cpp tests/unit/worker_progress_tests.cpp tests/unit/worker_allocation_error_tests.cpp tests/unit/security_storage_tests.cpp
         tests/unit/activity_protocol_tests.cpp tests/unit/security_audio_tests.cpp tests/unit/security_audit_tests.cpp tests/unit/security_clock_tests.cpp tests/unit/security_pipe_poll_tests.cpp tests/unit/security_client_activity_tests.cpp tests/unit/security_idle_broker_tests.cpp tests/unit/broker_file_metadata_tests.cpp tests/unit/broker_file_removal_tests.cpp tests/unit/broker_file_scoped_open_tests.cpp tests/unit/broker_file_directory_tests.cpp tests/unit/broker_file_rename_tests.cpp tests/unit/file_rename_tests.cpp)
     target_link_libraries(aether_security_tests PRIVATE aether_security aether_doctest)
     target_compile_definitions(aether_security_tests PRIVATE
@@ -565,12 +582,22 @@ if(BUILD_TESTING)
     # Debug suite was already ~59s; retain a bounded margin for added semantic cases.
     set_tests_properties(aether.unit.elf_bionic PROPERTIES TIMEOUT 90)
     add_executable(aether_native_posix_tests tests/unit/native_posix_main.cpp
-        tests/unit/native_checked_io_tests.cpp tests/unit/native_resource_limit_tests.cpp tests/unit/native_opening_tests.cpp tests/unit/native_thread_attribute_tests.cpp tests/unit/native_signal_stack_tests.cpp tests/unit/native_page_size_tests.cpp tests/unit/native_sysconf_tests.cpp tests/unit/native_mapping_tests.cpp tests/unit/native_condition_timed_tests.cpp tests/unit/native_directory_creation_tests.cpp tests/unit/native_rename_tests.cpp tests/unit/native_process_control_tests.cpp tests/unit/native_ptrace_tests.cpp tests/unit/native_wait_tests.cpp tests/unit/native_strftime_tests.cpp tests/unit/native_tokenization_tests.cpp tests/unit/native_stream_position_tests.cpp tests/unit/native_standard_stream_tests.cpp tests/unit/native_locale_integer_tests.cpp tests/unit/native_vsscanf_tests.cpp tests/unit/native_locale_tests.cpp tests/unit/native_ctype_tests.cpp tests/unit/native_fortified_memory_tests.cpp tests/unit/native_strnlen_tests.cpp tests/unit/native_tgkill_tests.cpp tests/unit/native_error_string_tests.cpp tests/unit/native_property_tests.cpp tests/unit/native_thread_name_tests.cpp tests/unit/native_fortified_print_tests.cpp tests/unit/native_sysinfo_tests.cpp tests/unit/native_dynamic_linker_tests.cpp tests/unit/native_auxv_tests.cpp tests/unit/native_thread_specific_tests.cpp tests/unit/native_abort_tests.cpp)
+        tests/unit/native_checked_io_tests.cpp tests/unit/native_resource_limit_tests.cpp tests/unit/native_opening_tests.cpp tests/unit/native_thread_attribute_tests.cpp tests/unit/native_page_size_tests.cpp tests/unit/native_sysconf_tests.cpp tests/unit/native_mapping_tests.cpp tests/unit/native_directory_creation_tests.cpp tests/unit/native_rename_tests.cpp tests/unit/native_process_control_tests.cpp tests/unit/native_ptrace_tests.cpp tests/unit/native_wait_tests.cpp tests/unit/native_strftime_tests.cpp tests/unit/native_tokenization_tests.cpp tests/unit/native_stream_position_tests.cpp tests/unit/native_standard_stream_tests.cpp tests/unit/native_locale_integer_tests.cpp tests/unit/native_vsscanf_tests.cpp tests/unit/native_locale_tests.cpp tests/unit/native_ctype_tests.cpp tests/unit/native_fortified_memory_tests.cpp tests/unit/native_strnlen_tests.cpp tests/unit/native_error_string_tests.cpp tests/unit/native_property_tests.cpp tests/unit/native_thread_name_tests.cpp tests/unit/native_fortified_print_tests.cpp tests/unit/native_sysinfo_tests.cpp tests/unit/native_dynamic_linker_tests.cpp tests/unit/native_auxv_tests.cpp tests/unit/native_thread_specific_tests.cpp)
     target_link_libraries(aether_native_posix_tests PRIVATE aether_bionic aether_core aether_doctest)
     target_compile_definitions(aether_native_posix_tests PRIVATE
         AETHER_NATIVE_TEST_DATA_DIR="${CMAKE_CURRENT_BINARY_DIR}/native-posix-unit-data")
     add_test(NAME aether.unit.native_posix COMMAND aether_native_posix_tests)
     set_tests_properties(aether.unit.native_posix PROPERTIES TIMEOUT 60)
+    # Measured Debug POSIX execution reached its 60s bound. Keep every case,
+    # separating signal/callback semantics while preserving both 60s limits.
+    add_executable(aether_native_signal_tests tests/unit/native_posix_main.cpp
+        tests/unit/native_signal_stack_tests.cpp tests/unit/native_condition_timed_tests.cpp
+        tests/unit/native_tgkill_tests.cpp tests/unit/native_abort_tests.cpp)
+    target_link_libraries(aether_native_signal_tests PRIVATE aether_bionic aether_core aether_doctest)
+    target_compile_definitions(aether_native_signal_tests PRIVATE
+        AETHER_NATIVE_TEST_DATA_DIR="${CMAKE_CURRENT_BINARY_DIR}/native-signal-unit-data")
+    add_test(NAME aether.unit.native_signals COMMAND aether_native_signal_tests)
+    set_tests_properties(aether.unit.native_signals PROPERTIES TIMEOUT 60)
     # Keep the new initializer suite independent: the existing Debug POSIX suite
     # is already near its 60-second bound. Preserve both checks and their limits.
     add_executable(aether_once_tests tests/unit/native_posix_main.cpp tests/unit/native_once_tests.cpp)
@@ -581,11 +608,79 @@ if(BUILD_TESTING)
     target_link_libraries(aether_multibyte_tests PRIVATE aether_bionic aether_core aether_doctest)
     add_test(NAME aether.unit.native_multibyte COMMAND aether_multibyte_tests)
     set_tests_properties(aether.unit.native_multibyte PROPERTIES TIMEOUT 60)
+    add_executable(aether_floating_tests tests/unit/native_posix_main.cpp tests/unit/native_floating_parser_tests.cpp tests/unit/native_floating_tests.cpp)
+    target_link_libraries(aether_floating_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_floating COMMAND aether_floating_tests)
+    set_tests_properties(aether.unit.native_floating PROPERTIES TIMEOUT 60)
+    add_executable(aether_syslog_tests tests/unit/native_posix_main.cpp tests/unit/native_syslog_tests.cpp)
+    target_link_libraries(aether_syslog_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_syslog COMMAND aether_syslog_tests)
+    set_tests_properties(aether.unit.native_syslog PROPERTIES TIMEOUT 60)
+    add_executable(aether_aligned_allocation_tests tests/unit/native_posix_main.cpp tests/unit/native_aligned_allocation_tests.cpp)
+    target_link_libraries(aether_aligned_allocation_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_aligned_allocation COMMAND aether_aligned_allocation_tests)
+    set_tests_properties(aether.unit.native_aligned_allocation PROPERTIES TIMEOUT 60)
+    add_executable(aether_collation_tests tests/unit/native_posix_main.cpp tests/unit/native_collation_tests.cpp)
+    target_link_libraries(aether_collation_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_collation COMMAND aether_collation_tests)
+    set_tests_properties(aether.unit.native_collation PROPERTIES TIMEOUT 60)
+    add_executable(aether_wide_memory_tests tests/unit/native_posix_main.cpp tests/unit/native_wide_memory_tests.cpp)
+    target_link_libraries(aether_wide_memory_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_wide_memory COMMAND aether_wide_memory_tests)
+    set_tests_properties(aether.unit.native_wide_memory PROPERTIES TIMEOUT 60)
+    add_executable(aether_pthread_equal_tests tests/unit/native_posix_main.cpp tests/unit/native_pthread_equal_tests.cpp)
+    target_link_libraries(aether_pthread_equal_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_pthread_equal COMMAND aether_pthread_equal_tests)
+    set_tests_properties(aether.unit.native_pthread_equal PROPERTIES TIMEOUT 60)
+    add_executable(aether_ungetc_tests tests/unit/native_posix_main.cpp tests/unit/native_ungetc_tests.cpp)
+    target_link_libraries(aether_ungetc_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_ungetc COMMAND aether_ungetc_tests)
+    set_tests_properties(aether.unit.native_ungetc PROPERTIES TIMEOUT 60)
+    add_executable(aether_cxa_destructor_tests tests/unit/native_posix_main.cpp tests/unit/native_cxa_destructor_tests.cpp)
+    target_link_libraries(aether_cxa_destructor_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_cxa_destructors COMMAND aether_cxa_destructor_tests)
+    set_tests_properties(aether.unit.native_cxa_destructors PROPERTIES TIMEOUT 60)
+    add_executable(aether_stream_format_tests tests/unit/native_posix_main.cpp tests/unit/native_stream_format_tests.cpp)
+    target_link_libraries(aether_stream_format_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_stream_format COMMAND aether_stream_format_tests)
+    set_tests_properties(aether.unit.native_stream_format PROPERTIES TIMEOUT 60)
+    add_executable(aether_allocating_print_tests tests/unit/native_posix_main.cpp tests/unit/native_allocating_print_tests.cpp)
+    target_link_libraries(aether_allocating_print_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_allocating_print COMMAND aether_allocating_print_tests)
+    set_tests_properties(aether.unit.native_allocating_print PROPERTIES TIMEOUT 60)
+    add_executable(aether_sched_yield_tests tests/unit/native_posix_main.cpp tests/unit/native_sched_yield_tests.cpp)
+    target_link_libraries(aether_sched_yield_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_sched_yield COMMAND aether_sched_yield_tests)
+    set_tests_properties(aether.unit.native_sched_yield PROPERTIES TIMEOUT 60)
+    add_executable(aether_strerror_r_tests tests/unit/native_posix_main.cpp tests/unit/native_strerror_r_tests.cpp)
+    target_link_libraries(aether_strerror_r_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_strerror_r COMMAND aether_strerror_r_tests)
+    set_tests_properties(aether.unit.native_strerror_r PROPERTIES TIMEOUT 60)
+    add_executable(aether_legacy_multibyte_tests tests/unit/native_posix_main.cpp tests/unit/native_legacy_multibyte_tests.cpp)
+    target_link_libraries(aether_legacy_multibyte_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_legacy_multibyte COMMAND aether_legacy_multibyte_tests)
+    set_tests_properties(aether.unit.native_legacy_multibyte PROPERTIES TIMEOUT 60)
+    add_executable(aether_wide_integer_tests tests/unit/native_posix_main.cpp tests/unit/native_wide_integer_tests.cpp)
+    target_link_libraries(aether_wide_integer_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_wide_integer COMMAND aether_wide_integer_tests)
+    set_tests_properties(aether.unit.native_wide_integer PROPERTIES TIMEOUT 60)
+    add_executable(aether_abort_message_tests tests/unit/native_posix_main.cpp tests/unit/native_abort_message_tests.cpp)
+    target_link_libraries(aether_abort_message_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_abort_message COMMAND aether_abort_message_tests)
+    set_tests_properties(aether.unit.native_abort_message PROPERTIES TIMEOUT 60)
+    add_executable(aether_dl_iterate_phdr_tests tests/unit/native_posix_main.cpp tests/unit/native_dl_iterate_phdr_tests.cpp)
+    target_link_libraries(aether_dl_iterate_phdr_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_dl_iterate_phdr COMMAND aether_dl_iterate_phdr_tests)
+    set_tests_properties(aether.unit.native_dl_iterate_phdr PROPERTIES TIMEOUT 60)
+    add_executable(aether_swprintf_tests tests/unit/native_posix_main.cpp tests/unit/native_swprintf_tests.cpp)
+    target_link_libraries(aether_swprintf_tests PRIVATE aether_bionic aether_core aether_doctest)
+    add_test(NAME aether.unit.native_swprintf COMMAND aether_swprintf_tests)
+    set_tests_properties(aether.unit.native_swprintf PROPERTIES TIMEOUT 60)
     add_executable(aether_unicode_tests tests/unit/native_posix_main.cpp tests/unit/native_unicode_tests.cpp)
     target_link_libraries(aether_unicode_tests PRIVATE aether_bionic aether_core aether_doctest)
     add_test(NAME aether.unit.native_unicode COMMAND aether_unicode_tests)
     set_tests_properties(aether.unit.native_unicode PROPERTIES TIMEOUT 60)
-    add_executable(aether_dex_tests tests/unit/dex_tests.cpp tests/unit/dex_linker_tests.cpp tests/unit/dex_source_tests.cpp tests/unit/dex_array_clone_tests.cpp tests/unit/dex_array_copy_tests.cpp tests/unit/dex038_tests.cpp tests/unit/dex_collections_tests.cpp tests/unit/dex_copy_list_bulk_tests.cpp tests/unit/dex_native_stack_setup_tests.cpp tests/unit/dex_class_tests.cpp tests/unit/dex_atomic_tests.cpp tests/unit/dex_map_tests.cpp tests/unit/dex_empty_map_tests.cpp tests/unit/dex_linked_hash_set_tests.cpp tests/unit/dex_enum_tests.cpp tests/unit/dex_reference_tests.cpp tests/unit/dex_field_updater_tests.cpp tests/unit/dex_set_tests.cpp tests/unit/dex_linked_map_tests.cpp tests/unit/dex_conversion_tests.cpp tests/unit/dex_atomic_integer_tests.cpp tests/unit/dex_atomic_long_tests.cpp tests/unit/dex_filled_array_tests.cpp tests/unit/dex_concurrent_map_tests.cpp tests/unit/dex_array_view_set_tests.cpp tests/unit/dex_sparse_switch_tests.cpp tests/unit/dex_string_value_tests.cpp tests/unit/dex_integer_tests.cpp tests/unit/dex_boolean_tests.cpp tests/unit/dex_byte_tests.cpp tests/unit/dex_floating_value_tests.cpp tests/unit/dex_integral_value_tests.cpp tests/unit/dex_regex_tests.cpp tests/unit/dex_thread_local_tests.cpp tests/unit/dex_progress_tests.cpp tests/unit/dex_uuid_tests.cpp tests/unit/dex_random_tests.cpp tests/unit/dex_integer_narrowing_tests.cpp tests/unit/dex_text_utils_tests.cpp tests/unit/dex_stream_tests.cpp tests/unit/dex_object_tests.cpp tests/unit/dex_runnable_tests.cpp tests/unit/dex_queue_tests.cpp tests/unit/dex_thread_tests.cpp tests/unit/dex_monitor_tests.cpp tests/unit/dex_execution_policy_tests.cpp tests/unit/dex_empty_list_tests.cpp tests/unit/dex_time_unit_tests.cpp tests/unit/dex_runtime_query_tests.cpp tests/unit/dex_math_tests.cpp tests/unit/dex_thread_pool_tests.cpp tests/unit/dex_live_list_tests.cpp tests/unit/dex_put_all_tests.cpp tests/unit/dex_method_reflection_tests.cpp tests/unit/dex_field_reflection_tests.cpp tests/unit/dex_string_search_tests.cpp tests/unit/dex_class_loader_tests.cpp tests/unit/dex_provider_field_tests.cpp tests/unit/dex_atomic_boolean_tests.cpp tests/unit/dex_count_down_latch_tests.cpp tests/unit/dex_scheduler_tests.cpp tests/unit/dex_execution_context_tests.cpp tests/unit/dex_managed_task_tests.cpp tests/unit/dex_task_barrier_tests.cpp tests/unit/dex_sleep_tests.cpp tests/unit/dex_main_callback_tests.cpp tests/unit/dex_owned_submission_tests.cpp tests/unit/dex_worker_entry_tests.cpp tests/unit/dex_guest_thread_tests.cpp tests/unit/dex_uncaught_handler_tests.cpp tests/unit/dex_system_property_tests.cpp tests/unit/dex_print_stream_tests.cpp tests/unit/dex_builder_object_tests.cpp tests/unit/dex_string_split_tests.cpp tests/unit/dex_integer_parse_tests.cpp tests/unit/dex_bitset_metadata_tests.cpp tests/unit/dex_literal_metadata_tests.cpp tests/unit/dex_array_list_bulk_tests.cpp tests/unit/dex_unmodifiable_list_tests.cpp tests/unit/dex_synchronized_list_tests.cpp tests/unit/dex_map_backed_set_tests.cpp tests/unit/dex_named_virtual_tests.cpp tests/unit/dex_queue_iterator_tests.cpp tests/unit/dex_executor_worker_tests.cpp tests/unit/dex_main_entry_tests.cpp tests/unit/dex_synchronous_queue_tests.cpp tests/unit/dex_executor_named_tests.cpp tests/unit/dex_future_task_tests.cpp tests/unit/dex_priority_tests.cpp tests/unit/dex_async_service_tests.cpp tests/unit/dex_async_task_tests.cpp tests/unit/jni_dynamic_loader_tests.cpp tests/unit/jni_thread_specific_tests.cpp tests/unit/dex_native_finalization_tests.cpp)
+    add_executable(aether_dex_tests tests/unit/dex_tests.cpp tests/unit/dex_linker_tests.cpp tests/unit/dex_source_tests.cpp tests/unit/dex_array_clone_tests.cpp tests/unit/dex_array_copy_tests.cpp tests/unit/dex038_tests.cpp tests/unit/dex_collections_tests.cpp tests/unit/dex_copy_list_bulk_tests.cpp tests/unit/dex_native_stack_setup_tests.cpp tests/unit/dex_class_tests.cpp tests/unit/dex_atomic_tests.cpp tests/unit/dex_map_tests.cpp tests/unit/dex_empty_map_tests.cpp tests/unit/dex_linked_hash_set_tests.cpp tests/unit/dex_enum_tests.cpp tests/unit/dex_reference_tests.cpp tests/unit/dex_field_updater_tests.cpp tests/unit/dex_set_tests.cpp tests/unit/dex_linked_map_tests.cpp tests/unit/dex_conversion_tests.cpp tests/unit/dex_atomic_integer_tests.cpp tests/unit/dex_atomic_long_tests.cpp tests/unit/dex_filled_array_tests.cpp tests/unit/dex_concurrent_map_tests.cpp tests/unit/dex_array_view_set_tests.cpp tests/unit/dex_sparse_switch_tests.cpp tests/unit/dex_string_value_tests.cpp tests/unit/dex_integer_tests.cpp tests/unit/dex_boolean_tests.cpp tests/unit/dex_byte_tests.cpp tests/unit/dex_floating_value_tests.cpp tests/unit/dex_integral_value_tests.cpp tests/unit/dex_regex_tests.cpp tests/unit/dex_thread_local_tests.cpp tests/unit/dex_progress_tests.cpp tests/unit/dex_uuid_tests.cpp tests/unit/dex_random_tests.cpp tests/unit/dex_integer_narrowing_tests.cpp tests/unit/dex_text_utils_tests.cpp tests/unit/dex_stream_tests.cpp tests/unit/dex_object_tests.cpp tests/unit/dex_runnable_tests.cpp tests/unit/dex_queue_tests.cpp tests/unit/dex_thread_tests.cpp tests/unit/dex_monitor_tests.cpp tests/unit/dex_execution_policy_tests.cpp tests/unit/dex_empty_list_tests.cpp tests/unit/dex_time_unit_tests.cpp tests/unit/dex_runtime_query_tests.cpp tests/unit/dex_math_tests.cpp tests/unit/dex_thread_pool_tests.cpp tests/unit/dex_live_list_tests.cpp tests/unit/dex_put_all_tests.cpp tests/unit/dex_method_reflection_tests.cpp tests/unit/dex_field_reflection_tests.cpp tests/unit/dex_string_search_tests.cpp tests/unit/dex_class_loader_tests.cpp tests/unit/dex_provider_field_tests.cpp tests/unit/dex_atomic_boolean_tests.cpp tests/unit/dex_count_down_latch_tests.cpp tests/unit/dex_scheduler_tests.cpp tests/unit/dex_execution_context_tests.cpp tests/unit/dex_managed_task_tests.cpp tests/unit/dex_task_barrier_tests.cpp tests/unit/dex_sleep_tests.cpp tests/unit/dex_main_callback_tests.cpp tests/unit/dex_owned_submission_tests.cpp tests/unit/dex_worker_entry_tests.cpp tests/unit/dex_guest_thread_tests.cpp tests/unit/dex_uncaught_handler_tests.cpp tests/unit/dex_system_property_tests.cpp tests/unit/dex_print_stream_tests.cpp tests/unit/dex_builder_object_tests.cpp tests/unit/dex_string_split_tests.cpp tests/unit/dex_integer_parse_tests.cpp tests/unit/dex_bitset_metadata_tests.cpp tests/unit/dex_literal_metadata_tests.cpp tests/unit/dex_array_list_bulk_tests.cpp tests/unit/dex_unmodifiable_list_tests.cpp tests/unit/dex_synchronized_list_tests.cpp tests/unit/dex_map_backed_set_tests.cpp tests/unit/dex_named_virtual_tests.cpp tests/unit/dex_queue_iterator_tests.cpp tests/unit/dex_executor_worker_tests.cpp tests/unit/dex_main_entry_tests.cpp tests/unit/dex_synchronous_queue_tests.cpp tests/unit/dex_executor_named_tests.cpp tests/unit/dex_future_task_tests.cpp tests/unit/dex_priority_tests.cpp tests/unit/dex_async_service_tests.cpp tests/unit/dex_async_task_tests.cpp tests/unit/jni_dynamic_loader_tests.cpp tests/unit/jni_thread_specific_tests.cpp tests/unit/jni_static_field_tests.cpp tests/unit/dex_verified_storage_tests.cpp tests/unit/dex_code_storage_tests.cpp tests/unit/dex_string_table_tests.cpp tests/unit/dex_stable_table_tests.cpp tests/unit/dex_prototype_storage_tests.cpp tests/unit/dex_load_diagnostic_tests.cpp tests/unit/dex_error_context_tests.cpp tests/unit/jni_lazy_stack_tests.cpp tests/unit/dex_native_finalization_tests.cpp)
     target_link_libraries(aether_dex_tests PRIVATE aether_jni aether_core aether_doctest)
     target_compile_definitions(aether_dex_tests PRIVATE AETHER_DEX_FIXTURE_APK="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/hello-aether.apk")
     target_compile_definitions(aether_dex_tests PRIVATE AETHER_MULTIDEX_FIXTURE_APK="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/multidex-aether.apk")
@@ -667,7 +762,7 @@ if(BUILD_TESTING)
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/security/package_tests.py" "$<TARGET_FILE:aether>")
     set_tests_properties(aether.security.packages PROPERTIES TIMEOUT 90 ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
     # Parser-only entry point: actual ELF loading; never construct a CPU or run lifecycle calls.
-    add_executable(aether_parser_probe tests/security/parser_probe.cpp src/dex/image.cpp src/dex/annotations.cpp
+    add_executable(aether_parser_probe tests/security/parser_probe.cpp src/dex/image.cpp src/dex/code_storage.cpp src/dex/annotations.cpp
         src/dex/bytecode.cpp tests/security/parser_elf.cpp tests/security/parser_package.cpp)
     target_link_libraries(aether_parser_probe PRIVATE aether_security aether_bionic userenv)
     set_target_properties(aether_parser_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")

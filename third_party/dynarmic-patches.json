@@ -11,20 +11,20 @@
     {
       "path": "third_party/dynarmic/src/dynarmic/interface/A64/config.h",
       "upstreamSha256": "51271d2f7df0ea50bc7ef57405fb24c3e98805e999da9030ac45320f87a7eafc",
-      "patchedSha256": "f6b856c8e2bba2c70c1fd14482ad6788f87517135a91decaff736aa55c789324",
-      "reason": "Per-instance noexcept observers for actual block lookup and compilation evidence."
+      "patchedSha256": "0ff1f437aae0050f8520269624f2f19289750a7fb66e591db40328fad168dcfc",
+      "reason": "Per-instance noexcept observers for actual block lookup and compilation evidence. Also implements original live-SP alignment IR and terminal fault prefix-cycle accounting for the Windows x64/A64 profile (ADR0343)."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp",
       "upstreamSha256": "290ce9e654325ee5661e49059dfcbf9dd67a517b9428f73d177cb21ab089969d",
-      "patchedSha256": "aedb0cb2234b73cb5e53e63132f95f15e3c32f20be67f619dde806f34e28f776",
-      "reason": "Invoke block observers on real cache hit/miss and after Emit seals generated code RX; measure compilation with steady_clock. Reject non-canonical raw program counters before descriptor masking can alias a valid cached code address."
+      "patchedSha256": "3107400dad019ac1fd2faf1acde051772519c29642dea5826e2678af42320c3f",
+      "reason": "Invoke block observers on real cache hit/miss and after Emit seals generated code RX; measure compilation with steady_clock. Reject non-canonical raw program counters before descriptor masking can alias a valid cached code address. ADR0395: preserve queued cache invalidation across CPU Reset using the existing request mutex and authoritative pending state."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp",
       "upstreamSha256": "450e9bc6c6497c053e9f39223542b0d3cc247bec358783ce178615f4d65827b4",
-      "patchedSha256": "bcaa0d863259f757d4cbaf9218af3c1eed53b5669c611120708bdc98954232f2",
-      "reason": "Initialize Windows exception metadata before PreludeComplete makes its code allocation RX."
+      "patchedSha256": "189b5699a37042c18069a4e7fa07fb73431170977ed509e79cdfc97fbf18b060",
+      "reason": "Initialize Windows exception metadata before PreludeComplete makes its code allocation RX. Also implements original live-SP alignment IR and terminal fault prefix-cycle accounting for the Windows x64/A64 profile (ADR0343). ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/common/spin_lock_x64.cpp",
@@ -37,6 +37,96 @@
       "upstreamSha256": "8df5b462793222293df008a0410a7c073b9577b925fe7bd09f017cdb848ce36e",
       "patchedSha256": "00027643e7976ac9de98c5d2abd7871e84ac04fd156562bc0be0612718887676",
       "reason": "Bound straight-line translation blocks to 256 guest instructions and dispatch to the continuation, limiting IR growth and budget overshoot."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/ir/opcodes.inc",
+      "upstreamSha256": "3809ad4d53e577c24740cc3dedfb432c063cac582f4c6e2088bf827a5b9a6011",
+      "patchedSha256": "be31ec20ac3bc97acdb86ec62c39cfa0c696c6836cb75b934deaa73ff8e52430",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained. ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/ir/microinstruction.cpp",
+      "upstreamSha256": "11eb9a0da4e326df5771fe205c7761f893c91bf0a42a04de1badb2febdc34656",
+      "patchedSha256": "fd93efa2d61a5a778399726d1ad0c1155f056145d94c6425d493ccc7a7dd1f09",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained. Ordinary A64 memory reads remain fault-capable side effects/core-CPSR barriers when their result is discarded, preserving ZR loads through DCE. ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.h",
+      "upstreamSha256": "0a98fd24c6f1dda2bca3fc55ec154be6ac7a0e40674d50037053a7a75020ddd7",
+      "patchedSha256": "047dc239fa684ff24b40493d2c22de59203efbd4a3ee57b2cbd0efbb4f00833e",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/a64_ir_emitter.cpp",
+      "upstreamSha256": "7946d3f6cb35d04476463f6c9b9ff2fb163c173548409a820eaf1235f85df789",
+      "patchedSha256": "693dfb1adcf8276bca258fb5746f1e66259d60b6115f006c2517806485c99bd9",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained. ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_exclusive.cpp",
+      "upstreamSha256": "8f8c1bd6ce63712ea709553a9208374677d1e91d5b284dc90f43e469f97ae041",
+      "patchedSha256": "7308b01f8dc737f53deb9fbe859d50003ffb45a05ae1b4da325dcc0d0d03503d",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_multiple_structures.cpp",
+      "upstreamSha256": "abbe0cf9d60225024573574c0da3a369ba17c3fc0d625ec08ea7a1133dfd4b9c",
+      "patchedSha256": "87f56bd5a7d362f7f65ede67c038c3acb68e3f46bf2cd90fb4a35dea988b9479",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_register_pair.cpp",
+      "upstreamSha256": "bd6d0419cfd26131a7f2c857e16fef96260ca932e3d9c498801bb36a058520d7",
+      "patchedSha256": "59e33a6f199ecce14c11ec8f2082d7e4820cc65cd4b93cc22d965c741a20320a",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_register_register_offset.cpp",
+      "upstreamSha256": "c7d7520921f4f639a0c1b3a0652197e0193bb85c2c5c40273a1907d16aa72702",
+      "patchedSha256": "beeaf9cd501f656a1df50f23c98045a6f3ae77ae50e86837442364cd0d25b258",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained. ADR0394: omit the SP check only for the existing no-op register-prefetch hint; preserve real scalar/SIMD access checks."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_register_immediate.cpp",
+      "upstreamSha256": "7f9511483a4fa043641cf0e333ce0ed54931c50146282e6acb075cbb8e07f13f",
+      "patchedSha256": "f6698625d7642ed89d9c7e3e55d09078b8604237e973aa1ab88d81995b6ff9df",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_single_structure.cpp",
+      "upstreamSha256": "2dc8204939291d9cc57647a7181d26b09061a1232270d237247480fd7f69ec45",
+      "patchedSha256": "8fcf0acd6c920d420d3f5f068e2d2fce7e77ef4a8a35abff904bbd54ae17ebe3",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/load_store_register_unprivileged.cpp",
+      "upstreamSha256": "b050a7f7b7fb0c8eff73b51effb374ffcff82f1e9dd095b748f26335571b3228",
+      "patchedSha256": "6d9f0619c9afdcc64aae81780005576d2703af7b4f0e646e7923b5d9412b047e",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp",
+      "upstreamSha256": "daf980c160570cf2354dd4653311e7ac50ae6ad14ccac0fe568856401b5be16e",
+      "patchedSha256": "dceb5bf0b0d31b8a775fd4e67e533593dcbeda59e782adb3caa387aae30de40c",
+      "reason": "Aether original live-SP alignment IR and precise terminal memory-fault cycle accounting; Windows x64/A64 profile, ADR0343. Existing upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/impl.cpp",
+      "upstreamSha256": "8575d0954956fd252a4c842fe7290a185e2272070902093811a28d2a9ed6ba82",
+      "patchedSha256": "04922f8703d1ae0568ad4d704009f431eea0f2a9769b22baea1c8925a3107782",
+      "reason": "Original Aether centralized effective-address alignment for ordered/exclusive A64 memory operations; Windows x64, ADR0343. Original upstream notices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/emit_x64_floating_point.cpp",
+      "upstreamSha256": "f8b69a24b9ce98478e84ce444d61ebfcad40ae0947776f2553306f9e36d0bdb2",
+      "patchedSha256": "a4bb04b1361b5ea184ce79365c54b7eb57ec8bfd56ecd8ceb69d26bccd90f10e",
+      "reason": "Original Aether scalar FPCompare32/64 raw-bit input-denormal classification with FPCR.FZ, accumulating FPSR.IDC before existing x86 comparisons; ADR0347. ADR0348 reuses the classifier before scalar FADD/FSUB/FMUL/FDIV32/64 arithmetic and NaN normalization with admitted scratch registers. ADR0349 adds scalar unary sqrt/round, ordinary/numeric minmax and native fused arithmetic input classification before destructive operations, preserving software/FP16 paths and FZ0 behavior. ADR0350 adds native Single/Double/Half format and FP-to-fixed raw input classification before NaN normalization, scaling or conversion, preserving software and FP16-input paths. Original0BSDnotices retained, no implementation import."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/frontend/A64/translate/impl/floating_point_conditional_compare.cpp",
+      "upstreamSha256": "05060dd2cb457b9f19aaa3d78b5f7a83552a9ef2d9cb488b54060baa06026455",
+      "patchedSha256": "e3d2594be5cfe65ad1b6ead54bb03db085e731b2892022bdee8955f3a6b81673",
+      "reason": "Original Aether FCCMP/FCCMPE false-condition operand selection to benign+0 before comparison, retaining exact true operands and immediate NZCV fallback without accumulating false-path FP exceptions; ADR0347. Existing0BSDnotices retained."
     }
   ]
 }

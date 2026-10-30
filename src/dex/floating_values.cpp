@@ -71,6 +71,7 @@ std::int32_t compare_bits(std::uint64_t left,std::uint64_t right,bool wide) {
     return (a>b)-(a<b);
 }
 }
+std::uint64_t widen_float_bits(std::uint32_t bits) noexcept { return widen(bits); }
 std::optional<HostClass> floating_class(std::string_view type) {
     static constexpr std::array<std::string_view,2> interfaces{"Ljava/lang/Comparable;","Ljava/io/Serializable;"};
     if(type==float_type || type==double_type)return HostClass{"Ljava/lang/Number;",interfaces};

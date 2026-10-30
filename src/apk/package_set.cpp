@@ -77,9 +77,10 @@ std::size_t metadata_size(const ManifestInfo &m) {
         size += 32 + s.size();
     for (const auto &s : m.permissions)
         size += 32 + s.size();
-    for (const auto &a : m.activities)
-        size += manifest_activity_record_bytes + a.name.size() + a.target.size() + a.label.literal.size() +
-                a.icon.literal.size() + a.permission.literal.size();
+    const auto activity_bytes = activity_metadata_size(m);
+    if (activity_bytes > manifest_activity_bytes)
+        limit("XAPK member Activity/filter metadata is misaligned or exceeds 4 MiB");
+    size += activity_bytes;
     return size;
 }
 } // namespace

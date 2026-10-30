@@ -7,6 +7,8 @@ bool floating_method(std::string_view type,std::string_view name,std::string_vie
 bool floating_static(std::string_view name,std::string_view signature) noexcept;
 std::optional<Value> floating_static_call(std::string_view type,std::string_view name,std::string_view signature,std::span<const Value>);
 std::optional<Value> floating_constant(std::string_view type,std::string_view name,std::string_view descriptor);
+// Exact binary32 widening, including subnormals/signed zero; NaNs canonicalize.
+std::uint64_t widen_float_bits(std::uint32_t bits) noexcept;
 class ManagedFloating {
   public:
     explicit ManagedFloating(bool wide):wide_(wide){}

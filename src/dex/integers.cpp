@@ -1,9 +1,40 @@
 #include "integers.hpp"
 #include <array>
 #include <bit>
+#include "../../third_party/unicode/ucd16.hpp"
 
 namespace aether::dex {
-std::uint32_t parse_integer(ManagedRuntime &runtime,ObjectId text,std::int32_t radix) {
+namespace {
+// Reuse licensed data already shipped with Aether. The decimal flag is bit3
+// in that data's classification contract. All BMP ranges are ten digits and
+// match the Java-profile Unicode15.1 data (ADR0347); ASCII is stored separately.
+constexpr std::uint16_t decimal_flag = 1U << 3;
+static_assert([] {
+    std::size_t count = 0;
+    for (const auto &range : bionic::unicode16::properties)
+        if (range.first <= 0xffff && (range.flags & decimal_flag)) {
+            if (range.last > 0xffff || range.last - range.first != 9) return false;
+            ++count;
+        }
+    return count == 36;
+}());
+std::uint32_t java_digit(char16_t c) noexcept {
+    if (c >= u'0' && c <= u'9') return static_cast<std::uint32_t>(c - u'0');
+    if (c >= u'a' && c <= u'z') return static_cast<std::uint32_t>(c - u'a' + 10);
+    if (c >= u'A' && c <= u'Z') return static_cast<std::uint32_t>(c - u'A' + 10);
+    if (c >= 0xff21 && c <= 0xff3a) return static_cast<std::uint32_t>(c - 0xff21 + 10);
+    if (c >= 0xff41 && c <= 0xff5a) return static_cast<std::uint32_t>(c - 0xff41 + 10);
+    std::size_t low = 0, high = bionic::unicode16::properties.size();
+    while (low < high) {
+        const auto middle = low + (high - low) / 2;
+        const auto &range = bionic::unicode16::properties[middle];
+        if (c < range.first) high = middle;
+        else if (c > range.last) low = middle + 1;
+        else return (range.flags & decimal_flag) ? static_cast<std::uint32_t>(c - range.first) : 0xffffffffu;
+    }
+    return 0xffffffffu;
+}
+std::uint64_t parse_signed(ManagedRuntime &runtime,ObjectId text,std::int32_t radix,unsigned width) {
     if(!text)runtime.raise("Ljava/lang/NumberFormatException;",u"s == null");
     const auto value=runtime.string(text);
     if(radix<2 || radix>36 || value.empty())
@@ -11,22 +42,24 @@ std::uint32_t parse_integer(ManagedRuntime &runtime,ObjectId text,std::int32_t r
     const bool negative=value.front()==u'-';
     const auto first=negative || value.front()==u'+'?std::size_t{1}:std::size_t{0};
     if(first==value.size())runtime.raise("Ljava/lang/NumberFormatException;",u"Integer sign has no digits");
-    const auto base=static_cast<std::uint32_t>(radix);
-    const std::uint32_t maximum=negative?0x80000000u:0x7fffffffu;
-    std::uint32_t magnitude=0;
+    const auto base=static_cast<std::uint64_t>(radix);
+    const auto sign_bit = std::uint64_t{1} << (width - 1);
+    const auto maximum = negative ? sign_bit : sign_bit - 1;
+    std::uint64_t magnitude=0;
     for(auto at=first;at<value.size();++at) {
-        const auto c=value[at];
-        if(c>0x7f)
-            throw DexError("AETHER_DEX_INTEGER_PARSE_UNSUPPORTED",
-                "Integer.parseInt Unicode Character.digit is not implemented; ASCII digits only");
-        const auto digit=c>=u'0' && c<=u'9'?static_cast<std::uint32_t>(c-u'0'):
-            c>=u'a' && c<=u'z'?static_cast<std::uint32_t>(c-u'a'+10):
-            c>=u'A' && c<=u'Z'?static_cast<std::uint32_t>(c-u'A'+10):0xffffffffu;
+        const auto digit=java_digit(value[at]);
         if(digit>=base || magnitude>(maximum-digit)/base)
             runtime.raise("Ljava/lang/NumberFormatException;",u"Invalid or overflowing integer");
         magnitude=magnitude*base+digit;
     }
-    return negative?std::uint32_t{0}-magnitude:magnitude;
+    return negative?std::uint64_t{0}-magnitude:magnitude;
+}
+}
+std::uint32_t parse_integer(ManagedRuntime &runtime,ObjectId text,std::int32_t radix) {
+    return static_cast<std::uint32_t>(parse_signed(runtime,text,radix,32));
+}
+std::uint64_t parse_long(ManagedRuntime &runtime,ObjectId text,std::int32_t radix) {
+    return parse_signed(runtime,text,radix,64);
 }
 std::optional<HostClass> integer_class(std::string_view descriptor) {
     static constexpr std::array<std::string_view, 2> interfaces{"Ljava/lang/Comparable;",

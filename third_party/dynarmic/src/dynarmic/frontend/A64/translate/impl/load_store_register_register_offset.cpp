@@ -41,7 +41,7 @@ static bool RegSharedDecodeAndOperation(TranslatorVisitor& v, size_t scale, u8 s
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP alignment
+        if (memop != IR::MemOp::PREFETCH) v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);
@@ -106,7 +106,7 @@ static bool VecSharedDecodeAndOperation(TranslatorVisitor& v, size_t scale, u8 s
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);

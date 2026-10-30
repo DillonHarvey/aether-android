@@ -129,7 +129,12 @@ public:
 
     void Reset() {
         ASSERT(!is_executing);
+        std::unique_lock lock{invalidation_mutex};
         jit_state = {};
+        // Queued invalidation intent is independent of architectural CPU reset.
+        if (invalidate_entire_cache || !invalid_cache_ranges.empty()) {
+            HaltExecution(HaltReason::CacheInvalidation);
+        }
     }
 
     void HaltExecution(HaltReason hr) {

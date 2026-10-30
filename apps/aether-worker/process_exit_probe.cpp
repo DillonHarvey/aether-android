@@ -1,7 +1,10 @@
 // Compiled original ARM64 only. No external APK, method or guest-code input.
 #include "probes.hpp"
 #include "aether/bionic/guest_posix.hpp"
+#include "aether/common/abort_message.hpp"
 #include "aether/common/process_exit.hpp"
+#include <string_view>
+#include <vector>
 
 namespace aether::security {
 std::uint8_t run_process_exit_probe(HANDLE writer, std::uint64_t session, std::uint8_t status) {
@@ -18,6 +21,8 @@ std::uint8_t run_process_exit_probe(HANDLE writer, std::uint64_t session, std::u
     if (!target)
         throw ProtocolError("Process exit fixture could not resolve its fixed libc export");
     constexpr a64::Address marker = 0x80000, entry = 0x90000;
+    constexpr a64::Address message_address = marker + 256;
+    constexpr std::string_view abort_message = "LPAC abort \"proof\" \\\n\xff";
     memory.map(marker, 4096, a64::read_write);
     memory.map(entry, 4096, a64::read_write);
     const auto low = [](auto address, unsigned reg) {
@@ -26,12 +31,28 @@ std::uint8_t run_process_exit_probe(HANDLE writer, std::uint64_t session, std::u
     const auto high = [](auto address, unsigned reg) {
         return 0xf2a00000U | reg | static_cast<std::uint32_t>(((address >> 16) & 65535) << 5);
     };
-    // Preserve LR, call real _exit/abort, then mark only an incorrect return.
-    const std::array<std::uint32_t, 10> code{
-        0xa9bf7bfd, low(target->address, 16), high(target->address, 16), 0xd63f0200,
+    // Preserve LR, call the fixed guest setter before abort, then mark only an
+    // incorrect return. The ordinary _exit instruction sequence stays identical.
+    std::vector<std::uint32_t> code{0xa9bf7bfd};
+    if (aborting) {
+        const auto setter = services.resolve("libc.so", "android_set_abort_message", "LIBC");
+        if (!setter)
+            throw ProtocolError("Abort fixture could not resolve its fixed message setter");
+        std::vector<std::uint8_t> message(abort_message.begin(), abort_message.end());
+        message.push_back(0);
+        if (!memory.write(message_address, message))
+            throw ProtocolError("Cannot write fixed abort fixture message");
+        const std::array<std::uint32_t, 5> prefix{
+            low(message_address, 0), high(message_address, 0),
+            low(setter->address, 16), high(setter->address, 16), 0xd63f0200};
+        code.insert(code.end(), prefix.begin(), prefix.end());
+    }
+    const std::array<std::uint32_t, 9> tail{
+        low(target->address, 16), high(target->address, 16), 0xd63f0200,
         low(marker, 1), high(marker, 1), 0x52800002U | (0x1234U << 5), 0xb9000022,
         0xa8c17bfd, 0xd65f03c0};
-    if (!memory.write(entry, {reinterpret_cast<const std::uint8_t *>(code.data()), sizeof(code)}))
+    code.insert(code.end(), tail.begin(), tail.end());
+    if (!memory.write(entry, {reinterpret_cast<const std::uint8_t *>(code.data()), code.size() * sizeof(code[0])}))
         throw ProtocolError("Cannot write process exit fixture");
     memory.protect(entry, a64::read_execute);
     try {
@@ -48,8 +69,11 @@ std::uint8_t run_process_exit_probe(HANDLE writer, std::uint64_t session, std::u
             !memory.read(marker, observed) || observed != std::array<std::uint8_t, 4>{} ||
             !cpu.metrics().compiled_blocks || !cpu.metrics().guest_ticks)
             throw ProtocolError("Process exit fixture continued or lost the terminal status");
-        if (aborting)
-            throw ProtocolError("AETHER_GUEST_SIGNAL: guest terminated abnormally by signal 6");
+        if (aborting) {
+            if (!exit.abort_message || *exit.abort_message != abort_message)
+                throw ProtocolError("Abort fixture lost its copied guest message snapshot");
+            throw ProtocolError(guest_signal_diagnostic(exit));
+        }
         write_pipe_frame(writer, guest_exit_frame(session, exit.status));
         return exit.status;
     }

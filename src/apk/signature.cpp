@@ -256,25 +256,42 @@ struct Algorithm {
     std::uint32_t id;
     const char *name;
     bool wide;
-    enum Kind { pss, rsa, ec } kind;
+    enum Kind { pss, rsa, ec, dsa } kind;
     unsigned rank;
 };
-constexpr std::array<Algorithm, 6> algorithms = {{{0x101, "RSA-PSS-SHA256", false, Algorithm::pss, 3},
+constexpr std::array<Algorithm, 7> algorithms = {{{0x101, "RSA-PSS-SHA256", false, Algorithm::pss, 3},
                                                   {0x102, "RSA-PSS-SHA512", true, Algorithm::pss, 6},
                                                   {0x103, "RSA-PKCS1-SHA256", false, Algorithm::rsa, 1},
                                                   {0x104, "RSA-PKCS1-SHA512", true, Algorithm::rsa, 4},
                                                   {0x201, "ECDSA-SHA256", false, Algorithm::ec, 2},
-                                                  {0x202, "ECDSA-SHA512", true, Algorithm::ec, 5}}};
+                                                  {0x202, "ECDSA-SHA512", true, Algorithm::ec, 5},
+                                                  {0x301, "DSA-SHA256", false, Algorithm::dsa, 0}}};
+Bytes dsa_integer(Der &fields) {
+    auto value = fields.get(2).contents;
+    require(!value.empty() && !(value.front() & 128), "DSA public integer is negative or empty");
+    if (value.size() > 1 && value.front() == 0) {
+        require(value[1] & 128, "DSA public integer is not canonical");
+        value = value.subspan(1);
+    }
+    require(value.front() != 0, "DSA public integer is zero");
+    return value;
+}
+bool less_integer(Bytes value, Bytes limit) {
+    return value.size() < limit.size() ||
+           (value.size() == limit.size() &&
+            std::lexicographical_compare(value.begin(), value.end(), limit.begin(), limit.end()));
+}
 struct Key {
     CERT_PUBLIC_KEY_INFO *info = nullptr;
     BCRYPT_KEY_HANDLE handle = nullptr;
     ULONG bits = 0;
+    Bytes dsa_group;
     explicit Key(Bytes encoded) {
         Der outer{encoded};
         const auto sequence = outer.get(0x30);
         outer.end();
         Der fields{sequence.contents};
-        (void)fields.get(0x30);
+        const auto identifier = fields.get(0x30);
         (void)fields.get(3);
         fields.end();
         DWORD size = 0;
@@ -324,14 +341,81 @@ struct Key {
                                                                                                  : 0u;
                 require(width && public_bits.size() == 1 + 2 * width && public_bits.front() == 4,
                         "APK ECDSA requires an uncompressed NIST P-256, P-384 or P-521 public key");
+            } else if (std::strcmp(info->Algorithm.pszObjId, szOID_X957_DSA) == 0) {
+                // DSA requires explicit canonical p/q/g parameters; no inherited
+                // parameters or permissive BER integers cross the host boundary.
+                Der algorithm_fields{identifier.contents};
+                const auto oid = algorithm_fields.get(6).contents;
+                constexpr std::array<std::uint8_t, 7> dsa_oid = {0x2a, 0x86, 0x48, 0xce, 0x38, 4, 1};
+                require(std::equal(oid.begin(), oid.end(), dsa_oid.begin(), dsa_oid.end()),
+                        "Noncanonical DSA public-key identifier");
+                const auto encoded_parameters = algorithm_fields.get(0x30);
+                algorithm_fields.end();
+                require(std::equal(encoded_parameters.encoded.begin(), encoded_parameters.encoded.end(),
+                                   parameters.begin(), parameters.end()),
+                        "DSA public-key parameters differ from their DER encoding");
+                Der domain{encoded_parameters.contents};
+                const auto modulus = dsa_integer(domain);
+                dsa_group = dsa_integer(domain);
+                const auto generator = dsa_integer(domain);
+                domain.end();
+                Der public_value{public_bits};
+                const auto value = dsa_integer(public_value);
+                public_value.end();
+                bounded(((modulus.size() == 128 && dsa_group.size() == 20) ||
+                         (modulus.size() == 256 && dsa_group.size() == 32)) &&
+                            (modulus.front() & 128) && (dsa_group.front() & 128),
+                        "DSA APK signing supports only 1024/160-bit and 2048/256-bit p/q pairs");
+                const auto greater_than_one = [](Bytes number) {
+                    return number.size() > 1 || number.front() > 1;
+                };
+                require(less_integer(dsa_group, modulus) && greater_than_one(generator) &&
+                            less_integer(generator, modulus) && greater_than_one(value) &&
+                            less_integer(value, modulus),
+                        "DSA public-key values are outside their domain");
+                if (dsa_group.size() == 32) {
+                    // Crypt32's SPKI importer does not support this host's
+                    // FIPS186-3 DSA keys. Import the same validated public
+                    // integers through CNG's explicit V2 public-key format.
+                    // SPKI carries no generation seed/counter: mark it absent.
+                    BCRYPT_DSA_KEY_BLOB_V2 header{
+                        BCRYPT_DSA_PUBLIC_MAGIC_V2, 256, DSA_HASH_ALGORITHM_SHA256,
+                        DSA_FIPS186_3, 32, 32, {0xff, 0xff, 0xff, 0xff}};
+                    static_assert(sizeof(header) == 28);
+                    std::vector<std::uint8_t> blob(sizeof(header) + 32 + 32 + 3 * 256);
+                    std::memcpy(blob.data(), &header, sizeof(header));
+                    std::size_t offset = sizeof(header) + 32;
+                    const auto append = [&](Bytes integer, std::size_t width) {
+                        std::copy(integer.begin(), integer.end(),
+                                  blob.begin() + static_cast<std::ptrdiff_t>(offset + width - integer.size()));
+                        offset += width;
+                    };
+                    append(dsa_group, 32);
+                    append(modulus, 256);
+                    append(generator, 256);
+                    append(value, 256);
+                    struct Provider {
+                        BCRYPT_ALG_HANDLE handle = nullptr;
+                        ~Provider() { if (handle) BCryptCloseAlgorithmProvider(handle, 0); }
+                    } provider;
+                    crypto(BCryptOpenAlgorithmProvider(&provider.handle, BCRYPT_DSA_ALGORITHM,
+                                                       nullptr, 0),
+                           "Cannot open APK DSA verification provider");
+                    require(BCryptImportKeyPair(provider.handle, nullptr, BCRYPT_DSA_PUBLIC_BLOB,
+                                                &handle, blob.data(), static_cast<ULONG>(blob.size()), 0) == 0,
+                            "Unsupported or invalid APK DSA public key");
+                }
             } else
                 invalid("Unsupported APK SubjectPublicKeyInfo algorithm");
-            require(CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, info, 0, nullptr, &handle),
-                    "Unsupported or invalid APK public key");
+            if (!handle)
+                require(CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, info, 0, nullptr, &handle),
+                        "Unsupported or invalid APK public key");
             ULONG got = 0;
             crypto(BCryptGetProperty(handle, BCRYPT_KEY_LENGTH, reinterpret_cast<PUCHAR>(&bits), sizeof(bits),
                                      &got, 0),
                    "Cannot inspect APK signing key size");
+            require(dsa_group.empty() || bits == (dsa_group.size() == 20 ? 1024u : 2048u),
+                    "Imported DSA key size differs from its canonical domain");
         } catch (...) {
             if (handle)
                 BCryptDestroyKey(handle);
@@ -367,6 +451,22 @@ std::vector<std::uint8_t> ec_signature(Bytes encoded, ULONG bits) {
     pair.end();
     return result;
 }
+std::vector<std::uint8_t> dsa_signature(Bytes encoded, Bytes group) {
+    Der outer{encoded};
+    const auto sequence = outer.get(0x30);
+    outer.end();
+    Der pair{sequence.contents};
+    const auto width = group.size();
+    std::vector<std::uint8_t> result(width * 2);
+    for (std::size_t n = 0; n < 2; ++n) {
+        const auto value = dsa_integer(pair);
+        require(less_integer(value, group), "DSA signature integer is outside its subgroup");
+        std::copy(value.begin(), value.end(),
+                  result.begin() + static_cast<std::ptrdiff_t>((n + 1) * width - value.size()));
+    }
+    pair.end();
+    return result;
+}
 void verify(const Algorithm &algorithm, Bytes public_key, Bytes data, Bytes signature) {
     Key key(public_key);
     const auto hash = digest(data, algorithm.wide);
@@ -380,6 +480,16 @@ void verify(const Algorithm &algorithm, Bytes public_key, Bytes data, Bytes sign
         result = BCryptVerifySignature(key.handle, nullptr, const_cast<PUCHAR>(hash.data()),
                                        static_cast<ULONG>(hash.size()), const_cast<PUCHAR>(raw.data()),
                                        static_cast<ULONG>(raw.size()), 0);
+    } else if (algorithm.kind == Algorithm::dsa) {
+        require(std::strcmp(key.info->Algorithm.pszObjId, szOID_X957_DSA) == 0 &&
+                    !key.dsa_group.empty(),
+                "APK DSA verification requires a supported DSA public key");
+        const auto raw = dsa_signature(signature, key.dsa_group);
+        // DSA uses the leftmost min(hash bits, q bits). The CNG 1024-bit
+        // provider requires that truncation explicitly rather than a 32-byte hash.
+        result = BCryptVerifySignature(key.handle, nullptr, const_cast<PUCHAR>(hash.data()),
+                                       static_cast<ULONG>((std::min)(hash.size(), key.dsa_group.size())),
+                                       const_cast<PUCHAR>(raw.data()), static_cast<ULONG>(raw.size()), 0);
     } else {
         require(std::strcmp(key.info->Algorithm.pszObjId, szOID_RSA_RSA) == 0 && key.bits >= 1024 &&
                     key.bits <= 16384 && signature.size() == (key.bits + 7) / 8,
@@ -500,7 +610,7 @@ SignatureReport verify_block(Bytes bytes, const Layout &where, Bytes encoded, bo
                 }
         if (!selected)
             return {
-                "unsupported", scheme, "APK signer has no supported RSA or ECDSA signature algorithm.", {}};
+                "unsupported", scheme, "APK signer has no supported RSA, ECDSA or DSA signature algorithm.", {}};
         verify(*selected, public_key, signed_data, selected_signature);
         Cursor data{signed_data};
         const auto digests = records(data.field());
@@ -511,6 +621,14 @@ SignatureReport verify_block(Bytes bytes, const Layout &where, Bytes encoded, bo
                     "APK v3 signed and unsigned SDK ranges disagree");
         }
         Cursor attributes{data.field()};
+        if (!modern && !data.empty()) {
+            // Android's v2 verifier permits opaque signed-data extensions.
+            // verify() above authenticated this complete field, including this
+            // remainder. It grants no extra semantics, identity or authority.
+            (void)data.take(data.bytes.size() - data.at);
+            result.message = " Authenticated APK v2 signed-data extension bytes were ignored; "
+                             "no semantics or authority were inferred.";
+        }
         data.end();
         require(digests.size() == signatures.size(),
                 "APK signature algorithm list differs from signed digests");
@@ -649,9 +767,11 @@ SignatureReport verify_signature(Bytes bytes) {
             {}};
     result.status = "verified";
     result.scheme = scheme;
+    const auto extension_note = std::move(result.message);
     result.message = "APK " + scheme +
                      " signatures and protected content digests are valid for all reported signers. "
                      "Publisher identity, compatibility and execution permission are not established.";
+    result.message += extension_note;
     return result;
 }
 } // namespace aether::apk

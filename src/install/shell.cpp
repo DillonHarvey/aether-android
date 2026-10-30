@@ -2,6 +2,7 @@
 #include "aether/apk/artwork.hpp"
 #include "aether/apk/package.hpp"
 #include "aether/common/text.hpp"
+#include "aether/install/notification_identity.hpp"
 #include "aether/dex/fixture_hash.hpp"
 #include "aether/security/worker_image.hpp"
 #include "private.hpp"
@@ -16,6 +17,7 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <sddl.h>
+#include <utility>
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <wrl/client.h>
@@ -27,6 +29,7 @@ using Microsoft::WRL::ComPtr;
 constexpr std::uint64_t link_limit = 64 * 1024;
 constexpr std::uint64_t icon_limit = 512 * 1024;
 constexpr wchar_t uninstall_parent[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\";
+constexpr wchar_t notification_marker[] = L"AetherNotificationRegistration";
 void require(bool value, const char *code, const char *message) {
     if (!value)
         throw InstallError(code, message);
@@ -50,6 +53,15 @@ struct Key {
     Key() = default;
     Key(const Key &) = delete;
     Key &operator=(const Key &) = delete;
+    Key(Key &&other) noexcept : value(std::exchange(other.value, nullptr)) {}
+    Key &operator=(Key &&other) noexcept {
+        if (this != &other) {
+            if (value)
+                RegCloseKey(value);
+            value = std::exchange(other.value, nullptr);
+        }
+        return *this;
+    }
 };
 struct ShellLease {
     UniqueHandle mutex;
@@ -296,6 +308,9 @@ void verify_key(HKEY key, const InstalledApp &app, const std::filesystem::path &
         return;
     require(recorded_id == utf16(app.id) && recorded_store == store.wstring(), "AETHER_SHELL_CONFLICT",
             "Windows registration belongs to another installation");
+    const auto notification = read_number(key, notification_marker);
+    require(!notification || *notification == 1, "AETHER_SHELL_CONFLICT",
+            "Windows notification registration has an unknown version");
     const auto expected_strings = strings(app, store);
     const auto expected_numbers = numbers(app);
     for (DWORD index = 0; index < values; ++index) {
@@ -304,28 +319,31 @@ void verify_key(HKEY key, const InstalledApp &app, const std::filesystem::path &
         check(HRESULT_FROM_WIN32(
                   RegEnumValueW(key, index, name.data(), &length, nullptr, nullptr, nullptr, nullptr)),
               "Enumerate Windows registration values");
-        require(expected_strings.contains(std::wstring(name.data(), length)) ||
+        require(std::wstring_view(name.data(), length) == notification_marker ||
+                    expected_strings.contains(std::wstring(name.data(), length)) ||
                     expected_numbers.contains(std::wstring(name.data(), length)),
                 "AETHER_SHELL_CONFLICT", "Unknown Windows registration values are preserved");
     }
 }
-bool open_key(Key &key, const InstalledApp &app, bool create) {
+bool open_key(Key &key, const InstalledApp &app, bool create, bool write = true) {
+    require(!create || write, "AETHER_SHELL_STATE", "Creating a Windows registration requires write access");
     const auto path = registry_path(app);
+    const auto access = KEY_READ | KEY_WOW64_64KEY | (write ? KEY_WRITE | DELETE : 0);
     if (!create) {
         const auto status = RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), REG_OPTION_OPEN_LINK,
-                                          KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY, &key.value);
+                                          access, &key.value);
         if (status == ERROR_FILE_NOT_FOUND)
             return false;
         check(HRESULT_FROM_WIN32(status), "Open Windows application registration");
     } else {
-        if (open_key(key, app, false))
+        if (open_key(key, app, false, write))
             return true;
         Descriptor descriptor;
         SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
         DWORD disposition = 0;
         check(HRESULT_FROM_WIN32(RegCreateKeyExW(
                   HKEY_CURRENT_USER, path.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
-                  KEY_READ | KEY_WRITE | DELETE | KEY_WOW64_64KEY, &attributes, &key.value, &disposition)),
+                  access, &attributes, &key.value, &disposition)),
               "Create Windows application registration");
     }
     DWORD type = 0, size = 0;
@@ -333,12 +351,212 @@ bool open_key(Key &key, const InstalledApp &app, bool create) {
     require(link == ERROR_FILE_NOT_FOUND, "AETHER_SHELL_PATH", "Registry symbolic links are unsupported");
     return true;
 }
+enum class NotificationKey { parent, application, server };
+Key open_notification_key(const InstalledApp &app, NotificationKey kind, bool write = false,
+                          bool create = false) {
+    const auto owned_root = L"Software\\Classes\\CLSID\\" + notification_clsid(app.id);
+    const auto path = kind == NotificationKey::parent ? std::wstring(L"Software\\Classes\\CLSID")
+                     : kind == NotificationKey::server ? owned_root + L"\\LocalServer32" : owned_root;
+    Key held;
+    std::wstring traversed;
+    for (std::size_t begin = 0; begin < path.size();) {
+        const auto end = path.find(L'\\', begin);
+        const auto part = path.substr(begin, end == std::wstring::npos ? path.size() - begin : end - begin);
+        if (!traversed.empty())
+            traversed += L'\\';
+        traversed += part;
+        const bool owned = traversed == owned_root || traversed == owned_root + L"\\LocalServer32";
+        const auto access = KEY_READ | KEY_WOW64_64KEY | (write ? KEY_WRITE | DELETE : 0);
+        Key next;
+        auto status = RegOpenKeyExW(held.value ? held.value : HKEY_CURRENT_USER, part.c_str(),
+                                    REG_OPTION_OPEN_LINK, access, &next.value);
+        if (status == ERROR_FILE_NOT_FOUND && create) {
+            Descriptor descriptor;
+            SECURITY_ATTRIBUTES attributes{sizeof(attributes), descriptor.value, FALSE};
+            check(HRESULT_FROM_WIN32(RegCreateKeyExW(
+                      held.value ? held.value : HKEY_CURRENT_USER, part.c_str(), 0, nullptr,
+                      REG_OPTION_NON_VOLATILE, access, owned ? &attributes : nullptr, &next.value, nullptr)),
+                  "Create notification registration component");
+            status = ERROR_SUCCESS;
+        }
+        if (status == ERROR_FILE_NOT_FOUND)
+            return {};
+        check(HRESULT_FROM_WIN32(status), "Open notification registration component");
+        DWORD type = 0, bytes = 0;
+        auto link = RegQueryValueExW(next.value, L"SymbolicLinkValue", nullptr, &type, nullptr, &bytes);
+        if (traversed == L"Software\\Classes" && link == ERROR_SUCCESS) {
+            // Reuse the Explorer registration rule for Windows' exact current-
+            // user Classes alias. Every other registry link remains refused.
+            const auto policy = security::runtime_directory_sddl();
+            const auto owner_end = policy.find(L"G:");
+            require(policy.starts_with(L"O:") && owner_end != std::wstring::npos,
+                    "AETHER_SHELL_POLICY", "Cannot identify the current user's Classes hive");
+            const auto leaf = policy.substr(2, owner_end - 2) + L"_Classes";
+            const auto expected = L"\\Registry\\User\\" + leaf;
+            std::wstring actual(expected.size(), L'\0');
+            require(type == REG_LINK && bytes == expected.size() * sizeof(wchar_t),
+                    "AETHER_SHELL_PATH", "The per-user Classes alias has an unexpected target");
+            check(HRESULT_FROM_WIN32(RegQueryValueExW(next.value, L"SymbolicLinkValue", nullptr, &type,
+                      reinterpret_cast<BYTE *>(actual.data()), &bytes)), "Read the Windows Classes alias");
+            require(type == REG_LINK && bytes == expected.size() * sizeof(wchar_t) &&
+                        CompareStringOrdinal(actual.data(), static_cast<int>(actual.size()),
+                                             expected.data(), static_cast<int>(expected.size()), TRUE) == CSTR_EQUAL,
+                    "AETHER_SHELL_PATH", "The Classes alias does not identify the current user");
+            next = Key{};
+            check(HRESULT_FROM_WIN32(RegOpenKeyExW(HKEY_USERS, leaf.c_str(), REG_OPTION_OPEN_LINK,
+                                                  access, &next.value)), "Open the verified Classes hive");
+            link = RegQueryValueExW(next.value, L"SymbolicLinkValue", nullptr, &type, nullptr, &bytes);
+        }
+        require(link == ERROR_FILE_NOT_FOUND, "AETHER_SHELL_PATH",
+                "Registry links in notification registration are preserved");
+        if (owned)
+            verify_key_policy(next.value);
+        held = std::move(next);
+        if (end == std::wstring::npos)
+            break;
+        begin = end + 1;
+    }
+    return held;
+}
+std::wstring notification_command(const InstalledApp &app, const std::filesystem::path &store) {
+    return quote_windows_argument(utf16(app.launcher)) + L" notification-server --app-id " + utf16(app.id) +
+           L" --store " + quote_windows_argument(store.wstring());
+}
+enum class NotificationValue { missing, prefix, complete };
+NotificationValue notification_value(HKEY key, const wchar_t *name, const std::wstring &expected,
+                                     bool pending) {
+    DWORD type = 0, length = 0;
+    auto status = RegQueryValueExW(key, name, nullptr, &type, nullptr, &length);
+    if (status == ERROR_FILE_NOT_FOUND)
+        return NotificationValue::missing;
+    const auto expected_size = (expected.size() + 1) * sizeof(wchar_t);
+    require(status == ERROR_SUCCESS && type == REG_SZ && length <= expected_size,
+            "AETHER_SHELL_CONFLICT", "Notification registration has unknown value type or extent");
+    std::vector<BYTE> actual(length);
+    const auto original = length;
+    check(HRESULT_FROM_WIN32(RegQueryValueExW(key, name, nullptr, &type, actual.data(), &length)),
+          "Read notification registration value");
+    const auto *first = reinterpret_cast<const BYTE *>(expected.c_str());
+    require(type == REG_SZ && length == original && std::equal(actual.begin(), actual.end(), first) &&
+                (length == expected_size || pending),
+            "AETHER_SHELL_CONFLICT", "Changed notification registration content is preserved");
+    return length == expected_size ? NotificationValue::complete : NotificationValue::prefix;
+}
+void notification_shape(HKEY key, bool server) {
+    DWORD children = 0, values = 0;
+    check(HRESULT_FROM_WIN32(RegQueryInfoKeyW(key, nullptr, nullptr, nullptr, &children, nullptr, nullptr,
+                                             &values, nullptr, nullptr, nullptr, nullptr)),
+          "Inspect notification registration shape");
+    require(children <= (server ? 0u : 1u) && values <= (server ? 1u : 3u),
+            "AETHER_SHELL_CONFLICT", "Unknown notification registration material is preserved");
+    if (children) {
+        std::array<wchar_t, 64> child{};
+        DWORD length = static_cast<DWORD>(child.size());
+        check(HRESULT_FROM_WIN32(RegEnumKeyExW(key, 0, child.data(), &length, nullptr, nullptr, nullptr, nullptr)),
+              "Read notification registration child");
+        require(std::wstring_view(child.data(), length) == L"LocalServer32", "AETHER_SHELL_CONFLICT",
+                "Unexpected notification registration child is preserved");
+    }
+    for (DWORD index = 0; index < values; ++index) {
+        std::array<wchar_t, 64> name{};
+        DWORD length = static_cast<DWORD>(name.size());
+        check(HRESULT_FROM_WIN32(RegEnumValueW(key, index, name.data(), &length, nullptr, nullptr, nullptr, nullptr)),
+              "Read notification registration value name");
+        const std::wstring_view field(name.data(), length);
+        require(server ? field.empty() : field == L"AetherAppId" || field == L"AetherStore" || field == L"AetherRuntime",
+                "AETHER_SHELL_CONFLICT", "Unknown notification registration value is preserved");
+    }
+}
+struct NotificationProjection {
+    Key application, server;
+    bool marker = false, complete = false;
+};
+NotificationProjection notification_projection(const InstalledApp &app, const std::filesystem::path &store,
+                                                bool write = false) {
+    NotificationProjection result;
+    Key locator;
+    if (open_key(locator, app, false, write)) {
+        verify_key(locator.value, app, store, app.shell == ShellState::pending);
+        result.marker = read_number(locator.value, notification_marker) == 1u;
+    }
+    const bool pending = result.marker &&
+                         (app.shell == ShellState::pending || app.state == State::removing);
+    result.application = open_notification_key(app, NotificationKey::application, write);
+    if (!result.application.value)
+        return result;
+    notification_shape(result.application.value, false);
+    const std::array states{
+        notification_value(result.application.value, L"AetherAppId", utf16(app.id), pending),
+        notification_value(result.application.value, L"AetherStore", store.wstring(), pending),
+        notification_value(result.application.value, L"AetherRuntime", utf16(app.launcher), pending)};
+    bool incomplete = false;
+    for (const auto state : states) {
+        require(!incomplete || state == NotificationValue::missing, "AETHER_SHELL_CONFLICT",
+                "Notification ownership markers are not a recorded write prefix");
+        incomplete = incomplete || state != NotificationValue::complete;
+    }
+    require(!incomplete || pending, "AETHER_SHELL_CONFLICT",
+            "Incomplete notification registration lacks an owned pending intent");
+    result.server = open_notification_key(app, NotificationKey::server, write);
+    if (result.server.value) {
+        require(!incomplete, "AETHER_SHELL_CONFLICT", "Notification server precedes its complete owner markers");
+        notification_shape(result.server.value, true);
+        const auto state = notification_value(result.server.value, L"", notification_command(app, store), pending);
+        require(state == NotificationValue::complete || pending, "AETHER_SHELL_CONFLICT",
+                "Incomplete notification server lacks an owned pending intent");
+        result.complete = result.marker && state == NotificationValue::complete;
+    }
+    return result;
+}
+void apply_notification_projection(const InstalledApp &app, const std::filesystem::path &store) {
+    auto checked_projection = notification_projection(app, store, true);
+    require(checked_projection.marker && app.shell == ShellState::pending, "AETHER_SHELL_STATE",
+            "Notification registration requires its durable maintenance marker and pending intent");
+    auto application = open_notification_key(app, NotificationKey::application, true, true);
+    set_string(application.value, L"AetherAppId", utf16(app.id));
+    set_string(application.value, L"AetherStore", store.wstring());
+    set_string(application.value, L"AetherRuntime", utf16(app.launcher));
+    check(HRESULT_FROM_WIN32(RegFlushKey(application.value)), "Flush notification ownership markers");
+    auto server = open_notification_key(app, NotificationKey::server, true, true);
+    set_string(server.value, L"", notification_command(app, store));
+    check(HRESULT_FROM_WIN32(RegFlushKey(server.value)), "Flush notification local-server command");
+    require(notification_projection(app, store).complete, "AETHER_SHELL_INTEGRITY",
+            "Notification registration failed readback");
+}
+void remove_notification_projection(const InstalledApp &app, const std::filesystem::path &store) {
+    auto projection = notification_projection(app, store, true);
+    if (!projection.application.value)
+        return;
+    if (projection.server.value) {
+        projection.server = Key{};
+        check(HRESULT_FROM_WIN32(RegDeleteKeyExW(projection.application.value, L"LocalServer32", KEY_WOW64_64KEY, 0)),
+              "Remove the selected notification server");
+        check(HRESULT_FROM_WIN32(RegFlushKey(projection.application.value)), "Flush notification server removal");
+    }
+    auto parent = open_notification_key(app, NotificationKey::parent, true);
+    projection.application = Key{};
+    check(HRESULT_FROM_WIN32(RegDeleteKeyExW(parent.value, notification_clsid(app.id).c_str(), KEY_WOW64_64KEY, 0)),
+          "Remove the selected notification class");
+    check(HRESULT_FROM_WIN32(RegFlushKey(parent.value)), "Flush notification class removal");
+}
 void set_property(IPropertyStore *store, REFPROPERTYKEY key, const std::wstring &text) {
     PROPVARIANT value{};
     check(InitPropVariantFromString(text.c_str(), &value), "Create shortcut identity value");
     const auto status = store->SetValue(key, value);
     PropVariantClear(&value);
     check(status, "Set shortcut identity");
+}
+CLSID notification_guid(const InstalledApp &app) {
+    CLSID value{};
+    check(CLSIDFromString(notification_clsid(app.id).c_str(), &value), "Parse installed notification CLSID");
+    return value;
+}
+void set_notification_property(IPropertyStore *store, const InstalledApp &app) {
+    PROPVARIANT value{};
+    check(InitPropVariantFromCLSID(notification_guid(app), &value), "Create notification shortcut CLSID");
+    const auto status = store->SetValue(PKEY_AppUserModel_ToastActivatorCLSID, value);
+    PropVariantClear(&value);
+    check(status, "Set notification shortcut CLSID");
 }
 bool link_matches(const std::filesystem::path &path, const InstalledApp &app,
                   const std::filesystem::path &store) {
@@ -394,6 +612,29 @@ std::optional<std::wstring> link_identity(const std::filesystem::path &path) {
     PropVariantClear(&value);
     return result;
 }
+bool shortcut_notification_matches(const std::filesystem::path &path, const InstalledApp &app) {
+    if (!path_exists(path))
+        return false;
+    auto held = detail::private_file(path, FILE_READ_ATTRIBUTES, OPEN_EXISTING, link_limit,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE, true);
+    Apartment apartment;
+    ComPtr<IShellLinkW> link;
+    check(CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&link)),
+          "Read notification shortcut properties");
+    ComPtr<IPersistFile> persisted;
+    check(link.As(&persisted), "Read persisted notification shortcut");
+    if (FAILED(persisted->Load(path.c_str(), STGM_READ)))
+        return false; // Existing ownership checks separately reject nonempty unreadable links.
+    ComPtr<IPropertyStore> properties;
+    check(link.As(&properties), "Read notification shortcut identity");
+    PROPVARIANT value{};
+    check(properties->GetValue(PKEY_AppUserModel_ToastActivatorCLSID, &value), "Read notification shortcut CLSID");
+    const bool legacy = value.vt == VT_EMPTY;
+    const bool match = value.vt == VT_CLSID && value.puuid && IsEqualCLSID(*value.puuid, notification_guid(app));
+    PropVariantClear(&value);
+    require(legacy || match, "AETHER_SHELL_CONFLICT", "Changed notification shortcut CLSID is preserved");
+    return match;
+}
 bool empty_pending_link(const std::filesystem::path &path, const InstalledApp &app) {
     if (app.shell != ShellState::pending)
         return false;
@@ -411,10 +652,12 @@ void validate_shell_entries(const InstalledApp &app, const std::filesystem::path
         const auto owner = link_identity(path);
         require(owner == identity(app) || (!owner && empty_pending_link(path, app)), "AETHER_SHELL_CONFLICT",
                 "The recorded shortcut has no matching app identity; conflicting material is preserved");
+        (void)shortcut_notification_matches(path, app);
     }
     Key key;
     if (open_key(key, app, false))
         verify_key(key.value, app, store, app.shell == ShellState::pending);
+    (void)notification_projection(app, store);
 }
 std::vector<std::uint8_t> recorded_icon(const InstalledApp &app, const std::filesystem::path &store) {
     const auto artwork = package_artwork(app, store);
@@ -422,6 +665,71 @@ std::vector<std::uint8_t> recorded_icon(const InstalledApp &app, const std::file
     require(artwork.label == app.display_name && apk::sha256(bytes) == app.icon_sha256,
             "AETHER_SHELL_INTEGRITY", "Package artwork differs from the recorded update identity");
     return bytes;
+}
+void validate_alias_history(const InstalledApp &selected, const ShellIconAliases &aliases) {
+    require(valid_app_id(selected.id) && selected.package_generation <= 4096 &&
+                valid_shell_record(selected) && aliases.generations.size() <= 4096 &&
+                aliases.committed_sha256.size() <= 4096 &&
+                std::is_sorted(aliases.generations.begin(), aliases.generations.end()) &&
+                std::adjacent_find(aliases.generations.begin(), aliases.generations.end()) ==
+                    aliases.generations.end() &&
+                std::all_of(aliases.generations.begin(), aliases.generations.end(),
+                            [&](auto generation) { return generation <= selected.package_generation; }) &&
+                std::is_sorted(aliases.committed_sha256.begin(), aliases.committed_sha256.end()) &&
+                std::adjacent_find(aliases.committed_sha256.begin(), aliases.committed_sha256.end()) ==
+                    aliases.committed_sha256.end() &&
+                std::all_of(aliases.committed_sha256.begin(), aliases.committed_sha256.end(),
+                            [](const auto &hash) {
+                                return hash.size() == 64 &&
+                                       std::all_of(hash.begin(), hash.end(), [](char c) {
+                                           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                                       });
+                            }) &&
+                (aliases.generations.empty() || !aliases.committed_sha256.empty()),
+            "AETHER_SHELL_STATE", "Invalid bounded committed icon alias history");
+}
+struct IconAlias {
+    std::filesystem::path path;
+    UniqueHandle file;
+    std::string digest;
+};
+struct IconAliases {
+    UniqueHandle directory;
+    std::vector<IconAlias> entries;
+};
+IconAliases open_icon_aliases(const InstalledApp &selected, const std::filesystem::path &store,
+                              const ShellIconAliases &aliases, DWORD access,
+                              std::optional<std::vector<std::uint8_t>> &expected) {
+    validate_alias_history(selected, aliases);
+    IconAliases result;
+    const auto directory = store / selected.id;
+    if (aliases.generations.empty() || !path_exists(directory))
+        return result;
+    result.directory = detail::hold_directory(directory, false, true);
+    for (const auto generation : aliases.generations) {
+        if (!selected.icon_sha256.empty() && generation == selected.icon_generation)
+            continue; // The active projection has its own stricter ownership contract.
+        const auto path = directory / (generation ? "app-" + std::to_string(generation) + ".ico" : "app.ico");
+        IconAlias entry{path, {}, {}};
+        if (path_exists(path)) {
+            entry.file = detail::private_file(path, GENERIC_READ | access, OPEN_EXISTING, icon_limit);
+            const auto bytes = detail::read_contents(entry.file.get());
+            entry.digest = apk::sha256(bytes);
+            if (!bytes.empty() && !std::binary_search(aliases.committed_sha256.begin(),
+                                                     aliases.committed_sha256.end(), entry.digest)) {
+                require(!selected.icon_sha256.empty(), "AETHER_SHELL_CONFLICT",
+                        "Historical icon has unknown content; conflicting material is preserved");
+                if (!expected)
+                    expected = recorded_icon(selected, store);
+                require(bytes.size() < expected->size() &&
+                            std::equal(bytes.begin(), bytes.end(), expected->begin()),
+                        "AETHER_SHELL_CONFLICT",
+                        "Historical icon is neither committed artwork nor an exact current-artwork prefix");
+            }
+        }
+        result.entries.push_back(std::move(entry));
+    }
+    return result;
 }
 void replace_update_icon(const InstalledApp &selected, const InstalledApp &other,
                          const std::filesystem::path &store) {
@@ -547,13 +855,27 @@ security::InstalledRelaunch shell_relaunch(const InstalledApp &app, const std::f
                 "property limit of 255 UTF-16 characters; use the registered Start shortcut"};
     return {utf8(command), label, utf8(icon), {}};
 }
-security::InstalledActivity prepare_shell_relaunch(std::string_view id) {
+namespace {
+void validate_registered_shell_store(const PackageStore &store, std::string_view id) {
+    // list() is the authoritative held journal snapshot, without redundant APK
+    // hashing. Preparing a session separately validates the actual held bytes.
+    const auto apps = store.list();
+    const auto found = std::find_if(apps.begin(), apps.end(), [&](const auto &app) { return app.id == id; });
+    require(found != apps.end(), "AETHER_SHELL_NOT_REGISTERED",
+            "This app no longer exists in its registered package store");
+    const auto shell_lease = hold_shell_registration();
+    require(installed_state(found->state) && found->shell == ShellState::ready &&
+                found->launcher == utf8(shell_launcher().wstring()) && inspect_shell_registration(*found, store.root()),
+            "AETHER_SHELL_INTEGRITY", "Windows registration needs explicit repair before registered opening");
+}
+} // namespace
+std::filesystem::path registered_shell_store(std::string_view id) {
     require(valid_app_id(id), "AETHER_INSTALL_ID", "Invalid registered application ID");
     const auto root = [&] {
         InstalledApp locator;
         locator.id = id;
         Key key;
-        require(open_key(key, locator, false), "AETHER_SHELL_NOT_REGISTERED",
+        require(open_key(key, locator, false, false), "AETHER_SHELL_NOT_REGISTERED",
                 "This app no longer has a Windows registration; remove its stale taskbar pin");
         verify_key_policy(key.value);
         const auto path = read_string(key.value, L"AetherStore");
@@ -568,11 +890,18 @@ security::InstalledActivity prepare_shell_relaunch(std::string_view id) {
     // current projections under the same Shell coordination as update/uninstall.
     // No registry command, permission or package path is ever executed here.
     PackageStore store(root);
-    const auto shell_lease = hold_shell_registration();
-    const auto app = store.info(id);
-    require(app.shell == ShellState::ready && app.launcher == utf8(shell_launcher().wstring()) &&
-                inspect_shell_registration(app, root),
-            "AETHER_SHELL_INTEGRITY", "Windows registration needs explicit repair before taskbar relaunch");
+    validate_registered_shell_store(store, id);
+    return root;
+}
+security::InstalledActivity prepare_shell_relaunch(std::string_view id) {
+    const auto root = registered_shell_store(id);
+    // Reopen and repeat the authoritative check: the short locator snapshot
+    // has closed, so update/removal may have intervened before this admission.
+    PackageStore store(root);
+    validate_registered_shell_store(store, id);
+    // The retained read snapshot excludes this store's mutations. Release the
+    // cross-app Shell mutex before package hashing/inspection so another app's
+    // relaunch is not blocked by this preparation's potentially lengthy reads.
     return store.prepare_launch(id);
 }
 void plan_shell_registration(InstalledApp &app, const std::filesystem::path &store,
@@ -607,6 +936,7 @@ void plan_shell_registration(InstalledApp &app, const std::filesystem::path &sto
     app.shell = ShellState::pending;
     require(valid_shell_record(app), "AETHER_SHELL_UNSUPPORTED",
             "Application identity exceeds Windows registration limits");
+    (void)notification_projection(app, store); // Preflight any occupied deterministic COM identity.
 }
 void plan_shell_update(const InstalledApp &previous, InstalledApp &candidate, const apk::Artwork &artwork,
                        const std::filesystem::path &store) {
@@ -642,17 +972,100 @@ void plan_shell_update(const InstalledApp &previous, InstalledApp &candidate, co
     require(valid_shell_record(candidate), "AETHER_SHELL_UNSUPPORTED",
             "Updated application identity exceeds Windows registration limits");
 }
+bool apply_shell_icon_aliases(const InstalledApp &selected, const std::filesystem::path &store,
+                              const ShellIconAliases &aliases) {
+    validate_alias_history(selected, aliases);
+    require((selected.state == State::installed || selected.state == State::update_committed ||
+             selected.state == State::update_rolled_back) &&
+                selected.shell == ShellState::ready,
+            "AETHER_SHELL_STATE", "Historical icons require a durably selected Windows registration");
+    if (std::none_of(aliases.generations.begin(), aliases.generations.end(),
+                     [&](auto generation) {
+                         return selected.icon_sha256.empty() || generation != selected.icon_generation;
+                     }))
+        return false;
+    require(!selected.icon_sha256.empty() &&
+                std::binary_search(aliases.committed_sha256.begin(), aliases.committed_sha256.end(),
+                                   selected.icon_sha256),
+            "AETHER_SHELL_STATE", "Historical icons require the durably selected committed artwork");
+    const auto shell_lease = hold_shell_registration();
+    std::optional<std::vector<std::uint8_t>> expected = recorded_icon(selected, store);
+    auto held = open_icon_aliases(selected, store, aliases, GENERIC_WRITE, expected);
+    bool changed = false;
+    // Every existing alias has passed identity/content checks before the first
+    // creation or write. A raced missing path is refused by CREATE_NEW.
+    for (auto &entry : held.entries) {
+        const bool existed = static_cast<bool>(entry.file);
+        if (existed && entry.digest == selected.icon_sha256)
+            continue;
+        if (!existed)
+            entry.file = detail::private_file(entry.path, GENERIC_READ | GENERIC_WRITE, CREATE_NEW, icon_limit);
+        LARGE_INTEGER zero{};
+        require(SetFilePointerEx(entry.file.get(), zero, nullptr, FILE_BEGIN) &&
+                    SetEndOfFile(entry.file.get()) && FlushFileBuffers(entry.file.get()),
+                "AETHER_SHELL_IO", "Historical icon write was interrupted; explicitly repair the app");
+        detail::replace_contents(entry.file.get(), *expected);
+        require(detail::read_contents(entry.file.get()) == *expected, "AETHER_SHELL_INTEGRITY",
+                "Historical icon failed durable readback");
+        changed = true;
+    }
+    // Release every exclusive alias identity before synchronous Shell delivery.
+    // Explicit recovery must also refresh old pin paths whose bytes already match.
+    for (auto &entry : held.entries)
+        entry.file.reset();
+    for (const auto &entry : held.entries)
+        SHChangeNotify(entry.digest.empty() ? SHCNE_CREATE : SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH,
+                       entry.path.c_str(), nullptr);
+    return changed;
+}
+void validate_shell_icon_aliases(const InstalledApp &selected, const std::filesystem::path &store,
+                                 const ShellIconAliases &aliases) {
+    const auto shell_lease = hold_shell_registration();
+    std::optional<std::vector<std::uint8_t>> expected;
+    (void)open_icon_aliases(selected, store, aliases, 0, expected);
+}
+void remove_shell_icon_aliases(const InstalledApp &selected, const std::filesystem::path &store,
+                               const ShellIconAliases &aliases) {
+    const auto shell_lease = hold_shell_registration();
+    std::optional<std::vector<std::uint8_t>> expected;
+    auto held = open_icon_aliases(selected, store, aliases, DELETE, expected);
+    // Ownership of all existing aliases is established before deleting any.
+    for (auto &entry : held.entries) {
+        if (!entry.file)
+            continue;
+        FILE_DISPOSITION_INFO disposition{TRUE};
+        require(SetFileInformationByHandle(entry.file.get(), FileDispositionInfo, &disposition,
+                                           sizeof(disposition)) != FALSE,
+                "AETHER_SHELL_IO", "Cannot remove the selected app's historical icon");
+        entry.file.reset();
+        SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW, entry.path.c_str(), nullptr);
+    }
+}
 void retire_shell_update(const InstalledApp &retired, const InstalledApp &current,
-                         const std::filesystem::path &store) {
+                         const std::filesystem::path &store, const ShellIconAliases *aliases) {
     if (retired.shell == ShellState::none)
         return;
     require(valid_shell_record(retired) && valid_shell_record(current) && retired.id == current.id &&
                 retired.package_generation != current.package_generation &&
                 retired.shortcut_name != current.shortcut_name,
             "AETHER_UPDATE_STATE", "Update retirement requires distinct recorded version paths");
+    bool preserve_alias = false;
+    if (aliases) {
+        validate_alias_history(current, *aliases);
+        require((current.state == State::update_committed || current.state == State::update_rolled_back) &&
+                    (current.icon_sha256.empty() ||
+                     std::binary_search(aliases->committed_sha256.begin(), aliases->committed_sha256.end(),
+                                        current.icon_sha256)),
+                "AETHER_UPDATE_STATE", "Historical icon retirement requires a durably selected update");
+        preserve_alias =
+            std::binary_search(aliases->generations.begin(), aliases->generations.end(), retired.icon_generation);
+        if (preserve_alias)
+            validate_shell_icon_aliases(current, store, *aliases);
+    }
     auto directory = detail::hold_directory(store / retired.id, false, true);
     UniqueHandle retired_icon;
-    if (!retired.icon_sha256.empty() && icon_path(retired, store) != icon_path(current, store) &&
+    if (!preserve_alias && !retired.icon_sha256.empty() &&
+        icon_path(retired, store) != icon_path(current, store) &&
         path_exists(icon_path(retired, store))) {
         retired_icon =
             detail::private_file(icon_path(retired, store), GENERIC_READ | DELETE, OPEN_EXISTING, icon_limit);
@@ -668,6 +1081,8 @@ void retire_shell_update(const InstalledApp &retired, const InstalledApp &curren
         require(owner || empty_pending_link(path, retired), "AETHER_SHELL_CONFLICT",
                 "Retired shortcut has unknown content and is preserved");
         if (owner == identity(retired) || !owner) {
+            if (owner)
+                (void)shortcut_notification_matches(path, retired);
             auto file =
                 detail::private_file(path, DELETE | FILE_READ_ATTRIBUTES, OPEN_EXISTING, link_limit, 0, true);
             FILE_DISPOSITION_INFO disposition{TRUE};
@@ -691,12 +1106,23 @@ void apply_shell_registration(const InstalledApp &app, const std::filesystem::pa
             "No registration intent exists");
     // Recheck before touching either projection, including resumed pending intents.
     validate_shell_ownership(app, store);
-    if (inspect_shell_registration(app, store))
+    if (inspect_shell_registration(app, store) && inspect_notification_registration(app, store))
         return;
+    require(app.shell == ShellState::pending, "AETHER_SHELL_STATE",
+            "Notification projection changes require an explicit pending Windows repair");
+    Key key;
+    (void)open_key(key, app, true);
+    verify_key(key.value, app, store, true);
+    set_string(key.value, L"AetherAppId", utf16(app.id));
+    set_string(key.value, L"AetherStore", store.wstring());
+    // Older maintenance rejects this distinct unknown marker. Flush it before
+    // creating any persistent COM leaf so it cannot silently orphan that leaf.
+    set_number(key.value, notification_marker, 1);
+    check(HRESULT_FROM_WIN32(RegFlushKey(key.value)), "Flush notification maintenance marker");
     apply_icon(app, store, prepared);
     Programs programs(true);
     const auto path = programs.root / utf16(app.shortcut_name);
-    if (!link_matches(path, app, store)) {
+    if (!link_matches(path, app, store) || !shortcut_notification_matches(path, app)) {
         auto held = detail::private_file(path, FILE_READ_ATTRIBUTES, OPEN_ALWAYS, link_limit,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE, true);
         Apartment apartment;
@@ -715,6 +1141,7 @@ void apply_shell_registration(const InstalledApp &app, const std::filesystem::pa
         ComPtr<IPropertyStore> properties;
         check(link.As(&properties), "Set shortcut properties");
         set_property(properties.Get(), PKEY_AppUserModel_ID, identity(app));
+        set_notification_property(properties.Get(), app);
         check(properties->Commit(), "Commit shortcut identity");
         ComPtr<IPersistFile> file;
         check(link.As(&file), "Persist shortcut");
@@ -727,9 +1154,7 @@ void apply_shell_registration(const InstalledApp &app, const std::filesystem::pa
         }
         held.reset();
     }
-    Key key;
-    (void)open_key(key, app, true);
-    verify_key(key.value, app, store, app.shell == ShellState::pending);
+    apply_notification_projection(app, store);
     // Identity markers are the first values; a partial owned leaf remains repairable.
     set_string(key.value, L"AetherAppId", utf16(app.id));
     set_string(key.value, L"AetherStore", store.wstring());
@@ -773,7 +1198,7 @@ bool inspect_shell_registration(const InstalledApp &app, const std::filesystem::
     if (!link_matches(programs.root / utf16(app.shortcut_name), app, store))
         return false;
     Key key;
-    if (!open_key(key, app, false))
+    if (!open_key(key, app, false, false))
         return false;
     verify_key(key.value, app, store, app.shell == ShellState::pending);
     for (const auto &[name, value] : strings(app, store))
@@ -782,12 +1207,42 @@ bool inspect_shell_registration(const InstalledApp &app, const std::filesystem::
     for (const auto &[name, value] : numbers(app))
         if (read_number(key.value, name.c_str()) != value)
             return false;
+    if (read_number(key.value, notification_marker))
+        return shortcut_notification_matches(programs.root / utf16(app.shortcut_name), app) &&
+               notification_projection(app, store).complete;
     return true;
+}
+bool inspect_notification_registration(const InstalledApp &app, const std::filesystem::path &store) {
+    if (app.shell != ShellState::ready)
+        return false;
+    require(valid_shell_record(app), "AETHER_SHELL_STATE", "Invalid notification registration identity");
+    const auto shell_lease = hold_shell_registration();
+    Key key;
+    if (!open_key(key, app, false, false))
+        return false;
+    verify_key(key.value, app, store, false);
+    return read_number(key.value, notification_marker) == 1u && inspect_shell_registration(app, store);
+}
+void notify_shell_repair(const InstalledApp &app, const std::filesystem::path &store) {
+    require(app.shell == ShellState::ready && valid_shell_record(app), "AETHER_SHELL_STATE",
+            "Shell cache repair requires a settled Windows registration");
+    const auto shell_lease = hold_shell_registration();
+    validate_shell_ownership(app, store);
+    require(inspect_shell_registration(app, store), "AETHER_SHELL_INTEGRITY",
+            "Shell cache repair requires matching owned icon, shortcut and Windows registration");
+    Programs programs(false);
+    const auto shortcut = programs.root / utf16(app.shortcut_name);
+    const auto icon = icon_path(app, store);
+    // Notify only this recorded app's current projections. Do not delete global
+    // caches, touch OS-owned taskbar pins, or replay any installation write.
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, icon.c_str(), nullptr);
+    SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, shortcut.c_str(), nullptr);
+    SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSH, programs.root.c_str(), nullptr);
 }
 void remove_shell_registration(const InstalledApp &app, const std::filesystem::path &store) {
     if (app.shell == ShellState::none)
         return;
-    require(valid_shell_record(app), "AETHER_SHELL_STATE", "Invalid recorded registration identity");
+    require(valid_app_id(app.id) && valid_shell_record(app), "AETHER_SHELL_STATE", "Invalid recorded registration identity");
     validate_icon_ownership(app, store);
     Programs programs(false);
     Key key;
@@ -804,8 +1259,19 @@ void remove_shell_registration(const InstalledApp &app, const std::filesystem::p
             require(owner == identity(app) || (!owner && empty_pending_link(path, app)),
                     "AETHER_SHELL_CONFLICT",
                     "The shortcut identity changed; unrelated material is preserved");
+            if (owner)
+                (void)shortcut_notification_matches(path, app);
         }
     }
+    // Validate every exact owned COM value before removal. Its deletion is
+    // flushed before the uninstall marker can disappear.
+    (void)notification_projection(app, store);
+    const auto history_status = host::clear_notification_history("Aether.App." + app.id);
+    if (history_status != host::NotificationStatus::ok)
+        throw InstallError("AETHER_NOTIFICATION_HISTORY",
+            "Cannot clear the installed app's Windows notification history; status=" +
+            std::to_string(static_cast<unsigned>(history_status)) + "; Windows registration is preserved");
+    remove_notification_projection(app, store);
     if (registered) {
         check(HRESULT_FROM_WIN32(
                   RegDeleteKeyExW(HKEY_CURRENT_USER, registry_path(app).c_str(), KEY_WOW64_64KEY, 0)),

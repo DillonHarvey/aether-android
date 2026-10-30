@@ -26,10 +26,22 @@ void permissions(std::ostream &out, std::uint32_t mask) {
         out << ((mask & security::installed_clock) ? "," : "") << "\"private-files\"";
     if (mask & security::installed_wall_clock)
         out << ((mask & (security::installed_clock | security::installed_files)) ? "," : "") << "\"wall-clock\"";
+    if (mask & security::installed_audio_playback)
+        out << ((mask & (security::installed_clock | security::installed_files | security::installed_wall_clock)) ? "," : "")
+            << "\"audio-playback\"";
+    if (mask & security::installed_notifications)
+        out << ((mask & (security::installed_clock | security::installed_files | security::installed_wall_clock |
+                        security::installed_audio_playback)) ? "," : "") << "\"notifications\"";
+    if (mask & security::installed_clipboard)
+        out << ((mask & ~security::installed_clipboard) ? "," : "") << "\"clipboard\"";
     out << ']';
 }
 } // namespace
 
+std::string_view session_failure_code(AppSessionFailure failure) noexcept {
+    return failure == AppSessionFailure::incomplete ? "AETHER_APP_SESSION_INCOMPLETE"
+                                                    : "AETHER_APP_SESSION_FAILED";
+}
 bool AppDiagnostics::passed() const {
     return std::none_of(checks.begin(), checks.end(),
                         [](const auto &check) { return check.status == "fail"; });
@@ -65,6 +77,13 @@ std::string AppDiagnostics::json() const {
         fingerprints(out, certificates);
         out << '}';
     }
+    out << ",\"sessionFailure\":";
+    if (session_failure)
+        out << "{\"code\":" << json_quote(session_failure_code(*session_failure))
+            << ",\"stage\":" << json_quote(session_failure_stage)
+            << ",\"causeEstablished\":false,\"currentPackageAttributionEstablished\":false}";
+    else
+        out << "null";
     out << ",\"checks\":[";
     for (std::size_t index = 0; index < checks.size(); ++index) {
         const auto &check = checks[index];
@@ -82,6 +101,11 @@ std::string AppDiagnostics::text() const {
     out << "App diagnostics: " << (passed() ? "no failed checks" : "attention required")
         << "\nApp ID: " << app.id << "\nPackage: " << json_quote(app.package_id)
         << "\nVersion: " << json_quote(app.version_name) << " (" << app.version_code << ")\n";
+    if (session_failure)
+        out << "Previous app session: " << session_failure_code(*session_failure)
+            << " [" << session_failure_stage << "]\n"
+               "The failure cause is unknown. Current package diagnostics are inspected separately; "
+               "they do not identify the package version that failed.\n";
     for (const auto &check : checks)
         out << check.name << ": " << check.status << (check.code.empty() ? "" : " [" + check.code + "]")
             << " - " << check.detail << '\n';

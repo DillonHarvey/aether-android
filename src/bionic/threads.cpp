@@ -291,6 +291,32 @@ a64::Fault NativeThreads::run_next(std::uint64_t budget, std::uint64_t &spent) {
     }
     return a64::Fault::unsupported_service;
 }
+a64::Fault NativeThreads::yield(bool full_frame) {
+    rejection_={};
+    if(std::this_thread::get_id()!=owner_){
+        rejection_="sched_yield: native scheduling requires the owner thread";
+        return a64::Fault::unsupported_service;
+    }
+    if(priority_restore_failed_){
+        rejection_="sched_yield: native owner priority restoration failed";
+        return a64::Fault::windows_service;
+    }
+    const bool pending=has_runnable();
+    if(pending && !full_frame){
+        rejection_="sched_yield: queued native progress requires a trusted full guest frame";
+        return a64::Fault::unsupported_service;
+    }
+    std::this_thread::yield();
+    if(!pending)return a64::Fault::none;
+    // Reuse the same bounded runner, TLS/priority restoration, detached cleanup
+    // and retained joinable result/failure as blocking native operations. Never
+    // drain the queue, restart a failed peer or switch to a managed fiber here.
+    std::uint64_t spent=0;
+    const auto fault=run_next(1'000'000,spent);
+    if(fault!=a64::Fault::none && rejection_.empty())rejection_="sched_yield: queued native execution failed";
+    return fault;
+}
+
 a64::Fault NativeThreads::pump(std::uint64_t budget) {
     if(budget>1000000)budget=1000000;
     for(;;) {

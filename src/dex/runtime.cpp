@@ -8,6 +8,7 @@
 #include "async_task.hpp"
 #include "atomics.hpp"
 #include "bytes.hpp"
+#include "characters.hpp"
 #include "class_names.hpp"
 #include "collections.hpp"
 #include "unmodifiable_lists.hpp"
@@ -23,6 +24,7 @@
 #include "booleans.hpp"
 #include "uuids.hpp"
 #include "random.hpp"
+#include "math.hpp"
 #include "streams.hpp"
 #include "maps.hpp"
 #include "empty_maps.hpp"
@@ -39,12 +41,22 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <thread>
 #include <type_traits>
 #include <utility>
 
 namespace aether::dex {
+struct ViewActivationState {
+    ManagedRuntime *runtime = nullptr;
+    HostInterface *provider = nullptr;
+    void *context = nullptr;
+    ViewActivationState *previous = nullptr, *delegation_parent = nullptr;
+    ObjectId receiver = 0;
+    std::uint64_t generation = 0, provider_generation = 0;
+    bool recorded = false;
+};
 namespace {
 [[noreturn]] void fail(std::string_view kind, const std::string &message) {
     throw DexError("AETHER_DEX_" + std::string(kind), message);
@@ -133,6 +145,7 @@ std::string_view core_super(std::string_view type) {
     if(const auto integral=integral_class(type))return integral->superclass;
     if(const auto floating=floating_class(type))return floating->superclass;
     if(const auto byte=byte_class(type))return byte->superclass;
+    if(const auto character=character_class(type))return character->superclass;
     if(const auto uuid=uuid_class(type))return uuid->superclass;
     if(const auto random=random_class(type))return random->superclass;
     if(const auto boolean=boolean_class(type))return boolean->superclass;
@@ -145,7 +158,9 @@ std::string_view core_super(std::string_view type) {
         return collection->superclass;
     if (type == "Ljava/lang/Object;")
         return {};
-    if (type == "Ljava/lang/String;" || type == "Ljava/lang/StringBuilder;" ||
+    if (type == "Ljava/lang/StringBuilder;")
+        return "Ljava/lang/AbstractStringBuilder;";
+    if (type == "Ljava/lang/String;" ||
         type == "Ljava/lang/CharSequence;" || type == "Ljava/lang/Class;" || type == "Ljava/lang/System;" ||
         type == "Ljava/lang/ThreadGroup;" || type == "Ljava/lang/Thread$UncaughtExceptionHandler;" ||
         type == "Ljava/lang/reflect/Type;" ||
@@ -154,21 +169,29 @@ std::string_view core_super(std::string_view type) {
     if (type == "Ljava/util/concurrent/CountDownLatch;") return "Ljava/lang/Object;";
     if (type == "Laether/dex/RuntimeClassLoader;") return "Ljava/lang/ClassLoader;";
     if (type == "Ljava/lang/ClassLoader;") return "Ljava/lang/Object;";
-    if (type == "Ljava/lang/reflect/Method;") return "Ljava/lang/reflect/Executable;";
+    if (type == "Ljava/lang/reflect/Method;" || type == "Ljava/lang/reflect/Constructor;")
+        return "Ljava/lang/reflect/Executable;";
     if (type == "Ljava/lang/reflect/Field;") return "Ljava/lang/reflect/AccessibleObject;";
     if (type == "Ljava/lang/reflect/Executable;") return "Ljava/lang/reflect/AccessibleObject;";
     if (type == "Ljava/lang/reflect/AccessibleObject;") return "Ljava/lang/Object;";
     if (type == "Ljava/lang/InterruptedException;") return "Ljava/lang/Exception;";
     if (type == "Ljava/lang/Exception;" || type == "Ljava/lang/Error;")
         return "Ljava/lang/Throwable;";
+    if (type == "Ljava/lang/VirtualMachineError;")
+        return "Ljava/lang/Error;";
+    if (type == "Ljava/lang/OutOfMemoryError;")
+        return "Ljava/lang/VirtualMachineError;";
     if (type == "Ljava/lang/NumberFormatException;")
+        return "Ljava/lang/IllegalArgumentException;";
+    if (type == "Ljava/lang/IllegalThreadStateException;")
         return "Ljava/lang/IllegalArgumentException;";
     if (type == "Ljava/lang/RuntimeException;")
         return "Ljava/lang/Exception;";
     if (type == "Ljava/lang/ReflectiveOperationException;")
         return "Ljava/lang/Exception;";
     if (type == "Ljava/lang/ClassNotFoundException;" || type == "Ljava/lang/NoSuchFieldException;" ||
-        type == "Ljava/lang/IllegalAccessException;" || type == "Ljava/lang/NoSuchMethodException;" ||
+        type == "Ljava/lang/IllegalAccessException;" || type == "Ljava/lang/InstantiationException;" ||
+        type == "Ljava/lang/NoSuchMethodException;" ||
         type == "Ljava/lang/reflect/InvocationTargetException;")
         return "Ljava/lang/ReflectiveOperationException;";
     if (type == "Ljava/lang/CloneNotSupportedException;")
@@ -177,7 +200,6 @@ std::string_view core_super(std::string_view type) {
         type == "Ljava/lang/IndexOutOfBoundsException;" || type == "Ljava/lang/NegativeArraySizeException;" ||
         type == "Ljava/lang/ArrayStoreException;" || type == "Ljava/lang/ClassCastException;" ||
         type == "Ljava/lang/IllegalStateException;" || type == "Ljava/lang/IllegalArgumentException;" ||
-        type == "Ljava/lang/IllegalThreadStateException;" ||
         type == "Ljava/lang/IllegalMonitorStateException;" ||
         type == "Ljava/lang/SecurityException;" || type == "Ljava/lang/UnsupportedOperationException;" ||
         type == "Ljava/util/NoSuchElementException;" || type == "Ljava/util/ConcurrentModificationException;")
@@ -185,8 +207,15 @@ std::string_view core_super(std::string_view type) {
     if (type == "Ljava/lang/ArrayIndexOutOfBoundsException;" ||
         type == "Ljava/lang/StringIndexOutOfBoundsException;")
         return "Ljava/lang/IndexOutOfBoundsException;";
-    if (type == "Ljava/lang/ExceptionInInitializerError;" || type == "Ljava/lang/NoClassDefFoundError;" ||
-        type == "Ljava/lang/NoSuchMethodError;")
+    if (type == "Ljava/lang/ExceptionInInitializerError;" || type == "Ljava/lang/NoClassDefFoundError;")
+        return "Ljava/lang/LinkageError;";
+    if (type == "Ljava/lang/NoSuchMethodError;")
+        return "Ljava/lang/IncompatibleClassChangeError;";
+    if (type == "Ljava/lang/NoSuchFieldError;")
+        return "Ljava/lang/IncompatibleClassChangeError;";
+    if (type == "Ljava/lang/IncompatibleClassChangeError;")
+        return "Ljava/lang/LinkageError;";
+    if (type == "Ljava/lang/LinkageError;")
         return "Ljava/lang/Error;";
     return {};
 }
@@ -269,6 +298,7 @@ struct Object {
     std::unique_ptr<ManagedIntegral> integral;
     std::unique_ptr<ManagedFloating> floating;
     std::unique_ptr<ManagedByte> byte;
+    std::unique_ptr<ManagedCharacter> character;
     std::unique_ptr<ManagedInteger> integer;
     std::unique_ptr<ManagedBoolean> boolean;
     std::unique_ptr<ManagedUuid> uuid;
@@ -293,10 +323,15 @@ struct Object {
     ObjectId cause = 0;
     std::size_t bytes = 0;
     bool marked = false;
+    // Weak canonical membership: ordinary roots retain interned Strings, while
+    // resolved literal indices independently keep their constants alive.
+    bool interned_string = false;
+    bool provider_enum = false; // Authenticated direct Enum child created by new_host_enum.
 };
 struct Frame {
     Index method = 0;
     std::uint32_t pc = 0;
+    bool executing=false; // Only an active interpreter loop supplies an instruction witness.
     std::vector<Value> arguments, registers;
     Value result;
     ObjectId caught = 0;
@@ -342,6 +377,7 @@ struct ExecutionContext {
     std::exception_ptr native_finalization_failure;
     bool native_discarded=false, cancellation_requested=false;
     std::vector<Frame *> frames;
+    ViewActivationState *activation = nullptr;
     Value last_result;
     ObjectId last_exception = 0;
     ObjectId thread_object = 0;
@@ -354,6 +390,8 @@ struct ExecutionContext {
         value(last_result);
         value(Value::reference(last_exception));
         value(Value::reference(thread_object));
+        for (auto scope = activation; scope; scope = scope->previous)
+            value(Value::reference(scope->receiver));
         for (const auto *frame : frames) {
             for (auto v : frame->arguments) value(v);
             for (auto v : frame->registers) value(v);
@@ -437,10 +475,22 @@ struct ManagedRuntime::Impl {
     const std::uint64_t execution_owner = Scheduler::execution_token();
     std::map<ObjectId, Object> heap;
     std::map<ObjectId, std::size_t> pins;
+    static constexpr std::size_t retained_root_limit = 65536, native_root_cells = 4096;
+    struct NativeRoots {
+        std::uint64_t token = 0;
+        std::span<ObjectId> cells;
+        std::size_t live = 0;
+    };
+    // The fixed registry cannot hold more full pools than the existing root
+    // quota allows. Unused reserved cells never count as live root metrics.
+    std::array<NativeRoots, retained_root_limit / native_root_cells> native_roots{};
+    std::size_t native_root_capacity = 0, native_root_references = 0;
+    std::uint64_t next_native_root_token = 1;
     std::map<std::string, ObjectId, std::less<>> class_objects;
     std::map<Index, ObjectId> strings;
     std::array<ObjectId,256> long_cache{},short_cache{};
     std::array<ObjectId,256> byte_cache{};
+    std::array<ObjectId,128> character_cache{};
     std::array<ObjectId, 256> integer_cache{};
     std::array<ObjectId,2> boolean_cache{};
     std::array<ObjectId, 7> time_units{};
@@ -455,6 +505,7 @@ struct ManagedRuntime::Impl {
     std::map<Index, Value> statics;
     std::map<Index, VerifiedCode> verified;
     RuntimeProgressSink *progress_sink=nullptr;
+    mutable bool allocation_failure_reported=false;
     mutable ExecutionContext main_context;
     std::array<ExecutionContext*,16> native_contexts{};
     std::array<std::uint64_t,16> native_context_tokens{};
@@ -466,7 +517,8 @@ struct ManagedRuntime::Impl {
     ObjectId java_version_property = 0;
     ObjectId empty_list = 0;
     std::array<ObjectId,3> empty_map_objects{};
-    ObjectId runtime_object = 0, vm_runtime_object = 0;
+    ObjectId runtime_object = 0, vm_runtime_object = 0, math_random_object = 0;
+    ObjectId native_allocation_error = 0; // Charged runtime-owned emergency root, not a pin.
     std::vector<std::u16string> hidden_api_exemptions;
     std::size_t hidden_api_bytes=0;
     ObjectId loader_object = 0;
@@ -493,6 +545,63 @@ struct ManagedRuntime::Impl {
         }
         progress_sink->report(event);
     }
+    // Failure capture only inspects resident state. Unlike current_context(),
+    // this lookup cannot construct a diagnostic or allocate when binding is absent.
+    const ExecutionContext *allocation_context() const noexcept {
+        const auto token=Scheduler::execution_token();
+        if(native_context_depth)
+            return token==native_context_tokens[native_context_depth-1] ? native_contexts[native_context_depth-1] : nullptr;
+        if(token==execution_owner)return &main_context;
+        // Task identities are process-unique; do not call Scheduler::current(),
+        // whose validation could allocate an error while already out of memory.
+        if(scheduler)
+            for(const auto &task:tasks)if(task && task->id==token)return &task->context;
+        return nullptr;
+    }
+    void report_allocation_failure(RuntimeAllocationPhase phase,Index method=no_index,
+                                   const Frame *executing_frame=nullptr,bool prefer_caller=false) const noexcept {
+        if(std::this_thread::get_id()!=owner)return;
+        if(!progress_sink || allocation_failure_reported)return;
+        if(phase==RuntimeAllocationPhase::class_load && loader) {
+            static_assert(static_cast<std::uint32_t>(RuntimeAllocationPhase::class_complete)==
+                11+static_cast<std::uint32_t>(ClassLoadAllocationPhase::complete));
+            static_assert(static_cast<std::uint32_t>(RuntimeAllocationPhase::dex_code_storage_publish)==
+                11+static_cast<std::uint32_t>(ClassLoadAllocationPhase::code_storage_publish));
+            const auto source_phase=static_cast<std::uint32_t>(loader->allocation_failure_phase());
+            if(source_phase>=1 && source_phase<=static_cast<std::uint32_t>(ClassLoadAllocationPhase::code_storage_publish))
+                phase=static_cast<RuntimeAllocationPhase>(11+source_phase);
+        }
+        if(prefer_caller) {
+            if(const auto *context=allocation_context()) {
+                if(!context->frames.empty())method=context->frames.back()->method;
+                for(auto it=context->frames.rbegin();it!=context->frames.rend();++it)
+                    if((*it)->executing){executing_frame=*it;break;}
+            }
+        }
+        if(executing_frame)method=executing_frame->method;
+        RuntimeAllocationFailure event{phase};
+        event.instructions=metrics.instructions;
+        if(method<image.methods.size()) {
+            event.method=method;
+            const auto &declaration=image.methods[method];
+            if(declaration.owner<image.types.size())event.owner=image.types[declaration.owner];
+            event.name=declaration.name;
+            if(declaration.code && declaration.code->units.size()<=65536)
+                event.code_units=static_cast<std::uint32_t>(declaration.code->units.size());
+            if(executing_frame && event.code_units) {
+                const auto found=verified.find(method);
+                const auto pc=executing_frame->pc;
+                if(found!=verified.end() && pc<found->second.at.size() && pc<event.code_units) {
+                    const auto instruction=found->second.at[pc];
+                    if(instruction!=no_index && instruction<found->second.instructions.size()) {
+                        event.pc=pc;event.opcode=found->second.instructions[instruction].opcode;
+                    }
+                }
+            }
+        }
+        allocation_failure_reported=true;
+        progress_sink->allocation_failure(event);
+    }
     struct ProgressEnd {
         const Impl &impl;RuntimeProgressStage stage;Index method;std::uint32_t pc;
         ~ProgressEnd(){impl.report_progress(stage,method,pc);}
@@ -512,7 +621,12 @@ struct ManagedRuntime::Impl {
         }
     };
     void ensure_class(std::string_view descriptor) const {
-        LoadingProgress progress(*this,descriptor);loader->ensure(descriptor);
+        try {
+            LoadingProgress progress(*this,descriptor);loader->ensure(descriptor);
+        } catch(const std::bad_alloc &) {
+            report_allocation_failure(RuntimeAllocationPhase::class_load,no_index,nullptr,true);
+            allocation_failure_checkpoint();throw;
+        }
     }
     ExecutionContext &current_context() const {
         if(native_context_depth){
@@ -539,6 +653,9 @@ struct ManagedRuntime::Impl {
         // an older caught pthread exit cannot turn cancellation into completion.
         if(!current_context().cancellation_requested)execution_checkpoint();
     }
+    void allocation_failure_checkpoint() const {
+        if(std::this_thread::get_id()==owner)failure_checkpoint();
+    }
     template<class F> decltype(auto) provider_call(F &&call) const {
         execution_checkpoint();
         NonYielding barrier(current_context());
@@ -548,6 +665,9 @@ struct ManagedRuntime::Impl {
             } else {
                 decltype(auto) result=call();execution_checkpoint();return result;
             }
+        } catch(const std::bad_alloc &) {
+            report_allocation_failure(RuntimeAllocationPhase::provider,no_index,nullptr,true);
+            allocation_failure_checkpoint();throw;
         } catch(...) {failure_checkpoint();throw;}
     }
     bool scheduled_task() const {return Scheduler::execution_token()!=execution_owner;}
@@ -2759,6 +2879,19 @@ struct ManagedRuntime::Impl {
         } catch(const host::RegexError &error){regex_error(error);}
         (void)signature;return {};
     }
+    ObjectId box_integer(std::uint32_t bits) {
+        const auto number = std::bit_cast<std::int32_t>(bits);
+        const bool cached = number >= -128 && number <= 127;
+        const auto slot = cached ? static_cast<std::size_t>(number + 128) : 0;
+        if (cached && integer_cache[slot]) return integer_cache[slot];
+        Object value;
+        value.type = integer_type;
+        value.integer = std::make_unique<ManagedInteger>();
+        value.integer->initialize(bits);
+        const auto id = allocate(std::move(value));
+        if (cached) integer_cache[slot] = id;
+        return id;
+    }
     ObjectId box_integral(std::string_view type,std::uint64_t bits) {
         const bool large=type==long_type;
         const auto normalized=large?bits:static_cast<std::uint64_t>(static_cast<std::int64_t>(std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(bits))));
@@ -2810,6 +2943,29 @@ struct ManagedRuntime::Impl {
         }
         return value.byte->invoke(runtime,name,signature,args,other);
     }
+    ObjectId box_character(std::uint32_t bits) {
+        const auto code = static_cast<std::uint16_t>(bits);
+        if (code < character_cache.size() && character_cache[code]) return character_cache[code];
+        Object value;
+        value.type = character_type;
+        value.character = std::make_unique<ManagedCharacter>();
+        value.character->initialize(code);
+        const auto id = allocate(std::move(value));
+        if (code < character_cache.size()) character_cache[code] = id;
+        return id;
+    }
+    std::optional<Value> invoke_character(ObjectId receiver, std::string_view name,
+                                           std::string_view signature, std::span<const Value> args) {
+        auto &value = object(receiver);
+        if (value.type != character_type || !value.character)
+            fail("STATE", "Character lacks authenticated final-class state");
+        const ManagedCharacter *other = nullptr;
+        if (name == "equals" || name == "compareTo") {
+            const auto id = reference(args[1]);
+            if (id) other = object(id).character.get();
+        }
+        return value.character->invoke(runtime, name, signature, args, other);
+    }
     ObjectId box_boolean(bool value) {
         auto &cached=boolean_cache[value?1:0];
         if(!cached) {
@@ -2827,6 +2983,88 @@ struct ManagedRuntime::Impl {
             const auto id=reference(args[1]);if(id)other=object(id).boolean.get();
         }
         return value.boolean->invoke(runtime,name,signature,args,other);
+    }
+    std::optional<Value> hosted_virtual(ObjectId receiver, std::string_view name,
+                                        std::span<const std::string> parameters,
+                                        std::string_view result_type, std::span<const Value> args,
+                                        bool activation_delegation = false) {
+        if (!host || name == "<init>" || name == "<clinit>") return {};
+        const auto actual_type = std::string(object(receiver).type);
+        auto boundary = actual_type;
+        for (unsigned depth = 0;; ++depth) {
+            if (depth == 256) fail("CLASS_LIMIT", "Provider virtual hierarchy exceeds limit");
+            const auto *definition = resolve_class(boundary);
+            if (!definition) break;
+            if (definition->superclass == no_index) return {};
+            boundary = image.types.at(definition->superclass);
+        }
+        if (core_type(boundary) || boundary.starts_with('[') ||
+            !provider_call([&] { return host->class_info(boundary); })) return {};
+        const auto method = provider_call([&] { return host->public_method(boundary, name, parameters); });
+        if (!method) return {};
+        const bool compatible_result = method->return_type == result_type ||
+            (reference_type(method->return_type) && reference_type(result_type) &&
+             subtype(method->return_type, result_type));
+        if (method->name != name || !compatible_result ||
+            method->parameters.size() != parameters.size() ||
+            !std::equal(method->parameters.begin(), method->parameters.end(), parameters.begin()) ||
+            !(method->flags & 1u) || (method->flags & (8u | 0x400u)) ||
+            !subtype(actual_type, method->owner))
+            fail("METHOD_METADATA", "Provider virtual declaration does not match the requested public method");
+        if (args.size() != parameters.size() + 1 || reference(args[0]) != receiver)
+            fail("SIGNATURE", "Provider virtual arguments do not match their receiver and declaration");
+        std::optional<ViewActivationScope> activation;
+        if (name == "performClick" && parameters.empty() && result_type == "Z" && method->return_type == "Z")
+            activation.emplace(runtime, receiver, activation_delegation);
+        NonYielding barrier(current_context());
+        const auto result = provider_call([&] { return host->invoke_reflected(runtime, *method, args); });
+        RegexRoot result_root(runtime, result.kind == ValueKind::reference ? reference(result) : ObjectId{0});
+        const auto validated = typed(typed(result, method->return_type), result_type);
+        if (activation) activation->complete(validated.kind == ValueKind::word && validated.bits != 0);
+        return validated;
+    }
+    std::optional<Value> hosted_char_sequence(ObjectId receiver, std::string_view name,
+                                              std::string_view signature, std::span<const Value> args) {
+        std::size_t count = 0;
+        std::string_view result_type;
+        if (name == "length" && signature == "()I") result_type = "I";
+        else if (name == "charAt" && signature == "(I)C") { count = 1; result_type = "C"; }
+        else if (name == "subSequence" && signature == "(II)Ljava/lang/CharSequence;") {
+            count = 2; result_type = "Ljava/lang/CharSequence;";
+        } else if (name == "toString" && signature == "()Ljava/lang/String;") result_type = "Ljava/lang/String;";
+        else return {};
+        if (!host || !object(receiver).host_state) return {};
+        const auto actual_type = std::string(object(receiver).type);
+        if (!subtype(actual_type, "Ljava/lang/CharSequence;")) return {};
+        // Nominal validation may resolve metadata. Reacquire storage afterward;
+        // no character view survives provider lookup or invocation.
+        if (!object(receiver).host_state || !object(receiver).host_state->char_sequence_view()) return {};
+        if (args.size() != count + 1) fail("SIGNATURE", "Wrong hosted CharSequence argument count");
+        const std::array<std::string, 2> parameters{"I", "I"};
+        for (std::size_t n = 0; n < count; ++n) (void)typed(args[n + 1], "I");
+        auto provider_type = actual_type;
+        unsigned depth = 0;
+        for (; depth < 256; ++depth) {
+            const auto *definition = resolve_class(provider_type);
+            if (!definition) break;
+            if (definition->superclass == no_index) return {};
+            provider_type = image.types.at(definition->superclass);
+        }
+        if (depth == 256) fail("CLASS_LIMIT", "Hosted CharSequence hierarchy exceeds limit");
+        const auto method = provider_call([&] {
+            return host->public_method(provider_type, name, std::span{parameters}.first(count));
+        });
+        if (!method || method->name != name || method->parameters.size() != count ||
+            method->return_type != result_type || !(method->flags & 1) || (method->flags & (8 | 0x400)) ||
+            !std::equal(method->parameters.begin(), method->parameters.end(), parameters.begin()) ||
+            !subtype(actual_type, method->owner))
+            fail("API_UNSUPPORTED", "Hosted CharSequence lacks an authenticated public declaration");
+        NonYielding barrier(current_context());
+        const auto result = provider_call([&] { return host->invoke_reflected(runtime, *method, args); });
+        // A provider can return a newly allocated buffer. Type validation may
+        // resolve metadata, so root it before that work can collect anything.
+        RegexRoot result_root(runtime, result.kind == ValueKind::reference ? result.bits : ObjectId{0});
+        return typed(result, result_type);
     }
     Value call_virtual_named(ObjectId receiver, std::string_view name, std::string_view signature,
                              std::span<const Value> arguments = {}, bool allow_thread_base = false) {
@@ -2866,6 +3104,23 @@ struct ManagedRuntime::Impl {
                 authenticate_named(frame,signature,arguments);
                 NonYielding barrier(current_context());
                 return Value::word(runtime.string(receiver).empty());
+            }
+            if(type=="Ljava/lang/String;" && name=="intern" && signature=="()Ljava/lang/String;") {
+                authenticate_named(frame,signature,arguments);
+                NonYielding barrier(current_context());
+                return string_intern(receiver);
+            }
+            if(type=="Ljava/lang/String;" && name=="compareTo" &&
+               (signature=="(Ljava/lang/String;)I" || signature=="(Ljava/lang/Object;)I")) {
+                authenticate_named(frame,signature,arguments);
+                NonYielding barrier(current_context());
+                return string_compare(receiver,reference(frame.arguments[1]));
+            }
+            if(type=="Ljava/lang/String;" && name=="replace" &&
+               signature=="(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;") {
+                authenticate_named(frame,signature,arguments);
+                NonYielding barrier(current_context());
+                return string_replace(receiver,reference(frame.arguments[1]),reference(frame.arguments[2]));
             }
             if(type==copy_list_type && name=="addIfAbsent" && signature=="(Ljava/lang/Object;)Z") {
                 authenticate_named(frame,signature,arguments);
@@ -2958,6 +3213,24 @@ struct ManagedRuntime::Impl {
                 NonYielding barrier(current_context());
                 return string_split(receiver,reference(frame.arguments[1]),
                     limited?std::bit_cast<std::int32_t>(word(frame.arguments[2])):0);
+            }
+            if (type == "Ljava/lang/Class;" && (name == "getConstructor" || name == "getDeclaredConstructor") &&
+                signature == "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") {
+                authenticate_named(frame, signature, arguments);
+                NonYielding barrier(current_context());
+                return Value::reference(lookup_constructor(frame.arguments, name == "getDeclaredConstructor"));
+            }
+            if (type == "Ljava/lang/reflect/Constructor;" && name == "newInstance" &&
+                signature == "([Ljava/lang/Object;)Ljava/lang/Object;") {
+                authenticate_named(frame, signature, arguments);
+                NonYielding barrier(current_context());
+                return invoke_reflected_constructor(frame.arguments);
+            }
+            if (type == "Ljava/lang/reflect/Method;" && name == "invoke" &&
+                signature == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;") {
+                authenticate_named(frame, signature, arguments);
+                NonYielding barrier(current_context());
+                return invoke_reflected_method(frame.arguments);
             }
             if(type=="Ljava/lang/Class;" && name=="isArray" && signature=="()Z") {
                 if(!arguments.empty())fail("SIGNATURE","Named Class.isArray requires no arguments");
@@ -3065,6 +3338,16 @@ struct ManagedRuntime::Impl {
                 NonYielding barrier(current_context());
                 return append_object(receiver,reference(frame.arguments[1]));
             }
+            if(type=="Ljava/lang/StringBuilder;" && name=="insert" && signature=="(ILjava/lang/String;)Ljava/lang/StringBuilder;") {
+                authenticate_named(frame,signature,arguments);
+                NonYielding barrier(current_context());
+                return builder_insert(receiver,std::bit_cast<std::int32_t>(word(frame.arguments[1])),reference(frame.arguments[2]));
+            }
+            if(type=="Ljava/lang/StringBuilder;" && name=="reverse" && signature=="()Ljava/lang/StringBuilder;") {
+                authenticate_named(frame,signature,arguments);
+                NonYielding barrier(current_context());
+                return builder_reverse(receiver);
+            }
             if((type=="Ljava/lang/String;" || type=="Ljava/lang/StringBuilder;") && name=="toString" && signature=="()Ljava/lang/String;") {
                 if(!arguments.empty())fail("SIGNATURE","Named CharSequence.toString requires no arguments");
                 NonYielding barrier(current_context());
@@ -3096,6 +3379,14 @@ struct ManagedRuntime::Impl {
                 if(one)frame.arguments[1]=typed(arguments[0],signature=="(Ljava/lang/Byte;)I"?byte_type:"Ljava/lang/Object;");
                 NonYielding barrier(current_context());
                 if(const auto result=invoke_byte(receiver,name,signature,frame.arguments))return *result;
+            }
+            if (type == character_type && name != "<init>" && character_method(name, signature)) {
+                const bool one = name == "equals" || name == "compareTo";
+                if (arguments.size() != (one ? 1u : 0u)) fail("SIGNATURE", "Wrong named Character argument count");
+                if (one) frame.arguments[1] = typed(arguments[0],
+                    signature == "(Ljava/lang/Character;)I" ? character_type : "Ljava/lang/Object;");
+                NonYielding barrier(current_context());
+                if (const auto result = invoke_character(receiver, name, signature, frame.arguments)) return *result;
             }
             if(type==boolean_type) {
                 NonYielding barrier(current_context());
@@ -3223,19 +3514,37 @@ struct ManagedRuntime::Impl {
             }
             const auto *definition = resolve_class(type);
             if (!definition) {
-                // Exact public provider toString at the actual hierarchy boundary.
-                // Managed overrides were searched first; no synthetic DEX ID or
-                // Object fallback may replace a provider's real representation.
-                if(host && name=="toString" && signature=="()Ljava/lang/String;" &&
-                   !core_type(type) && provider_call([&]{return host->class_info(type);})) {
-                    if(!arguments.empty())fail("SIGNATURE","Named provider toString requires no arguments");
-                    const auto method=provider_call([&]{return host->public_method(type,name,{});});
-                    if(method && method->name==name && method->parameters.empty() &&
-                       method->return_type=="Ljava/lang/String;" && (method->flags&1) && !(method->flags&(8|0x400)) &&
-                       subtype(object(receiver).type,method->owner)) {
-                        NonYielding barrier(current_context());
-                        return typed(provider_call([&]{return host->invoke_reflected(runtime,*method,frame.arguments);}),"Ljava/lang/String;");
+                // Managed overrides were searched first. Invoke an actual
+                // public provider declaration without inventing a DEX ID.
+                if (const auto result = hosted_char_sequence(receiver, name, signature, frame.arguments))
+                    return *result;
+                if (host && !core_type(type)) {
+                    if (signature.size() > 1024 || signature.empty() || signature.front() != '(')
+                        fail("SIGNATURE", "Invalid named provider method descriptor");
+                    const auto close = signature.find(')');
+                    if (close == signature.npos) fail("SIGNATURE", "Named provider descriptor has no return type");
+                    std::vector<std::string> parameters;
+                    for (std::size_t at = 1; at < close;) {
+                        const auto first = at;
+                        while (at < close && signature[at] == '[') ++at;
+                        if (at == close) fail("SIGNATURE", "Incomplete named provider array descriptor");
+                        if (signature[at] == 'L') {
+                            at = signature.find(';', at);
+                            if (at == signature.npos || at >= close)
+                                fail("SIGNATURE", "Incomplete named provider reference descriptor");
+                        }
+                        ++at;
+                        const auto parameter = signature.substr(first, at - first);
+                        if (!static_field_descriptor(parameter))
+                            fail("SIGNATURE", "Invalid named provider parameter descriptor");
+                        parameters.emplace_back(parameter);
                     }
+                    const auto result_type = signature.substr(close + 1);
+                    if (result_type != "V" && !static_field_descriptor(result_type))
+                        fail("SIGNATURE", "Invalid named provider return descriptor");
+                    authenticate_named(frame, signature, arguments);
+                    if (const auto result = hosted_virtual(receiver, name, parameters, result_type, frame.arguments))
+                        return *result;
                 }
                 break;
             }
@@ -3620,15 +3929,69 @@ struct ManagedRuntime::Impl {
         }
     }
     const Class *resolve_class(std::string_view descriptor) const {
-        check_thread();
-        if (loader) {
-            NonYielding barrier(current_context());
-            LoadingProgress progress(*this,descriptor);
-            const auto *definition=loader->definition(descriptor);
-            check_thread(); // A newly linked file may contain a reserved loader definition.
-            return definition;
+        try {
+            check_thread();
+            if (loader) {
+                NonYielding barrier(current_context());
+                LoadingProgress progress(*this,descriptor);
+                const auto *definition=loader->definition(descriptor);
+                check_thread(); // A newly linked file may contain a reserved loader definition.
+                return definition;
+            }
+            return image.definition(descriptor);
+        } catch(const std::bad_alloc &) {
+            report_allocation_failure(RuntimeAllocationPhase::class_load,no_index,nullptr,true);
+            allocation_failure_checkpoint();throw;
         }
-        return image.definition(descriptor);
+    }
+    static bool static_field_descriptor(std::string_view descriptor) {
+        std::size_t dimensions=0;
+        while(!descriptor.empty() && descriptor.front()=='['){++dimensions;descriptor.remove_prefix(1);}
+        if(dimensions>255 || descriptor.empty())return false;
+        if(descriptor.size()==1)return std::string_view("ZBSCIJFD").find(descriptor.front())!=std::string_view::npos;
+        if(descriptor.size()<3 || descriptor.front()!='L' || descriptor.back()!=';')return false;
+        descriptor.remove_prefix(1);descriptor.remove_suffix(1);
+        if(descriptor.front()=='/' || descriptor.back()=='/' || descriptor.find("//")!=std::string_view::npos)return false;
+        for(const auto c:descriptor)if(!(c=='/' || c=='$' || c=='-' || c=='_' ||
+            (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9')))return false;
+        return true;
+    }
+    const Field &declared_static_field(Index index) const {
+        check_thread();
+        if(index>=image.fields.size())fail("FIELD_METADATA","Invalid native static field index");
+        const auto &field=image.fields[index];
+        if(!field.declared)fail("FIELD_UNSUPPORTED","Native static field has no owned declaration");
+        if(!(field.flags&8) || field.owner>=image.types.size() || field.type>=image.types.size() ||
+           !static_field_descriptor(image.types.at(field.type)))
+            fail("FIELD_METADATA","Native field is not a valid declared static field");
+        const auto *definition=resolve_class(image.types.at(field.owner));
+        if(!definition)fail("FIELD_UNSUPPORTED","Native static field declaring inventory is unavailable");
+        if(definition->static_fields.size()>262144)fail("FIELD_LIMIT","Static field inventory exceeds work budget");
+        if(definition->type!=field.owner ||
+           std::find(definition->static_fields.begin(),definition->static_fields.end(),index)==definition->static_fields.end())
+            fail("FIELD_METADATA","Static field is absent from its actual declaring class");
+        return field;
+    }
+    const Field &declared_instance_field(Index index) const {
+        check_thread();
+        if (index >= image.fields.size())
+            fail("FIELD_METADATA", "Invalid native instance field index");
+        const auto &field = image.fields.at(index);
+        if (!field.declared)
+            fail("FIELD_UNSUPPORTED", "Native instance field has no owned declaration");
+        if ((field.flags & 8) || field.owner >= image.types.size() || field.type >= image.types.size() ||
+            !static_field_descriptor(image.types.at(field.type)))
+            fail("FIELD_METADATA", "Native field is not a valid declared instance field");
+        const auto *definition = resolve_class(image.types.at(field.owner));
+        if (!definition)
+            fail("FIELD_UNSUPPORTED", "Native instance field declaring inventory is unavailable");
+        if (definition->instance_fields.size() > 262144)
+            fail("FIELD_LIMIT", "Instance field inventory exceeds its work budget");
+        if ((definition->flags & 0x200) || definition->type != field.owner ||
+            std::find(definition->instance_fields.begin(), definition->instance_fields.end(), index) ==
+                definition->instance_fields.end())
+            fail("FIELD_METADATA", "Instance field is absent from its actual declaring class");
+        return field;
     }
     const Object &object(ObjectId id) const {
         check_thread();
@@ -3734,6 +4097,8 @@ struct ManagedRuntime::Impl {
                     todo.push_back("Ljava/lang/CharSequence;");
                 if (current == "Ljava/lang/String;" || current == "Ljava/lang/StringBuilder;")
                     todo.push_back("Ljava/io/Serializable;");
+                if (current == "Ljava/lang/String;" || current == "Ljava/lang/StringBuilder;")
+                    todo.push_back("Ljava/lang/Comparable;");
             }
         }
         return false;
@@ -3792,6 +4157,9 @@ struct ManagedRuntime::Impl {
             (void)count;
             mark(id, todo);
         }
+        for (const auto &roots : native_roots)
+            for (const auto id : roots.cells)
+                mark(id, todo);
         mark(loader_object, todo);
         for (const auto &[name, id] : class_objects) {
             (void)name;
@@ -3805,6 +4173,7 @@ struct ManagedRuntime::Impl {
         for(const auto id:long_cache)mark(id,todo);
         for(const auto id:short_cache)mark(id,todo);
         for(const auto id:byte_cache)mark(id,todo);
+        for(const auto id:character_cache)mark(id,todo);
         for (const auto id : integer_cache)
             mark(id, todo);
         for (const auto id : time_units)mark(id,todo);
@@ -3836,6 +4205,8 @@ struct ManagedRuntime::Impl {
         mark(empty_list, todo);
         for(const auto id:empty_map_objects)mark(id,todo);
         mark(runtime_object, todo);
+        mark(math_random_object, todo);
+        mark(native_allocation_error, todo);
         mark(vm_runtime_object, todo);
         while (!todo.empty()) {
             const auto id = todo.back();
@@ -4006,6 +4377,7 @@ struct ManagedRuntime::Impl {
         if(value.integral)value.bytes+=sizeof(ManagedIntegral);
         if(value.floating)value.bytes+=sizeof(ManagedFloating);
         if(value.byte)value.bytes+=sizeof(ManagedByte);
+        if(value.character)value.bytes+=sizeof(ManagedCharacter);
         if(value.boolean)value.bytes+=sizeof(ManagedBoolean);
         if(value.uuid)value.bytes+=sizeof(ManagedUuid);
         if(value.random)value.bytes+=sizeof(ManagedRandom);
@@ -4051,9 +4423,26 @@ struct ManagedRuntime::Impl {
             fail("INDEX", "Invalid string index");
         if (const auto it = strings.find(index); it != strings.end())
             return it->second;
-        const auto id = runtime.new_string(image.strings[index]);
+        auto id = canonical_string(image.strings[index]);
+        if(!id) {
+            id=runtime.new_string(image.strings[index]);
+            object(id).interned_string=true;
+        }
         strings.emplace(index, id);
         return id;
+    }
+    ObjectId canonical_string(std::u16string_view text) const {
+        // Scan the existing bounded heap instead of maintaining an uncharged
+        // second text table. GC removes dead weak members with their Objects.
+        for(const auto &[id,value]:heap)
+            if(value.interned_string && value.type=="Ljava/lang/String;" && value.text==text)return id;
+        return 0;
+    }
+    Value string_intern(ObjectId receiver) {
+        const auto existing=canonical_string(runtime.string(receiver));
+        if(existing)return Value::reference(existing);
+        object(receiver).interned_string=true;
+        return Value::reference(receiver);
     }
     void initialize(std::string_view type) {
         execution_checkpoint();
@@ -4076,7 +4465,7 @@ struct ManagedRuntime::Impl {
         state = 1;
         try {
             for (const auto index : definition->static_fields)
-                statics[index] = default_value(image.types.at(image.fields.at(index).type));
+                statics.try_emplace(index, default_value(image.types.at(image.fields.at(index).type)));
             for (std::size_t i = 0; i < definition->static_values.size(); ++i) {
                 const auto index = definition->static_fields.at(i);
                 const auto &entry = definition->static_values[i];
@@ -4239,6 +4628,12 @@ struct ManagedRuntime::Impl {
                 (method.name=="toString" && signature==(large?"(J)Ljava/lang/String;":"(S)Ljava/lang/String;"));
         }
         if(owner_type==float_type || owner_type==double_type)return floating_static(method.name,image.prototypes.at(method.prototype).descriptor);
+        if (owner_type == character_type) {
+            const auto &signature = image.prototypes.at(method.prototype).descriptor;
+            if (character_static(method.name, signature)) return true;
+            if (character_method(method.name, signature)) return false;
+            fail("API_UNSUPPORTED", "Character operation is outside the implemented value profile");
+        }
         if(owner_type==byte_type) {
             const auto &signature=image.prototypes.at(method.prototype).descriptor;
             return method.name=="valueOf" || method.name=="parseByte" || method.name=="decode" ||
@@ -4379,6 +4774,7 @@ struct ManagedRuntime::Impl {
         }
         if(object(id).floating)return object(id).floating->hash();
         if(object(id).byte)return static_cast<std::uint32_t>(object(id).byte->value());
+        if(object(id).character)return object(id).character->value();
         if(object(id).uuid)return object(id).uuid->hash();
         if(object(id).boolean)return object(id).boolean->value()?1231U:1237U;
         if (object(id).integer)
@@ -4389,6 +4785,7 @@ struct ManagedRuntime::Impl {
         if(left) {
             if(object(left).integral)(void)object(left).integral->bits();
             if(object(left).floating)(void)object(left).floating->bits();
+            if(object(left).character)(void)object(left).character->value();
         }
         if (left == right)
             return true;
@@ -4412,6 +4809,8 @@ struct ManagedRuntime::Impl {
         }
         if(object(left).floating)return object(left).floating->equals(right?object(right).floating.get():nullptr);
         if(object(left).byte)return right && object(right).byte && object(left).byte->value()==object(right).byte->value();
+        if(object(left).character)return right && object(right).character &&
+            object(left).character->value()==object(right).character->value();
         if(object(left).uuid)return object(left).uuid->equals(right?object(right).uuid.get():nullptr);
         if(object(left).boolean)
             return right && object(right).boolean && object(left).boolean->value()==object(right).boolean->value();
@@ -4429,6 +4828,50 @@ struct ManagedRuntime::Impl {
         result.metadata = {image.types.at(m.owner), m.name, image.types.at(p.return_type), {}, m.flags};
         for (const auto parameter : p.parameters) result.metadata.parameters.push_back(image.types.at(parameter));
         return result;
+    }
+    ReflectedMethod owned_reflected_method_declaration(Index index) const {
+        check_thread();
+        if (index >= image.methods.size())
+            fail("METHOD_METADATA", "Invalid reflected method declaration index");
+        const auto &method = image.methods.at(index);
+        if (!method.declared)
+            fail("METHOD_UNSUPPORTED", "Reflected JNI methods require owned declarations");
+        if (method.owner >= image.types.size() || method.prototype >= image.prototypes.size() ||
+            std::popcount(method.flags & 7u) > 1 || method.name.empty())
+            fail("METHOD_METADATA", "Reflected method has invalid ownership or visibility");
+        if (method.name == "<clinit>")
+            fail("METHOD_UNSUPPORTED", "Class initializers are not reflective Method objects");
+        const auto *definition = resolve_class(image.types.at(method.owner));
+        if (!definition)
+            fail("METHOD_UNSUPPORTED", "Reflected method declaring inventory is unavailable");
+        if (definition->type != method.owner || std::popcount(definition->flags & 7u) > 1 ||
+            method.direct != bool(method.flags & (8u | 2u | 0x10000u)))
+            fail("METHOD_METADATA", "Reflected method differs from its declaring class inventory");
+        const auto &inventory = method.direct ? definition->direct_methods : definition->virtual_methods;
+        if (inventory.size() > 262144)
+            fail("METHOD_LIMIT", "Reflected method declaration inventory exceeds its work bound");
+        if (std::find(inventory.begin(), inventory.end(), index) == inventory.end())
+            fail("METHOD_METADATA", "Reflected method is absent from its owned declaration inventory");
+        const auto &prototype = image.prototypes.at(method.prototype);
+        if (prototype.return_type >= image.types.size() || prototype.parameters.size() > limits.array_length ||
+            prototype.parameters.size() > 262144 - inventory.size())
+            fail("METHOD_LIMIT", "Reflected method prototype exceeds its metadata bound");
+        const bool constructor = method.name == "<init>";
+        if (constructor != bool(method.flags & 0x10000u) ||
+            (constructor && (!method.direct || (method.flags & (8u | 0x100u | 0x400u)) ||
+                             (definition->flags & 0x200u) || image.types.at(prototype.return_type) != "V")))
+            fail("METHOD_METADATA", "Reflected constructor has invalid declaration metadata");
+        if (!method.code && !(method.flags & (0x100u | 0x400u)))
+            fail("METHOD_METADATA", "Reflected concrete method has no owned body");
+        // Metadata resolution never initializes the declaring/parameter types
+        // or executes a guest Method/Constructor constructor.
+        known(image.types.at(prototype.return_type));
+        for (const auto parameter : prototype.parameters) {
+            if (parameter >= image.types.size() || image.types.at(parameter) == "V")
+                fail("METHOD_METADATA", "Reflected method has an invalid parameter type");
+            known(image.types.at(parameter));
+        }
+        return reflected_declaration(index);
     }
     std::optional<ReflectedMethod> object_public_method(std::string_view name,
                                                        const std::vector<std::string> &parameters) const {
@@ -4616,26 +5059,227 @@ struct ManagedRuntime::Impl {
         metrics.heap_bytes=metrics.heap_bytes-hidden_api_bytes+bytes;hidden_api_bytes=bytes;
         hidden_api_exemptions.swap(replacement);return Value::nothing();
     }
+    ObjectId lookup_constructor(std::span<const Value> args, bool declared_only) {
+        const auto target = std::string(runtime.represented_class(reference(args[0])));
+        const auto array = reference(args[1]);
+        if (array && object(array).type != "[Ljava/lang/Class;")
+            runtime.raise("Ljava/lang/IllegalArgumentException;");
+        std::size_t work = 0;
+        const auto step = [&] {
+            if (++work > 262144) fail("METHOD_LIMIT", "Constructor discovery exceeds its work bound");
+        };
+        std::vector<std::string> parameters;
+        const auto count = array ? object(array).elements.size() : 0;
+        if (count > limits.array_length) fail("METHOD_LIMIT", "Constructor parameter count exceeds its bound");
+        parameters.reserve(count);
+        for (std::size_t n = 0; n < count; ++n) {
+            step();
+            const auto parameter = reference(object(array).elements[n]);
+            if (!parameter) runtime.raise("Ljava/lang/NoSuchMethodException;", u"Constructor parameter type is null");
+            parameters.emplace_back(runtime.represented_class(parameter));
+        }
+        if (target.starts_with('[') || !reference_type(target))
+            runtime.raise("Ljava/lang/NoSuchMethodException;");
+        const auto *definition = resolve_class(target);
+        if (!definition)
+            fail("METHOD_UNSUPPORTED", "Provider constructor discovery requires an actual declaration inventory");
+        for (const auto index : definition->direct_methods) {
+            step();
+            if (index >= image.methods.size()) fail("METHOD_METADATA", "Constructor inventory has an invalid index");
+            const auto &method = image.methods.at(index);
+            if (!method.declared || !method.direct || method.owner != definition->type ||
+                method.prototype >= image.prototypes.size())
+                fail("METHOD_METADATA", "Constructor inventory has invalid declaration ownership");
+            if (method.name != "<init>" || (!declared_only && !(method.flags & 1u))) continue;
+            const auto &prototype = image.prototypes.at(method.prototype);
+            if (prototype.parameters.size() != parameters.size()) continue;
+            bool matches = true;
+            for (std::size_t n = 0; n < parameters.size(); ++n) {
+                step();
+                if (prototype.parameters[n] >= image.types.size())
+                    fail("METHOD_METADATA", "Constructor prototype has an invalid parameter index");
+                if (image.types.at(prototype.parameters[n]) != parameters[n]) { matches = false; break; }
+            }
+            if (matches) return runtime.new_reflected_method(index);
+        }
+        // No superclass search: constructors are never inherited. Discovery
+        // has performed metadata work only, without initializing the target.
+        runtime.raise("Ljava/lang/NoSuchMethodException;");
+    }
+    Value reflective_argument(ObjectId id, std::string_view parameter) {
+        if (reference_type(parameter)) {
+            if (id && !subtype(object(id).type, parameter)) runtime.raise("Ljava/lang/IllegalArgumentException;");
+            return Value::reference(id);
+        }
+        if (!id) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        const auto &value = object(id);
+        char source = 0;
+        std::uint64_t bits = 0;
+        if (value.type == boolean_type && value.boolean) { source = 'Z'; bits = value.boolean->value(); }
+        else if (value.type == byte_type && value.byte) {
+            source = 'B'; bits = static_cast<std::uint64_t>(static_cast<std::int64_t>(value.byte->value()));
+        } else if (value.type == character_type && value.character) { source = 'C'; bits = value.character->value(); }
+        else if (value.type == short_type && value.integral && !value.integral->is_long()) {
+            source = 'S'; bits = value.integral->bits();
+        } else if (value.type == integer_type && value.integer) {
+            source = 'I'; bits = static_cast<std::uint64_t>(static_cast<std::int64_t>(
+                std::bit_cast<std::int32_t>(value.integer->value())));
+        } else if (value.type == long_type && value.integral && value.integral->is_long()) {
+            source = 'J'; bits = value.integral->bits();
+        } else if (value.type == float_type && value.floating) { source = 'F'; bits = value.floating->bits(); }
+        else if (value.type == double_type && value.floating) { source = 'D'; bits = value.floating->bits(); }
+        if (parameter.size() != 1) fail("METHOD_METADATA", "Invalid reflective primitive parameter descriptor");
+        std::string_view allowed;
+        switch (parameter.front()) {
+        case 'Z': allowed = "Z"; break;
+        case 'B': allowed = "B"; break;
+        case 'C': allowed = "C"; break;
+        case 'S': allowed = "BS"; break;
+        case 'I': allowed = "BSCI"; break;
+        case 'J': allowed = "BSCIJ"; break;
+        case 'F': allowed = "BSCIJF"; break;
+        case 'D': allowed = "BSCIJFD"; break;
+        default: fail("METHOD_METADATA", "Invalid reflective primitive parameter descriptor");
+        }
+        if (!source || allowed.find(source) == allowed.npos) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        // Only exact final wrapper storage is read. Never invoke an arbitrary
+        // Number conversion or admit a narrowing/boolean-numeric conversion.
+        if (parameter == "F") return Value::word(source == 'F' ? static_cast<std::uint32_t>(bits) :
+            static_cast<std::uint32_t>(integral_floating_bits(bits, false)));
+        if (parameter == "D") return Value::wide(source == 'D' ? bits : source == 'F' ?
+            widen_float_bits(static_cast<std::uint32_t>(bits)) : integral_floating_bits(bits, true));
+        return parameter == "J" ? Value::wide(bits) : Value::word(static_cast<std::uint32_t>(bits));
+    }
+    Value invoke_reflected_constructor(std::span<const Value> args) {
+        const auto constructor = reference(args[0]);
+        const auto array = reference(args[1]);
+        RegexRoot constructor_root(runtime, constructor), array_root(runtime, array);
+        const auto &member = object(constructor);
+        if (member.type != "Ljava/lang/reflect/Constructor;" || !member.reflected_method)
+            fail("METHOD_METADATA", "Constructor invocation requires authenticated executable storage");
+        const auto &stored = *member.reflected_method;
+        if (stored.provider || stored.vm_runtime_operation || stored.managed == no_index)
+            fail("METHOD_UNSUPPORTED", "Provider constructors have no owned invocation declaration");
+        const auto canonical = owned_reflected_method_declaration(stored.managed);
+        const auto &metadata = canonical.metadata;
+        if (metadata.name != "<init>" || stored.metadata.owner != metadata.owner || stored.metadata.name != metadata.name ||
+            stored.metadata.return_type != metadata.return_type || stored.metadata.parameters != metadata.parameters ||
+            stored.metadata.flags != metadata.flags)
+            fail("METHOD_METADATA", "Constructor storage differs from its owned declaration");
+        const auto *definition = resolve_class(metadata.owner);
+        if (!definition) fail("METHOD_UNSUPPORTED", "Constructor declaring inventory is unavailable");
+        if (definition->flags & (0x200u | 0x400u)) runtime.raise("Ljava/lang/InstantiationException;");
+        const bool accessible = member.reflective_access_override;
+        // The pinned Android Constructor path checks declaring-class access,
+        // not Method.invoke's member/receiver access rules. Adapter/routing
+        // frames are transparent; no real Java caller is the native-entry case.
+        std::optional<std::string> caller;
+        const auto &frames = current_context().frames;
+        for (auto at = frames.size(); at; ) {
+            const auto method = frames[--at]->method;
+            if (method != no_index && image.methods.at(method).declared) {
+                caller = image.types.at(image.methods.at(method).owner); break;
+            }
+        }
+        if (!accessible && !(definition->flags & 1u) && caller) {
+            const auto package = [](std::string_view type) {
+                const auto slash = type.rfind('/'); return type.substr(0, slash == type.npos ? 0 : slash);
+            };
+            if (*caller != metadata.owner && package(*caller) != package(metadata.owner))
+                runtime.raise("Ljava/lang/IllegalAccessException;");
+        }
+        // Match ART: initialization and receiver allocation precede argument
+        // count/unboxing. A clinit may mutate the original passed Object[].
+        const auto receiver = runtime.new_object(metadata.owner);
+        RegexRoot receiver_root(runtime, receiver);
+        if (array && !object(array).type.starts_with("[L") && !object(array).type.starts_with("[["))
+            runtime.raise("Ljava/lang/IllegalArgumentException;");
+        const auto count = array ? object(array).elements.size() : 0;
+        if (count != metadata.parameters.size()) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        struct Arguments {
+            ManagedRuntime &runtime;
+            std::vector<ObjectId> roots;
+            ~Arguments() { for (const auto id : roots) runtime.release(id); }
+            void add(ObjectId id) {
+                runtime.retain(id);
+                try { roots.push_back(id); } catch (...) { runtime.release(id); throw; }
+            }
+        } captured{runtime, {}};
+        captured.roots.reserve(count);
+        std::vector<Value> delegated;
+        delegated.reserve(count + 1);
+        delegated.push_back(Value::reference(receiver));
+        for (std::size_t n = 0; n < count; ++n) {
+            // Capture each current element, retaining it before any type
+            // metadata callback. Later elements still read the live original
+            // array; no borrowed span survives a resolving operation.
+            const auto id = reference(object(array).elements[n]);
+            captured.add(id);
+            delegated.push_back(reflective_argument(id, metadata.parameters[n]));
+        }
+        try {
+            if (!current_context().barriers) fail("STATE", "Reflective constructor lacks its core barrier");
+            SuspendCoreBarrier allow(current_context());
+            (void)runtime.invoke(stored.managed, delegated);
+        } catch (const JavaException &cause) {
+            // Only the actual constructor body is wrapped. Access, clinit,
+            // allocation and argument failures above retain their own outcome.
+            current_context().last_exception = cause.object;
+            const auto wrapper = runtime.new_object("Ljava/lang/reflect/InvocationTargetException;");
+            object(wrapper).cause = cause.object;
+            ++metrics.exceptions; current_context().last_exception = wrapper;
+            throw JavaException(wrapper);
+        }
+        return Value::reference(receiver);
+    }
+    Value reflective_result(Value result, std::string_view descriptor) {
+        // Return validation and boxing follow the invocation boundary. Their
+        // failures are never exceptions thrown by the reflected target body.
+        RegexRoot result_root(runtime, result.kind == ValueKind::reference ? reference(result) : 0);
+        result = typed(result, descriptor);
+        if (reference_type(descriptor)) return result;
+        if (descriptor == "V") return Value::reference(0);
+        if (descriptor.size() != 1) fail("METHOD_METADATA", "Invalid reflective return descriptor");
+        ObjectId boxed;
+        switch (descriptor.front()) {
+        case 'Z': boxed = box_boolean(word(result) != 0); break;
+        case 'B': boxed = box_byte(word(result)); break;
+        case 'C': boxed = box_character(word(result)); break;
+        case 'S': boxed = box_integral(short_type, word(result)); break;
+        case 'I': boxed = box_integer(word(result)); break;
+        case 'J': boxed = box_integral(long_type, wide(result)); break;
+        case 'F': boxed = box_floating(float_type, word(result)); break;
+        case 'D': boxed = box_floating(double_type, wide(result)); break;
+        default: fail("METHOD_METADATA", "Invalid reflective return descriptor");
+        }
+        return Value::reference(boxed);
+    }
     Value invoke_reflected_method(std::span<const Value> args) {
-        const auto &state = object(reference(args[0])).reflected_method;
-        if (!state) fail("REFERENCE", "Method object has no validated declaration");
+        const auto member_id = reference(args[0]);
+        const auto receiver = reference(args[1]);
+        const auto array = reference(args[2]);
+        RegexRoot member_root(runtime, member_id), receiver_root(runtime, receiver), array_root(runtime, array);
+        const auto &member = object(member_id);
+        const auto &state = member.reflected_method;
+        if (member.type != "Ljava/lang/reflect/Method;" || !state)
+            fail("REFERENCE", "Method object has no validated declaration");
         const auto &method = state->metadata;
-        if (method.return_type != "V" && !reference_type(method.return_type))
-            fail("API_UNSUPPORTED", "Reflected primitive return boxing is not implemented");
-        for (const auto &parameter : method.parameters)
-            if (!reference_type(parameter)) fail("API_UNSUPPORTED", "Reflected primitive argument unboxing is not implemented");
+        const bool accessible = member.reflective_access_override;
+        // ART initializes even an instance method's declaring class before
+        // receiver/argument conversion. Keep the original Object[] identity:
+        // a class initializer can replace its elements before we read them.
+        initialize(method.owner);
         const auto *declaring_class = resolve_class(method.owner);
         if (declaring_class && std::popcount(declaring_class->flags & 7u) > 1)
             fail("METHOD_METADATA", "Reflected declaring class has contradictory visibility modifiers");
-        if (declaring_class && !(declaring_class->flags & 1) &&
-            !object(reference(args[0])).reflective_access_override) {
+        if (declaring_class && !(declaring_class->flags & 1) && !accessible) {
             std::string_view caller;
             if (const auto index = caller_frame_method(); index != no_index) caller = image.types.at(image.methods.at(index).owner);
             const auto package = [](std::string_view type) { const auto slash=type.rfind('/'); return type.substr(0,slash==type.npos?0:slash); };
             if (caller.empty() || (caller != method.owner && package(caller) != package(method.owner)))
                 runtime.raise("Ljava/lang/IllegalAccessException;", u"Reflected declaring class is inaccessible");
         }
-        if(!(method.flags&1) && !object(reference(args[0])).reflective_access_override) {
+        if(!(method.flags&1) && !accessible) {
             std::string_view caller;
             if(const auto index=caller_frame_method();index!=no_index)caller=image.types.at(image.methods.at(index).owner);
             const auto package=[](std::string_view type){const auto slash=type.rfind('/');return type.substr(0,slash==type.npos?0:slash);};
@@ -4650,35 +5294,53 @@ struct ManagedRuntime::Impl {
         }
         const bool stat = (method.flags & 8) != 0;
         std::vector<Value> delegated;
+        delegated.reserve(method.parameters.size() + (stat ? 0u : 1u));
         if (!stat) {
-            const auto receiver = reference(args[1]);
             if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
             if (!subtype(object(receiver).type, method.owner)) runtime.raise("Ljava/lang/IllegalArgumentException;");
             delegated.push_back(Value::reference(receiver));
         }
-        const auto array = reference(args[2]);
         if (array && !object(array).type.starts_with("[L") && !object(array).type.starts_with("[["))
             runtime.raise("Ljava/lang/IllegalArgumentException;");
         const auto count = array ? object(array).elements.size() : 0;
         if (count != method.parameters.size()) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        struct Arguments {
+            ManagedRuntime &runtime;
+            std::vector<ObjectId> roots;
+            ~Arguments() { for (const auto id : roots) runtime.release(id); }
+            void add(ObjectId id) {
+                runtime.retain(id);
+                try { roots.push_back(id); } catch (...) { runtime.release(id); throw; }
+            }
+        } captured{runtime, {}};
+        captured.roots.reserve(count);
         for (std::size_t n=0; n<count; ++n) {
-            const auto value=object(array).elements[n]; const auto id=reference(value);
-            if (id && !subtype(object(id).type, method.parameters[n])) runtime.raise("Ljava/lang/IllegalArgumentException;");
-            delegated.push_back(Value::reference(id));
+            const auto id = reference(object(array).elements[n]);
+            captured.add(id); // Retain before subtype/provider callbacks.
+            delegated.push_back(reflective_argument(id, method.parameters[n]));
         }
-        // Class initialization errors precede target invocation and are not wrapped.
-        if (stat) initialize(method.owner);
+        // Resolve dispatch before the body-only exception boundary. Preserve
+        // Method's existing static/private/virtual selection and access rules.
+        const bool virtual_dispatch = !stat && !(method.flags & 2u);
+        const auto target = state->managed == no_index || !virtual_dispatch ? state->managed :
+            virtual_target(state->managed, receiver);
+        Value result;
         try {
-            Value result;
             if(state->vm_runtime_operation) {
                 result=state->vm_runtime_operation==1?vm_runtime():set_hidden_api_exemptions(reference(delegated[0]),reference(delegated[1]));
             } else if (state->provider) {
                 if (!host) fail("API_UNSUPPORTED", "Reflected provider is detached");
-                result = typed(provider_call([&] { return host->invoke_reflected(runtime, method, delegated); }), method.return_type);
-            } else if (state->managed != no_index) {
-                result = (stat || (method.flags&2)) ? runtime.invoke(state->managed, delegated) : runtime.invoke_virtual(state->managed, delegated);
+                std::optional<ViewActivationScope> activation;
+                if (!stat && method.name == "performClick" && method.parameters.empty() && method.return_type == "Z")
+                    activation.emplace(runtime, receiver); // A reflected call is a distinct activation, not a super edge.
+                result = provider_call([&] { return host->invoke_reflected(runtime, method, delegated); });
+                result = typed(result, method.return_type);
+                if (activation) activation->complete(result.kind == ValueKind::word && result.bits != 0);
+            } else if (target != no_index) {
+                if (!current_context().barriers) fail("STATE", "Reflected method lacks its core barrier");
+                SuspendCoreBarrier allow(current_context());
+                result = runtime.invoke_resolved(target, delegated, virtual_dispatch);
             } else fail("API_UNSUPPORTED", "Reflected Object declaration has no executable dispatch reference");
-            return method.return_type == "V" ? Value::reference(0) : result;
         } catch (const JavaException &cause) {
             current_context().last_exception = cause.object;
             const auto wrapper = runtime.new_object("Ljava/lang/reflect/InvocationTargetException;");
@@ -4686,6 +5348,7 @@ struct ManagedRuntime::Impl {
             ++metrics.exceptions; current_context().last_exception = wrapper;
             throw JavaException(wrapper);
         }
+        return reflective_result(result, method.return_type);
     }
     void validate_reflected_field(const HostField &field) const {
         if (std::popcount(field.flags & 7u) > 1 || (field.flags & ~0x50dfu))
@@ -4694,6 +5357,24 @@ struct ManagedRuntime::Impl {
             fail("FIELD_METADATA", "Reflected declaring class has contradictory visibility modifiers");
         known(field.type);
         if (field.type == "V") fail("FIELD_METADATA", "Reflected field cannot have void type");
+    }
+    ReflectedField reflected_field_declaration(Index index) const {
+        if (index >= image.fields.size())
+            fail("FIELD_METADATA", "Invalid reflected field declaration index");
+        const auto &field = (image.fields.at(index).flags & 8)
+                                ? declared_static_field(index) : declared_instance_field(index);
+        const auto &owner_type = image.types.at(field.owner);
+        const auto *definition = resolve_class(owner_type);
+        if (!definition)
+            fail("FIELD_UNSUPPORTED", "Reflected field requires an owned declaring class");
+        ReflectedField result;
+        result.managed = index;
+        result.metadata = {owner_type, field.name, image.types.at(field.type), field.flags,
+                           (definition->flags & 1u) != 0};
+        // Resolution of the field type is metadata-only. Neither the declaring
+        // class nor the field type is initialized by reflection conversion.
+        validate_reflected_field(result.metadata);
+        return result;
     }
     ObjectId lookup_declared_field(std::span<const Value> args) {
         const auto declaring_type=std::string(runtime.represented_class(reference(args[0])));
@@ -4774,7 +5455,7 @@ struct ManagedRuntime::Impl {
         if(slot==object(receiver).fields.end()) fail("FIELD_METADATA", "Receiver has no declared field slot");
         return typed(slot->second,field.type);
     }
-    Value read_public_provider_field(Index index, const Frame &frame, std::uint32_t receiver_register) {
+    Value read_public_provider_field(Index index, const Frame &frame, std::uint32_t receiver_register, bool object_field) {
         const auto &reference_field=image.fields.at(index);
         const auto &declaring_type=image.types.at(reference_field.owner);
         const auto metadata=host ? provider_call([&] { return host->public_field(declaring_type,reference_field.name); }) : std::nullopt;
@@ -4784,13 +5465,42 @@ struct ManagedRuntime::Impl {
         validate_reflected_field(*metadata);
         if((metadata->flags&7u)!=1u || !metadata->declaring_class_public || (metadata->flags&8))
             fail("FIELD_UNSUPPORTED", "External instance reads require a public nonstatic field and public declaring class");
-        if(!reference_type(metadata->type)) fail("VALUE_TYPE", "iget-object requires a reference field");
+        if(object_field ? !reference_type(metadata->type) : metadata->type != "I")
+            fail("VALUE_TYPE", "External iget opcode disagrees with provider field type");
         // Resolve the provider declaration before touching guest registers: an
         // unsupported native field must not become a fabricated receiver error.
         const auto receiver=reference(frame.get(receiver_register));
         if(!receiver) runtime.raise("Ljava/lang/NullPointerException;");
         if(!subtype(object(receiver).type,declaring_type)) runtime.raise("Ljava/lang/ClassCastException;");
         return typed(provider_call([&] { return host->read_reflected_field(runtime,*metadata,receiver); }),metadata->type);
+    }
+    void write_public_provider_field(Index index, const Frame &frame, std::uint32_t receiver_register,
+                                     Value value, bool object_field) {
+        const auto &field = image.fields.at(index);
+        const auto &declaring = image.types.at(field.owner);
+        auto *const provider = host;
+        const auto generation = host_generation;
+        const auto receiver = reference(frame.get(receiver_register));
+        runtime.retain(receiver);
+        struct Release { ManagedRuntime &runtime; ObjectId id; ~Release() { runtime.release(id); } } receiver_root{runtime, receiver};
+        const auto value_id = object_field ? reference(value) : ObjectId{0};
+        runtime.retain(value_id);
+        Release value_root{runtime, value_id};
+        const auto metadata = provider ? provider_call([&] { return provider->public_field(declaring, field.name); }) : std::nullopt;
+        if (!metadata) fail("FIELD_UNSUPPORTED", "External instance write metadata is incomplete");
+        if (!subtype(declaring, metadata->owner) || metadata->name != field.name || metadata->type != image.types.at(field.type))
+            fail("FIELD_METADATA", "External instance write does not match its provider declaration");
+        validate_reflected_field(*metadata);
+        if ((metadata->flags & 7u) != 1u || !metadata->declaring_class_public || (metadata->flags & (8u | 16u)))
+            fail("FIELD_UNSUPPORTED", "Provider writes require a public mutable nonstatic field and public class");
+        if (object_field ? !reference_type(metadata->type) : metadata->type != "I")
+            fail("VALUE_TYPE", "External iput opcode disagrees with provider field type");
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!subtype(object(receiver).type, declaring)) runtime.raise("Ljava/lang/ClassCastException;");
+        const auto checked_value = typed(value, metadata->type);
+        if (host != provider || host_generation != generation)
+            fail("FIELD_UNSUPPORTED", "Provider binding changed while resolving an instance write");
+        provider_call([&] { provider->write_reflected_field(runtime, *metadata, receiver, checked_value); });
     }
     [[noreturn]] void reflection_failure(std::string_view cause_type, std::u16string_view message) {
         try {
@@ -4922,11 +5632,15 @@ struct ManagedRuntime::Impl {
         if (type.empty() || type.front() != 'L' || core_type(type))
             return false;
         const auto *definition = resolve_class(type);
-        return definition && (definition->flags & 0x4000) && definition->superclass != no_index &&
-               image.types.at(definition->superclass) == enum_type;
+        if (definition) return (definition->flags & 0x4000) && definition->superclass != no_index &&
+                               image.types.at(definition->superclass) == enum_type;
+        if (host) if (const auto info = provider_call([&] { return host->class_info(type); }))
+            return !info->is_abstract && !info->is_interface && info->superclass == enum_type;
+        return false;
     }
     std::string_view declaring_enum(ObjectId id) {
         auto type = std::string_view(object(id).type);
+        if (object(id).provider_enum && object(id).enumeration) return type;
         if (type == time_unit_type || type==async_status_type) return type;
         for (unsigned depth = 0; depth < 256; ++depth) {
             const auto *definition = resolve_class(type);
@@ -4953,6 +5667,8 @@ struct ManagedRuntime::Impl {
         }
         const auto *definition = resolve_class(type);
         std::vector<ObjectId> constants;
+        if (!definition)
+            fail("ENUM_UNSUPPORTED", "Provider enum constant inventories are not implemented by managed reflection");
         for (const auto index : definition->static_fields) {
             const auto &field = image.fields.at(index);
             if (!(field.flags & 0x4000))
@@ -5080,6 +5796,39 @@ struct ManagedRuntime::Impl {
         }
         return Value::word(0xffffffffu);
     }
+    Value builder_insert(ObjectId receiver,std::int32_t offset,ObjectId inserted) {
+        if(object(receiver).type!="Ljava/lang/StringBuilder;")fail("VALUE_TYPE","String insert requires a StringBuilder");
+        const auto text=runtime.char_sequence(receiver);
+        if(offset<0 || static_cast<std::size_t>(offset)>text.size())
+            runtime.raise("Ljava/lang/StringIndexOutOfBoundsException;");
+        const auto addition=inserted?runtime.string(inserted):std::u16string_view(u"null");
+        if(addition.size()>limits.array_length-text.size())fail("STRING_LIMIT","StringBuilder insert exceeds length limit");
+        if(addition.size()*sizeof(char16_t)>limits.heap_bytes-metrics.heap_bytes)
+            fail("HEAP_LIMIT","Managed character sequence exceeds heap limit");
+        // No callback or collection occurs while either rooted UTF-16 view is
+        // live. Commit only after construction, preserving text on allocation failure.
+        std::u16string result;
+        result.reserve(text.size()+addition.size());
+        result.append(text.substr(0,static_cast<std::size_t>(offset)));
+        result.append(addition);
+        result.append(text.substr(static_cast<std::size_t>(offset)));
+        replace_text(receiver,std::move(result));
+        return Value::reference(receiver);
+    }
+    Value builder_reverse(ObjectId receiver) {
+        auto &value=object(receiver);
+        if(value.type!="Ljava/lang/StringBuilder;")fail("VALUE_TYPE","Reverse requires a StringBuilder");
+        auto &text=value.text;
+        std::reverse(text.begin(),text.end());
+        // Reversing UTF-16 units flips existing pairs. Repair those low/high
+        // adjacencies; isolated surrogates otherwise retain ordinary unit order.
+        for(std::size_t at=0;at+1<text.size();++at)
+            if(text[at]>=0xdc00 && text[at]<=0xdfff && text[at+1]>=0xd800 && text[at+1]<=0xdbff) {
+                std::swap(text[at],text[at+1]);
+                ++at;
+            }
+        return Value::reference(receiver);
+    }
     Value append_boolean(ObjectId receiver,bool value) {
         if(object(receiver).type!="Ljava/lang/StringBuilder;")fail("VALUE_TYPE","Boolean append requires a StringBuilder");
         const auto text=runtime.char_sequence(receiver);
@@ -5132,6 +5881,166 @@ struct ManagedRuntime::Impl {
         std::u16string combined(left);combined.append(right);
         return Value::reference(runtime.new_string(combined));
     }
+    Value math_random_value() {
+        if(!math_random_object) {
+            std::array<std::uint8_t,16> bytes{};
+            if(!host::secure_random_128(bytes))fail("RANDOM_ENTROPY_UNAVAILABLE","Windows entropy is unavailable");
+            std::uint64_t seed=0;
+            for(unsigned n=0;n<8;++n)seed=(seed<<8)|bytes[n];
+            Object generator;generator.type=random_type;generator.random=std::make_unique<ManagedRandom>();
+            generator.random->initialize(seed);
+            math_random_object=allocate(std::move(generator));
+        }
+        // One private, charged/rooted generator per application runtime. The
+        // existing single-owner scheduler serializes calls from logical threads.
+        random_work();const auto high=object(math_random_object).random->next(26);
+        random_work();const auto low=object(math_random_object).random->next(27);
+        const auto numerator=(static_cast<std::uint64_t>(high)<<27)|low;
+        if(!numerator)return Value::wide(0);
+        const auto exponent=static_cast<unsigned>(std::bit_width(numerator)-1);
+        // numerator/2^53 is exactly representable. Construct its IEEE bits so
+        // ambient host rounding/DAZ cannot bias the documented [0,1) result.
+        const auto bits=(static_cast<std::uint64_t>(exponent+970u)<<52)|((numerator<<(52u-exponent))&0x000fffffffffffffULL);
+        return Value::wide(bits);
+    }
+    Value string_compare(ObjectId receiver,ObjectId other) {
+        // The erased Comparable bridge casts before calling the String overload.
+        (void)object(receiver);
+        if(other && object(other).type!="Ljava/lang/String;")
+            runtime.raise("Ljava/lang/ClassCastException;");
+        const auto left=runtime.string(receiver),right=runtime.string(other);
+        const auto count=std::min(left.size(),right.size());
+        for(std::size_t at=0;at<count;++at)
+            if(left[at]!=right[at])return Value::word(static_cast<std::uint32_t>(
+                static_cast<std::int32_t>(left[at])-static_cast<std::int32_t>(right[at])));
+        return Value::word(static_cast<std::uint32_t>(
+            static_cast<std::int32_t>(left.size())-static_cast<std::int32_t>(right.size())));
+    }
+    Value string_replace(ObjectId receiver,ObjectId target,ObjectId replacement) {
+        if(!current_context().barriers)fail("STATE","String.replace lacks its core barrier");
+        // Android snapshots target.toString() before replacement.toString().
+        // Retain each result before another callback can allocate or suspend.
+        const auto snapshot=[&](ObjectId sequence) {
+            SuspendCoreBarrier allow(current_context());
+            return reference(runtime.invoke_virtual_named(sequence,"toString","()Ljava/lang/String;"));
+        };
+        const auto target_id=snapshot(target);RegexRoot target_root(runtime,target_id);
+        const auto replacement_id=snapshot(replacement);RegexRoot replacement_root(runtime,replacement_id);
+        // Prefix storage and the output share the existing heap budget. No view
+        // crosses collection; all three immutable strings are rooted by frames.
+        const auto needle_size=runtime.string(target_id).size();
+        if(needle_size>std::numeric_limits<std::size_t>::max()/sizeof(std::uint32_t))
+            fail("STRING_LIMIT","String replacement prefix size exceeds index bounds");
+        const auto prefix_bytes=needle_size*sizeof(std::uint32_t);
+        if(prefix_bytes>limits.heap_bytes-metrics.heap_bytes)collect();
+        if(prefix_bytes>limits.heap_bytes-metrics.heap_bytes)
+            fail("HEAP_LIMIT","String replacement prefix exceeds managed heap budget");
+        std::vector<std::uint32_t> prefix(needle_size);
+        const auto reserved=prefix.capacity()*sizeof(std::uint32_t);
+        if(reserved>limits.heap_bytes-metrics.heap_bytes)
+            fail("HEAP_LIMIT","String replacement prefix capacity exceeds managed heap budget");
+        RegexCharge prefix_charge(metrics.heap_bytes,reserved);
+        const auto text=runtime.string(receiver),needle=runtime.string(target_id),added=runtime.string(replacement_id);
+        for(std::size_t at=1,matched=0;at<needle.size();++at) {
+            while(matched && needle[at]!=needle[matched])matched=prefix[matched-1];
+            if(needle[at]==needle[matched])++matched;
+            prefix[at]=static_cast<std::uint32_t>(matched);
+        }
+        // Two linear passes count then emit non-overlapping literal matches.
+        // Replacement text is never interpreted as a regex or searched again.
+        const auto matches=[&](auto emit) {
+            if(needle.empty()) {
+                for(std::size_t at=0;at<=text.size();++at)emit(at,at);
+                return;
+            }
+            for(std::size_t at=0,matched=0;at<text.size();++at) {
+                while(matched && text[at]!=needle[matched])matched=prefix[matched-1];
+                if(text[at]==needle[matched])++matched;
+                if(matched==needle.size()) {emit(at+1-matched,at+1);matched=0;}
+            }
+        };
+        std::size_t count=0;
+        matches([&](std::size_t,std::size_t){++count;});
+        if(!count)return Value::reference(receiver);
+        auto length=text.size();
+        if(added.size()>=needle.size()) {
+            const auto growth=added.size()-needle.size();
+            if(growth && count>(limits.array_length-length)/growth)
+                fail("STRING_LIMIT","String replacement exceeds length limit");
+            length+=count*growth;
+        } else length-=count*(needle.size()-added.size());
+        if(length>(limits.heap_bytes-metrics.heap_bytes)/sizeof(char16_t))
+            fail("HEAP_LIMIT","String replacement output exceeds managed heap budget");
+        std::u16string result;result.reserve(length);
+        const auto output_bytes=result.capacity()*sizeof(char16_t);
+        if(output_bytes>limits.heap_bytes-metrics.heap_bytes)
+            fail("HEAP_LIMIT","String replacement output capacity exceeds managed heap budget");
+        RegexCharge output_charge(metrics.heap_bytes,output_bytes);
+        std::size_t cursor=0;
+        matches([&](std::size_t first,std::size_t last) {
+            result.append(text.substr(cursor,first-cursor));result.append(added);cursor=last;
+        });
+        result.append(text.substr(cursor));
+        return Value::reference(runtime.new_string(result));
+    }
+    Value system_arraycopy(std::span<const Value> args) {
+        const auto source = reference(args[0]), destination = reference(args[2]);
+        if (!source || !destination) runtime.raise("Ljava/lang/NullPointerException;");
+        RegexRoot source_root(runtime, source), destination_root(runtime, destination);
+        // Component errors precede range errors, including a zero-length copy.
+        const auto source_type = object(source).type, destination_type = object(destination).type;
+        if (!source_type.starts_with('[') || !destination_type.starts_with('['))
+            runtime.raise("Ljava/lang/ArrayStoreException;");
+        const auto source_component = std::string_view(source_type).substr(1);
+        const auto destination_component = std::string_view(destination_type).substr(1);
+        const bool source_reference = reference_type(source_component);
+        const bool destination_reference = reference_type(destination_component);
+        if (source_reference != destination_reference ||
+            (!source_reference && source_component != destination_component))
+            runtime.raise("Ljava/lang/ArrayStoreException;");
+        const auto source_position = std::bit_cast<std::int32_t>(word(args[1]));
+        const auto destination_position = std::bit_cast<std::int32_t>(word(args[3]));
+        const auto length = std::bit_cast<std::int32_t>(word(args[4]));
+        const auto source_size = object(source).elements.size();
+        const auto destination_size = object(destination).elements.size();
+        if (source_position < 0 || destination_position < 0 || length < 0 ||
+            static_cast<std::size_t>(source_position) > source_size ||
+            static_cast<std::size_t>(destination_position) > destination_size ||
+            static_cast<std::size_t>(length) > source_size - static_cast<std::size_t>(source_position) ||
+            static_cast<std::size_t>(length) > destination_size - static_cast<std::size_t>(destination_position))
+            runtime.raise("Ljava/lang/ArrayIndexOutOfBoundsException;");
+        const auto count = static_cast<std::size_t>(length);
+        // Charge bounded native work before mutation. No allocation, callback
+        // or scheduling checkpoint is introduced in a bulk primitive/self copy.
+        auto &context = current_context();
+        if (count > context.remaining || (scheduled_task() && count > task_work_remaining) ||
+            (!scheduled_task() && main_callback_inflight && count > main_callback_work_remaining))
+            fail("BUDGET", "System.arraycopy work allowance exhausted");
+        context.remaining -= count;
+        if (scheduled_task()) task_work_remaining -= count;
+        else if (main_callback_inflight) main_callback_work_remaining -= count;
+        const auto first = static_cast<std::size_t>(source_position);
+        const auto target = static_cast<std::size_t>(destination_position);
+        if (!count) return Value::nothing();
+        if (source == destination || !source_reference) {
+            auto &from = object(source).elements;
+            auto &to = object(destination).elements;
+            if (source == destination && target > first && target - first < count)
+                std::copy_backward(from.begin() + first, from.begin() + first + count, to.begin() + target + count);
+            else if (source != destination || target != first)
+                std::copy(from.begin() + first, from.begin() + first + count, to.begin() + target);
+        } else {
+            // Different reference arrays can fail partway through. Check each
+            // captured element in order and retain it across metadata loading;
+            // already successful stores remain visible on ArrayStoreException.
+            for (std::size_t at = 0; at < count; ++at) {
+                const auto value = runtime.array_get(source, static_cast<std::int32_t>(first + at));
+                RegexRoot element_root(runtime, reference(value));
+                runtime.array_set(destination, static_cast<std::int32_t>(target + at), value);
+            }
+        }
+        return Value::nothing();
+    }
     Value typed_array_copy(ObjectId source,std::int32_t length,ObjectId requested_class) {
         const auto descriptor=std::string(runtime.represented_class(requested_class));
         // Arrays.copyOf constructs the requested array before inspecting source.
@@ -5158,12 +6067,20 @@ struct ManagedRuntime::Impl {
         const auto &type = image.types.at(method.owner);
         const auto &signature = image.prototypes.at(method.prototype).descriptor;
         ++metrics.core_calls;
+        if (virtual_dispatch && !args.empty() &&
+            (type == "Ljava/lang/CharSequence;" || type == "Ljava/lang/Object;"))
+            if (const auto result = hosted_char_sequence(reference(args[0]), method.name, signature, args))
+                return *result;
         if(type=="Ljava/util/ArrayList;" && method.name=="<init>" && signature=="(Ljava/util/Collection;)V")
             return array_list_construct_collection(reference(args[0]),reference(args[1]));
         if(type=="Ljava/lang/StringBuilder;" && method.name=="append" && signature=="(Z)Ljava/lang/StringBuilder;")
             return append_boolean(reference(args[0]),word(args[1])!=0);
         if(type=="Ljava/lang/StringBuilder;" && method.name=="append" && signature=="(Ljava/lang/Object;)Ljava/lang/StringBuilder;")
             return append_object(reference(args[0]),reference(args[1]));
+        if(type=="Ljava/lang/StringBuilder;" && method.name=="insert" && signature=="(ILjava/lang/String;)Ljava/lang/StringBuilder;")
+            return builder_insert(reference(args[0]),std::bit_cast<std::int32_t>(word(args[1])),reference(args[2]));
+        if(type=="Ljava/lang/StringBuilder;" && method.name=="reverse" && signature=="()Ljava/lang/StringBuilder;")
+            return builder_reverse(reference(args[0]));
         const bool object_view_method=type=="Ljava/lang/Object;" && virtual_dispatch &&
             ((method.name=="equals" && signature=="(Ljava/lang/Object;)Z") ||
              (method.name=="hashCode" && signature=="()I") || (method.name=="toString" && signature=="()Ljava/lang/String;"));
@@ -5351,6 +6268,8 @@ struct ManagedRuntime::Impl {
             run_pool_worker(reference(args[0]));return Value::nothing();
         }
         if (type == "Ljava/lang/Math;") {
+            if(method.name=="random" && signature=="()D")return math_random_value();
+            if(const auto value=invoke_math(method.name,signature,args))return *value;
             if ((method.name == "min" || method.name == "max") && signature == "(II)I") {
                 const auto a=std::bit_cast<std::int32_t>(word(args[0])), b=std::bit_cast<std::int32_t>(word(args[1]));
                 return Value::word(static_cast<std::uint32_t>(method.name == "min" ? std::min(a,b) : std::max(a,b)));
@@ -5622,6 +6541,23 @@ struct ManagedRuntime::Impl {
              (method.name=="compareTo" && (signature=="(Ljava/util/UUID;)I" || signature=="(Ljava/lang/Object;)I"))))
             if(object(reference(args[0])).uuid)
                 if(const auto result=invoke_uuid(reference(args[0]),method.name,signature,args))return *result;
+        if (type == long_type && method.name == "parseLong" &&
+            (signature == "(Ljava/lang/String;)J" || signature == "(Ljava/lang/String;I)J"))
+            return Value::wide(parse_long(runtime, reference(args[0]),
+                args.size() == 2 ? std::bit_cast<std::int32_t>(word(args[1])) : 10));
+        if (type == character_type && character_static(method.name, signature)) {
+            const auto code = static_cast<std::uint16_t>(word(args[0]));
+            if (method.name == "valueOf") return Value::reference(box_character(code));
+            if (method.name == "hashCode") return Value::word(code);
+            if (method.name == "compare") return Value::word(static_cast<std::uint32_t>(
+                static_cast<std::int32_t>(code) - static_cast<std::uint16_t>(word(args[1]))));
+            return Value::reference(runtime.new_string(std::u16string(1, static_cast<char16_t>(code))));
+        }
+        if (!args.empty() && character_method(method.name, signature) &&
+            (type == character_type || (virtual_dispatch &&
+                (type == "Ljava/lang/Object;" || type == "Ljava/lang/Comparable;"))) &&
+            object(reference(args[0])).character)
+            if (const auto result = invoke_character(reference(args[0]), method.name, signature, args)) return *result;
         if(type==long_type || type==short_type) {
             const bool large=type==long_type;
             if(method.name=="valueOf" && signature==(large?"(J)Ljava/lang/Long;":"(S)Ljava/lang/Short;"))return Value::reference(box_integral(type,args[0].bits));
@@ -5719,20 +6655,7 @@ struct ManagedRuntime::Impl {
         if (type == integer_type && method.name == "valueOf") {
             if (signature != "(I)Ljava/lang/Integer;")
                 fail("API_UNSUPPORTED", type + "." + method.name + signature + " is not implemented");
-            const auto bits = word(args[0]);
-            const auto number = std::bit_cast<std::int32_t>(bits);
-            const bool cached = number >= -128 && number <= 127;
-            const auto slot = cached ? static_cast<std::size_t>(number + 128) : 0;
-            if (cached && integer_cache[slot])
-                return Value::reference(integer_cache[slot]);
-            Object result;
-            result.type = integer_type;
-            result.integer = std::make_unique<ManagedInteger>();
-            result.integer->initialize(bits);
-            const auto id = allocate(std::move(result));
-            if (cached)
-                integer_cache[slot] = id;
-            return Value::reference(id);
+            return Value::reference(box_integer(word(args[0])));
         }
         if (type == integer_type || type == number_type || type == "Ljava/lang/Comparable;") {
             auto &receiver = object(reference(args[0]));
@@ -6124,11 +7047,18 @@ struct ManagedRuntime::Impl {
                 return Value::reference(0);
             fail("CLASS_LOADER_UNSUPPORTED", "Class loader provenance is incomplete for "+std::string(represented));
         }
+        if (type == "Ljava/lang/Class;" && (method.name == "getConstructor" || method.name == "getDeclaredConstructor") &&
+            signature == "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;")
+            return Value::reference(lookup_constructor(args, method.name == "getDeclaredConstructor"));
+        if (type == "Ljava/lang/reflect/Constructor;" && method.name == "newInstance" &&
+            signature == "([Ljava/lang/Object;)Ljava/lang/Object;")
+            return invoke_reflected_constructor(args);
         if (type == "Ljava/lang/Class;" && method.name == "getDeclaredField" &&
             signature == "(Ljava/lang/String;)Ljava/lang/reflect/Field;")
             return Value::reference(lookup_declared_field(args));
         if ((type == "Ljava/lang/reflect/AccessibleObject;" || type == "Ljava/lang/reflect/Executable;" ||
-             type == "Ljava/lang/reflect/Field;" || type == "Ljava/lang/reflect/Method;") && !args.empty() &&
+             type == "Ljava/lang/reflect/Field;" || type == "Ljava/lang/reflect/Method;" ||
+             type == "Ljava/lang/reflect/Constructor;") && !args.empty() &&
             ((method.name == "setAccessible" && signature == "(Z)V") ||
              (method.name == "isAccessible" && signature == "()Z"))) {
             auto &member=object(reference(args[0]));
@@ -6156,17 +7086,23 @@ struct ManagedRuntime::Impl {
         if (type == "Ljava/lang/Class;" && (method.name == "getMethod" || method.name=="getDeclaredMethod") &&
             signature == "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;")
             return Value::reference(lookup_public_method(args,method.name=="getDeclaredMethod"));
-        if (type == "Ljava/lang/reflect/Method;") {
-            const auto &state = object(reference(args[0])).reflected_method;
-            if (!state) fail("REFERENCE", "Method object has no validated declaration");
+        if (type == "Ljava/lang/reflect/Method;" || type == "Ljava/lang/reflect/Constructor;" ||
+            type == "Ljava/lang/reflect/Executable;") {
+            const auto &member = object(reference(args[0]));
+            const auto &state = member.reflected_method;
+            if (!state) fail("REFERENCE", "Executable object has no validated declaration");
+            const bool constructor = member.type == "Ljava/lang/reflect/Constructor;";
             const auto &metadata = state->metadata;
-            if (method.name == "invoke" && signature == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")
+            if (!constructor && type == "Ljava/lang/reflect/Method;" && method.name == "invoke" &&
+                signature == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")
                 return invoke_reflected_method(args);
             if (method.name == "getName" && signature == "()Ljava/lang/String;")
-                return Value::reference(runtime.new_string(std::u16string(metadata.name.begin(), metadata.name.end())));
+                return Value::reference(runtime.new_string(constructor ? binary_name(metadata.owner) :
+                    std::u16string(metadata.name.begin(), metadata.name.end())));
             if (method.name == "getDeclaringClass" && signature == "()Ljava/lang/Class;")
                 return Value::reference(runtime.class_object(metadata.owner));
-            if (method.name == "getReturnType" && signature == "()Ljava/lang/Class;")
+            if (!constructor && type == "Ljava/lang/reflect/Method;" && method.name == "getReturnType" &&
+                signature == "()Ljava/lang/Class;")
                 return Value::reference(runtime.class_object(metadata.return_type));
             if (method.name == "getModifiers" && signature == "()I") {
                 if (state->provider) fail("API_UNSUPPORTED", "Reflected provider modifier metadata is incomplete");
@@ -6484,6 +7420,15 @@ struct ManagedRuntime::Impl {
         }
         if(type=="Ljava/lang/String;" && method.name=="concat" && signature=="(Ljava/lang/String;)Ljava/lang/String;")
             return string_concat(reference(args[0]),reference(args[1]));
+        if(type=="Ljava/lang/String;" && method.name=="intern" && signature=="()Ljava/lang/String;")
+            return string_intern(reference(args[0]));
+        if((type=="Ljava/lang/String;" || (type=="Ljava/lang/Comparable;" && virtual_dispatch &&
+            object(reference(args[0])).type=="Ljava/lang/String;")) && method.name=="compareTo" &&
+           (signature=="(Ljava/lang/String;)I" || signature=="(Ljava/lang/Object;)I"))
+            return string_compare(reference(args[0]),reference(args[1]));
+        if(type=="Ljava/lang/String;" && method.name=="replace" &&
+           signature=="(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;")
+            return string_replace(reference(args[0]),reference(args[1]),reference(args[2]));
         if(type=="Ljava/lang/String;" && method.name=="contains" && signature=="(Ljava/lang/CharSequence;)Z")
             return string_contains(reference(args[0]),reference(args[1]));
         if(type=="Ljava/lang/String;" && method.name=="split" &&
@@ -6591,13 +7536,19 @@ struct ManagedRuntime::Impl {
                         appended = other ? runtime.char_sequence(other) : u"null";
                     } else
                         fail("API_UNSUPPORTED", type + "." + method.name + signature + " is not implemented");
-                    if (appended.size() > limits.array_length - text.size())
+                    // A hosted CharSequence read can resolve metadata. Do not
+                    // reuse the earlier borrowed receiver view afterward.
+                    const auto &current_text = object(id).text;
+                    if (appended.size() > limits.array_length - current_text.size())
                         fail("STRING_LIMIT", "StringBuilder append exceeds length limit");
-                    replace_text(id, std::u16string(text) + appended);
+                    replace_text(id, std::u16string(current_text) + appended);
                     return Value::reference(id);
                 }
             }
         }
+        if (type == "Ljava/lang/System;" && method.name == "arraycopy" &&
+            signature == "(Ljava/lang/Object;ILjava/lang/Object;II)V")
+            return system_arraycopy(args);
         if(type=="Ljava/lang/System;" && method.name=="getProperty" &&
            (signature=="(Ljava/lang/String;)Ljava/lang/String;" ||
             signature=="(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")) {
@@ -6924,9 +7875,14 @@ struct ManagedRuntime::Impl {
         return Value::wide(std::bit_cast<std::uint64_t>(value));
     }
     Value execute(Frame &frame, const VerifiedCode &code) {
+        RuntimeAllocationPhase allocation_phase=RuntimeAllocationPhase::execute;
+        frame.executing=true;
+        struct Executing {Frame &frame;~Executing(){frame.executing=false;}} executing{frame};
+        try {
         report_progress(RuntimeProgressStage::managed_enter,frame.method,frame.pc);
         const auto &method = image.methods.at(frame.method);
         for (;;) {
+            allocation_phase=RuntimeAllocationPhase::execute;
             safepoint();
             if (!scheduled_task() && main_callback_inflight) {
                 if (!main_callback_work_remaining)
@@ -7035,13 +7991,15 @@ struct ManagedRuntime::Impl {
                 else if (op == 0x2b) {
                     const auto key = std::bit_cast<std::int32_t>(word(get(ins.a)));
                     const auto at = std::int64_t(key) - ins.switch_first;
-                    if (at >= 0 && static_cast<std::uint64_t>(at) < ins.switch_targets.size())
-                        next = ins.switch_targets[static_cast<std::size_t>(at)];
+                    const auto &targets = ins.switch_targets();
+                    if (at >= 0 && static_cast<std::uint64_t>(at) < targets.size())
+                        next = targets[static_cast<std::size_t>(at)];
                 } else if (op == 0x2c) {
                     const auto key = std::bit_cast<std::int32_t>(word(get(ins.a)));
-                    const auto found = std::lower_bound(ins.switch_keys.begin(), ins.switch_keys.end(), key);
-                    if (found != ins.switch_keys.end() && *found == key)
-                        next = ins.switch_targets[static_cast<std::size_t>(found - ins.switch_keys.begin())];
+                    const auto &keys = ins.switch_keys();
+                    const auto found = std::lower_bound(keys.begin(), keys.end(), key);
+                    if (found != keys.end() && *found == key)
+                        next = ins.switch_targets()[static_cast<std::size_t>(found - keys.begin())];
                 } else if (op >= 0x2d && op <= 0x31) {
                     std::int32_t compare = 0;
                     if (op == 0x31) {
@@ -7115,9 +8073,14 @@ struct ManagedRuntime::Impl {
                     const bool time_constant = op == 0x62 && image.types.at(field.owner) == time_unit_type &&
                         image.types.at(field.type) == time_unit_type && time_unit_index(field.name).has_value();
                     const auto field_name = image.types.at(field.owner) + "." + field.name + ":" + image.types.at(field.type);
-                    if (!field.declared && op == 0x54) {
-                        put(read_public_provider_field(ins.index,frame,ins.b));
+                    if (!field.declared && (op == 0x54 || (op == 0x52 && image.types.at(field.type) == "I"))) {
+                        put(read_public_provider_field(ins.index,frame,ins.b,op == 0x54));
                         frame.pc=next;
+                        continue;
+                    }
+                    if (!field.declared && (op == 0x5b || (op == 0x59 && image.types.at(field.type) == "I"))) {
+                        write_public_provider_field(ins.index, frame, ins.b, get(ins.a), op == 0x5b);
+                        frame.pc = next;
                         continue;
                     }
                     if (!field.declared && !time_constant && !(op >= 0x60 && op < 0x67))
@@ -7177,7 +8140,15 @@ struct ManagedRuntime::Impl {
                         dispatch = virtual_target(ins.index, reference(args[0]));
                     else if (op == 0x6f || op == 0x75)
                         dispatch = super_target(frame.method, ins.index, reference(args[0]));
-                    frame.result = runtime.invoke_resolved(dispatch, args, virtual_call || interface_call);
+                    bool activation_delegation = false;
+                    if ((op == 0x6f || op == 0x75) && target.name == "performClick" && proto.descriptor == "()Z" &&
+                        frame.method != no_index && !frame.arguments.empty() && !args.empty()) {
+                        const auto &caller = image.methods.at(frame.method);
+                        activation_delegation = !(caller.flags & 8u) && caller.name == "performClick" &&
+                            image.prototypes.at(caller.prototype).descriptor == "()Z" &&
+                            reference(frame.arguments[0]) == reference(args[0]);
+                    }
+                    frame.result = runtime.invoke_resolved(dispatch, args, virtual_call || interface_call, activation_delegation);
                 } else if (op >= 0x8d && op <= 0x8f) {
                     // Narrow the low bits, then explicitly extend the signed
                     // byte/short or unsigned Java char back to a full DEX word.
@@ -7210,6 +8181,7 @@ struct ManagedRuntime::Impl {
                 } else
                     fail("OPCODE_UNSUPPORTED", "Missing opcode executor");
             } catch (const JavaException &error) {
+                allocation_phase=RuntimeAllocationPhase::exception_handler;
                 execution_checkpoint();
                 bool handled = false;
                 for (const auto &block : method.code->tries) {
@@ -7231,14 +8203,21 @@ struct ManagedRuntime::Impl {
                 if (!handled)
                     throw;
             } catch (const DexError &error) {
+                allocation_phase=RuntimeAllocationPhase::error_diagnostic;
                 execution_checkpoint();
                 throw DexError(error.code, image.types.at(method.owner) + "." + method.name +
                                                " pc=" + std::to_string(ins.pc) + ": " + error.what());
             }
             frame.pc = next;
         }
+        } catch(const std::bad_alloc &) {
+            report_allocation_failure(allocation_phase,frame.method,&frame);
+            allocation_failure_checkpoint();throw;
+        }
     }
-    Value invoke(Index index, std::span<const Value> arguments, bool virtual_dispatch) {
+    Value invoke(Index index, std::span<const Value> arguments, bool virtual_dispatch, bool activation_delegation) {
+        RuntimeAllocationPhase allocation_phase=RuntimeAllocationPhase::invoke_setup;
+        try {
         check_thread();
         execution_checkpoint();
         if (index >= image.methods.size())
@@ -7271,6 +8250,9 @@ struct ManagedRuntime::Impl {
             ~Pop() { owner_context.frames.pop_back(); }
         } pop{current_context()};
         metrics.maximum_frames = std::max(metrics.maximum_frames, frame_count());
+        std::optional<ViewActivationScope> activation;
+        if (!stat && method.name == "performClick" && prototype.descriptor == "()Z")
+            activation.emplace(runtime, reference(frame.arguments[0]), activation_delegation);
         if (stat && method.name != "<clinit>")
             initialize(type);
         Value result;
@@ -7279,9 +8261,27 @@ struct ManagedRuntime::Impl {
         // native implicit-monitor contract remains unsupported, never skipped.
         if (method.declared && (method.flags & 0x20))
             fail("SYNCHRONIZATION_UNSUPPORTED", "Implicit synchronized method monitors are not implemented");
-        if (!method.declared)
-            result = core(index, frame.arguments, virtual_dispatch);
-        else if (method.flags & 0x100) {
+        if (host && method.declared && !stat && method.name == "setSelectionRequired" &&
+            prototype.descriptor == "(Z)V")
+            host->collection_selection_policy_write(runtime, reference(frame.arguments[0]));
+        if (!method.declared) {
+            allocation_phase=RuntimeAllocationPhase::core;
+            // A symbolic Set/Iterator/Object declaration can dispatch to a
+            // genuine Android provider implementation. Managed overrides were
+            // already selected by virtual_target; direct/super calls keep the
+            // original core/provider path.
+            std::optional<Value> provided;
+            if (virtual_dispatch && !stat) {
+                std::vector<std::string> parameters;
+                parameters.reserve(prototype.parameters.size());
+                for (const auto parameter : prototype.parameters)
+                    parameters.push_back(image.types.at(parameter));
+                provided = hosted_virtual(reference(frame.arguments[0]), method.name, parameters,
+                                          image.types.at(prototype.return_type), frame.arguments, true);
+            }
+            result = provided ? *provided : core(index, frame.arguments, virtual_dispatch);
+        } else if (method.flags & 0x100) {
+            allocation_phase=RuntimeAllocationPhase::native;
             if(background() && (native_context_depth || !native || !native->supports_background()))fail("TASK_NATIVE_UNSUPPORTED","Background managed native calls require per-context JNI/CPU state");
             NonYielding barrier(current_context());
             if (!native)
@@ -7293,15 +8293,18 @@ struct ManagedRuntime::Impl {
         } else {
             if (!method.code)
                 fail("ABSTRACT_METHOD", "Method has no executable body");
+            allocation_phase=RuntimeAllocationPhase::verification;
             if (!verified.contains(index))
                 verified.emplace(index, verify(image, index));
             ++metrics.managed_calls;
+            allocation_phase=RuntimeAllocationPhase::registers;
             frame.registers.resize(method.code->registers);
             auto reg = std::uint32_t(method.code->registers - method.code->incoming);
             for (auto value : frame.arguments) {
                 frame.put(reg, value);
                 reg += value.kind == ValueKind::wide ? 2 : 1;
             }
+            allocation_phase=RuntimeAllocationPhase::execute;
             try {
                 result = execute(frame, verified.at(index));
             } catch (const JavaException &) {
@@ -7313,10 +8316,52 @@ struct ManagedRuntime::Impl {
                 runtime.raise("Ljava/lang/IllegalMonitorStateException;");
         }
         frame.result=result; // Root newly returned references through subtype/loader callbacks.
+        allocation_phase=RuntimeAllocationPhase::return_validation;
         execution_checkpoint();
-        return typed(result, image.types[prototype.return_type]);
+        const auto validated = typed(result, image.types[prototype.return_type]);
+        if (activation) activation->complete(validated.kind == ValueKind::word && validated.bits != 0);
+        return validated;
+        } catch(const std::bad_alloc &) {
+            report_allocation_failure(allocation_phase,index);
+            allocation_failure_checkpoint();throw;
+        }
     }
 };
+ViewActivationScope::ViewActivationScope(ManagedRuntime &runtime, ObjectId receiver, bool delegation) {
+    auto &impl = *runtime.impl_;
+    impl.check_thread();
+    if (!receiver || !impl.host) return;
+    const auto generation = impl.host->begin_view_activation(receiver);
+    if (!generation) return;
+    auto &context = impl.current_context();
+    auto state = std::make_unique<ViewActivationState>();
+    state->runtime = &runtime; state->provider = impl.host;
+    state->provider_generation = impl.host_generation;
+    state->context = &context; state->previous = context.activation;
+    state->receiver = receiver; state->generation = generation;
+    const auto previous = state->previous;
+    state->delegation_parent = delegation && previous && previous->receiver == receiver &&
+        previous->generation == generation && previous->provider == impl.host &&
+        previous->provider_generation == impl.host_generation ? previous : nullptr;
+    // Publish only fully initialized storage. GC traces every active receiver
+    // through its logical ExecutionContext, including suspended callbacks.
+    context.activation = state.get();
+    state_ = std::move(state);
+}
+ViewActivationScope::~ViewActivationScope() noexcept {
+    if (!state_) return;
+    auto &context = *static_cast<ExecutionContext *>(state_->context);
+    context.activation = state_->previous;
+}
+void ViewActivationScope::complete(bool activated) noexcept {
+    if (!activated || !state_) return;
+    auto &impl = *state_->runtime->impl_;
+    if (state_->recorded || impl.host != state_->provider || impl.host_generation != state_->provider_generation) return;
+    // Consume this call and its explicit delegation ancestors before observation.
+    // A later sibling super call starts unrecorded and represents another action.
+    for (auto *scope = state_.get(); scope; scope = scope->delegation_parent) scope->recorded = true;
+    impl.host->view_activated(state_->receiver, state_->generation);
+}
 ManagedRuntime::ManagedRuntime(DexImage image, RuntimeLimits limits)
     : impl_(std::make_unique<Impl>(*this, std::move(image), limits)) {}
 ManagedRuntime::ManagedRuntime(std::shared_ptr<ClassSource> source, RuntimeLimits limits)
@@ -7327,6 +8372,7 @@ void ManagedRuntime::set_progress_sink(RuntimeProgressSink *sink) {
     if (sink && !sink->prepare_native_stack())
         fail("PROGRESS_STACK", "Cannot prepare bounded native fault diagnostics on owner stack");
     p.progress_sink=sink;
+    p.allocation_failure_reported=false;
 }
 void ManagedRuntime::set_native_interface(NativeInterface *interface) {
     impl_->check_thread(interface == nullptr);
@@ -7355,7 +8401,8 @@ const RuntimeMetrics &ManagedRuntime::metrics() const noexcept { return impl_->m
 Value ManagedRuntime::invoke(Index method, std::span<const Value> arguments) {
     return invoke_resolved(method, arguments, false);
 }
-Value ManagedRuntime::invoke_resolved(Index method, std::span<const Value> arguments, bool virtual_dispatch) {
+Value ManagedRuntime::invoke_resolved(Index method, std::span<const Value> arguments, bool virtual_dispatch,
+                                      bool activation_delegation) {
     auto &p = *impl_;
     p.check_thread(true);p.execution_checkpoint();
     p.check_thread();
@@ -7371,7 +8418,7 @@ Value ManagedRuntime::invoke_resolved(Index method, std::span<const Value> argum
         ~End() { --owner_context.invocations; }
     } end{p.current_context()};
     try {
-        const auto result = p.invoke(method, arguments, virtual_dispatch);
+        const auto result = p.invoke(method, arguments, virtual_dispatch, activation_delegation);
         if (outer)
             p.current_context().last_result = result;
         return result;
@@ -7430,6 +8477,307 @@ Index ManagedRuntime::lookup(std::string_view owner, std::string_view name, std:
         fail("SIGNATURE", "Method lookup static/instance mismatch");
     return index;
 }
+Index ManagedRuntime::lookup_jni_method(std::string_view owner, std::string_view name,
+                                        std::string_view signature, bool is_static) {
+    return lookup_jni_method_impl(owner, name, signature, is_static, true);
+}
+bool ManagedRuntime::jni_method_compatible(Index index, std::string_view supplied_class) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (index >= p.image.methods.size())
+        fail("METHOD_METADATA", "Invalid canonical JNI method declaration index");
+    const auto &method = p.image.methods.at(index);
+    if (!method.declared)
+        fail("METHOD_UNSUPPORTED", "Symbolic JNI method compatibility requires its original lookup Class");
+    if (method.prototype >= p.image.prototypes.size())
+        fail("METHOD_METADATA", "Canonical JNI method has invalid prototype metadata");
+    try {
+        return lookup_jni_method_impl(supplied_class, method.name,
+            p.image.prototypes.at(method.prototype).descriptor, bool(method.flags & 8), false) == index;
+    } catch (const DexError &error) {
+        if (error.code != "AETHER_DEX_METHOD_NOT_FOUND" && error.code != "AETHER_DEX_SIGNATURE")
+            throw;
+        return false;
+    }
+}
+Index ManagedRuntime::lookup_jni_method_impl(std::string_view owner, std::string_view name,
+                                             std::string_view signature, bool is_static, bool initialize_class) {
+    auto &p = *impl_;
+    if (initialize_class)
+        p.initialize(owner);
+    else {
+        p.check_thread();
+        p.known(owner); // Class loading/metadata only, never class initialization.
+    }
+    if (name.size() > 1024 || signature.size() > 1024)
+        fail("METHOD_LIMIT", "Native method name or descriptor exceeds 1024 bytes");
+    if (name.empty() || signature.empty() || name == "<clinit>" ||
+        (name == "<init>" && is_static))
+        fail("METHOD_NOT_FOUND", "Invalid native method name or descriptor");
+    for (const auto text : {name, signature})
+        for (const auto character : text)
+            if (static_cast<unsigned char>(character) < 0x21 ||
+                static_cast<unsigned char>(character) > 0x7e)
+                fail("METHOD_UNSUPPORTED", "Native method metadata requires supported ASCII identifiers");
+    const bool constructor = name == "<init>";
+    std::size_t work = 0;
+    const auto charge = [&] {
+        if (++work > 262144)
+            fail("METHOD_LIMIT", "Native method lookup exceeds its work budget");
+    };
+    const auto selected = [&](Index index) {
+        if (bool(p.image.methods.at(index).flags & 8) != is_static)
+            fail("METHOD_NOT_FOUND", "Native method lookup static/instance mismatch");
+        return index;
+    };
+    const auto declared = [&](const Class &definition, std::string_view descriptor,
+                              bool inherited_interface) -> std::optional<Index> {
+        if (definition.type >= p.image.types.size() || p.image.types.at(definition.type) != descriptor ||
+            std::popcount(definition.flags & 7u) > 1)
+            fail("METHOD_METADATA", "Native declaring class has invalid ownership or visibility");
+        const std::array inventories{&definition.direct_methods, &definition.virtual_methods};
+        for (std::size_t kind = inherited_interface ? 1u : 0u; kind < inventories.size(); ++kind) {
+            for (const auto index : *inventories[kind]) {
+                charge();
+                if (index >= p.image.methods.size())
+                    fail("METHOD_METADATA", "Native method inventory has an invalid index");
+                const auto &method = p.image.methods.at(index);
+                if (!method.declared || method.owner != definition.type || method.direct != (kind == 0) ||
+                    method.owner >= p.image.types.size() || method.prototype >= p.image.prototypes.size() ||
+                    std::popcount(method.flags & 7u) > 1 ||
+                    (inherited_interface && (method.flags & (8u | 2u))))
+                    fail("METHOD_METADATA", "Native method inventory has invalid declaration ownership");
+                const auto &prototype = p.image.prototypes.at(method.prototype);
+                if (method.name == name && prototype.descriptor == signature)
+                    return index;
+            }
+        }
+        return {};
+    };
+    const auto package = [](std::string_view type) {
+        const auto slash = type.rfind('/');
+        return type.substr(0, slash == type.npos ? 0 : slash);
+    };
+    std::string current(owner);
+    std::set<std::string> seen;
+    std::vector<std::string> class_path;
+    std::vector<Index> interface_roots;
+    std::optional<Index> uninherited;
+    bool target_interface = false;
+    while (!current.empty()) {
+        charge();
+        if (!seen.insert(current).second)
+            fail("CLASS_LIMIT", "Cyclic native method superclass hierarchy");
+        if (seen.size() > 65536)
+            fail("CLASS_LIMIT", "Native method hierarchy exceeds 65536 classes");
+        const auto *definition = p.resolve_class(current);
+        if (!definition) {
+            // Exact core/provider symbolic dispatch remains the existing
+            // fallback, not a complete inherited declaration inventory. An
+            // Object miss must not prevent the owned interface search below.
+            try { return lookup(current, name, signature, is_static); }
+            catch (const DexError &error) {
+                if (error.code != "AETHER_DEX_METHOD_NOT_FOUND")
+                    throw;
+                if (current != "Ljava/lang/Object;")
+                    fail("METHOD_UNSUPPORTED", "Native superclass provider method inventory is incomplete");
+                if (current != "Ljava/lang/Object;" || class_path.empty())
+                    throw;
+            }
+            break;
+        }
+        if (class_path.empty())
+            target_interface = (definition->flags & 0x200) != 0;
+        class_path.push_back(current);
+        if (const auto index = declared(*definition, current, false)) {
+            const auto flags = p.image.methods.at(*index).flags;
+            // ART searches an inherited superclass declaration before copied
+            // interface methods. Package access survives only an unbroken
+            // same-package path; private methods are not inherited.
+            const bool inherited = (flags & (1u | 4u)) || (!(flags & 2u) &&
+                std::all_of(class_path.begin(), class_path.end(), [&](const auto &type) {
+                    charge(); return package(type) == package(current);
+                }));
+            if (class_path.size() == 1 || inherited)
+                return selected(*index);
+            // Copied interface methods are searched only below the first
+            // uninherited declaration; that declaration is the final fallback.
+            uninherited = *index;
+            break;
+        }
+        if (constructor)
+            break; // Constructors cannot be inherited, even through symbolic references.
+        for (const auto interface_type : definition->interfaces) {
+            charge();
+            if (interface_type >= p.image.types.size())
+                fail("METHOD_METADATA", "Native interface inventory has an invalid type");
+            interface_roots.push_back(interface_type);
+        }
+        if (target_interface)
+            break; // Do not treat an interface's encoded Object parent as inheritance.
+        if (definition->superclass == no_index)
+            break;
+        charge();
+        if (definition->superclass >= p.image.types.size())
+            fail("METHOD_METADATA", "Native superclass inventory has an invalid type");
+        current = p.image.types.at(definition->superclass);
+    }
+
+    struct InterfaceDeclaration {
+        const Class *definition;
+        std::optional<Index> method;
+        bool complete = false;
+    };
+    std::map<Index, InterfaceDeclaration> graph;
+    std::vector<std::pair<Index, bool>> pending;
+    for (auto it = interface_roots.rbegin(); it != interface_roots.rend(); ++it)
+        pending.emplace_back(*it, false);
+    while (!pending.empty()) {
+        charge();
+        const auto [type, exiting] = pending.back();
+        pending.pop_back();
+        if (exiting) { graph.at(type).complete = true; continue; }
+        if (const auto found = graph.find(type); found != graph.end()) {
+            if (!found->second.complete)
+                fail("CLASS_LIMIT", "Cyclic native interface method hierarchy");
+            continue;
+        }
+        if (graph.size() + seen.size() >= 65536)
+            fail("CLASS_LIMIT", "Native interface hierarchy exceeds 65536 classes");
+        if (type >= p.image.types.size())
+            fail("METHOD_METADATA", "Native interface inventory has an invalid type");
+        const auto &descriptor = p.image.types.at(type);
+        const auto *definition = p.resolve_class(descriptor);
+        if (!definition)
+            fail("METHOD_UNSUPPORTED", "Native interface provider method inventory is incomplete");
+        if (!(definition->flags & 0x200))
+            fail("METHOD_METADATA", "Native interface inventory names an ordinary class");
+        const auto method = declared(*definition, descriptor, true);
+        graph.emplace(type, InterfaceDeclaration{definition, method});
+        pending.emplace_back(type, true);
+        for (auto it = definition->interfaces.rbegin(); it != definition->interfaces.rend(); ++it) {
+            charge();
+            pending.emplace_back(*it, false);
+        }
+    }
+    // Suppress strict ancestors once over the union, including defaults masked
+    // by abstract redeclarations. Lookup must still return an abstract method
+    // ID; default_target() is an invocation resolver and rejects that outcome.
+    std::set<Index> ancestors;
+    std::vector<Index> ancestor_work;
+    for (const auto &[type, entry] : graph) {
+        (void)type;
+        if (entry.method)
+            for (const auto parent : entry.definition->interfaces) {
+                charge(); ancestor_work.push_back(parent);
+            }
+    }
+    while (!ancestor_work.empty()) {
+        charge();
+        const auto type = ancestor_work.back();
+        ancestor_work.pop_back();
+        if (!ancestors.insert(type).second)
+            continue;
+        for (const auto parent : graph.at(type).definition->interfaces) {
+            charge(); ancestor_work.push_back(parent);
+        }
+    }
+    std::optional<Index> concrete, abstract_method;
+    for (const auto &[type, entry] : graph) {
+        charge();
+        if (!entry.method || ancestors.contains(type))
+            continue;
+        const auto &method = p.image.methods.at(*entry.method);
+        if (method.flags & 0x400) {
+            if (!abstract_method || *entry.method < *abstract_method)
+                abstract_method = entry.method;
+        } else {
+            if (!method.code)
+                fail("METHOD_UNSUPPORTED", "Native interface default has no supported owned body");
+            if (concrete)
+                // ART uses a copied conflict stub. Returning an ordinary
+                // default ID here would let CallNonvirtual bypass the conflict.
+                fail("METHOD_UNSUPPORTED", "Conflicting native interface defaults require an actual conflict method ID");
+            concrete = entry.method;
+        }
+    }
+    if (concrete || abstract_method)
+        return selected(concrete ? *concrete : *abstract_method);
+    if (uninherited)
+        return selected(*uninherited);
+    if (target_interface && !constructor && !is_static) {
+        // An interface may expose public nonstatic Object declarations after
+        // its own hierarchy. Authenticate the existing symbolic ID against the
+        // runtime's exact Object inventory; do not synthesize a new DEX method.
+        if (const auto *object_class = p.resolve_class("Ljava/lang/Object;")) {
+            if (const auto index = declared(*object_class, "Ljava/lang/Object;", false)) {
+                const auto flags = p.image.methods.at(*index).flags;
+                if ((flags & 1u) && !(flags & 8u))
+                    return *index;
+            }
+        } else {
+            // Same nine public declarations as object_public_method(), without
+            // its reflective metadata allocation or additional global-ID scan.
+            constexpr std::array<std::pair<std::string_view, std::string_view>, 9> public_object{{
+                {"getClass", "()Ljava/lang/Class;"}, {"equals", "(Ljava/lang/Object;)Z"},
+                {"hashCode", "()I"}, {"toString", "()Ljava/lang/String;"},
+                {"notify", "()V"}, {"notifyAll", "()V"}, {"wait", "()V"},
+                {"wait", "(J)V"}, {"wait", "(JI)V"}}};
+            for (const auto &[method_name, descriptor] : public_object) {
+                charge();
+                if (method_name != name || descriptor != signature)
+                    continue;
+                try { return lookup("Ljava/lang/Object;", name, signature, false); }
+                catch (const DexError &error) {
+                    if (error.code != "AETHER_DEX_METHOD_NOT_FOUND" && error.code != "AETHER_DEX_SIGNATURE")
+                        throw;
+                }
+                break;
+            }
+        }
+    }
+    fail("METHOD_NOT_FOUND", "No matching declared native method exists in the owned hierarchy");
+}
+std::optional<std::string> ManagedRuntime::superclass(std::string_view descriptor) const {
+    auto &p = *impl_;
+    p.check_thread();
+    p.known(descriptor);
+    if (descriptor == "Ljava/lang/Object;" ||
+        (descriptor.size() == 1 && std::string_view("VZBSCIJFD").find(descriptor.front()) != std::string_view::npos) ||
+        p.is_interface(descriptor))
+        return {};
+    if (descriptor.starts_with('['))
+        return std::string("Ljava/lang/Object;");
+    if (const auto *definition = p.resolve_class(descriptor)) {
+        if (definition->superclass == no_index)
+            fail("CLASS_METADATA", "Non-Object managed class has no declared superclass");
+        return p.image.types.at(definition->superclass);
+    }
+    if (p.host)
+        if (const auto info = p.provider_call([&] { return p.host->class_info(descriptor); })) {
+            if (info->superclass.empty())
+                fail("CLASS_METADATA", "Non-Object provider class has no declared superclass");
+            p.known(info->superclass);
+            return std::string(info->superclass);
+        }
+    // The KeySetView adapter currently has only coarse assignability metadata;
+    // its real CollectionView direct parent is not in this runtime's class space.
+    // Do not expose that dispatch shortcut as an authoritative JNI superclass.
+    if (descriptor == map_keys_type)
+        fail("CLASS_UNSUPPORTED", "KeySetView direct superclass metadata is unavailable");
+    const auto parent = core_super(descriptor);
+    if (parent.empty())
+        fail("CLASS_UNSUPPORTED", "Superclass metadata is unavailable for the requested class");
+    p.known(parent);
+    return std::string(parent);
+}
+bool ManagedRuntime::class_assignable(std::string_view from, std::string_view to) const {
+    auto &p = *impl_;
+    p.check_thread();
+    p.known(from);
+    p.known(to);
+    return p.subtype(from, to);
+}
 void ManagedRuntime::initialize(std::string_view descriptor) { impl_->initialize(descriptor); }
 ObjectId ManagedRuntime::new_object(std::string_view type) {
     auto &p = *impl_;
@@ -7470,6 +8818,8 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
         (atomic_info && (atomic_info->is_abstract || atomic_info->is_interface)) ||
         (literal && (literal->is_abstract || literal->is_interface)))
         fail("ALLOCATION", "Cannot instantiate abstract class or interface");
+    if (type == "Ljava/lang/VirtualMachineError;")
+        fail("ALLOCATION", "Cannot instantiate abstract VirtualMachineError");
     Object result;
     result.type = type;
     if (type == snapshot_iterator_type)
@@ -7485,7 +8835,7 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
             fail("ALLOCATION_UNSUPPORTED","Synchronized list views require their validated collection factory");
         if(unmodifiable_class(type))
             fail("ALLOCATION_UNSUPPORTED","Unmodifiable views require their validated collection factory");
-        if(literal_metadata_class(type))
+        if(literal_metadata_class(type) && type != character_type)
             fail("ALLOCATION_UNSUPPORTED",std::string(type)+" has class metadata only; storage and methods are not implemented");
         if(type=="Ljava/util/BitSet;")
             fail("ALLOCATION_UNSUPPORTED","BitSet class metadata is available; BitSet storage and methods are not implemented");
@@ -7505,7 +8855,8 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
             fail("ALLOCATION_UNSUPPORTED", "Guest ThreadGroup creation is not implemented; use the owner group");
         if (type == "Ljava/lang/ClassLoader;" || type == "Laether/dex/RuntimeClassLoader;")
             fail("ALLOCATION_UNSUPPORTED", "ClassLoader objects require the canonical runtime class space");
-        if (type == "Ljava/lang/reflect/Method;" || type == "Ljava/lang/reflect/Field;" ||
+        if (type == "Ljava/lang/reflect/Method;" || type == "Ljava/lang/reflect/Constructor;" ||
+            type == "Ljava/lang/reflect/Field;" ||
             type == "Ljava/lang/reflect/Executable;" || type == "Ljava/lang/reflect/AccessibleObject;")
             fail("ALLOCATION_UNSUPPORTED", "Reflection objects require validated lookup");
         if (type == synchronized_map_type)
@@ -7576,6 +8927,10 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
         if(type==byte_type) {
             if(result.type!=type)fail("ALLOCATION_UNSUPPORTED","Byte is final and cannot be subclassed");
             result.byte=std::make_unique<ManagedByte>();
+        }
+        if (type == character_type) {
+            if (result.type != type) fail("ALLOCATION_UNSUPPORTED", "Character is final and cannot be subclassed");
+            result.character = std::make_unique<ManagedCharacter>();
         }
         if(type==boolean_type) {
             if(result.type!=type)fail("ALLOCATION_UNSUPPORTED","Boolean is final and cannot be subclassed");
@@ -7983,6 +9338,43 @@ ObjectId ManagedRuntime::new_string(std::u16string_view value) {
     result.text = value;
     return impl_->allocate(std::move(result));
 }
+ObjectId ManagedRuntime::new_host_input_stream(std::unique_ptr<HostInputStream> source) {
+    auto &p = *impl_;
+    struct Close {
+        std::unique_ptr<HostInputStream> &source;
+        ~Close() { if (source) (void)source->close(); }
+    } close{source};
+    p.check_thread();
+    if (!source || !p.host) fail("INPUT_STREAM_UNSUPPORTED", "A current provider and actual input source are required");
+    if (p.resolve_class(file_input_stream_type) || p.resolve_class(input_stream_type))
+        fail("STREAM_PROVIDER", "Package classes collide with the actual runtime input stream implementation");
+    auto *const provider = p.host;
+    const auto generation = p.host_generation;
+    const auto charge = source->bytes();
+    if (charge < sizeof(HostInputStream) || charge > p.limits.heap_bytes)
+        fail("HEAP_LIMIT", "Input adapter has invalid or excessive fixed storage");
+    const auto id = new_object(file_input_stream_type);
+    retain(id);
+    struct Release { ManagedRuntime &runtime; ObjectId id; ~Release() { runtime.release(id); } } root{*this, id};
+    if (charge > p.limits.heap_bytes - p.metrics.heap_bytes) collect();
+    if (charge > p.limits.heap_bytes - p.metrics.heap_bytes)
+        fail("HEAP_LIMIT", "Input adapter exceeds shared heap quota");
+    if (p.host != provider || p.host_generation != generation)
+        fail("STREAM_PROVIDER", "Input stream provider binding changed during adoption");
+    if (source->bytes() != charge) fail("STREAM_STATE", "Input adapter byte accounting changed during admission");
+    auto &object = p.object(id);
+    auto &state = p.stream_state(id, false);
+    if (state.initialized || state.source) fail("STREAM_STATE", "Input stream adoption requires fresh runtime storage");
+    // Commit only after every allocating/admission step has completed. Until
+    // now the local guard owns close; afterward ManagedStream owns it.
+    state.source = std::move(source);
+    state.source_bytes = charge;
+    state.provider_generation = generation;
+    state.initialized = true;
+    object.bytes += charge;
+    p.metrics.heap_bytes += charge;
+    return id;
+}
 ObjectId ManagedRuntime::new_string_set(std::span<const std::optional<std::u16string>> values) {
     auto &p=*impl_;p.check_thread();
     if(values.size()>p.limits.array_length)fail("MAP_LIMIT","Managed string set exceeds element limit");
@@ -8052,10 +9444,21 @@ std::u16string_view ManagedRuntime::string(ObjectId object) const {
     return o.text;
 }
 std::u16string_view ManagedRuntime::char_sequence(ObjectId object) const {
-    const auto &o = impl_->object(object);
-    if (o.type != "Ljava/lang/String;" && o.type != "Ljava/lang/StringBuilder;")
-        fail("API_UNSUPPORTED", "CharSequence implementation is not supported: " + o.type);
-    return o.text;
+    auto &p = *impl_;
+    const auto &o = p.object(object);
+    if (o.type == "Ljava/lang/String;" || o.type == "Ljava/lang/StringBuilder;") return o.text;
+    const auto type = std::string(o.type);
+    if (!p.subtype(type, "Ljava/lang/CharSequence;"))
+        fail("API_UNSUPPORTED", "Object is not a supported CharSequence: " + type);
+    if (p.resolve_class(type))
+        fail("API_UNSUPPORTED", "Managed CharSequence subclasses require virtual capture, not a base storage view");
+    const auto *state = p.object(object).host_state.get();
+    if (state) if (const auto text = state->char_sequence_view()) {
+        if (text->size() > p.limits.array_length)
+            fail("STRING_LIMIT", "Hosted CharSequence exceeds the managed character bound");
+        return *text;
+    }
+    fail("API_UNSUPPORTED", "CharSequence implementation has no supported storage: " + type);
 }
 std::u16string_view ManagedRuntime::exception_message(ObjectId object) const {
     const auto &o = impl_->object(object);
@@ -8083,6 +9486,16 @@ void ManagedRuntime::array_set(ObjectId object, std::int32_t index, Value value)
         fail("VALUE_TYPE", "Expected an array object");
     if (index < 0 || static_cast<std::size_t>(index) >= o.elements.size())
         raise("Ljava/lang/ArrayIndexOutOfBoundsException;");
+    if (o.type == "[Ljava/lang/Object;") {
+        // Every live managed reference is an Object. Internal Object[] list
+        // updates must not resolve metadata or allocate midway through a shift.
+        // Keep value-kind and liveness validation; narrower arrays still use
+        // the full component assignability path below.
+        const auto id = reference(value);
+        if (id) (void)impl_->object(id);
+        o.elements[static_cast<std::size_t>(index)] = Value::reference(id);
+        return;
+    }
     const auto component = std::string_view(o.type).substr(1);
     if (reference_type(component) && !assignable(reference(value), component))
         raise("Ljava/lang/ArrayStoreException;");
@@ -8150,6 +9563,368 @@ void ManagedRuntime::set_host_state(ObjectId id, std::unique_ptr<HostObjectState
     p.metrics.heap_bytes = p.metrics.heap_bytes - old + bytes;
     target.host_bytes = bytes;
     target.host_state = std::move(state);
+}
+Index ManagedRuntime::lookup_instance_field(std::string_view owner, std::string_view name,
+                                           std::string_view descriptor) {
+    auto &p = *impl_;
+    p.initialize(owner);
+    if (name.size() > 1024 || descriptor.size() > 1024)
+        fail("FIELD_LIMIT", "Native field name or descriptor exceeds 1024 bytes");
+    for (const auto text : {name, descriptor})
+        for (const auto character : text)
+            if (static_cast<unsigned char>(character) > 0x7e)
+                fail("FIELD_UNSUPPORTED", "Non-ASCII native field identifiers are not supported");
+    if (name.empty() || std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 0x21; }) ||
+        !Impl::static_field_descriptor(descriptor))
+        fail("FIELD_NOT_FOUND", "Invalid native instance field name or descriptor");
+    try { p.known(descriptor); }
+    catch (const DexError &error) {
+        if (error.code != "AETHER_DEX_CLASS_UNSUPPORTED" && error.code != "AETHER_DEX_CLASS_NOT_FOUND")
+            throw;
+        fail("FIELD_UNSUPPORTED", "Native instance field descriptor type is unavailable");
+    }
+    std::string current(owner);
+    std::set<std::string> seen;
+    std::size_t work = 0;
+    const auto charge = [&] {
+        if (++work > 262144)
+            fail("FIELD_LIMIT", "Native instance field lookup exceeds its work budget");
+    };
+    while (!current.empty()) {
+        charge();
+        if (!seen.insert(current).second)
+            fail("FIELD_METADATA", "Cyclic native instance field superclass hierarchy");
+        if (seen.size() > 65536)
+            fail("FIELD_LIMIT", "Native instance field hierarchy exceeds 65536 classes");
+        const auto *definition = p.resolve_class(current);
+        if (!definition) {
+            // Object has no instance fields; primitive mirrors and arrays have
+            // no field declarations (array length is not a JNI field).
+            if (current == "Ljava/lang/Object;" || current.starts_with('[') ||
+                (current.size() == 1 && std::string_view("VZBSCIJFD").find(current.front()) != std::string_view::npos))
+                break;
+            fail("FIELD_UNSUPPORTED", "Native instance field hierarchy has incomplete provider metadata");
+        }
+        if ((definition->flags & 0x200) && !definition->instance_fields.empty())
+            fail("FIELD_METADATA", "An interface cannot declare instance fields");
+        for (const auto index : definition->instance_fields) {
+            charge();
+            if (index >= p.image.fields.size())
+                fail("FIELD_METADATA", "Instance field inventory has an invalid index");
+            const auto &field = p.image.fields.at(index);
+            if (!field.declared || (field.flags & 8) || field.owner >= p.image.types.size() ||
+                field.type >= p.image.types.size() || field.owner != definition->type ||
+                p.image.types.at(field.owner) != current)
+                fail("FIELD_METADATA", "Instance field inventory has invalid declaration ownership");
+            if (field.name == name && p.image.types.at(field.type) == descriptor)
+                return index;
+        }
+        // ART's JNI instance lookup ignores interfaces and static declarations,
+        // including a same-name static field hiding an inherited instance field.
+        if ((definition->flags & 0x200) || definition->superclass == no_index)
+            break;
+        charge();
+        current = p.image.types.at(definition->superclass);
+    }
+    fail("FIELD_NOT_FOUND", "No matching declared instance field exists in the owned hierarchy");
+}
+Value ManagedRuntime::get_instance_field(ObjectId receiver, Index index) {
+    auto &p = *impl_;
+    p.check_thread();
+    retain(receiver);
+    struct Root { ManagedRuntime &runtime; ObjectId object; ~Root() { runtime.release(object); } } receiver_root{*this, receiver};
+    const auto &field = p.declared_instance_field(index);
+    if (!p.subtype(p.object(receiver).type, p.image.types.at(field.owner)))
+        fail("FIELD_METADATA", "Native instance field receiver has an incompatible class");
+    const auto &slots = p.object(receiver).fields;
+    const auto found = slots.find(index);
+    if (found == slots.end())
+        fail("FIELD_METADATA", "Native instance field receiver has no declared storage slot");
+    const auto value = found->second;
+    const auto object = value.kind == ValueKind::reference ? value.bits : ObjectId{0};
+    retain(object);
+    Root value_root{*this, object};
+    return p.typed(value, p.image.types.at(field.type));
+}
+void ManagedRuntime::set_instance_field(ObjectId receiver, Index index, Value value) {
+    auto &p = *impl_;
+    p.check_thread();
+    retain(receiver);
+    struct Root { ManagedRuntime &runtime; ObjectId object; ~Root() { runtime.release(object); } } receiver_root{*this, receiver};
+    const auto object = value.kind == ValueKind::reference ? value.bits : ObjectId{0};
+    retain(object);
+    Root value_root{*this, object};
+    const auto &field = p.declared_instance_field(index);
+    if (!p.subtype(p.object(receiver).type, p.image.types.at(field.owner)))
+        fail("FIELD_METADATA", "Native instance field receiver has an incompatible class");
+    const auto checked = p.typed(value, p.image.types.at(field.type));
+    auto &slots = p.object(receiver).fields;
+    const auto found = slots.find(index);
+    if (found == slots.end())
+        fail("FIELD_METADATA", "Native instance field receiver has no declared storage slot");
+    found->second = checked;
+}
+Index ManagedRuntime::reflected_field_index(ObjectId id) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (!id)
+        fail("FIELD_METADATA", "JNI reflected field conversion requires a nonnull Field");
+    retain(id);
+    struct Root { ManagedRuntime &runtime; ObjectId object; ~Root() { runtime.release(object); } } root{*this, id};
+    const auto &object = p.object(id);
+    if (object.type != "Ljava/lang/reflect/Field;" || !object.reflected_field)
+        fail("FIELD_METADATA", "JNI reflected field conversion requires authenticated Field storage");
+    const auto &state = *object.reflected_field;
+    if (state.provider || state.managed == no_index)
+        fail("FIELD_UNSUPPORTED", "Provider reflected fields do not have owned JNI declaration IDs");
+    const auto canonical = p.reflected_field_declaration(state.managed);
+    const auto &actual = state.metadata;
+    const auto &expected = canonical.metadata;
+    if (actual.owner != expected.owner || actual.name != expected.name || actual.type != expected.type ||
+        actual.flags != expected.flags || actual.declaring_class_public != expected.declaring_class_public)
+        fail("FIELD_METADATA", "Reflected Field metadata differs from its owned declaration");
+    return state.managed;
+}
+ObjectId ManagedRuntime::new_reflected_field(Index index) {
+    auto &p = *impl_;
+    p.check_thread();
+    Object result;
+    result.type = "Ljava/lang/reflect/Field;";
+    result.reflected_field = std::make_unique<const ReflectedField>(p.reflected_field_declaration(index));
+    // The normal allocator charges immutable metadata; it invokes no Java
+    // constructor or initializer. Publish a JNI root before any later safepoint.
+    return p.allocate(std::move(result));
+}
+Index ManagedRuntime::reflected_method_index(ObjectId id) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (!id)
+        fail("METHOD_METADATA", "JNI reflection conversion requires a nonnull Method or Constructor");
+    retain(id);
+    struct Root { ManagedRuntime &runtime; ObjectId object; ~Root() { runtime.release(object); } } root{*this, id};
+    const auto &object = p.object(id);
+    if ((object.type != "Ljava/lang/reflect/Method;" && object.type != "Ljava/lang/reflect/Constructor;") ||
+        !object.reflected_method)
+        fail("METHOD_METADATA", "JNI reflection conversion requires authenticated executable storage");
+    const auto &state = *object.reflected_method;
+    if (state.provider || state.vm_runtime_operation || state.managed == no_index)
+        fail("METHOD_UNSUPPORTED", "Provider and special reflected methods do not have owned JNI IDs");
+    const auto canonical = p.owned_reflected_method_declaration(state.managed);
+    const auto &actual = state.metadata;
+    const auto &expected = canonical.metadata;
+    const bool constructor = expected.name == "<init>";
+    if (constructor != (object.type == "Ljava/lang/reflect/Constructor;") ||
+        actual.owner != expected.owner || actual.name != expected.name || actual.return_type != expected.return_type ||
+        actual.parameters != expected.parameters || actual.flags != expected.flags)
+        fail("METHOD_METADATA", "Reflected executable metadata differs from its owned declaration");
+    return state.managed;
+}
+ObjectId ManagedRuntime::new_reflected_method(Index index) {
+    auto &p = *impl_;
+    p.check_thread();
+    auto declaration = p.owned_reflected_method_declaration(index);
+    Object result;
+    result.type = declaration.metadata.name == "<init>" ? "Ljava/lang/reflect/Constructor;" : "Ljava/lang/reflect/Method;";
+    result.reflected_method = std::make_unique<const ReflectedMethod>(std::move(declaration));
+    return p.allocate(std::move(result));
+}
+ObjectId ManagedRuntime::new_host_enum(std::string_view descriptor, std::u16string_view name,
+                                       std::int32_t ordinal) {
+    auto &p = *impl_;
+    p.check_thread();
+    const auto type = std::string(descriptor);
+    const auto label = std::u16string(name);
+    if (!p.host || type.empty() || type.front() != 'L' || core_type(type) || label.empty() || ordinal < 0 ||
+        p.resolve_class(type))
+        fail("ENUM_STATE", "Provider enum requires an external declaration and nonnegative ordinal");
+    const auto info = p.provider_call([&] { return p.host->class_info(type); });
+    if (!info || info->is_abstract || info->is_interface || info->superclass != enum_type)
+        fail("ENUM_STATE", "Provider enum must be an authenticated direct Enum child");
+    p.known(type);
+    const auto text = new_string(label);
+    retain(text);
+    struct Root { ManagedRuntime &runtime; ObjectId id; ~Root() { runtime.release(id); } } root{*this, text};
+    Object value;
+    value.type = type;
+    value.provider_enum = true;
+    value.enumeration = std::make_unique<ManagedEnum>();
+    const std::array args{Value::reference(0), Value::reference(text),
+                          Value::word(static_cast<std::uint32_t>(ordinal))};
+    (void)value.enumeration->invoke(*this, "<init>", "(Ljava/lang/String;I)V", args);
+    return p.allocate(std::move(value));
+}
+ObjectId ManagedRuntime::new_native_weak(ObjectId referent) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (!referent)
+        return 0;
+    retain(referent);
+    struct Root { ManagedRuntime &runtime; ObjectId object; ~Root() { runtime.release(object); } } root{*this, referent};
+    // Build only the collector's actual weak storage. Do not resolve, initialize
+    // or invoke a potentially guest-declared WeakReference class/constructor.
+    // The normal allocator charges this object and its WeakReference storage;
+    // the temporary strong root spans its possible collection.
+    Object value;
+    value.type = weak_reference_type;
+    value.weak = std::make_unique<WeakReference>();
+    value.weak->referent = referent;
+    value.weak->initialized = true;
+    // queue/next stay zero. The existing collector traces the wrapper and
+    // clears this referent when unreachable; it never marks it strongly.
+    return p.allocate(std::move(value));
+}
+ObjectId ManagedRuntime::native_weak_referent(ObjectId wrapper) const {
+    const auto &value = impl_->object(wrapper);
+    if (value.type != weak_reference_type || !value.weak || !value.weak->initialized ||
+        value.weak->queue || value.weak->next || value.weak->enqueued)
+        fail("REFERENCE", "Invalid native weak-reference wrapper");
+    return value.weak->referent;
+}
+ObjectId ManagedRuntime::prepare_native_allocation_error() {
+    auto &p = *impl_;
+    p.check_thread();
+    if (!p.native_allocation_error) {
+        // No class resolution/initialization, Java constructor, stack trace or
+        // allocation outside the ordinary managed heap/object limits. Publish
+        // the root immediately after allocation, before any further safepoint.
+        Object error;
+        error.type = "Ljava/lang/OutOfMemoryError;";
+        p.native_allocation_error = p.allocate(std::move(error));
+    }
+    return p.native_allocation_error;
+}
+std::uint64_t ManagedRuntime::register_native_roots(std::span<ObjectId> cells) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (cells.size() != Impl::native_root_cells || !cells.data() ||
+        std::any_of(cells.begin(), cells.end(), [](ObjectId id) { return id != 0; }))
+        fail("NATIVE_ROOTS", "Native root backing must contain exactly 4096 empty cells");
+    const auto address = reinterpret_cast<std::uintptr_t>(cells.data());
+    const auto bytes = cells.size_bytes();
+    for (const auto &roots : p.native_roots) {
+        if (!roots.token)
+            continue;
+        const auto other = reinterpret_cast<std::uintptr_t>(roots.cells.data());
+        if ((address <= other && other - address < bytes) ||
+            (other < address && address - other < roots.cells.size_bytes()))
+            fail("NATIVE_ROOTS", "Native root backing overlaps an existing registration");
+    }
+    const auto ordinary = p.metrics.pinned_references - p.native_root_references;
+    if (cells.size() > Impl::retained_root_limit - p.native_root_capacity - ordinary)
+        fail("ROOT_LIMIT", "Native root capacity exceeds the retained-root quota");
+    const auto slot = std::find_if(p.native_roots.begin(), p.native_roots.end(),
+                                   [](const auto &roots) { return roots.token == 0; });
+    if (slot == p.native_roots.end())
+        fail("ROOT_LIMIT", "Native root registration quota exhausted");
+    if (p.next_native_root_token == UINT64_MAX)
+        fail("NATIVE_ROOTS", "Native root token identity space exhausted");
+    const auto token = p.next_native_root_token++;
+    *slot = {token, cells, 0};
+    p.native_root_capacity += cells.size();
+    return token;
+}
+void ManagedRuntime::set_native_root(std::uint64_t token, std::size_t index, ObjectId object) {
+    auto &p = *impl_;
+    p.check_thread(true);
+    const auto slot = std::find_if(p.native_roots.begin(), p.native_roots.end(),
+                                   [&](const auto &roots) { return roots.token == token && token != 0; });
+    if (slot == p.native_roots.end() || index >= slot->cells.size())
+        fail("NATIVE_ROOTS", "Invalid native root registration or cell");
+    if (object && !p.heap.contains(object))
+        fail("REFERENCE", "Native root refers to an invalid managed object");
+    auto &cell = slot->cells[index];
+    if (!cell && object) {
+        ++slot->live;
+        ++p.native_root_references;
+        ++p.metrics.pinned_references;
+    } else if (cell && !object) {
+        --slot->live;
+        --p.native_root_references;
+        --p.metrics.pinned_references;
+    }
+    cell = object;
+}
+void ManagedRuntime::unregister_native_roots(std::uint64_t token) {
+    auto &p = *impl_;
+    p.check_thread(true);
+    const auto slot = std::find_if(p.native_roots.begin(), p.native_roots.end(),
+                                   [&](const auto &roots) { return roots.token == token && token != 0; });
+    if (slot == p.native_roots.end())
+        fail("NATIVE_ROOTS", "Invalid native root registration");
+    std::fill(slot->cells.begin(), slot->cells.end(), ObjectId{0});
+    p.native_root_capacity -= slot->cells.size();
+    p.native_root_references -= slot->live;
+    p.metrics.pinned_references -= slot->live;
+    *slot = {};
+}
+Index ManagedRuntime::lookup_static_field(std::string_view owner,std::string_view name,std::string_view descriptor) {
+    auto &p=*impl_;
+    // ART initializes the supplied class even if subsequent field lookup fails.
+    p.initialize(owner);
+    if(name.size()>1024 || descriptor.size()>1024)fail("FIELD_LIMIT","Native field name or descriptor exceeds 1024 bytes");
+    for(const auto value:{name,descriptor})for(const auto c:value)
+        if(static_cast<unsigned char>(c)>0x7e)fail("FIELD_UNSUPPORTED","Non-ASCII native field identifiers are not supported");
+    if(name.empty() || std::any_of(name.begin(),name.end(),[](unsigned char c){return c<0x21;}) ||
+       !Impl::static_field_descriptor(descriptor))
+        fail("FIELD_NOT_FOUND","Invalid native static field name or descriptor");
+    try{p.known(descriptor);}
+    catch(const DexError &error){
+        if(error.code!="AETHER_DEX_CLASS_UNSUPPORTED" && error.code!="AETHER_DEX_CLASS_NOT_FOUND")throw;
+        fail("FIELD_UNSUPPORTED","Native static field descriptor type is unavailable");
+    }
+    std::vector<std::string_view> pending{owner};std::set<std::string_view> seen;
+    std::size_t work=0;
+    const auto charge=[&](){if(++work>262144)fail("FIELD_LIMIT","Native static field lookup exceeds work budget");};
+    while(!pending.empty()){
+        charge();const auto current=pending.back();pending.pop_back();
+        if(!seen.insert(current).second)continue;
+        if(seen.size()>65536)fail("FIELD_LIMIT","Native static field hierarchy exceeds 65536 classes");
+        const auto *definition=p.resolve_class(current);
+        if(!definition){
+            // Object, primitive mirrors and arrays have complete empty static
+            // inventories. Other provider inventories must not be guessed.
+            if(current=="Ljava/lang/Object;" || current.starts_with('[') ||
+               (current.size()==1 && std::string_view("VZBSCIJFD").find(current.front())!=std::string_view::npos))continue;
+            fail("FIELD_UNSUPPORTED","Native static field hierarchy has incomplete provider metadata");
+        }
+        for(const auto index:definition->static_fields){
+            charge();
+            if(index>=p.image.fields.size())fail("FIELD_METADATA","Static field inventory has an invalid index");
+            const auto &field=p.image.fields[index];
+            if(!field.declared || !(field.flags&8) || field.owner>=p.image.types.size() ||
+               field.type>=p.image.types.size() || field.owner!=definition->type || p.image.types.at(field.owner)!=current)
+                fail("FIELD_METADATA","Static field inventory has invalid declaration or ownership");
+            if(field.name==name && p.image.types.at(field.type)==descriptor)return index;
+        }
+        // LIFO work visits the class itself, its direct interfaces recursively
+        // in declaration order, then its superclass and that class' interfaces.
+        if(definition->superclass!=no_index){charge();pending.push_back(p.image.types.at(definition->superclass));}
+        for(auto it=definition->interfaces.rbegin();it!=definition->interfaces.rend();++it){charge();pending.push_back(p.image.types.at(*it));}
+    }
+    fail("FIELD_NOT_FOUND","No matching declared static field exists in the owned hierarchy");
+}
+bool ManagedRuntime::static_field_compatible(Index index,std::string_view supplied_class) const {
+    auto &p=*impl_;const auto &field=p.declared_static_field(index);
+    p.known(supplied_class);
+    return p.subtype(supplied_class,p.image.types.at(field.owner));
+}
+Value ManagedRuntime::get_static_uninitialized(Index index) {
+    auto &p=*impl_;const auto &field=p.declared_static_field(index);
+    const auto found=p.statics.find(index);
+    const auto value=found==p.statics.end()?default_value(p.image.types.at(field.type)):found->second;
+    const auto root=value.kind==ValueKind::reference?value.bits:0;
+    retain(root);
+    struct Root {ManagedRuntime &runtime;ObjectId object;~Root(){runtime.release(object);}} retained{*this,root};
+    return p.typed(value,p.image.types.at(field.type));
+}
+void ManagedRuntime::set_static_uninitialized(Index index,Value value) {
+    auto &p=*impl_;p.check_thread();
+    const auto root=value.kind==ValueKind::reference?value.bits:0;
+    retain(root);
+    struct Root {ManagedRuntime &runtime;ObjectId object;~Root(){runtime.release(object);}} retained{*this,root};
+    const auto &field=p.declared_static_field(index);
+    const auto checked=p.typed(value,p.image.types.at(field.type));
+    p.statics.insert_or_assign(index,checked);
 }
 Value ManagedRuntime::get_static(Index index) {
     auto &p = *impl_;
@@ -8266,7 +10041,8 @@ void ManagedRuntime::retain(ObjectId id) {
     auto &p = *impl_;
     p.check_thread(true);
     if(!p.heap.contains(id))fail("REFERENCE","Retain of an invalid managed object");
-    if (p.metrics.pinned_references >= 65536)
+    if (p.metrics.pinned_references - p.native_root_references >=
+        Impl::retained_root_limit - p.native_root_capacity)
         fail("ROOT_LIMIT", "Too many retained managed roots");
     ++p.pins[id];
     ++p.metrics.pinned_references;

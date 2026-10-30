@@ -33,7 +33,7 @@ static bool LoadStoreRegisterImmediate(TranslatorVisitor& v, bool wback, bool po
         return v.UnpredictableInstruction();
     }
 
-    // TODO: Check SP alignment
+    if (Rn == Reg::SP) v.ir.CheckSPAlignment();
     IR::U64 address = Rn == Reg::SP ? IR::U64(v.SP(64)) : IR::U64(v.X(64, Rn));
     if (!postindex) {
         address = v.ir.Add(address, v.ir.Imm64(offset));
@@ -120,7 +120,7 @@ static bool LoadStoreSIMD(TranslatorVisitor& v, bool wback, bool postindex, size
 
     IR::U64 address;
     if (Rn == Reg::SP) {
-        // TODO: Check SP Alignment
+        v.ir.CheckSPAlignment();
         address = v.SP(64);
     } else {
         address = v.X(64, Rn);

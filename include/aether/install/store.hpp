@@ -1,5 +1,6 @@
 #pragma once
 #include "aether/apk/inspect.hpp"
+#include "aether/apk/intent_value.hpp"
 #include "aether/apk/signature.hpp"
 #include "aether/security/installed_activity.hpp"
 #include <functional>
@@ -7,6 +8,7 @@
 
 namespace aether::install {
 struct AppDiagnostics;
+struct LinkReview;
 class InstallError final : public std::runtime_error {
   public:
     std::string code;
@@ -86,6 +88,21 @@ struct PermissionReview {
     std::string sha256;
     std::uint32_t permissions = 0;
 };
+struct UninstallReview {
+    std::string id, package_id, sha256, launcher;
+    std::uint64_t package_generation = 0;
+    std::uint32_t version_code = 0, permissions = 0;
+    State state = State::installed;
+    ShellState shell = ShellState::none;
+    bool operator==(const UninstallReview &) const = default;
+};
+struct UninstallStatus {
+    InstalledApp app;
+    UninstallReview review;
+    // A momentary observation of the exact app lease, not a worker identity or
+    // a guarantee that a later removal can acquire its exclusive lease.
+    bool busy = false;
+};
 enum class InstallStage { verifying, writing, registering, finishing, complete };
 using InstallProgress = std::function<void(InstallStage)>;
 // One immutable source snapshot, prepared only after the user's Install action.
@@ -118,7 +135,8 @@ bool valid_app_id(std::string_view id) noexcept;
 std::filesystem::path default_store_root();
 
 // Authoritative append-only registry and final package/data directories. Every
-// instance retains exclusive registry access and non-reparse ancestor handles.
+// instance retains a shared read snapshot or exclusive mutation access, together
+// with non-reparse ancestor handles. Readers exclude registry writes/deletion.
 // No temporary files, rename-based staging, backups or automatic write retries.
 class PackageStore final {
   public:
@@ -134,13 +152,26 @@ class PackageStore final {
     InstalledApp install_fixture(const std::filesystem::path &apk);
     InstalledApp install_package(const std::filesystem::path &apk, std::string_view expected_sha256,
                                  bool fixture_only = false);
-    InstalledApp uninstall(std::string_view id, bool keep_data);
+    // Read-only observation; never creates the lease file or changes the app.
+    UninstallStatus review_uninstall(std::string_view id) const;
+    InstalledApp uninstall(std::string_view id, bool keep_data,
+                           const std::optional<UninstallReview> &review = {});
     InstalledApp set_permissions(std::string_view id, std::uint32_t allow, std::uint32_t deny,
                                  const std::optional<PermissionReview> &review = {});
     InstalledApp register_windows(std::string_view id);
     // The returned lease survives this short registry session and prevents removal
     // or permission changes until the isolated worker and its host have closed.
     security::InstalledActivity prepare_launch(std::string_view id);
+    security::InstalledActivity prepare_launch(std::string_view id, const apk::IntentValue &intent,
+                                               const apk::ActivityIntentPolicy &policy,
+                                               std::optional<std::size_t> chosen_declaration = {});
+    LinkReview review_link(const apk::IntentValue &intent, const apk::ActivityIntentPolicy &policy,
+                          const std::optional<std::string> &app_id = {}) const;
+    security::InstalledActivity prepare_link(const LinkReview &review, std::size_t row);
+    // Caller has explicitly approved this exact held document and Activity.
+    // Review/ordinary launch alone cannot attach a document service or read grant.
+    security::InstalledActivity prepare_file(const LinkReview &review, std::size_t row,
+                                               const host::PreparedDocumentSource &document);
     // Explicit recovery truncates only a short final frame after validating the
     // entire preceding chain, then rolls back incomplete install/removal intents.
     std::size_t recover();

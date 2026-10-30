@@ -1,4 +1,5 @@
 #include "aether/dex/linker.hpp"
+#include "load_diagnostics.hpp"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -73,7 +74,9 @@ struct Linker::Impl {
         table(input.fields, true);
         for (const auto &value : input.fields)
             charge(value.name.size());
-        table(input.methods, true);
+        // Preserve the legacy inline-body charge for every method identifier.
+        // That floor already includes one Code object, even when absent.
+        charge(input.methods.size() * (method_metadata_charge + sizeof(Index)));
         for (const auto &value : input.methods) {
             charge(value.name.size());
             if (value.code) {
@@ -102,7 +105,10 @@ struct Linker::Impl {
             bad("SOURCE", "Duplicate or invalid DEX source name");
         if (!input.sources.empty() || (input.version != 35 && input.version != 37 && input.version != 38))
             bad("SOURCE", "Linking requires individual DEX 035/037/038 images");
-        account(input);
+        try { account(input); }
+        catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::link_account);throw;
+        }
         auto map = std::make_shared<IndexMap>();
         map->source = name;
         map->version = input.version;

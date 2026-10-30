@@ -40,6 +40,9 @@ class NativeThreads {
     a64::Fault pump(std::uint64_t budget);
     bool has_runnable() const noexcept;
     a64::Fault run_next(std::uint64_t budget, std::uint64_t &spent);
+    // Offer the host owner, then run at most one queued native peer. This is
+    // run-to-completion cooperative progress, not resumable thread time slicing.
+    a64::Fault yield(bool full_frame);
     a64::Address tls()const noexcept;
     a64::Address error_address()const noexcept;
     std::optional<GuestPosixServices::ThreadBinding> exchange_binding(std::optional<GuestPosixServices::ThreadBinding> value);

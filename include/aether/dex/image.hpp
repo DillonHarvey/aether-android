@@ -1,6 +1,6 @@
 #pragma once
+#include "aether/dex/string_table.hpp"
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <span>
@@ -46,13 +46,50 @@ struct Code {
     // this immutable map; decoded instructions can use the full 32-bit index.
     std::shared_ptr<const IndexMap> references;
 };
+// Owning optional code with value semantics. Empty method-ID references carry
+// only a pointer; copies own independent mutable buffers, while IndexMap stays
+// shared and immutable. Dereference requires an engaged value, as with optional.
+class CodeStorage {
+  public:
+    CodeStorage() noexcept;
+    CodeStorage(std::nullopt_t) noexcept;
+    CodeStorage(const Code &value);
+    CodeStorage(Code &&value);
+    CodeStorage(const std::optional<Code> &value);
+    CodeStorage(std::optional<Code> &&value);
+    CodeStorage(const CodeStorage &other);
+    CodeStorage(CodeStorage &&other) noexcept;
+    ~CodeStorage();
+    CodeStorage &operator=(const CodeStorage &other);
+    CodeStorage &operator=(CodeStorage &&other) noexcept;
+    CodeStorage &operator=(std::nullopt_t) noexcept;
+    CodeStorage &operator=(const Code &value);
+    CodeStorage &operator=(Code &&value);
+    explicit operator bool() const noexcept;
+    bool has_value() const noexcept;
+    Code &operator*() noexcept;
+    const Code &operator*() const noexcept;
+    Code *operator->() noexcept;
+    const Code *operator->() const noexcept;
+    Code &value();
+    const Code &value() const;
+    void reset() noexcept;
+    Code &emplace();
+    void swap(CodeStorage &other) noexcept;
+  private:
+    std::unique_ptr<Code> value_;
+};
 struct Method {
     Index owner = 0, prototype = 0;
     std::string name;
     std::uint32_t flags = 0;
     bool declared = false, direct = false;
-    std::optional<Code> code;
+    CodeStorage code;
 };
+// Preserve the previous conservative per-ID metadata charge, including capacity
+// for one Code even on references without a body. Actual boxes are not charged
+// again; bytecode units, try regions and handler payloads keep their own charges.
+inline constexpr std::size_t method_metadata_charge=sizeof(Method)+sizeof(Code);
 struct Field {
     Index owner = 0, type = 0;
     std::string name;
@@ -72,13 +109,13 @@ struct Class {
 struct DexImage {
     std::string sha256;
     // Demand linking appends while existing frames/JNI calls retain references.
-    // Deque growth preserves element addresses; no caller retains iterators.
-    std::deque<std::u16string> strings;
-    std::deque<std::string> types;
-    std::deque<Prototype> prototypes;
-    std::deque<Field> fields;
-    std::deque<Method> methods;
-    std::deque<Class> classes;
+    // Stable pages preserve element addresses; callers retain no iterators.
+    StringTable strings;
+    StableTable<std::string> types;
+    StableTable<Prototype> prototypes;
+    StableTable<Field> fields;
+    StableTable<Method> methods;
+    StableTable<Class> classes;
     std::uint16_t version = 35;
     struct Source {
         std::string name, sha256;

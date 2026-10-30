@@ -1,6 +1,7 @@
 #pragma once
 #include "aether/a64/guest_cpu.hpp"
 #include "aether/elf/limits.hpp"
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -24,10 +25,21 @@ class ElfError : public std::runtime_error {
     ElfError(std::string code, std::string message);
     const std::string code;
 };
+struct InitializerContext {
+    // At most the first 48 bytes of the validated loaded-module identity.
+    std::string module;
+    Address entry = 0, fault_address = 0, pc = 0;
+    // Raw CPU detail, not necessarily a syscall number or deepest fault.
+    std::uint32_t detail = 0;
+    // Existing result registers x0, x1, x2 and x8, in that order.
+    std::array<std::uint64_t, 4> arguments{};
+    bool finalizer = false;
+};
 class InitializerError : public ElfError {
   public:
-    InitializerError(a64::Fault fault, std::string message);
+    InitializerError(a64::Fault fault, std::string message, InitializerContext context = {});
     const a64::Fault fault;
+    const InitializerContext context;
 };
 struct Segment {
     std::uint64_t offset = 0, address = 0, file_size = 0, memory_size = 0;
@@ -48,6 +60,9 @@ struct Relocation {
 // No section table is needed to load either representation.
 struct ElfImage {
     std::vector<std::uint8_t> bytes;
+    // Exact ELF64 Phdr bytes, retained for both input representations.
+    // The parser validates 1..128 entries of 56 bytes each.
+    std::vector<std::uint8_t> program_headers;
     std::string soname;
     std::vector<std::string> needed;
     std::vector<Segment> segments;
@@ -71,6 +86,12 @@ struct AddressInfo {
     // Lowest mapped PT_LOAD page, rather than the ELF relocation load bias.
     Address base = 0, symbol_address = 0;
     bool has_symbol = !symbol.empty();
+};
+struct ProgramHeaderInfo {
+    std::string name;
+    Address load_bias = 0;
+    std::vector<std::uint8_t> headers;
+    std::uint64_t adds = 0;
 };
 class ImportResolver {
   public:
@@ -108,6 +129,9 @@ class GuestLoader {
     // Observe committed guest PT_LOAD spans and their covering dynamic symbols.
     // Page padding, gaps and in-progress/rolled-back modules have no identity.
     std::optional<AddressInfo> address_info(Address address) const;
+    // Committed load order, with owned values safe across callback reentry.
+    // Provisional graph observations throw; an absent index returns nullopt.
+    std::optional<ProgramHeaderInfo> program_header_info(std::size_t index) const;
     void initialize(a64::GuestCpu &cpu, Address stack_top, std::optional<Address> thread_pointer = {});
     void finalize(a64::GuestCpu &cpu, Address stack_top);
     const std::vector<GuestModule> &modules() const noexcept;

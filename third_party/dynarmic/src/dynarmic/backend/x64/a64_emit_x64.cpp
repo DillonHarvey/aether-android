@@ -502,10 +502,80 @@ void A64EmitX64::EmitA64ExceptionRaised(A64EmitContext& ctx, IR::Inst* inst) {
     });
 }
 
+void A64EmitX64::EmitA64CheckSPAlignment(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(args[0].IsImmediate());
+    const u64 pc = args[0].GetImmediateU64();
+    const u64 first_pc = ctx.Location().PC();
+    ASSERT(pc >= first_pc && (pc - first_pc) % 4 == 0);
+    const u64 prefix_cycles = (pc - first_pc) / 4 + 1;
+    ASSERT(prefix_cycles <= ctx.block.CycleCount());
+
+    // Spill/marshal unconditionally. A branch around HostCall would leave the
+    // allocator's spill bookkeeping inconsistent on the valid-SP path.
+    ctx.reg_alloc.HostCall(nullptr, {}, args[1]);
+    Xbyak::Label aligned;
+    code.test(code.ABI_PARAM2, 15);
+    code.jz(aligned, code.T_NEAR);
+    // Materialize the captured value before reusing callback argument registers.
+    // It is the original live SP, not the effective address or a block snapshot.
+    code.mov(qword[r15 + offsetof(A64JitState, sp)], code.ABI_PARAM2);
+    code.mov(rax, pc);
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    Devirtualize<&A64::UserCallbacks::ExceptionRaised>(conf.callbacks).EmitCall(code, [&](RegList param) {
+        code.mov(param[0], pc);
+        code.mov(param[1], static_cast<u64>(A64::Exception::StackPointerAlignment));
+    });
+    if (conf.enable_cycle_counting) {
+        EmitAddCycles(prefix_cycles);
+    }
+    // The normal full-block charge lies after the IR and is bypassed here.
+    code.ForceReturnFromRunCode();
+    code.L(aligned);
+}
+
+void A64EmitX64::EmitA64CheckMemoryAlignment(A64EmitContext& ctx, IR::Inst* inst) {
+    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ASSERT(args[0].IsImmediate() && args[2].IsImmediate());
+    const u64 pc = args[0].GetImmediateU64();
+    const u64 mask = args[2].GetImmediateU64();
+    ASSERT(mask == 1 || mask == 3 || mask == 7 || mask == 15);
+    const u64 first_pc = ctx.Location().PC();
+    ASSERT(pc >= first_pc && (pc - first_pc) % 4 == 0);
+    const u64 prefix_cycles = (pc - first_pc) / 4 + 1;
+    ASSERT(prefix_cycles <= ctx.block.CycleCount());
+
+    // Marshal the actual effective address and spill before either branch.
+    ctx.reg_alloc.HostCall(nullptr, {}, args[1]);
+    Xbyak::Label aligned;
+    code.test(code.ABI_PARAM2, static_cast<u32>(mask));
+    code.jz(aligned, code.T_NEAR);
+    code.mov(rax, pc);
+    code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+    Devirtualize<&A64::UserCallbacks::MemoryAlignmentFault>(conf.callbacks).EmitCall(code, [&](RegList param) {
+        // Copy EA before overwriting its original argument register with PC.
+        code.mov(param[1], code.ABI_PARAM2);
+        code.mov(param[0], pc);
+    });
+    if (conf.enable_cycle_counting) {
+        EmitAddCycles(prefix_cycles);
+    }
+    code.ForceReturnFromRunCode();
+    code.L(aligned);
+}
+
 void A64EmitX64::EmitA64DataCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(nullptr, {}, args[1], args[2]);
     Devirtualize<&A64::UserCallbacks::DataCacheOperationRaised>(conf.callbacks).EmitCall(code);
+}
+
+void A64EmitX64::EmitA64CheckCacheOperationAbort(A64EmitContext& ctx, IR::Inst* inst) {
+    // The callback has already spilled architectural state. Only MemoryAbort
+    // means failure: a successful IC intentionally requests a generic halt so
+    // its code-cache invalidation can run after generated frames have exited.
+    // Reuse the precise PC/prefix-cycle return path before any subsequent IR.
+    EmitCheckMemoryAbort(ctx, inst);
 }
 
 void A64EmitX64::EmitA64InstructionCacheOperationRaised(A64EmitContext& ctx, IR::Inst* inst) {

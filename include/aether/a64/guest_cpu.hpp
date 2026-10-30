@@ -29,7 +29,8 @@ enum class Fault {
     jit_protection,
     nesting_limit,
     process_exit,
-    thread_exit
+    thread_exit,
+    alignment
 };
 std::string_view fault_name(Fault fault) noexcept;
 using Vector = std::array<std::uint64_t, 2>;
@@ -54,6 +55,8 @@ struct Metrics {
     std::uint64_t rx_checks = 0, rx_failures = 0, last_code_fingerprint = 0;
     Address last_compiled_pc = 0;
     std::uint64_t deferred_services = 0, nested_calls = 0, maximum_call_depth = 0;
+    std::uint64_t scheduling_yields = 0, data_cache_cleans = 0, instruction_cache_invalidations = 0;
+    std::uint64_t interpreted_lse_instructions = 0;
 };
 struct ServiceState {
     std::array<std::uint64_t, 31> registers{};

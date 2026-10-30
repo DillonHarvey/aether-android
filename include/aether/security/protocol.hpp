@@ -72,7 +72,23 @@ enum class Operation : std::uint16_t {
     icon_result = 60,           // Dedicated metadata process only; no runtime/admission authority.
     icon_pixels = 61,
     icon_permissions = 62, // Metadata text only, never a capability grant.
-    guest_exited = 63 // Terminal app-owned process exit, never startup success or broker request.
+    guest_exited = 63, // Terminal app-owned process exit, never startup success or broker request.
+    notification = 64, // Typed app-bound text notification; no AUMID/path/XML/activation command.
+    activity_launch = 65, // Startup-only fragments; no broker operation or runtime command.
+    document_info = 66, // Session-approved opaque content URI; no host path/handle.
+    document_open = 67,
+    document_read = 68,
+    document_close = 69,
+    activity_text_edit = 70, // Activity-only bounded observation fragments; never a delegated broker service.
+    activity_text_edit_ack = 71, // Host receipt acknowledgement; no app or equipment write authority.
+    activity_soft_input = 72, // Explicit claimed keyboard request; UI-owned window admission remains required.
+    activity_soft_input_ack = 73, // One native request-acceptance result, never observed visibility.
+    document_drop_claim = 74, // Exact staged drop ID and opaque URI; never a new source.
+    document_drop_release = 75, // Revoke only that drop and its live streams.
+    drop_text_info = 76, // One reviewed selection's length and exact UTF-16LE digest.
+    drop_text_read = 77, // Consecutive bounded UTF-16LE chunks; never clipboard authority.
+    activity_activation_terminal = 78, // Activity-only terminal fact custody; never a broker service.
+    activity_activation_terminal_ack = 79 // Host custody receipt, never a final-state acknowledgement.
 };
 enum class Status : std::uint32_t { ok, denied, unsupported, invalid, quota };
 struct Header {

@@ -30,6 +30,23 @@ std::string number(const std::optional<std::uint32_t> &value) {
 std::string flag_json(const ManifestBoolean &value) {
     return "{\"type\":" + std::to_string(value.type) + ",\"data\":" + std::to_string(value.data) + '}';
 }
+std::string filters_json(const std::vector<std::vector<ManifestIntentFilter>> &activities) {
+    return array_json(activities, [](const auto &filters) {
+        return array_json(filters, [](const ManifestIntentFilter &filter) {
+            return "{\"nodes\":" + array_json(filter.nodes, [](const ManifestFilterNode &node) {
+                return "{\"namespace\":" + json_quote(node.ns) + ",\"name\":" + json_quote(node.name) +
+                       ",\"parent\":" + (node.parent ? std::to_string(*node.parent) : "null") +
+                       ",\"attributes\":" + array_json(node.attributes, [](const ManifestFilterAttribute &attribute) {
+                           return "{\"namespace\":" + json_quote(attribute.ns) +
+                                  ",\"name\":" + json_quote(attribute.name) +
+                                  ",\"value\":{\"type\":" + std::to_string(attribute.value.type) +
+                                  ",\"data\":" + std::to_string(attribute.value.reference) +
+                                  ",\"literal\":" + json_quote(attribute.value.literal) + "}}";
+                       }) + '}';
+            }) + '}';
+        });
+    });
+}
 std::string file_json(const PackageFile &file) {
     return "{\"path\":" + json_quote(file.path) +
            ",\"compressedBytes\":" + std::to_string(file.compressed_bytes) +
@@ -218,8 +235,15 @@ std::string InspectResult::json(const SignatureReport *signing) const {
                       [](const Activity &activity) {
                           return "{\"name\":" + json_quote(activity.name) +
                                  ",\"target\":" + json_quote(activity.target) +
+                                 ",\"screenOrientation\":{\"type\":" + std::to_string(activity.screen_orientation.type) +
+                                 ",\"data\":" + std::to_string(activity.screen_orientation.data) + '}' +
                                  ",\"launcher\":" + (activity.launcher ? "true" : "false") + '}';
                       }) +
+           ",\"activityConfigChanges\":" + array_json(manifest.activity_config_changes,
+               [](const ManifestInteger &value) {
+                   return "{\"type\":" + std::to_string(value.type) + ",\"data\":" + std::to_string(value.data) + '}';
+               }) +
+           ",\"activityIntentFilters\":" + filters_json(manifest.activity_intent_filters) +
            "},\"presentation\":" + (presentation ? presentation->json() : "null") +
            ",\"manifest\":" + file_json(manifest_file) + ",\"dex\":" +
            array_json(dex,

@@ -27,7 +27,31 @@ std::u16string unicode(std::string_view text) {
     const auto value = utf16(text);
     return {value.begin(), value.end()};
 }
+bool runtime_policy(ResourceSelectionPolicy policy) {
+    return policy == ResourceSelectionPolicy::neutral_runtime ||
+           policy == ResourceSelectionPolicy::runtime_display;
+}
+void validate_display_target(const ResourceConfiguration &target) {
+    if (!target.density || target.density >= 0xfffe || !target.sdk ||
+        (target.orientation != 1 && target.orientation != 2) ||
+        !target.width_dp || !target.height_dp || !target.smallest_width_dp)
+        bad("A display runtime target requires numeric density, SDK, positive dp dimensions and portrait/landscape orientation",
+            "UNSUPPORTED");
+}
 bool better(const ResourceEntry &candidate, const ResourceEntry &old, const ResourceConfiguration &target) {
+    if (target.policy == ResourceSelectionPolicy::runtime_display) {
+        if (candidate.smallest_width_dp != old.smallest_width_dp)
+            return candidate.smallest_width_dp > old.smallest_width_dp;
+        // Matching has excluded dimensions above the target. Android ranks the
+        // pair by total width/height deficit, rather than preferring width alone.
+        const auto dimensions = [](const ResourceEntry &entry) {
+            return std::uint32_t{entry.width_dp} + entry.height_dp;
+        };
+        if (dimensions(candidate) != dimensions(old))
+            return dimensions(candidate) > dimensions(old);
+        if (candidate.orientation != old.orientation)
+            return candidate.orientation > old.orientation;
+    }
     // anydpi wins, then the smallest sufficient density, then the largest
     // undersized source. Frozen artwork specially prefers nodpi; runtime treats
     // its sentinel as an unscaled source only when it wins density selection.
@@ -47,20 +71,22 @@ bool better(const ResourceEntry &candidate, const ResourceEntry &old, const Reso
         return candidate.sdk > old.sdk;
     // Unqualified and explicit mdpi have equal effective density. Prefer the
     // explicit bucket on an otherwise exact tie, independently of chunk order.
-    return target.policy == ResourceSelectionPolicy::neutral_runtime && candidate.density > old.density;
+    return runtime_policy(target.policy) && candidate.density > old.density;
 }
 } // namespace
 ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                                    const ResourceConfiguration *configuration, ResourceParseOptions options) {
-    const bool runtime_selection =
-        configuration && configuration->policy == ResourceSelectionPolicy::neutral_runtime;
+    const bool runtime_selection = configuration && runtime_policy(configuration->policy);
+    const bool display_selection = configuration && configuration->policy == ResourceSelectionPolicy::runtime_display;
     const bool optimized = options.names == ResourceNamePolicy::optimized;
     if (optimized && (!runtime_selection || options.metadata_preview))
-        bad("Optimized tables require the explicit neutral runtime policy", "UNSUPPORTED");
+        bad("Optimized tables require an explicit runtime resource policy", "UNSUPPORTED");
     const bool extended = options.metadata_preview || optimized;
     if (runtime_selection &&
         (!configuration->density || configuration->density >= 0xfffe || !configuration->sdk))
         bad("A neutral runtime target requires an explicit numeric density and resource SDK", "UNSUPPORTED");
+    if (display_selection)
+        validate_display_target(*configuration);
     const std::size_t encoded_limit = (extended ? 64u : 16u) * 1024 * 1024;
     if (bytes.size() > encoded_limit)
         bad(extended ? "Extended resource table exceeds 64 MiB limit" : "Resource table exceeds 16 MiB limit",
@@ -240,13 +266,25 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         bad("Repeated resource configuration");
                     definitions.insert(id);
                     const auto density = item.u16(34), sdk = item.u16(44);
+                    const auto orientation = display_selection ? item.u8(32) : std::uint8_t{0};
+                    const auto smallest_width_dp = display_selection && config_size >= 32 ? item.u16(50) : std::uint16_t{0};
+                    const auto width_dp = display_selection && config_size >= 36 ? item.u16(52) : std::uint16_t{0};
+                    const auto height_dp = display_selection && config_size >= 36 ? item.u16(54) : std::uint16_t{0};
                     bool eligible = !configuration || sdk <= configuration->sdk;
                     if (configuration) {
                         // Every configuration is structurally checked. Qualifiers
-                        // outside the declared neutral policy never silently win.
-                        for (std::size_t i = 4; i < config_size; ++i)
-                            if (i != 14 && i != 15 && i != 24 && i != 25 && item.u8(20 + i))
+                        // outside the selected policy never silently win.
+                        for (std::size_t i = 4; i < config_size; ++i) {
+                            const bool display_qualifier = display_selection &&
+                                (i == 12 || (i >= 30 && i <= 35));
+                            if (!display_qualifier && i != 14 && i != 15 && i != 24 && i != 25 && item.u8(20 + i))
                                 eligible = false;
+                        }
+                        if (display_selection &&
+                            ((orientation && orientation != configuration->orientation) ||
+                             smallest_width_dp > configuration->smallest_width_dp ||
+                             width_dp > configuration->width_dp || height_dp > configuration->height_dp))
+                            eligible = false;
                     }
                     const auto width = flags & 2 ? 2u : 4u;
                     if (start < part.header + std::uint64_t(count) * width || start > part.size ||
@@ -370,7 +408,8 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         if (eligible) {
                             ResourceEntry candidate{resource_id,   data,      value_type,
                                                     types[id - 1], keys[key], std::string(container),
-                                                    density,       sdk};
+                                                    density,       sdk, orientation,
+                                                    width_dp, height_dp, smallest_width_dp};
                             const auto old = result.entries_.find(resource_id);
                             if (old == result.entries_.end()) {
                                 result.entries_.emplace(resource_id, std::move(candidate));
@@ -445,6 +484,8 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
 ResourceTable ResourceTable::compose(const PackageView &package, std::string_view package_name,
                                      const ResourceConfiguration *configuration,
                                      ResourceParseOptions options) {
+    if (configuration && configuration->policy == ResourceSelectionPolicy::runtime_display)
+        validate_display_target(*configuration);
     ResourceTable result;
     result.metadata_preview_ = options.metadata_preview;
     result.optimized_runtime_ = options.names == ResourceNamePolicy::optimized;
@@ -479,8 +520,8 @@ void ResourceTable::merge(ResourceTable other) {
     const std::size_t encoded_limit = (extended ? 64u : 16u) * 1024 * 1024;
     const std::size_t string_limit = extended ? 262144u : 65536u;
     const bool runtime_selection =
-        (configuration_ && configuration_->policy == ResourceSelectionPolicy::neutral_runtime) ||
-        (other.configuration_ && other.configuration_->policy == ResourceSelectionPolicy::neutral_runtime);
+        (configuration_ && runtime_policy(configuration_->policy)) ||
+        (other.configuration_ && runtime_policy(other.configuration_->policy));
     if (runtime_selection && (configuration_ || encoded_bytes_) && configuration_ != other.configuration_)
         bad("Cannot compose resource tables selected for different runtime configurations", "UNSUPPORTED");
     if (!package_.empty() && package_ != other.package_)
@@ -509,7 +550,8 @@ void ResourceTable::merge(ResourceTable other) {
         if (found != entries_.end() && configuration_ && other.configuration_) {
             const auto &old = found->second;
             if (old.type != entry.type || old.name != entry.name ||
-                (old.density == entry.density && old.sdk == entry.sdk))
+                (std::tie(old.density, old.sdk, old.orientation, old.width_dp, old.height_dp, old.smallest_width_dp) ==
+                 std::tie(entry.density, entry.sdk, entry.orientation, entry.width_dp, entry.height_dp, entry.smallest_width_dp)))
                 bad("Resource identity/configuration is ambiguous across APK members", "UNSUPPORTED");
         } else if (found != entries_.end() ||
                    (!extended && !names.emplace(id >> 24, entry.type, entry.name).second))

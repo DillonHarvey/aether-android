@@ -1,4 +1,5 @@
 #include "aether/dex/archive_source.hpp"
+#include "load_diagnostics.hpp"
 #include "aether/apk/bytes.hpp"
 #include <algorithm>
 #include <set>
@@ -72,12 +73,20 @@ struct ArchiveSource::Impl {
         return std::string_view(names).substr(entry.offset, entry.length);
     }
     std::vector<std::uint8_t> read(std::size_t file) const {
+        try {
         if (file >= files.size())
             bad("Unknown DEX source index");
         auto bytes = files[file].archive->read(files[file].entry);
-        if (apk::sha256(bytes) != files[file].hash)
-            bad("DEX source differs from its inspected immutable identity");
+        try {
+            if (apk::sha256(bytes) != files[file].hash)
+                bad("DEX source differs from its inspected immutable identity");
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::archive_hash);throw;
+        }
         return bytes;
+        } catch(const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::archive_read);throw;
+        }
     }
     explicit Impl(std::span<const ArchiveDexInput> inputs, ArchiveIndexPolicy policy) {
         if (policy != ArchiveIndexPolicy::inspected && policy != ArchiveIndexPolicy::directory)
@@ -188,7 +197,12 @@ std::string_view ArchiveSource::source_name(std::size_t index) const {
         bad("Unknown DEX source index");
     return impl_->files[index].name;
 }
-DexImage ArchiveSource::load(std::size_t index) { return parse(impl_->read(index)); }
+DexImage ArchiveSource::load(std::size_t index) {
+    try { return parse(impl_->read(index)); }
+    catch(const std::bad_alloc &) {
+        detail::note_class_load_allocation(ClassLoadAllocationPhase::source);throw;
+    }
+}
 std::size_t ArchiveSource::indexed_classes() const noexcept { return impl_->entries.size(); }
 std::size_t ArchiveSource::index_bytes() const noexcept {
     return impl_->names.capacity() + impl_->entries.capacity() * sizeof(Impl::Entry);

@@ -3,14 +3,50 @@
 #include "aether/apk/hash.hpp"
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <limits>
 #include <map>
 #include <set>
 
 namespace aether::elf {
-InitializerError::InitializerError(a64::Fault fault_, std::string message)
-    : ElfError("AETHER_ELF_INITIALIZER_FAILED", std::move(message)), fault(fault_) {}
+InitializerError::InitializerError(a64::Fault fault_, std::string message, InitializerContext context_)
+    : ElfError("AETHER_ELF_INITIALIZER_FAILED", std::move(message)), fault(fault_), context(std::move(context_)) {}
 namespace {
+std::string initializer_message(a64::Fault fault, const InitializerContext &context, bool module_truncated) {
+    std::string message = "Guest initializer/finalizer failed: " + std::string(a64::fault_name(fault));
+    message += context.finalizer ? "; phase=fini; module=\"" : "; phase=init; module=\"";
+    std::string suffix = "\"";
+    const auto hex = [&](std::string_view name, std::uint64_t value) {
+        std::array<char, 16> digits{};
+        const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(), value, 16);
+        suffix += ' ';suffix += name;suffix += "=0x";
+        suffix.append(digits.data(), static_cast<std::size_t>(converted.ptr - digits.data()));
+    };
+    hex("entry", context.entry);hex("fault_address", context.fault_address);hex("pc", context.pc);
+    hex("detail(raw)", context.detail);
+    constexpr std::array<std::string_view, 4> names{"x0", "x1", "x2", "x8"};
+    for (std::size_t i = 0; i < names.size(); ++i) hex(names[i], context.arguments[i]);
+    // All numeric fields remain visible within 350 bytes. Escape only a bounded
+    // module prefix; it is an untrusted identity, never format or control text.
+    const auto room = 350 - std::min<std::size_t>(350, message.size() + suffix.size());
+    const auto end = std::min<std::size_t>(48, context.module.size());
+    const auto start = message.size();
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::size_t at = 0;
+    for (; at < end; ++at) {
+        const auto byte = static_cast<unsigned char>(context.module[at]);
+        std::array<char, 4> escaped{};std::size_t count = 1;
+        if (byte == '\\' || byte == '"') {escaped[0] = '\\';escaped[1] = static_cast<char>(byte);count = 2;}
+        else if (byte < 0x20 || byte > 0x7e) {escaped = {'\\', 'x', digits[byte >> 4], digits[byte & 15]};count = 4;}
+        else escaped[0] = static_cast<char>(byte);
+        const auto used = message.size() - start;
+        if (room < 3 || used > room - 3 || count > room - 3 - used) break;
+        message.append(escaped.data(), count);
+    }
+    if ((module_truncated || at < context.module.size()) && room >= 3) message += "...";
+    message += suffix;
+    return message;
+}
 constexpr Address page = a64::GuestMemory::page_size;
 Address down(Address value) { return value & ~(page - 1); }
 Address up(Address value) { return down(value + page - 1); }
@@ -144,6 +180,7 @@ struct GuestLoader::Impl {
         return std::nullopt;
     }
     void call(a64::GuestCpu &cpu, Address address, Address stack_top,
+              std::string_view module, bool finalizer,
               std::optional<Address> thread_pointer = {}) const {
         if (!address || address == std::numeric_limits<Address>::max())
             return;
@@ -153,10 +190,14 @@ struct GuestLoader::Impl {
         const auto result = cpu.call(address, arguments, stack_top, 1'000'000, {}, thread_pointer);
         if(result.fault==a64::Fault::process_exit){cpu.process_checkpoint();throw ProcessExit{static_cast<std::uint8_t>(result.detail)};}
         if(result.fault==a64::Fault::thread_exit)throw ThreadExit{result.registers[0]};
-        if (!result.returned)
-            throw InitializerError(result.fault == a64::Fault::none ? a64::Fault::invalid_call : result.fault,
-                                   "Guest initializer/finalizer failed: " +
-                                       std::string(a64::fault_name(result.fault)));
+        if (!result.returned) {
+            InitializerContext context{std::string(module.substr(0, 48)), address, result.fault_address, result.pc,
+                                       result.detail, {result.registers[0], result.registers[1],
+                                                       result.registers[2], result.registers[8]}, finalizer};
+            const auto fault = result.fault == a64::Fault::none ? a64::Fault::invalid_call : result.fault;
+            auto message = initializer_message(fault, context, module.size() > context.module.size());
+            throw InitializerError(fault, std::move(message), std::move(context));
+        }
     }
     Address read_pointer(Address address) const {
         std::array<std::uint8_t, 8> bytes{};
@@ -448,6 +489,17 @@ std::optional<AddressInfo> GuestLoader::address_info(Address address) const {
     }
     return std::nullopt;
 }
+std::optional<ProgramHeaderInfo> GuestLoader::program_header_info(std::size_t index) const {
+    const auto &p = *impl_;
+    if (p.loading)
+        throw ElfError("AETHER_ELF_LOAD_STATE", "Program headers are unavailable during graph mutation");
+    if (!p.loaded || index >= p.modules.size()) return std::nullopt;
+    const auto &module = p.modules[index];
+    // Modules remain pinned after dlclose. Each committed module is one actual
+    // image load; neither an open handle nor a virtual service is a new image.
+    return ProgramHeaderInfo{module.image.soname, module.base, module.image.program_headers,
+                             static_cast<std::uint64_t>(p.modules.size())};
+}
 void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top, std::optional<Address> thread_pointer) {
     auto &p = *impl_;
     if (!p.loaded || p.initialization_started)
@@ -459,9 +511,9 @@ void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top, std::optiona
             auto &m = p.modules[at];
             if (m.initialized) continue;
             if (m.image.init)
-                p.call(cpu, m.base + m.image.init, stack_top, thread_pointer);
+                p.call(cpu, m.base + m.image.init, stack_top, m.image.soname, false, thread_pointer);
             for (std::uint64_t i = 0; i < m.image.init_count; ++i)
-                p.call(cpu, p.read_pointer(m.base + m.image.init_array + i * 8), stack_top, thread_pointer);
+                p.call(cpu, p.read_pointer(m.base + m.image.init_array + i * 8), stack_top, m.image.soname, false, thread_pointer);
             m.initialized = true;
         }
     } catch (...) {
@@ -481,9 +533,9 @@ void GuestLoader::finalize(a64::GuestCpu &cpu, Address stack_top) {
         // Do not repeat partially executed finalizers after a guest fault.
         m.finalized = true;
         for (auto j = m.image.fini_count; j > 0; --j)
-            p.call(cpu, p.read_pointer(m.base + m.image.fini_array + (j - 1) * 8), stack_top);
+            p.call(cpu, p.read_pointer(m.base + m.image.fini_array + (j - 1) * 8), stack_top, m.image.soname, true);
         if (m.image.fini)
-            p.call(cpu, m.base + m.image.fini, stack_top);
+            p.call(cpu, m.base + m.image.fini, stack_top, m.image.soname, true);
     }
 }
 const std::vector<GuestModule> &GuestLoader::modules() const noexcept { return impl_->modules; }

@@ -2,6 +2,8 @@
 #include "aether/bionic/guest_posix.hpp"
 #include "aether/dex/runtime.hpp"
 
+namespace aether::audio { class GuestAudioServices; }
+
 namespace aether::jni {
 struct Metrics {
     std::uint64_t calls = 0, native_calls = 0, managed_callbacks = 0, on_load_calls = 0;
@@ -12,12 +14,14 @@ struct Metrics {
 // memory and clock must outlive this bridge. The ELF loader consumes module
 // bytes/sources during construction; streamed files are not retained afterward.
 // The caller must authorize all module bytes before executing managed/native code.
+// An optional app-scoped audio adapter is borrowed and must also outlive the bridge.
 class Bridge final : public dex::NativeInterface, public a64::GuestServices {
   public:
     static constexpr a64::Address environment = 0x60000, java_vm = 0x60008;
     Bridge(dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
            const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
-           host::FileService *files = nullptr, bool attach_interface = true, std::string_view package = {});
+           host::FileService *files = nullptr, bool attach_interface = true, std::string_view package = {},
+           audio::GuestAudioServices *audio = nullptr);
     ~Bridge();
     Bridge(const Bridge &) = delete;
     Bridge &operator=(const Bridge &) = delete;

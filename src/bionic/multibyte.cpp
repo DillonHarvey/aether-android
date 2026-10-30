@@ -280,6 +280,28 @@ a64::Fault NativeMultibyte::invoke(MultibyteOperation operation,std::array<std::
             std::array<std::uint8_t,4> local{};State state(memory_,registers[0],local);
             result=state.initial()?1:0;break;
         }
+        case MultibyteOperation::mbtowc:{
+            State state(memory_,0,private_states_[5]);
+            if(!registers[1]){state.reset();result=0;break;}
+            result=conversion.decode(state,registers[1],0,registers[2],registers[0]).size;
+            // Bionic maps incomplete input to int -1/EILSEQ, retaining its
+            // private prefix even if publishing errno itself faults.
+            if(result==incomplete)result=conversion.invalid_value();
+            break;
+        }
+        case MultibyteOperation::mblen:{
+            std::array<std::uint8_t,4> local{};State state(memory_,0,local);
+            // The native wrapper uses a fresh state and directly narrows the
+            // restartable result to int: incomplete remains signed int -2.
+            result=conversion.decode(state,registers[0],0,registers[0]?registers[1]:1,0,0,!registers[0]).size;
+            break;
+        }
+        case MultibyteOperation::wctomb:{
+            State state(memory_,0,private_states_[6]);
+            if(!registers[0]){state.reset();result=0;break;}
+            result=conversion.wcrtomb(state,registers[0],static_cast<std::uint32_t>(registers[1]));
+            break;
+        }
         default:throw Unsupported{"multibyte: unknown operation"};
         }
         registers[0]=result;
