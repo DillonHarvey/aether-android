@@ -30,3 +30,14 @@ Work in progress for Windows 11 on 64-bit Intel and AMD PCs.
 Counts describe source implementation within the recorded scope, not complete app compatibility.
 
 <!-- aether:compatibility-progress:end -->
+
+## Building on Windows
+
+Use an x64 Visual Studio developer shell with CMake 3.25+, Ninja and Python 3.10+:
+
+```powershell
+cmake --preset windows-source-release
+cmake --build --preset windows-source-release
+```
+
+The public repository contains source and build inputs; the private development test suite is not published. Debug and Release presets automatically disable tests when `tests/` is absent. The full development test suite cannot currently be reproduced from a public checkout.
