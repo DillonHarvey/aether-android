@@ -61,6 +61,18 @@ EXCLUDED_DIRS = {
 EXCLUDED_SUFFIXES = {
     ".md",
     ".markdown",
+    ".rst",
+    ".ronn",
+    ".dox",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".html",
+    ".htm",
     ".apk",
     ".apks",
     ".xapk",
@@ -92,8 +104,14 @@ EXCLUDED_SUFFIXES = {
 }
 SECRET_PATTERN = (
     r"gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|"
-    r"AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"
+    r"(AKIA|ASIA)[0-9A-Z]{16}|AIza[A-Za-z0-9_-]{35}|"
+    r"xox[baprs]-[A-Za-z0-9-]{15,}|"
+    r"sk-(proj-|svcacct-)?[A-Za-z0-9_-]{24,}|sk_live_[A-Za-z0-9]{20,}|"
+    r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|"
+    r"eyJ[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}|"
+    r"-----BEGIN (RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"
 )
+
 VENDOR_TEST_HELPERS = {
     "core/lightweight_test.hpp",
     "core/lightweight_test_trait.hpp",
@@ -112,13 +130,31 @@ def permitted(name):
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or "\\" in name:
         return False
-    if name in ROOT_FILES or name == "docs/assets/aether-banner.svg":
+    if name in ROOT_FILES:
         return True
     if not path.parts:
+        return False
+    if (path.name.casefold().startswith(".env")
+            or path.name.casefold() in {".netrc", ".git-credentials", "credentials.json", "secrets.json", "id_rsa", "id_ed25519"}):
         return False
     if path.parts[0] == "tools":
         return len(path.parts) == 2 and path.name in TOOLS
     if path.parts[0] not in SOURCE_ROOTS:
+        return False
+    basename = path.name.casefold()
+    if (re.match(r"^(?:readme|changelog|news)(?:[._-]|$)", basename)
+            or basename in {"doxyfile", "doxygen.conf", ".codecov.yml"}):
+        return False
+    if name.startswith((
+        "third_party/dynarmic/externals/fmt/support/python/",
+        "third_party/dynarmic/externals/zydis/assets/img/",
+        "third_party/dynarmic/externals/zydis/assets/screenshots/",
+        "third_party/dynarmic/externals/zydis/man/",
+    )) or name in {
+        "third_party/dynarmic/externals/fmt/support/mkdocs",
+        "third_party/dynarmic/externals/fmt/support/mkdocs.yml",
+        "third_party/dynarmic/externals/zydis/assets/version-bump-checklist.txt",
+    }:
         return False
     if name.removeprefix("third_party/boost/boost/") in VENDOR_TEST_HELPERS:
         return False

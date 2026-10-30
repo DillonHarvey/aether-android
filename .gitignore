@@ -14,11 +14,6 @@
 !/src/
 !/third_party/
 !/tools/
-!/docs/
-/docs/*
-!/docs/assets/
-/docs/assets/*
-!/docs/assets/aether-banner.svg
 
 # Only tools needed to build, install, inspect or publish the project.
 /tools/*
@@ -105,3 +100,39 @@ CMakeUserPresets.json
 *.key
 *.keystore
 *.jks
+
+# Documentation and presentation material stay local until release.
+**/[Rr][Ee][Aa][Dd][Mm][Ee]*
+**/[Cc]hange[Ll]og*
+**/NEWS
+*.rst
+*.ronn
+*.dox
+*.pdf
+*.doc
+*.docx
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.html
+*.htm
+**/Doxyfile
+**/doxygen.conf
+**/.codecov.yml
+/third_party/dynarmic/externals/fmt/support/python/
+/third_party/dynarmic/externals/fmt/support/mkdocs
+/third_party/dynarmic/externals/fmt/support/mkdocs.yml
+/third_party/dynarmic/externals/zydis/assets/img/
+/third_party/dynarmic/externals/zydis/assets/screenshots/
+/third_party/dynarmic/externals/zydis/assets/version-bump-checklist.txt
+/third_party/dynarmic/externals/zydis/man/
+!/README.md
+
+# Local authentication material must never enter the source upload.
+**/.netrc
+**/.git-credentials
+**/credentials.json
+**/secrets.json
+**/id_rsa
+**/id_ed25519
