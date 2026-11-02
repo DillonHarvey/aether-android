@@ -8,24 +8,28 @@ Work in progress for Windows 11 on 64-bit Intel and AMD PCs.
 
 <!-- aether:compatibility-progress:start -->
 
-**910 / 3,589 implemented (25.36%)**
+Catalogue last audited: 2026-11-02.
 
-| Category | Total | Implemented | Progress |
-| :--- | ---: | ---: | ---: |
-| Packages & signing | 140 | 40 | 28.57% |
-| ARM64 translation | 238 | 142 | 59.66% |
-| Native libraries & POSIX | 457 | 119 | 26.04% |
-| DEX & Java runtime | 601 | 257 | 42.76% |
-| Java/native bridge (JNI) | 285 | 160 | 56.14% |
-| Android framework | 231 | 18 | 7.79% |
-| Screens & graphics | 862 | 54 | 6.26% |
-| Files & networking | 198 | 14 | 7.07% |
-| Media & devices | 236 | 0 | 0.00% |
-| App engines | 128 | 0 | 0.00% |
-| Security & permissions | 88 | 31 | 35.23% |
-| Windows integration | 65 | 64 | 98.46% |
-| Quality & reproducibility | 60 | 11 | 18.33% |
-| **Total** | **3,589** | **910** | **25.36%** |
+**933 / 3,589 implemented (26.00%)**
+
+| Category | Total | Implemented | In progress | Not started | Progress |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Packages & signing | 140 | 40 | 45 | 55 | 28.57% |
+| ARM64 translation | 238 | 142 | 87 | 9 | 59.66% |
+| Native libraries & POSIX | 457 | 130 | 143 | 184 | 28.45% |
+| DEX & Java runtime | 601 | 266 | 164 | 171 | 44.26% |
+| Java/native bridge (JNI) | 285 | 160 | 88 | 37 | 56.14% |
+| Android framework | 231 | 20 | 32 | 179 | 8.66% |
+| Screens & graphics | 862 | 55 | 134 | 673 | 6.38% |
+| Files & networking | 198 | 14 | 11 | 173 | 7.07% |
+| Media & devices | 236 | 0 | 7 | 229 | 0.00% |
+| App engines | 128 | 0 | 0 | 128 | 0.00% |
+| Security & permissions | 88 | 31 | 29 | 28 | 35.23% |
+| Windows integration | 65 | 64 | 1 | 0 | 98.46% |
+| Quality & reproducibility | 60 | 11 | 42 | 7 | 18.33% |
+| **Total** | **3,589** | **933** | **783** | **1,873** | **26.00%** |
+
+**Completed areas:** Windows native install / shell / lifecycle (35/35).
 
 Counts describe source implementation within the recorded scope, not complete app compatibility.
 
