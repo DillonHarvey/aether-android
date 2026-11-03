@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 #include <vector>
 #include <windows.h>
 
@@ -48,7 +49,7 @@ struct GuestMemory::Impl {
     std::size_t backing_total = 0;
     std::vector<Region> regions; // Always ordered by guest address, without overlaps.
     std::size_t total = 0;
-    std::uint64_t generation = 1;
+    std::uint64_t generation = 1, code_generation = 1;
     const Region *find(Address address, std::size_t size, Permission permission) const noexcept {
         if (!size || size > std::numeric_limits<Address>::max() - address)
             return nullptr;
@@ -68,6 +69,24 @@ GuestMemory::~GuestMemory() = default;
 std::optional<GuestMemory::Mapping> GuestMemory::mapping(Address address) const noexcept {
     for(const auto &r:impl_->regions)if(address>=r.address && address-r.address<r.size)return Mapping{r.address,r.size,r.permissions};
     return {};
+}
+GuestMemory::WordIdentity::WordIdentity(std::weak_ptr<const void> backing,std::size_t offset) noexcept
+    :backing_(std::move(backing)),offset_(offset) {}
+bool GuestMemory::WordIdentity::same_backing(const WordIdentity &other) const noexcept {
+    // Weak ownership order identifies the original control block even after
+    // its object is destroyed. No lock(), host pointer or backing lease escapes.
+    return !backing_.owner_before(other.backing_) && !other.backing_.owner_before(backing_);
+}
+bool GuestMemory::WordIdentity::operator==(const WordIdentity &other) const noexcept {
+    return offset_==other.offset_ && same_backing(other);
+}
+std::optional<GuestMemory::WordIdentity> GuestMemory::word_identity(Address address,Permission required) const noexcept {
+    const auto requested=static_cast<unsigned>(required);
+    if(address%4 || address>=address_limit || !requested || (requested&~7U))return {};
+    const auto *region=impl_->find(address,4,required);
+    if(!region)return {};
+    return WordIdentity{std::weak_ptr<const void>{region->backing},
+        region->offset+static_cast<std::size_t>(address-region->address)};
 }
 void GuestMemory::map(Address address, std::size_t size, Permission permissions) {
     validate_permissions(permissions);
@@ -93,6 +112,7 @@ void GuestMemory::map(Address address, std::size_t size, Permission permissions)
     backing->charge = &impl_->backing_total;
     impl_->total += size;
     ++impl_->generation;
+    if (has(permissions, Permission::execute)) ++impl_->code_generation;
 }
 void GuestMemory::protect(Address address, Permission permissions) {
     validate_permissions(permissions);
@@ -101,8 +121,11 @@ void GuestMemory::protect(Address address, Permission permissions) {
             DWORD old = 0;
             if (!VirtualProtect(r.data(), r.size, host_protection(permissions), &old))
                 throw GuestError("AETHER_GUEST_PROTECTION", "Windows rejected guest memory protection");
+            const bool code_changed = r.permissions != permissions &&
+                (has(r.permissions, Permission::execute) || has(permissions, Permission::execute));
             r.permissions = permissions;
             ++impl_->generation;
+            if (code_changed) ++impl_->code_generation;
             return;
         }
     throw GuestError("AETHER_GUEST_MAPPING", "No mapping starts at this guest address");
@@ -112,18 +135,22 @@ void GuestMemory::unmap(Address address) {
                                  [address](const auto &r) { return r.address == address; });
     if (it == impl_->regions.end())
         throw GuestError("AETHER_GUEST_MAPPING", "No mapping starts at this guest address");
+    const bool code_changed = has(it->permissions, Permission::execute);
     impl_->total -= it->size;
     impl_->regions.erase(it);
     ++impl_->generation;
+    if (code_changed) ++impl_->code_generation;
 }
 void GuestMemory::unmap_range(Address address, std::size_t size) {
     validate_range(address, size);
     const auto end = address + size;
     std::size_t count = 0, removed = 0;
+    bool code_changed = false;
     for (const auto &region : impl_->regions) {
         const auto first = std::max(address, region.address), last = std::min(end, region.address + region.size);
         if (first >= last) { ++count; continue; }
         removed += static_cast<std::size_t>(last - first);
+        code_changed |= has(region.permissions, Permission::execute);
         count += (region.address < first) + (last < region.address + region.size);
     }
     if (!removed) return;
@@ -142,7 +169,91 @@ void GuestMemory::unmap_range(Address address, std::size_t size) {
     impl_->regions.swap(prepared);
     impl_->total -= removed;
     ++impl_->generation;
+    if (code_changed) ++impl_->code_generation;
     // Only this scope's last backing references release Windows allocations and charge.
+}
+void GuestMemory::remap_range(Address address, std::size_t size, Address target, std::size_t new_size) {
+    validate_range(address, size);
+    validate_range(target, new_size);
+    if (!target) throw GuestError("AETHER_GUEST_MAPPING", "Remap target cannot be the null page");
+    const auto end = address + size, target_end = target + new_size;
+    if (target != address && target < end && address < target_end)
+        throw GuestError("AETHER_GUEST_MAPPING", "Remap destination overlaps the source");
+    const auto retained = std::min(size, new_size);
+    auto cursor = address;
+    Permission growth_permission = Permission::none;
+    std::size_t count = 0;
+    bool code_changed = false;
+    for (const auto &region : impl_->regions) {
+        const auto region_end = region.address + region.size;
+        const auto first = std::max(address, region.address), last = std::min(end, region_end);
+        if (first < last) {
+            if (first != cursor)
+                throw GuestError("AETHER_GUEST_MAPPING", "Remap source contains an unmapped gap");
+            cursor = last;
+            growth_permission = region.permissions;
+            code_changed |= has(region.permissions, Permission::execute);
+            count += (region.address < first) + (last < region_end);
+            if (first < address + retained) ++count;
+        } else {
+            if (target < region_end && region.address < target_end)
+                throw GuestError("AETHER_GUEST_MAPPING", "Remap destination is occupied");
+            ++count;
+        }
+        // A partly selected source view may also contain occupied destination
+        // pages outside the old range (notably same-address growth).
+        if (target == address && new_size > size && region_end > end && region.address < target_end)
+            throw GuestError("AETHER_GUEST_MAPPING", "Remap growth overlaps existing pages");
+        if (target != address && first < last &&
+            ((region.address < first && target < first && region.address < target_end) ||
+             (last < region_end && target < region_end && last < target_end)))
+            throw GuestError("AETHER_GUEST_MAPPING", "Remap destination overlaps retained source neighbours");
+    }
+    if (cursor != end)
+        throw GuestError("AETHER_GUEST_MAPPING", "Remap source contains an unmapped gap");
+    const auto growth = new_size > size ? new_size - size : 0;
+    if (growth) ++count;
+    if (count > 4096 || growth > maximum_bytes - impl_->backing_total)
+        throw GuestError("AETHER_GUEST_MAPPING", "Remap exceeds the guest view or resident backing quota");
+    if (target == address && size == new_size) return;
+    std::vector<Impl::Region> prepared;
+    prepared.reserve(count);
+    for (const auto &region : impl_->regions) {
+        const auto region_end = region.address + region.size;
+        const auto first = std::max(address, region.address), last = std::min(end, region_end);
+        if (first >= last) { prepared.push_back(region); continue; }
+        if (region.address < first)
+            prepared.push_back({region.address, static_cast<std::size_t>(first - region.address),
+                region.permissions, region.backing, region.offset});
+        if (last < region_end)
+            prepared.push_back({last, static_cast<std::size_t>(region_end - last), region.permissions,
+                region.backing, region.offset + static_cast<std::size_t>(last - region.address)});
+        const auto kept_end = std::min(last, address + retained);
+        if (first < kept_end)
+            prepared.push_back({target + (first - address), static_cast<std::size_t>(kept_end - first),
+                region.permissions, region.backing, region.offset + static_cast<std::size_t>(first - region.address)});
+    }
+    std::shared_ptr<Impl::Backing> added;
+    if (growth) {
+        added = std::make_shared<Impl::Backing>();
+        added->size = growth;
+        added->allocation = static_cast<std::uint8_t *>(
+            VirtualAlloc(nullptr, growth + 2 * page_size, MEM_RESERVE, PAGE_NOACCESS));
+        if (!added->allocation || !VirtualAlloc(added->allocation + page_size, growth, MEM_COMMIT,
+                                               host_protection(growth_permission)))
+            throw GuestError("AETHER_GUEST_ALLOCATION", "Windows could not allocate remap growth backing");
+        prepared.push_back({target + size, growth, growth_permission, added, 0});
+    }
+    std::sort(prepared.begin(), prepared.end(), [](const auto &left, const auto &right) {
+        return left.address < right.address;
+    });
+    // No fallible operation remains. Existing backings retain their charge;
+    // truncated backings are released only if their final view disappears.
+    if (added) { impl_->backing_total += growth; added->charge = &impl_->backing_total; }
+    impl_->regions.swap(prepared);
+    impl_->total = impl_->total - size + new_size;
+    ++impl_->generation;
+    if (code_changed) ++impl_->code_generation;
 }
 void GuestMemory::protect_range(Address address, std::size_t size, Permission permissions) {
     validate_permissions(permissions);
@@ -175,19 +286,24 @@ void GuestMemory::protect_range(Address address, std::size_t size, Permission pe
             prepared.push_back({last, static_cast<std::size_t>(region.address + region.size - last), region.permissions, region.backing,
                                 region.offset + static_cast<std::size_t>(last - region.address)});
     }
-    bool changed = false;
+    bool changed = false, code_changed = false;
     for (auto &region : prepared) {
         if (region.address < address || region.address + region.size > end || region.permissions == permissions) continue;
         DWORD old = 0;
         if (!VirtualProtect(region.data(), region.size, host_protection(permissions), &old)) {
-            if (changed) { impl_->regions.swap(prepared); ++impl_->generation; }
+            if (changed) {
+                impl_->regions.swap(prepared); ++impl_->generation;
+                if (code_changed) ++impl_->code_generation;
+            }
             throw GuestError("AETHER_GUEST_PROTECTION", "Windows rejected part of a guest protection range");
         }
+        code_changed |= has(region.permissions, Permission::execute) || has(permissions, Permission::execute);
         region.permissions = permissions;
         changed = true;
     }
     impl_->regions.swap(prepared);
     ++impl_->generation;
+    if (code_changed) ++impl_->code_generation;
 }
 std::optional<Address> GuestMemory::find_free(Address begin, Address end, std::size_t size) const noexcept {
     if (!begin || begin >= end || end > address_limit || begin % page_size || end % page_size || !size || size % page_size || size > end - begin)
@@ -202,18 +318,35 @@ std::optional<Address> GuestMemory::find_free(Address begin, Address end, std::s
     }
     return size <= end - candidate ? std::optional<Address>{candidate} : std::nullopt;
 }
-bool GuestMemory::accessible(Address address, std::size_t size, Permission permission) const noexcept {
-    if (!size || address >= address_limit || size > address_limit - address)
-        return false;
-    while (size) {
-        const auto r = impl_->find(address, 1, permission);
-        if (!r)
-            return false;
-        const auto count = std::min(size, r->size - static_cast<std::size_t>(address - r->address));
+std::optional<MemoryFailure> GuestMemory::access_failure(Address address, std::size_t size,
+                                                       Permission permission) const noexcept {
+    const auto requested = static_cast<unsigned>(permission);
+    if (!size || !requested || (requested & ~7u))
+        return MemoryFailure{MemoryFailureKind::invalid, address, permission};
+    if (address >= address_limit)
+        return MemoryFailure{MemoryFailureKind::unmapped, address, permission};
+    // Locate mappings without filtering permissions, so an occupied protected
+    // byte remains distinguishable from a gap. Never add the requested size.
+    for (const auto &region : impl_->regions) {
+        if (address < region.address)
+            return MemoryFailure{MemoryFailureKind::unmapped, address, permission};
+        const auto offset = address - region.address;
+        if (offset >= region.size) continue;
+        if ((static_cast<unsigned>(region.permissions) & requested) != requested)
+            return MemoryFailure{MemoryFailureKind::protection, address, permission};
+        const auto count = std::min(size, region.size - static_cast<std::size_t>(offset));
+        // Each region was admitted wholly within address_limit. Advancing by
+        // its bounded remainder cannot wrap, even for an oversized request.
         address += count;
         size -= count;
+        if (!size) return {};
+        if (address == address_limit)
+            return MemoryFailure{MemoryFailureKind::unmapped, address, permission};
     }
-    return true;
+    return MemoryFailure{MemoryFailureKind::unmapped, address, permission};
+}
+bool GuestMemory::accessible(Address address, std::size_t size, Permission permission) const noexcept {
+    return !access_failure(address, size, permission);
 }
 bool GuestMemory::read(Address address, std::span<std::uint8_t> target,
                        Permission permission) const noexcept {
@@ -242,6 +375,7 @@ bool GuestMemory::write(Address address, std::span<const std::uint8_t> source) n
     return true;
 }
 std::uint64_t GuestMemory::generation() const noexcept { return impl_->generation; }
+std::uint64_t GuestMemory::code_generation() const noexcept { return impl_->code_generation; }
 std::size_t GuestMemory::mapped_bytes() const noexcept { return impl_->total; }
 bool GuestMemory::host_pages_are_non_executable() const noexcept {
     for (const auto &r : impl_->regions) {

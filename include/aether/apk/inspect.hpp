@@ -60,6 +60,32 @@ struct ManifestInteger {
 };
 inline constexpr std::size_t manifest_activity_config_bytes = 8;
 static_assert(sizeof(ManifestInteger) == manifest_activity_config_bytes);
+// Only NativeActivity's two entry keys are retained. Resource attributes remain
+// distinct even if their encoded value happens to be a literal string.
+struct ManifestNativeValue {
+    DisplayValue value{manifest_absent_type, 0, {}};
+    bool resource_attribute = false;
+};
+// Complete ordered raw declarations, not a resolved Android Bundle. Keep both
+// value/resource attributes: resource=0 can have different parser semantics
+// from a nonzero resource, and duplicate names are resolved only by consumers.
+struct ManifestMetaDataEntry {
+    DisplayValue name{manifest_absent_type, 0, {}};
+    DisplayValue value{manifest_absent_type, 0, {}};
+    DisplayValue resource{manifest_absent_type, 0, {}};
+};
+// Actual retained capacities, capped by the existing manifest metadata bound.
+// Returns manifest_activity_bytes + 1 on overflow/excess; no copying occurs.
+std::size_t activity_meta_data_storage_size(
+    const std::vector<std::vector<ManifestMetaDataEntry>> &) noexcept;
+struct ManifestNativeEntry {
+    ManifestNativeValue lib_name, func_name;
+    // A direct meta-data key without a literal name could resolve to either
+    // entry key; NativeActivity cannot prove their absence in that case.
+    bool unresolved_name = false;
+};
+inline constexpr std::size_t manifest_activity_native_bytes = 128;
+static_assert(sizeof(ManifestNativeEntry) <= manifest_activity_native_bytes);
 // Public Android 15 configChanges flags; recognizing a bit does not implement
 // the corresponding device change or Activity recreation behavior.
 inline constexpr std::uint32_t manifest_config_changes_mask = 0x5000ffff;
@@ -70,11 +96,13 @@ struct Activity {
     DisplayValue label, icon;
     ManifestBoolean enabled, exported;
     ManifestInteger screen_orientation;
+    ManifestInteger theme;
     DisplayValue permission{manifest_absent_type, 0, {}};
 };
 // Manifest inventory is independent of the single launcher selected for execution.
-// Charge a fixed record allowance plus all retained UTF-8 strings, consistently
-// across Debug/Release. XML input, string-pool and node limits remain separate.
+// Legacy component/filter records use fixed allowances plus retained strings.
+// Raw metadata additionally accounts actual vector/string capacities within
+// the same bound. XML input, string-pool and node limits remain separate.
 inline constexpr std::size_t manifest_activity_count = 8192;
 inline constexpr std::size_t manifest_activity_bytes = 4 * 1024 * 1024;
 inline constexpr std::size_t manifest_activity_record_bytes = 256;
@@ -109,10 +137,15 @@ struct ManifestInfo {
     // Empty when no application android:appComponentFactory is declared.
     std::string app_component_factory_name;
     std::string version_name;
+    // Preserve actual attribute presence/type independently of legacy display text.
+    // A literal beginning with @resource: remains a literal, and empty differs from absent.
+    bool version_name_present = false;
+    std::optional<std::uint32_t> version_name_resource;
     std::optional<std::uint32_t> version_code;
     std::optional<std::uint32_t> version_code_major;
     std::optional<std::uint32_t> min_sdk;
     std::optional<std::uint32_t> target_sdk;
+    ManifestInteger application_theme;
     std::optional<bool> extract_native_libs;
     std::string split;
     std::string config_for_split;
@@ -121,18 +154,36 @@ struct ManifestInfo {
     std::vector<std::string> required_splits;
     std::vector<std::string> permissions;
     std::vector<Activity> activities;
+    // Actual signed declarations, not service execution or resolution authority.
+    // False preserves unknown/unmodeled names and hand-constructed inventories.
+    std::vector<std::string> declared_services;
+    bool service_inventory_bound = false;
     DisplayValue label, icon, round_icon;
     ManifestBoolean enabled;
     DisplayValue permission{manifest_absent_type, 0, {}};
     // Parsed manifests retain one compact value per Activity/alias. An empty
     // vector also represents all-absent values in hand-constructed metadata.
     std::vector<ManifestInteger> activity_config_changes;
+    // Raw SDK input used with configChanges; aliases remain unbound.
+    std::vector<ManifestInteger> activity_recreate_on_config_changes;
+    // Aligned with declarations, including aliases. Each selected component
+    // owns its metadata; an empty vector means both keys absent everywhere.
+    std::vector<ManifestNativeEntry> activity_native_entries;
+    // Aligned raw direct Activity/alias metadata declarations. Bound establishes
+    // complete raw inventory only, not resolved names/values or alias inheritance.
+    std::vector<std::vector<ManifestMetaDataEntry>> activity_meta_data;
+    bool activity_meta_data_bound = false;
     // One filter inventory per Activity/alias; alias filters belong to the alias,
     // independently of its executable target. Empty outer storage represents
     // all-empty inventories in hand-constructed metadata, as with configChanges.
     std::vector<std::vector<ManifestIntentFilter>> activity_intent_filters;
+    // Application-level raw android:supportsRtl. Absence defaults false only
+    // at a consumer with known held-manifest provenance; references/unknown
+    // encodings must not silently become a known false ApplicationInfo bit.
+    ManifestBoolean supports_rtl;
 };
-// Fixed record allowances plus all retained activity/filter text. Misaligned
+// Fixed record allowances plus retained activity/filter text and actual service
+// name capacities. Misaligned
 // side metadata and arithmetic/budget overflow return 4 MiB + 1.
 // Empty side vectors represent all-absent metadata and receive the same fixed
 // per-Activity allowance as parsed/padded inventories. No routing is performed.

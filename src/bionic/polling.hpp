@@ -7,8 +7,14 @@ class NativeSignals;
 class NativePolling {
   public:
     NativePolling(a64::GuestMemory &memory,NativeDescriptors &files,NativeThreads &threads,NativeSignals &signals):memory_(memory),files_(files),threads_(threads),signals_(signals){}
-    a64::Fault invoke(a64::Address error,std::array<std::uint64_t,31> &,bool full_frame,a64::ServiceState *frame=nullptr);
+    a64::Fault invoke(a64::Address error,std::array<std::uint64_t,31> &,bool full_frame,a64::ServiceState *frame=nullptr,
+                      bool allow_deferred=false,std::shared_ptr<ProcessState> process={});
   private:
+    struct Watch {
+        std::int32_t fd=0;std::uint16_t events=0,revents=0;
+        bool originally_valid=false;std::weak_ptr<const void> description;
+    };
+    struct DeferredPoll;
     a64::GuestMemory &memory_;NativeDescriptors &files_;NativeThreads &threads_;NativeSignals &signals_;
 };
 }

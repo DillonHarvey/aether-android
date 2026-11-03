@@ -1,11 +1,13 @@
 #include "aether/security/activity_dispatcher.hpp"
 #include "aether/host/windows/unique_handle.hpp"
 #include "aether/host/windows/clipboard_service.hpp"
+#include "aether/host/native_window_context.hpp"
 #include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 namespace aether::security {
 namespace {
@@ -25,10 +27,14 @@ struct ActivityDispatcher::Impl {
     const std::shared_ptr<host::ClipboardWindowContext> clipboard_window =
         std::make_shared<host::ClipboardWindowContext>();
     host::UniqueHandle event{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+    host::UniqueHandle io_finished{CreateEventW(nullptr, TRUE, TRUE, nullptr)};
+    std::shared_ptr<host::NativeWindowContext> native_window;
+    bool joining_io = false;
     mutable std::mutex mutex;
     std::condition_variable wake;
     std::deque<Request> requests;
     std::vector<ActivityCompletion> completions;
+    std::optional<ActivityFinishRequest> finish_request;
     std::shared_ptr<const android::TextEditObservation> text_edit_observation;
     std::uint64_t text_edit_receipt = 0;
     std::uint64_t active_request_ticket = 0, text_edit_ticket = 0;
@@ -56,12 +62,15 @@ struct ActivityDispatcher::Impl {
     std::exception_ptr failure;
     IsolatedActivity *active = nullptr; // Protected by mutex; only cancel crosses threads.
     std::uint64_t next = 1, outstanding = 0, read_ticket = 0;
+    std::size_t key_credits = 0; // Submitted keys retain credit through UI consumption of their final result.
+    struct PendingKey { std::uint64_t origin = 0, ticket = 0; };
+    std::array<PendingKey, 256> pending_keys{}; // I/O-owner correlation, independent of command ACK accounting.
     bool stopping = false, closing = false, read_failed = false;
     HWND notification_window = nullptr;
     UINT notification_message = 0;
     bool notification_posted = false;
     std::jthread io;
-    Impl() { require(static_cast<bool>(event), "Cannot create completion event"); }
+    Impl() { require(static_cast<bool>(event) && static_cast<bool>(io_finished), "Cannot create dispatcher events"); }
     void check_owner() const { require(std::this_thread::get_id() == owner, "Wrong UI owner thread"); }
     void notify() {
         require(SetEvent(event.get()) != FALSE, "Cannot signal completion event");
@@ -75,8 +84,10 @@ struct ActivityDispatcher::Impl {
         std::lock_guard lock(mutex);
         stopping = true;
         clipboard_window->close();
+        if (native_window) native_window->close();
         active_request_ticket = 0;
         requests.clear();
+        finish_request.reset();
         if (active)
             active->cancel();
         wake.notify_all();
@@ -258,6 +269,7 @@ struct ActivityDispatcher::Impl {
         // Copy outside the mailbox lock. Only the I/O thread touches the connection.
         ActivityPublication update;
         update.state = std::make_shared<const ActivityState>(session.snapshot());
+        update.transport_session = session.transport_session();
         update.text_edit_observation_revision = completion.read_unavailable
             ? pending.text_edit_observation_revision : last_streamed_text_edit_revision;
         update.process_id = session.process_id();
@@ -297,7 +309,40 @@ struct ActivityDispatcher::Impl {
         const auto activation_count = completion.view_activations.size();
         completions.push_back(std::move(completion));
         pending_view_activation_count += activation_count;
+        // Install the command publication first, then its finish notice under
+        // the same mailbox lock. A woken UI cannot default an old pending key
+        // between the publication and receipt of this already-custodied notice.
+        if (const auto request = session.take_finish_request(); request && !stopping) {
+            require(!finish_request, "Unconsumed Activity finish notice already occupies UI custody");
+            finish_request = *request;
+        }
         notify();
+    }
+    void drain_finish_request(IsolatedActivity &session) {
+        const auto request = session.take_finish_request();
+        if (!request) return;
+        std::lock_guard lock(mutex);
+        if (stopping) return; // Aborted presentation cannot acquire new finish authority.
+        require(!finish_request, "Unconsumed Activity finish notice already occupies UI custody");
+        finish_request = *request;
+        notify(); // No state/history publication or command accounting.
+    }
+    void drain_key_results(IsolatedActivity &session) {
+        for (const auto &result : session.take_key_results()) {
+            const auto found = std::find_if(pending_keys.begin(), pending_keys.end(),
+                [&](const auto &entry) { return entry.origin == result.origin; });
+            require(found != pending_keys.end(), "Final key result has no original UI ticket");
+            ActivityCompletion completion{found->ticket, ActivityCommandKind::key};
+            completion.key_final = true;
+            completion.key_outcome = result.outcome;
+            completion.handled = result.outcome == KeyDispatchOutcome::handled;
+            // No latest-state replacement, historical View/text replay or
+            // completed-command increment for a deferred key's final outcome.
+            std::lock_guard lock(mutex);
+            completions.push_back(std::move(completion));
+            *found = {};
+            notify();
+        }
     }
     void observe_text_edit(const android::TextEditObservation &observation, std::uint64_t context,
                            AwakeDeadlineClock::time_point deadline) {
@@ -424,7 +469,7 @@ struct ActivityDispatcher::Impl {
             const ActivityTerminalActivationSink terminal_sink =
                 [this](const ActivityTerminalActivations &batch, std::uint64_t context,
                        AwakeDeadlineClock::time_point deadline) { observe_terminal_activations(batch, context, deadline); };
-            auto owned = application ? std::make_unique<IsolatedActivity>(*application, sink, soft_sink, clipboard_window, terminal_sink)
+            auto owned = application ? std::make_unique<IsolatedActivity>(*application, sink, soft_sink, clipboard_window, terminal_sink, native_window)
                                      : std::make_unique<IsolatedActivity>(apk, mode, developer_output_root, sink, soft_sink,
                                                                           clipboard_window, terminal_sink);
             auto &session = *owned;
@@ -454,6 +499,8 @@ struct ActivityDispatcher::Impl {
                     if (requests.empty()) {
                         lock.unlock();
                         (void)session.service_background();
+                        drain_finish_request(session);
+                        drain_key_results(session);
                         continue;
                     }
                     request = std::move(requests.front());
@@ -469,12 +516,29 @@ struct ActivityDispatcher::Impl {
                     else if (request.document) session.drop_document(std::move(*request.document), request.command);
                     else session.dispatch(request.command);
                     completion.handled = session.snapshot().handled;
+                    completion.key_outcome = session.snapshot().key_outcome;
+                    require((request.command.kind == ActivityCommandKind::key) ==
+                                (completion.key_outcome != KeyDispatchOutcome::none),
+                            "Activity key completion does not match its original command");
+                    if (completion.key_outcome == KeyDispatchOutcome::deferred) {
+                        const auto slot = std::find_if(pending_keys.begin(), pending_keys.end(),
+                            [](const auto &entry) { return !entry.origin; });
+                        require(slot != pending_keys.end(), "Pending UI key correlation quota exceeded");
+                        // Wire command sequences and UI tickets have distinct
+                        // namespaces. Early finals remain staged in the session.
+                        *slot = {session.command_count(), request.ticket};
+                    }
                 } catch (const ActivityReadUnavailable &) {
                     require(request.command.kind == ActivityCommandKind::refresh,
                             "A mutation cannot be retried as a state read");
                     completion.read_unavailable = true;
                 }
+                // Close cancellation finals refer to earlier, already-published
+                // keys and must reach the UI before its terminal close state.
+                if (request.command.kind == ActivityCommandKind::close) drain_key_results(session);
                 publish(session, completion);
+                drain_finish_request(session);
+                drain_key_results(session); // Provisional key ACK always precedes its final notification.
                 {
                     std::lock_guard lock(mutex);
                     active_request_ticket = 0;
@@ -489,6 +553,7 @@ struct ActivityDispatcher::Impl {
             stopping = true;
             active_request_ticket = 0;
             requests.clear();
+            finish_request.reset();
             SetEvent(event.get());
             if (notification_window)
                 PostMessageW(notification_window, notification_message, 0, 0);
@@ -498,14 +563,27 @@ struct ActivityDispatcher::Impl {
 ActivityDispatcher::ActivityDispatcher(const std::filesystem::path &apk, ActivityMode mode,
                                        const std::filesystem::path &developer_output_root)
     : impl_(std::make_unique<Impl>()) {
+    require(ResetEvent(impl_->io_finished.get()) != FALSE, "Cannot arm I/O completion event");
     impl_->io = std::jthread([self = impl_.get(), apk, mode, developer_output_root] {
+        struct Complete { HANDLE event; ~Complete() { SetEvent(event); } } complete{self->io_finished.get()};
         self->run(apk, mode, nullptr, developer_output_root);
     });
 }
-ActivityDispatcher::~ActivityDispatcher() = default;
+ActivityDispatcher::~ActivityDispatcher() {
+    // UI presentation users normally drain explicitly before HWND destruction.
+    // Preserve message-aware draining on exceptional scope exit as well.
+    if (impl_ && std::this_thread::get_id() == impl_->owner) {
+        try { join_io(); } catch (...) { }
+    }
+}
 ActivityDispatcher::ActivityDispatcher(InstalledActivity application) : impl_(std::make_unique<Impl>()) {
+    impl_->native_window = std::make_shared<host::NativeWindowContext>();
+    require(ResetEvent(impl_->io_finished.get()) != FALSE, "Cannot arm I/O completion event");
     impl_->io = std::jthread(
-        [self = impl_.get(), app = std::move(application)] { self->run({}, ActivityMode::normal, &app); });
+        [self = impl_.get(), app = std::move(application)] {
+            struct Complete { HANDLE event; ~Complete() { SetEvent(event); } } complete{self->io_finished.get()};
+            self->run({}, ActivityMode::normal, &app);
+        });
 }
 std::uint64_t ActivityDispatcher::submit(ActivityCommand command) {
     auto &p = *impl_;
@@ -525,9 +603,12 @@ std::uint64_t ActivityDispatcher::submit(ActivityCommand command) {
     // Reserve a final slot for ordered close. Completed but unconsumed replies also count.
     require(p.outstanding < (command.kind == ActivityCommandKind::close ? 257u : 256u),
             "Pending command quota exceeded");
+    if (command.kind == ActivityCommandKind::key)
+        require(p.key_credits < 256, "Pending key final-result quota exceeded");
     const auto ticket = p.next++;
     p.requests.push_back({ticket, std::move(command), {}, {}});
     const auto kind = p.requests.back().command.kind;
+    if (kind == ActivityCommandKind::key) ++p.key_credits;
     if (kind == ActivityCommandKind::refresh)
         p.read_ticket = ticket;
     if (kind == ActivityCommandKind::close) {
@@ -614,6 +695,30 @@ void ActivityDispatcher::close() {
     (void)submit(std::move(command));
 }
 void ActivityDispatcher::abort() noexcept { impl_->abort(); }
+std::shared_ptr<host::NativeWindowContext> ActivityDispatcher::graphics_window_context() const {
+    impl_->check_owner();
+    return impl_->native_window;
+}
+void ActivityDispatcher::join_io() {
+    auto &p = *impl_;
+    p.check_owner();
+    require(!p.joining_io, "Recursive I/O drain is unsupported");
+    if (!p.io.joinable()) return;
+    p.joining_io = true;
+    struct Reset { bool &value; ~Reset() { value = false; } } reset{p.joining_io};
+    p.abort();
+    const HANDLE done = p.io_finished.get();
+    for (;;) {
+        const auto result = MsgWaitForMultipleObjectsEx(1, &done, INFINITE, QS_SENDMESSAGE, 0);
+        if (result == WAIT_OBJECT_0) break;
+        require(result == WAIT_OBJECT_0 + 1, "Cannot wait for I/O retirement");
+        // Peek dispatches pending synchronous sent messages itself. Leave
+        // queued keyboard/input/close commands untouched during teardown.
+        MSG message{};
+        (void)PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+    }
+    p.io.join(); // Signaled completion proves no DXGI callback can still need UI.
+}
 HANDLE ActivityDispatcher::completion_event() const noexcept { return impl_->event.get(); }
 void ActivityDispatcher::set_notification(HWND window, UINT message) {
     auto &p = *impl_;
@@ -623,7 +728,8 @@ void ActivityDispatcher::set_notification(HWND window, UINT message) {
     p.notification_window = window;
     p.notification_message = message;
     p.notification_posted = false;
-    if (window && (!p.completions.empty() || p.text_edit_observation || p.soft_input_observation || p.failure))
+    if (window && (!p.completions.empty() || p.text_edit_observation || p.soft_input_observation ||
+                   p.terminal_activations || p.finish_request || p.failure))
         p.notify();
 }
 void ActivityDispatcher::bind_clipboard_window(HWND window) {
@@ -645,23 +751,41 @@ std::vector<ActivityCompletion> ActivityDispatcher::consume() {
     std::lock_guard lock(p.mutex);
     if (p.failure)
         std::rethrow_exception(p.failure);
-    if (p.pending.state)
+    if (p.pending.state && p.pending.state != p.visible.state)
         p.visible = p.pending;
     auto result = std::move(p.completions);
     p.completions.clear();
     p.pending_view_activation_count = 0;
     p.notification_posted = false;
     for (const auto &completion : result) {
-        if (completion.ticket)
+        if (completion.ticket && !completion.key_final)
             --p.outstanding;
-        if (completion.ticket == p.read_ticket)
+        if (completion.kind == ActivityCommandKind::key && completion.key_outcome != KeyDispatchOutcome::deferred) {
+            require(p.key_credits != 0, "Final key credit accounting underflow");
+            --p.key_credits;
+        }
+        if (!completion.key_final && completion.ticket == p.read_ticket)
             p.read_ticket = 0;
     }
-    if (p.text_edit_observation || p.soft_input_observation || p.terminal_activations)
+    if (p.text_edit_observation || p.soft_input_observation || p.terminal_activations || p.finish_request)
         p.notify();
     else
         require(ResetEvent(p.event.get()) != FALSE, "Cannot reset completion event");
     return result;
+}
+std::optional<ActivityFinishRequest> ActivityDispatcher::take_finish_request() {
+    auto &p = *impl_;
+    p.check_owner();
+    std::lock_guard lock(p.mutex);
+    if (p.failure) std::rethrow_exception(p.failure);
+    if (p.stopping) { p.finish_request.reset(); return {}; }
+    const auto request = std::exchange(p.finish_request, std::nullopt);
+    if (!request) return {};
+    p.notification_posted = false;
+    if (p.completions.empty() && !p.text_edit_observation && !p.soft_input_observation && !p.terminal_activations)
+        require(ResetEvent(p.event.get()) != FALSE, "Cannot reset Activity finish completion event");
+    else p.notify();
+    return request;
 }
 std::shared_ptr<const android::TextEditObservation> ActivityDispatcher::take_text_edit_observation() {
     auto &p = *impl_;
@@ -689,7 +813,7 @@ void ActivityDispatcher::complete_text_edit_observation(std::uint64_t event_revi
     p.text_edit_claimed = false;
     p.text_edit_receipt = event_revision;
     p.notification_posted = false;
-    if (p.completions.empty() && !p.failure && !p.soft_input_observation && !p.terminal_activations)
+    if (p.completions.empty() && !p.failure && !p.soft_input_observation && !p.terminal_activations && !p.finish_request)
         require(ResetEvent(p.event.get()) != FALSE, "Cannot reset TextEdit completion event");
     else
         p.notify();
@@ -721,7 +845,7 @@ void ActivityDispatcher::complete_soft_input_observation(std::uint64_t revision,
     p.soft_input_ticket = 0; p.soft_input_claimed = false;
     p.soft_input_receipt = revision; p.soft_input_accepted = accepted;
     p.notification_posted = false;
-    if (p.completions.empty() && !p.failure && !p.text_edit_observation && !p.terminal_activations)
+    if (p.completions.empty() && !p.failure && !p.text_edit_observation && !p.terminal_activations && !p.finish_request)
         require(ResetEvent(p.event.get()) != FALSE, "Cannot reset soft input completion event");
     else p.notify();
     p.wake.notify_all();
@@ -748,14 +872,14 @@ void ActivityDispatcher::complete_terminal_activations(std::uint64_t through_rev
     p.terminal_activation_receipt = through_revision;
     p.terminal_activation_receipted = true;
     p.notification_posted = false;
-    if (p.completions.empty() && !p.failure && !p.text_edit_observation && !p.soft_input_observation)
+    if (p.completions.empty() && !p.failure && !p.text_edit_observation && !p.soft_input_observation && !p.finish_request)
         require(ResetEvent(p.event.get()) != FALSE, "Cannot reset terminal activation completion event");
     else p.notify();
     p.wake.notify_all();
 }
 bool ActivityDispatcher::idle() const {
     std::lock_guard lock(impl_->mutex);
-    return impl_->pending.state && impl_->outstanding == 0 && !impl_->text_edit_observation && !impl_->soft_input_observation && !impl_->terminal_activations && !impl_->stopping;
+    return impl_->pending.state && impl_->outstanding == 0 && impl_->key_credits == 0 && !impl_->text_edit_observation && !impl_->soft_input_observation && !impl_->terminal_activations && !impl_->finish_request && !impl_->stopping;
 }
 bool ActivityDispatcher::read_pending() const {
     std::lock_guard lock(impl_->mutex);

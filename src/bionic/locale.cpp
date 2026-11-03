@@ -58,6 +58,12 @@ NativeLocale::Object *NativeLocale::object(Address address) noexcept {
     for(auto &entry:objects_)if(entry.address && entry.address==address)return &entry;
     return nullptr;
 }
+bool NativeLocale::valid_time_locale(Address address) const noexcept {
+    if(!initialized_ || !address || address==global_locale)return false;
+    for(const auto &entry:objects_)
+        if(entry.address==address)return entry.mode==1 || entry.mode==4;
+    return false;
+}
 Fault NativeLocale::fail(std::array<std::uint64_t,31> &r,unsigned error) noexcept {
     if(!memory_.write(threads_.error_address(),bytes<4>(error))){
         rejection_="locale: current logical errno is outside writable guest memory";return Fault::write;

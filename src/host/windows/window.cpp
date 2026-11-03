@@ -8,6 +8,9 @@
 #include "aether/host/windows/native_ime.hpp"
 #include "aether/host/windows/input_pane.hpp"
 #include "aether/host/windows/file_drop.hpp"
+#include "aether/host/native_window_context.hpp"
+#include "aether/host/activity_observation_identity.hpp"
+#include "aether/android/viewport.hpp"
 #include "aether/security/activity_dispatcher.hpp"
 #include <Windows.h>
 #include <imm.h>
@@ -46,6 +49,7 @@ namespace {
 using namespace android;
 using Microsoft::WRL::ComPtr;
 constexpr wchar_t window_class[] = L"Aether.ActivityWindow.v1";
+constexpr wchar_t native_presentation_owner[] = L"Aether.NativePresentation.Owner.v1";
 constexpr UINT exercise_message = WM_APP + 1;
 constexpr UINT completion_message = WM_APP + 2;
 constexpr UINT accessibility_action_message = WM_APP + 3;
@@ -53,6 +57,13 @@ constexpr UINT input_pane_message = WM_APP + 4;
 constexpr UINT file_drop_message = WM_APP + 5;
 constexpr UINT_PTR read_timer = 1;
 constexpr UINT_PTR responsiveness_timer = 2;
+std::uint64_t pointer_uptime_ms() noexcept {
+    ULONGLONG ticks = 0;
+    // Same awake-uptime origin as HostTimeService::read_uptime. This is the
+    // actual Aether UI ingress instant, not a claimed hardware packet time.
+    QueryUnbiasedInterruptTimePrecise(&ticks);
+    return ticks / 10'000;
+}
 const std::array window_identity_keys{
     PKEY_AppUserModel_ID, PKEY_AppUserModel_RelaunchCommand, PKEY_AppUserModel_RelaunchDisplayNameResource,
     PKEY_AppUserModel_RelaunchIconResource, PKEY_AppUserModel_PreventPinning};
@@ -407,8 +418,25 @@ class ActivityWindow {
     DpiScope dpi_scope;
     security::ActivityDispatcher &session;
     WindowReport &report;
+    WindowDiagnosticSink diagnostics;
+    WindowObservationSink observations;
+    ActivityObservationIdentityBinding observation_binding;
+    WindowObservationReducer observation_reducer;
+    WindowObservationFacts last_observation_facts{};
+    bool have_observation_facts = false, observation_retired = false;
+    bool last_refresh_unavailable = false;
+    std::uint64_t observed_read_failures = 0, observed_read_recoveries = 0;
     std::filesystem::path developer_output_root;
+    std::shared_ptr<NativeWindowContext> native_context;
     HWND window = nullptr;
+    HWND native_child = nullptr;
+    WNDPROC native_child_previous = nullptr;
+    std::unique_ptr<HostSurface> native_surface;
+    std::optional<NativeSurfaceRequest> admitted_surface_request;
+    std::optional<NativeSurfaceAdmission> admitted_surface;
+    std::uint64_t next_surface_producer = 1;
+    bool defer_window_initialization = false, initialization_started = false, window_initialized = false;
+    bool retiring_native_presentation = false, native_presentation_retired = false;
     HINSTANCE instance = GetModuleHandleW(nullptr);
     ATOM registered = 0;
     HICON large_icon = nullptr, small_icon = nullptr;
@@ -416,6 +444,13 @@ class ActivityWindow {
     Buffer buffer;
     unsigned dpi = 96;
     RECT viewport{};
+    struct SampledViewport {
+        RECT client{}, viewport{};
+        ViewportAdmission admission;
+        std::int32_t orientation = -1;
+    };
+    std::optional<SampledViewport> launch_viewport;
+    std::uint64_t next_viewport_revision = 1;
     RECT presentation_clip{};
     int presentation_pan = 0;
     std::shared_ptr<InputPane> input_pane;
@@ -468,6 +503,16 @@ class ActivityWindow {
     bool mouse_down = false, exercised = false, shutting_down = false;
     std::uint32_t touch_id = 0;
     bool touch_down = false;
+    std::optional<PointerInput> owned_pointer;
+    dex::ObjectId owned_pointer_leaf = 0;
+    std::uint64_t owned_pointer_generation = 0;
+    bool pointer_starting = false, pointer_start_cancelled = false;
+    std::uint32_t starting_pointer_source = 0, starting_pointer_id = 0;
+    struct PointerCapture {
+        PointerInput point;
+        dex::ObjectId leaf = 0;
+        std::uint64_t generation = 0;
+    };
     bool selftest_focus = false;
     bool power_suspended = false;
     HPOWERNOTIFY power_notification = nullptr;
@@ -522,6 +567,11 @@ class ActivityWindow {
         std::optional<char16_t> high;
     };
     std::deque<ImeCharacter> ime_characters;
+    struct PhysicalKey {
+        UINT scan = 0, normalized = 0;
+        bool extended = false;
+        bool operator==(const PhysicalKey &) const = default;
+    };
     struct NativeKey {
         UINT message;
         WPARAM wp;
@@ -532,9 +582,11 @@ class ActivityWindow {
         bool ime = false, allow_character = false;
         dex::ObjectId editor = 0;
         std::array<BYTE, 256> keyboard{};
+        KeyInput input;
+        PhysicalKey physical;
     };
     std::map<std::uint64_t, NativeKey> pending_keys;
-    std::uint64_t native_key_generation = 0;
+    std::uint64_t native_key_generation = 1;
     NativeKeyMapper key_mapper;
     struct CapturedKey {
         UINT message;
@@ -545,20 +597,224 @@ class ActivityWindow {
         MSG original{};
         HKL layout = nullptr;
         std::array<BYTE, 256> keyboard{};
+        PhysicalKey physical;
     };
     std::optional<CapturedKey> captured_key;
+    struct FirstKeyDown { PhysicalKey physical; KeyInput input; };
+    std::array<std::optional<FirstKeyDown>, 256> first_key_downs;
+    static bool same_key_scope(const KeyInput &left, const KeyInput &right) noexcept {
+        return left.root == right.root && left.window_generation == right.window_generation &&
+            left.input_generation == right.input_generation && left.capture_generation == right.capture_generation;
+    }
+    void retire_key_scope(const KeyInput &input, std::uint64_t generation) {
+        for (auto &first : first_key_downs)
+            if (first && same_key_scope(first->input, input)) first.reset();
+        std::erase_if(pending_keys, [&](const auto &entry) {
+            return entry.second.generation == generation && same_key_scope(entry.second.input, input);
+        });
+        if (captured_key && captured_key->generation == generation && same_key_scope(captured_key->input, input))
+            captured_key.reset();
+    }
     void retire_native_keys() {
         if (native_key_generation == std::numeric_limits<std::uint64_t>::max())
             fail("Native key generation exhausted");
         ++native_key_generation;
         pending_keys.clear();
         captured_key.reset();
+        first_key_downs = {};
         ime_characters.clear();
     }
     static bool equal_rect(const RECT &left, const RECT &right) noexcept {
         return left.left == right.left && left.top == right.top && left.right == right.right && left.bottom == right.bottom;
     }
-    void drop_diagnostic(const char *code) noexcept { OutputDebugStringA(code); }
+    SampledViewport sample_viewport(std::int32_t orientation) const {
+        if (!window || shutting_down || retiring_native_presentation ||
+            (orientation != -1 && orientation != 0 && orientation != 1))
+            fail("AETHER_VIEWPORT: inactive owner or unsupported orientation");
+        SampledViewport sampled;
+        sampled.orientation = orientation;
+        check_win(GetClientRect(window, &sampled.client), "Read actual Activity viewport client");
+        const auto width = sampled.client.right, height = sampled.client.bottom;
+        // These are the existing Buffer backing bounds, not an enlarged budget.
+        if (sampled.client.left || sampled.client.top || width <= 0 || height <= 0 || width > 16384 || height > 16384 ||
+            std::uint64_t(width) * std::uint64_t(height) > 16'777'216 || IsIconic(window))
+            fail("AETHER_VIEWPORT: actual client extent is unavailable or exceeds backing bounds");
+        const auto actual_dpi = GetDpiForWindow(window);
+        if (actual_dpi < 48 || actual_dpi > 960)
+            fail("AETHER_VIEWPORT: actual window DPI is unsupported");
+        sampled.viewport = sampled.client;
+        if (orientation != -1) {
+            const int numerator = orientation == 1 ? 2 : 3, denominator = orientation == 1 ? 3 : 2;
+            int logical_width = width, logical_height = height;
+            if (std::int64_t(logical_width) * denominator > std::int64_t(logical_height) * numerator)
+                logical_width = (std::max)(1, logical_height * numerator / denominator);
+            else
+                logical_height = (std::max)(1, logical_width * denominator / numerator);
+            sampled.viewport = {(width - logical_width) / 2, (height - logical_height) / 2,
+                (width - logical_width) / 2 + logical_width, (height - logical_height) / 2 + logical_height};
+        }
+        auto &admission = sampled.admission;
+        admission.width_px = static_cast<std::uint32_t>(sampled.viewport.right - sampled.viewport.left);
+        admission.height_px = static_cast<std::uint32_t>(sampled.viewport.bottom - sampled.viewport.top);
+        admission.host_dpi = actual_dpi;
+        // This owned Aether single-window virtual display uses the admitted
+        // client viewport as its full display area. Its host renderer provides
+        // no Android system navigation-bar region; Windows desktop/taskbar
+        // properties are neither queried nor represented by this fact.
+        admission.has_navigation_bar = false;
+        admission.configuration.screen_width_dp = static_cast<std::uint32_t>((std::max)(1,
+            MulDiv(static_cast<int>(admission.width_px), 96, static_cast<int>(actual_dpi))));
+        admission.configuration.screen_height_dp = static_cast<std::uint32_t>((std::max)(1,
+            MulDiv(static_cast<int>(admission.height_px), 96, static_cast<int>(actual_dpi))));
+        admission.configuration.smallest_screen_width_dp = (std::min)(admission.configuration.screen_width_dp,
+            admission.configuration.screen_height_dp);
+        admission.configuration.density_dpi = static_cast<std::uint32_t>(MulDiv(static_cast<int>(actual_dpi), 160, 96));
+        if (!admission.configuration.valid())
+            fail("AETHER_VIEWPORT: actual geometry has no supported display configuration");
+        return sampled;
+    }
+    static bool same_viewport_geometry(const SampledViewport &left, const SampledViewport &right) noexcept {
+        return left.orientation == right.orientation && EqualRect(&left.client, &right.client) &&
+            EqualRect(&left.viewport, &right.viewport) && left.admission.width_px == right.admission.width_px &&
+            left.admission.height_px == right.admission.height_px && left.admission.host_dpi == right.admission.host_dpi &&
+            left.admission.configuration == right.admission.configuration &&
+            left.admission.has_navigation_bar == right.admission.has_navigation_bar;
+    }
+    ViewportAdmission admit_viewport(const ViewportRequest &request) {
+        const auto current = sample_viewport(request.requested_orientation);
+        const ViewportIdentity empty{};
+        if (request.phase == ViewportPhase::launch_geometry) {
+            if (request.geometry_revision || !(request.identity == empty))
+                fail("AETHER_VIEWPORT: launch request cannot claim content identity");
+            if (launch_viewport) {
+                if (!same_viewport_geometry(*launch_viewport, current))
+                    fail("AETHER_VIEWPORT: frozen launch geometry changed before explicit reconfiguration");
+                return launch_viewport->admission;
+            }
+            if (next_viewport_revision == (std::numeric_limits<std::uint64_t>::max)())
+                fail("AETHER_VIEWPORT: geometry revision exhausted");
+            auto admitted = current;
+            admitted.admission.geometry_revision = next_viewport_revision++;
+            launch_viewport = std::move(admitted);
+            return launch_viewport->admission;
+        }
+        if (request.phase != ViewportPhase::bind_content || !request.geometry_revision || !request.identity.activity ||
+            !request.identity.content || !request.identity.window_generation || !request.identity.attachment_revision ||
+            !launch_viewport || request.geometry_revision != launch_viewport->admission.geometry_revision ||
+            !same_viewport_geometry(*launch_viewport, current))
+            fail("AETHER_VIEWPORT: binding has no current exact frozen geometry lease");
+        auto result = launch_viewport->admission;
+        result.identity = request.identity;
+        return result;
+    }
+    void diagnostic(std::string_view stage, std::string_view code) noexcept {
+        if (!diagnostics) return;
+        try { diagnostics(stage, code); }
+        catch (...) {
+            if (report.diagnostic_retention_failures != UINT64_MAX) ++report.diagnostic_retention_failures;
+            OutputDebugStringA("AETHER_DIAGNOSTIC_RETENTION_FAILED");
+        }
+    }
+    WindowObservationFacts capture_window_observation() {
+        WindowObservationFacts facts;
+        const auto &publication = session.publication();
+        const auto &state = session.snapshot();
+        const auto dispatch = session.dispatch_metrics();
+        DWORD process = 0;
+        const auto owner = window ? GetWindowThreadProcessId(window, &process) : 0;
+        const bool owned = window && owner == GetCurrentThreadId() && process == GetCurrentProcessId() &&
+            reinterpret_cast<ActivityWindow *>(GetWindowLongPtrW(window, GWLP_USERDATA)) == this;
+        facts.hwnd = owned ? static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(window)) : 0;
+        facts.host_pid = GetCurrentProcessId();
+        facts.worker_pid = publication.process_id;
+        if (observation_binding.bind(state, publication.transport_session, publication.process_id))
+            facts.transport_session = observation_binding.transport_session();
+        facts.activity = state.activity_object;
+        facts.content = state.content;
+        facts.window_generation = state.window_generation;
+        facts.input_generation = state.input_generation;
+        facts.source_view_revision = state.framework.view_revision;
+        facts.awake_100ns = security::AwakeDeadlineClock::now().time_since_epoch().count();
+        facts.visible = owned && IsWindowVisible(window);
+        facts.iconic = owned && IsIconic(window);
+        facts.worker_exited = publication.exited;
+        facts.finishing = state.finishing;
+        facts.lifecycle = static_cast<std::uint32_t>(state.lifecycle);
+        facts.terminal = shutting_down || terminal_activation_mode || state.lifecycle == Lifecycle::destroyed ||
+                         state.lifecycle == Lifecycle::failed;
+        facts.last_refresh_unavailable = last_refresh_unavailable;
+        facts.read_failures = dispatch.read_failures;
+        facts.read_recoveries = dispatch.recovered_reads;
+        // Visual tokens stay absent until a real renderer supplies an exact
+        // attachment/content completion witness. HWND custody is not pixels.
+        return facts;
+    }
+    void observation_loss() noexcept {
+        if (report.diagnostic_retention_failures != UINT64_MAX) ++report.diagnostic_retention_failures;
+        const WindowObservation lost{WindowObservationKind::loss, {}};
+        observation_reducer.observe(lost);
+        report.window_observations = observation_reducer.summary();
+        if (observations) {
+            try { observations(lost); }
+            catch (...) { OutputDebugStringA("AETHER_WINDOW_OBSERVATION_LOST"); }
+        }
+    }
+    void observe_window(WindowObservationKind kind) noexcept {
+        if (observation_retired) return;
+        try {
+            const auto facts = capture_window_observation();
+            if (facts.hwnd && facts.transport_session && facts.host_pid && facts.worker_pid &&
+                (!have_observation_facts || (facts.activity && facts.content) ||
+                 !(last_observation_facts.activity && last_observation_facts.content))) {
+                // Empty/unauthenticated terminal publications must not erase
+                // the last actual content identity needed for its retirement.
+                last_observation_facts = facts;
+                have_observation_facts = true;
+            }
+            const WindowObservation event{kind, facts};
+            observation_reducer.observe(event);
+            report.window_observations = observation_reducer.summary();
+            if (observations) observations(event);
+        } catch (...) { observation_loss(); }
+    }
+    void retire_window_observation() noexcept {
+        if (observation_retired || !have_observation_facts) return;
+        observation_retired = true;
+        try {
+            // Terminal snapshots may already have cleared their content. Keep
+            // the previously observed identity and explicitly retire it.
+            auto facts = last_observation_facts;
+            facts.awake_100ns = security::AwakeDeadlineClock::now().time_since_epoch().count();
+            facts.visible = window && IsWindowVisible(window);
+            facts.iconic = window && IsIconic(window);
+            facts.worker_exited = session.publication().exited;
+            facts.terminal = true;
+            const WindowObservation event{WindowObservationKind::retired, facts};
+            observation_reducer.observe(event);
+            report.window_observations = observation_reducer.summary();
+            if (observations) observations(event);
+        } catch (...) { observation_loss(); }
+    }
+    void observe_read_diagnostics() noexcept {
+        try {
+            const auto metrics = session.dispatch_metrics();
+            while (observed_read_failures < metrics.read_failures) {
+                ++observed_read_failures;
+                diagnostic("automatic-read", "AETHER_ACTIVITY_READ_FAILED");
+            }
+            while (observed_read_recoveries < metrics.recovered_reads) {
+                ++observed_read_recoveries;
+                diagnostic("automatic-read", "AETHER_ACTIVITY_READ_RECOVERED");
+            }
+        } catch (...) {
+            if (report.diagnostic_retention_failures != UINT64_MAX) ++report.diagnostic_retention_failures;
+            OutputDebugStringA("AETHER_DIAGNOSTIC_READ_METRICS_UNAVAILABLE");
+        }
+    }
+    void drop_diagnostic(const char *code) noexcept {
+        OutputDebugStringA(code);
+        diagnostic("drag-and-drop", code);
+    }
     bool drop_surface_ready(bool foreground) const {
         if (!window || shutting_down || power_suspended || report.installed_id.empty() ||
             !IsWindowVisible(window) || !IsWindowEnabled(window) || IsIconic(window) || configuration_ticket || placement_ticket ||
@@ -902,6 +1158,7 @@ class ActivityWindow {
         report.ime_diagnostic = code;
         if (report.ime_rejected != UINT64_MAX) ++report.ime_rejected;
         OutputDebugStringA(code); // Fixed diagnostic only; no input text is logged.
+        diagnostic("native-ime", code);
     }
     void unknown_ime_conversion() noexcept {
         ime_conversion_unknown = true;
@@ -951,6 +1208,7 @@ class ActivityWindow {
         clear_system_caret();
         if (native_key_generation != UINT64_MAX) ++native_key_generation;
         pending_keys.clear(); captured_key.reset();
+        first_key_downs = {};
         const auto old_token = ime_token;
         const auto old_view = ime_view;
         ime_token = 0; ime_view = 0; ime_composing = false;
@@ -1203,6 +1461,135 @@ class ActivityWindow {
     std::vector<std::uint32_t> before_click;
     bool queued_probe_key = false, released_probe_key = false;
     std::uint64_t last_read_ticket = 0, selftest_read_floor = 0;
+    void restore_native_child(HWND child) noexcept {
+        if (!child || !IsWindow(child)) return;
+        if (native_child_previous) {
+            SetLastError(0);
+            const auto previous = SetWindowLongPtrW(child, GWLP_WNDPROC,
+                                                   reinterpret_cast<LONG_PTR>(native_child_previous));
+            if (!previous && GetLastError()) std::terminate();
+        }
+        RemovePropW(child, native_presentation_owner);
+        native_child_previous = nullptr;
+    }
+    void retire_native_presentation(HWND destroying_child = nullptr) noexcept {
+        if (!native_context || native_presentation_retired || retiring_native_presentation) return;
+        // Sent DXGI messages may reenter while join_io drains the I/O thread.
+        // Close admission first, but retain the HWND and HostSurface marker until
+        // every presenter/renderer user is gone. An undrainable custody failure
+        // cannot safely continue by destroying the borrowed window anyway.
+        retiring_native_presentation = true;
+        native_context->close();
+        try { session.join_io(); } catch (...) { std::terminate(); }
+        if (native_surface) native_surface->invalidate();
+        native_surface.reset();
+        const auto child = std::exchange(native_child, nullptr);
+        restore_native_child(child);
+        if (child && child != destroying_child && IsWindow(child) && !DestroyWindow(child)) std::terminate();
+        native_presentation_retired = true;
+        retiring_native_presentation = false;
+    }
+    BOOL destroy_activity_window() noexcept {
+        if (retiring_native_presentation) return TRUE; // The outer retirement owns destruction.
+        retire_native_presentation();
+        return window ? DestroyWindow(window) : TRUE;
+    }
+    static LRESULT CALLBACK native_presentation_procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) noexcept {
+        auto *self = static_cast<ActivityWindow *>(GetPropW(hwnd, native_presentation_owner));
+        if (!self) return DefWindowProcW(hwnd, message, wp, lp);
+        const auto previous = self->native_child_previous;
+        if (message == WM_CLOSE) return 0; // Only the parent's drained owner may close this child.
+        if (message == WM_DESTROY) self->retire_native_presentation(hwnd);
+        if (message == WM_NCHITTEST) return HTTRANSPARENT; // Activity retains its actual input transform.
+        if (message == WM_ERASEBKGND) return 1;
+        if (message == WM_PAINT) { PaintScope paint(hwnd); return 0; } // Never paint over a real presentation.
+        return previous ? CallWindowProcW(previous, hwnd, message, wp, lp) : DefWindowProcW(hwnd, message, wp, lp);
+    }
+    NativeSurfaceAdmission realize_native_surface(const NativeSurfaceRequest &request) {
+        if (!native_context || !native_surface || !native_child || retiring_native_presentation ||
+            native_presentation_retired || !window || !request.root || !request.view || !request.window_generation ||
+            (request.requested_orientation != -1 && request.requested_orientation != 0 && request.requested_orientation != 1))
+            fail("AETHER_NATIVE_SURFACE: inactive owner or invalid root-fill request");
+        if (request.action == NativeSurfaceRequest::Action::abandon) {
+            if (!admitted_surface || !admitted_surface_request || !request.producer ||
+                request.producer != admitted_surface->producer || request.view != admitted_surface_request->view ||
+                request.root != admitted_surface_request->root ||
+                request.window_generation != admitted_surface_request->window_generation)
+                fail("AETHER_NATIVE_SURFACE: abandonment does not identify the current producer");
+            // The I/O coordinator has already received the renderer's consumer
+            // retirement ACK. Keep this permanent HWND/backend alive for later
+            // producers and early EGL adapter identity; only logical use ends.
+            const auto old = *admitted_surface;
+            check_win(SetWindowPos(native_child, nullptr, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW),
+                "Hide abandoned native SurfaceView");
+            admitted_surface.reset();
+            admitted_surface_request.reset();
+            return old;
+        }
+        if (shutting_down || terminal_activation_mode)
+            return {}; // Let the already-queued close retire the existing consumer normally.
+        if (request.action != NativeSurfaceRequest::Action::admit || request.producer ||
+            (admitted_surface_request && (request.view != admitted_surface_request->view ||
+                request.root != admitted_surface_request->root ||
+                request.window_generation != admitted_surface_request->window_generation)))
+            fail("AETHER_NATIVE_SURFACE: only one exact root-fill SurfaceView may be admitted");
+        if (presentation_pan)
+            fail("AETHER_NATIVE_SURFACE: panned or composed SurfaceView placement is unsupported");
+        RECT client{};
+        check_win(GetClientRect(window, &client), "Read actual native SurfaceView client extent");
+        if (client.right <= 0 || client.bottom <= 0 || IsIconic(window))
+            return {}; // A queued visibility signal may lag this actual UI state.
+        check_win(GetDpiForWindow(window) != 0, "Read actual native SurfaceView DPI");
+        // This root-fill profile uses the exact same physical letterbox policy
+        // as synchronize(). No default DisplayConfiguration or guest dimensions
+        // can create an admitted extent, and no oversized result is clamped.
+        int width = client.right, height = client.bottom;
+        if (request.requested_orientation != -1) {
+            const int numerator = request.requested_orientation == 1 ? 2 : 3;
+            const int denominator = request.requested_orientation == 1 ? 3 : 2;
+            if (std::int64_t(width) * denominator > std::int64_t(height) * numerator)
+                width = (std::max)(1, height * numerator / denominator);
+            else height = (std::max)(1, width * denominator / numerator);
+        }
+        if (width > static_cast<int>(HostSurface::maximum_dimension) ||
+            height > static_cast<int>(HostSurface::maximum_dimension))
+            fail("AETHER_NATIVE_SURFACE: root-fill physical extent exceeds the supported producer bound");
+        if (!admitted_surface && next_surface_producer > 4096)
+            fail("AETHER_NATIVE_SURFACE: one-shot producer identities exhausted");
+        const auto producer = admitted_surface ? admitted_surface->producer : next_surface_producer++;
+        check_win(SetWindowPos(native_child, nullptr, (client.right - width) / 2, (client.bottom - height) / 2,
+            width, height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW), "Place admitted native SurfaceView");
+        const auto actual = native_surface->snapshot();
+        if (actual.width != static_cast<unsigned>(width) || actual.height != static_cast<unsigned>(height))
+            fail("AETHER_NATIVE_SURFACE: realized producer differs from its physical admission");
+        native_context->publish(actual);
+        // The actual renderer/presenter texture is R8G8B8A8_UNORM: Android
+        // WINDOW_FORMAT_RGBA_8888. Producer IDs are never backend token aliases.
+        NativeSurfaceAdmission admission{producer, native_context->token(), actual.width, actual.height, 1};
+        admitted_surface_request = request;
+        admitted_surface = admission;
+        return admission;
+    }
+    void resize_native_presentation() {
+        if (!native_context || !native_surface || !native_child || retiring_native_presentation ||
+            native_presentation_retired || !window) return;
+        // Admitted backing retains its actual size/position until another
+        // explicit same-producer request acknowledges a new root-fill extent.
+        if (admitted_surface) return;
+        RECT parent{}, child{};
+        check_win(GetClientRect(window, &parent), "Read native presentation parent extent");
+        // A minimized/zero client retains its last actual backing. It does not
+        // publish invented zero dimensions or reconstruct a different surface.
+        if (parent.right <= 0 || parent.bottom <= 0 || IsIconic(window)) return;
+        const auto width = (std::min)(parent.right, static_cast<LONG>(HostSurface::maximum_dimension));
+        const auto height = (std::min)(parent.bottom, static_cast<LONG>(HostSurface::maximum_dimension));
+        check_win(GetClientRect(native_child, &child), "Read native presentation child extent");
+        if (child.right != width || child.bottom != height)
+            check_win(SetWindowPos(native_child, nullptr, 0, 0, width, height,
+                                   SWP_NOZORDER | SWP_NOACTIVATE), "Resize hidden native presentation");
+        native_context->publish(native_surface->snapshot());
+    }
     static LRESULT CALLBACK procedure(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) noexcept {
         auto *self = reinterpret_cast<ActivityWindow *>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         if (message == WM_NCCREATE) {
@@ -1221,12 +1608,20 @@ class ActivityWindow {
             // No C++ exception crosses the system callback boundary.
             self->shutting_down = true;
             KillTimer(hwnd, read_timer);
-            DestroyWindow(hwnd);
+            self->destroy_activity_window();
             PostQuitMessage(1);
             return 0;
         }
     }
     CapturedKey capture_key(const MSG &message) {
+        // Capture the actual UI ingress before layout lookup or bounded mapper
+        // work. This is the same awake-uptime origin as managed nanoTime/uptime.
+        const auto event_time = pointer_uptime_ms();
+        const auto &publication = session.snapshot();
+        const auto root = publication.content;
+        const auto window_epoch = publication.window_generation;
+        const auto input_epoch = publication.input_generation;
+        const auto capture_epoch = native_key_generation;
         NativeKeyMapper::Request request;
         check_win(GetKeyboardState(request.keyboard.data()) != FALSE, "Capture keyboard state");
         request.layout = GetKeyboardLayout(GetCurrentThreadId());
@@ -1249,8 +1644,15 @@ class ActivityWindow {
                                  ? 160u : android_keycode(normalized);
         KeyInput input{message.message == WM_KEYUP || message.message == WM_SYSKEYUP,
                        keycode, request.meta, 0, mapped.status, mapped.unicode};
+        input.event_time_known = true; input.event_time_ms = event_time;
+        input.source_known = true; input.source = 0x101;
+        if (root && window_epoch && input_epoch && capture_epoch) {
+            input.root = root; input.window_generation = window_epoch;
+            input.input_generation = input_epoch; input.capture_generation = capture_epoch;
+        }
         check_win(valid_key_input(input), "Captured key mapping exceeds the supported profile");
-        return {message.message, message.wParam, message.lParam, input, native_key_generation, message, request.layout, request.keyboard};
+        return {message.message, message.wParam, message.lParam, input, capture_epoch, message, request.layout, request.keyboard,
+                {request.scan, normalized, (message.lParam & (LPARAM(1) << 24)) != 0}};
     }
     void set_icons() {
         if (icon_bytes.empty())
@@ -1306,6 +1708,7 @@ class ActivityWindow {
     void set_dpi(unsigned value) {
         if (value < 48 || value > 960)
             fail("Unsupported window DPI");
+        if (value != dpi) cancel_pointer(); // Retain the last actual sample in its original transform.
         text_layouts.clear();
         dpi = value;
         observed_revision = ~std::uint64_t{0};
@@ -1322,7 +1725,11 @@ class ActivityWindow {
             y >= presentation_clip.top && y < presentation_clip.bottom;
     }
     PointerInput viewport_pointer(PointerAction action, std::uint32_t id, std::uint32_t source, int x, int y) const {
-        return logical_pointer(action, id, source, x - viewport.left, y - viewport.top + presentation_pan, dpi);
+        auto point = logical_pointer(action, id, source, x - viewport.left, y - viewport.top + presentation_pan, dpi);
+        point.time_known = true;
+        point.down_time_ms = point.event_time_ms = pointer_uptime_ms();
+        point.capture_dpi = dpi;
+        return point;
     }
     std::shared_ptr<const TextLayout> shaped_text(dex::ObjectId id, int width_pixels) {
         const auto &text = session.views().at(id).text;
@@ -1345,9 +1752,64 @@ class ActivityWindow {
     float text_height(dex::ObjectId id, int width_pixels) {
         return std::max(28.0f, shaped_text(id, width_pixels)->height() * 96.0f / static_cast<float>(dpi));
     }
+    dex::ObjectId surface_fill_leaf() const {
+        const auto &views = session.views();
+        auto current = session.content_view();
+        if (!current) return 0;
+        // Published state validates tree identity/cycles and caps it at256.
+        // Only a full content-root FrameLayout chain may lead to a Surface.
+        for (std::size_t depth = 0; depth <= views.size(); ++depth) {
+            const auto found = views.find(current);
+            if (found == views.end()) fail("AETHER_NATIVE_SURFACE: published fill-chain node is missing");
+            const auto &node = found->second;
+            if (node.kind == ViewKind::surface_view || node.kind == ViewKind::native_content) {
+                if (node.kind == ViewKind::native_content && current != session.content_view())
+                    fail("AETHER_NATIVE_SURFACE: NativeContentView must be the actual content root");
+                if (!node.children.empty()) fail("AETHER_NATIVE_SURFACE: native consumer cannot contain overlay children");
+                return current;
+            }
+            if (node.kind != ViewKind::frame_layout || node.children.size() != 1) break;
+            current = node.children.front();
+        }
+        // A Surface hidden in another container/overlay must never become a
+        // guessed text leaf or an independently positioned native child.
+        const auto has_surface = [&](auto &self, dex::ObjectId id) -> bool {
+            const auto &node = views.at(id);
+            if (node.kind == ViewKind::surface_view || node.kind == ViewKind::native_content) return true;
+            for (const auto child : node.children) if (self(self, child)) return true;
+            return false;
+        };
+        if (has_surface(has_surface, session.content_view()))
+            fail("AETHER_NATIVE_SURFACE: only a root native consumer or full-viewport SurfaceView fill chain is supported");
+        return 0;
+    }
     float arrange(dex::ObjectId id, float x, float y, float width, std::vector<ViewPlacement> &placements) {
         const auto &view = session.views().at(id);
+        if(view.kind==ViewKind::view)
+            fail("AETHER_VIEW_RENDER_UNSUPPORTED: generic View measurement is not implemented");
         width = std::max(width, 0.0f);
+        if (view.kind == ViewKind::frame_layout) {
+            if ((id != session.content_view() && session.views().at(view.parent).kind != ViewKind::frame_layout) ||
+                view.children.size() > 1)
+                fail("AETHER_NATIVE_SURFACE: composed FrameLayout placement is unsupported");
+            const auto height = static_cast<float>(viewport.bottom - viewport.top) * 96.0f / static_cast<float>(dpi);
+            if (!view.children.empty()) {
+                const auto child = view.children.front();
+                const auto kind = session.views().at(child).kind;
+                if (kind != ViewKind::frame_layout && kind != ViewKind::surface_view)
+                    fail("AETHER_NATIVE_SURFACE: FrameLayout supports only the proven Surface fill-chain profile");
+                (void)arrange(child, 0, 0, width, placements);
+            }
+            placements.push_back({id, {0, 0, width, height}});
+            return height;
+        }
+        if (view.kind == ViewKind::surface_view || view.kind == ViewKind::native_content) {
+            if (id != surface_fill_leaf() || !view.children.empty())
+                fail("AETHER_NATIVE_SURFACE: only a proven viewport-fill native consumer can be laid out");
+            const auto height = static_cast<float>(viewport.bottom - viewport.top) * 96.0f / static_cast<float>(dpi);
+            placements.push_back({id, {0, 0, width, height}});
+            return height;
+        }
         if (view.kind == ViewKind::scroll_view) {
             if (id != session.content_view()) fail("Nested ScrollView layout is unsupported");
             const auto height = static_cast<float>(viewport.bottom - viewport.top) * 96.0f / static_cast<float>(dpi);
@@ -1509,7 +1971,8 @@ class ActivityWindow {
                           : view.kind == ViewKind::edit_text ? AccessibilityKind::edit_text
                           : view.kind == ViewKind::scroll_view ? AccessibilityKind::scroll_view
                           : view.kind == ViewKind::button ? AccessibilityKind::button
-                          : view.kind == ViewKind::linear_layout ? AccessibilityKind::container
+                          : (view.kind == ViewKind::linear_layout || view.kind == ViewKind::frame_layout ||
+                             view.kind == ViewKind::native_content) ? AccessibilityKind::container
                           : AccessibilityKind::text;
                 node.enabled = enabled && view.enabled;
                 node.toggleable = view.kind == ViewKind::checkbox;
@@ -1591,7 +2054,10 @@ class ActivityWindow {
             auto origin = std::move(selected->origin);
             *selected = {}; // Consume before COM can pump a nested completion.
             const auto result = accessibility->complete_invoke(origin, true);
-            if (FAILED(result)) OutputDebugStringW(L"AETHER_UIA_INVOKED_EVENT_UNAVAILABLE\n");
+            if (FAILED(result)) {
+                OutputDebugStringW(L"AETHER_UIA_INVOKED_EVENT_UNAVAILABLE\n");
+                diagnostic("accessibility-invocation", "AETHER_UIA_INVOKED_EVENT_UNAVAILABLE");
+            }
             // Reentry may suspend publication or destroy the owned HWND. Never
             // deliver the next historical receipt against unsettled new state.
             if (!window || shutting_down || text_publication_pending() || configuration_ticket ||
@@ -1630,10 +2096,14 @@ class ActivityWindow {
             add(report.text_edit_gaps, delivered.retired);
             report.text_edit_diagnostic = "AETHER_TEXT_EDIT_HISTORY_GAP";
             OutputDebugStringA("AETHER_TEXT_EDIT_HISTORY_GAP");
+            for (std::uint64_t n = 0; n < delivered.retired; ++n)
+                diagnostic("accessibility-text-edit", "AETHER_TEXT_EDIT_HISTORY_GAP");
         }
         if (delivered.failed) {
             report.text_edit_diagnostic = "AETHER_TEXT_EDIT_DELIVERY_FAILED";
             OutputDebugStringA("AETHER_TEXT_EDIT_DELIVERY_FAILED");
+            for (std::uint64_t n = 0; n < delivered.failed; ++n)
+                diagnostic("accessibility-text-edit", "AETHER_TEXT_EDIT_DELIVERY_FAILED");
         }
         complete_streamed_text_edit();
         if (deferred_text_completion && !accessibility->text_edit_delivery_active()) {
@@ -1704,6 +2174,7 @@ class ActivityWindow {
         if (report.text_edit_gaps != UINT64_MAX) ++report.text_edit_gaps;
         report.text_edit_diagnostic = "AETHER_TEXT_EDIT_HISTORY_GAP";
         OutputDebugStringA("AETHER_TEXT_EDIT_HISTORY_GAP");
+        diagnostic("accessibility-text-edit", "AETHER_TEXT_EDIT_HISTORY_GAP");
         const auto found = session.views().find(view_id);
         if (!dropped_revision || !buffer_revision || found == session.views().end() ||
             found->second.kind != ViewKind::edit_text || found->second.text_buffer_revision < buffer_revision) return;
@@ -1785,6 +2256,16 @@ class ActivityWindow {
         requested_metadata_view_revision = source_revision;
         requested_metadata_invalidation = invalidation;
         accessibility_metadata_pending = false;
+    }
+    void request_periodic_read() {
+        if (!window || shutting_down || terminal_activation_mode || session.publication().exited) return;
+        ++report.timer_reads;
+        request_accessibility_metadata();
+        if (!window || shutting_down || terminal_activation_mode || session.publication().exited ||
+            accessibility_metadata_ticket) return;
+        // The existing dispatcher coalesces one read until its completion is
+        // consumed. Recovery on the next tick never replays mutations.
+        (void)session.refresh();
     }
     void perform_accessibility_action() {
         if (!accessibility || terminal_activation_mode)
@@ -1939,11 +2420,97 @@ class ActivityWindow {
             (void)session.submit(std::move(command));
         }
     }
+    bool native_surface_placement_ready() const {
+        const auto root = session.content_view();
+        const auto leaf = surface_fill_leaf();
+        if (!leaf)
+            return !admitted_surface; // A newly admitted root must first reach the published View tree.
+        if (!admitted_surface || !admitted_surface_request || !native_child || presentation_pan ||
+            admitted_surface_request->root != root || admitted_surface_request->view != leaf ||
+            admitted_surface_request->requested_orientation != session.snapshot().requested_orientation)
+            return false;
+        RECT child{}, bounds{};
+        if (!GetClientRect(native_child, &child) || !GetWindowRect(native_child, &bounds)) return false;
+        POINT origin{bounds.left, bounds.top};
+        if (!ScreenToClient(window, &origin)) return false;
+        return origin.x == viewport.left && origin.y == viewport.top &&
+            child.right == viewport.right - viewport.left && child.bottom == viewport.bottom - viewport.top &&
+            static_cast<unsigned>(child.right) == admitted_surface->width &&
+            static_cast<unsigned>(child.bottom) == admitted_surface->height;
+    }
+    bool captured_pointer_current(const PointerCapture &capture) const {
+        const auto &point = capture.point;
+        if (point.root != session.content_view()) return false;
+        if (!point.native_producer) return !admitted_surface && !surface_fill_leaf();
+        return admitted_surface && admitted_surface_request &&
+            point.native_producer == admitted_surface->producer &&
+            point.native_width == admitted_surface->width && point.native_height == admitted_surface->height &&
+            admitted_surface_request->root == point.root && admitted_surface_request->view == capture.leaf &&
+            admitted_surface_request->window_generation == capture.generation &&
+            surface_fill_leaf() == capture.leaf && native_surface_placement_ready();
+    }
+    bool pointer_identity_current() const {
+        return !owned_pointer || captured_pointer_current({*owned_pointer, owned_pointer_leaf, owned_pointer_generation});
+    }
+    bool pointer_input_ready() {
+        if (owned_pointer && !pointer_identity_current()) cancel_pointer();
+        const bool ready = !power_suspended && !configuration_ticket && !placement_ticket &&
+            native_surface_placement_ready();
+        if (!ready && owned_pointer) cancel_pointer(); // Never lose a gated terminal event.
+        return ready;
+    }
+    std::optional<PointerCapture> capture_pointer_down(PointerInput point) const {
+        point.root = session.content_view();
+        if (!point.root) return {};
+        PointerCapture capture{point};
+        const auto leaf = surface_fill_leaf();
+        if (leaf) {
+            if (!admitted_surface || !admitted_surface_request || !native_surface_placement_ready() ||
+                admitted_surface_request->root != point.root || admitted_surface_request->view != leaf) return {};
+            capture.point.native_producer = admitted_surface->producer;
+            capture.point.native_width = admitted_surface->width;
+            capture.point.native_height = admitted_surface->height;
+            capture.leaf = leaf;
+            capture.generation = admitted_surface_request->window_generation;
+        }
+        return capture;
+    }
+    bool begin_pointer(const PointerCapture &capture, std::uint32_t host_pointer = 0) {
+        if (pointer_start_cancelled || owned_pointer || mouse_down || touch_down || !captured_pointer_current(capture)) return false;
+        const auto &point = capture.point;
+        if (!valid_pointer_context(point) || point.capture_dpi != dpi) return false;
+        owned_pointer = point;
+        owned_pointer_leaf = capture.leaf;
+        owned_pointer_generation = capture.generation;
+        mouse_down = point.source == 0x2002;
+        touch_down = point.source == 0x1002;
+        touch_id = touch_down ? host_pointer : 0; // Windows ID is private; Android's sole pointer is0.
+        session.pointer(point);
+        return true;
+    }
+    void send_owned_pointer(PointerAction action, int x, int y) {
+        if (!owned_pointer) return;
+        const auto &owned = *owned_pointer;
+        auto point = viewport_pointer(action, owned.pointer, owned.source, x, y);
+        point.root = owned.root; point.native_producer = owned.native_producer;
+        point.native_width = owned.native_width; point.native_height = owned.native_height;
+        if (!owned.time_known || point.capture_dpi != owned.capture_dpi || point.event_time_ms < owned.event_time_ms)
+            fail("AETHER_WINDOW_INPUT: pointer capture clock or DPI changed inside a gesture");
+        point.down_time_ms = owned.down_time_ms;
+        if (action == PointerAction::up) {
+            owned_pointer.reset();
+            mouse_down = touch_down = false; touch_id = 0;
+            owned_pointer_leaf = 0; owned_pointer_generation = 0;
+        } else owned_pointer = point;
+        session.pointer(point);
+    }
     void synchronize() {
-        if (shutting_down || terminal_activation_mode || synchronizing || text_publication_pending())
+        if (shutting_down || terminal_activation_mode || synchronizing)
             return;
         synchronizing = true;
         struct Reset { bool &flag; ~Reset() { flag = false; } } reset{synchronizing};
+        if (owned_pointer && !pointer_identity_current()) cancel_pointer();
+        if (text_publication_pending()) return;
         RECT client{};
         check_win(GetClientRect(window, &client), "GetClientRect");
         const int w = client.right, h = client.bottom;
@@ -2017,9 +2584,14 @@ class ActivityWindow {
             publish_accessibility();
             return;
         }
-        if (resized || moved || observed_revision != session.metrics().view_revision) {
+        const bool native_placement_pending = surface_fill_leaf() && !native_surface_placement_ready();
+        if (resized || moved || native_placement_pending || observed_revision != session.metrics().view_revision) {
             // Defer geometry writes while a live pointer gesture owns its
             // positions. Automatic reads continue without dropping its release.
+            if (native_placement_pending && (mouse_down || touch_down)) {
+                cancel_pointer();
+                if (GetCapture() == window) ReleaseCapture();
+            }
             if (mouse_down || touch_down) { publish_accessibility(); return; }
             std::erase_if(text_layouts, [&](const auto &entry) { return !session.views().contains(entry.first); });
             const float width = static_cast<float>(viewport.right - viewport.left) * 96.0f / static_cast<float>(dpi);
@@ -2032,7 +2604,7 @@ class ActivityWindow {
             std::map<dex::ObjectId, ViewBounds> desired;
             for (const auto &placement : placements)
                 desired.emplace(placement.view, placement.bounds);
-            if (desired != natural_layout_bounds) {
+            if (native_placement_pending || desired != natural_layout_bounds) {
                 security::ActivityCommand command;
                 command.kind = security::ActivityCommandKind::place;
                 command.placements = std::move(placements);
@@ -2047,11 +2619,14 @@ class ActivityWindow {
     }
     void draw_node(dex::ObjectId id, bool enabled = true) {
         const auto &view = session.views().at(id);
+        if(view.kind==ViewKind::view)
+            fail("AETHER_VIEW_RENDER_UNSUPPORTED: generic View drawing is not implemented");
+        if (view.kind == ViewKind::surface_view || view.kind == ViewKind::native_content) return; // Admitted native pixels.
         auto r = rectangle(layout_bounds.at(id));
         DcState state(buffer.dc);
         IntersectClipRect(buffer.dc, r.left, r.top, r.right, r.bottom);
         enabled = enabled && view.enabled;
-        if (view.kind == ViewKind::linear_layout || view.kind == ViewKind::scroll_view) {
+        if (view.kind == ViewKind::linear_layout || view.kind == ViewKind::scroll_view || view.kind == ViewKind::frame_layout) {
             for (auto child : view.children)
                 draw_node(child, enabled);
             return;
@@ -2148,17 +2723,26 @@ class ActivityWindow {
         ++report.paints;
     }
     void cancel_pointer() {
-        if (mouse_down || touch_down) {
-            (void)session.pointer(
-                {PointerAction::cancel, touch_down ? touch_id : 0, touch_down ? 0x1002u : 0x2002u, 0, 0});
-            mouse_down = touch_down = false;
-        }
+        if (pointer_starting) pointer_start_cancelled = true;
+        auto point = std::exchange(owned_pointer, std::nullopt);
+        mouse_down = touch_down = false; touch_id = 0;
+        owned_pointer_leaf = 0; owned_pointer_generation = 0;
         repeats.fill(0);
+        first_key_downs = {};
+        if (point) {
+            point->action = PointerAction::cancel;
+            const auto cancelled_at = pointer_uptime_ms();
+            if (!point->time_known || cancelled_at < point->event_time_ms)
+                fail("AETHER_WINDOW_INPUT: pointer cancellation clock regressed");
+            point->event_time_ms = cancelled_at;
+            session.pointer(*point); // Last actual coordinates and original DOWN identity.
+        }
+        if (point && point->source == 0x2002 && window && GetCapture() == window) ReleaseCapture();
     }
     void close() {
         if (!consuming_terminal_activations) (void)consume_terminal_activations();
         if (terminal_activation_mode) {
-            if (window) check_win(DestroyWindow(window), "Destroy terminal window");
+            if (window) check_win(destroy_activity_window(), "Destroy terminal window");
             return;
         }
         if (!shutting_down) {
@@ -2362,7 +2946,10 @@ class ActivityWindow {
             auto origin = std::move(entry.origin); // Consume before native reentry.
             if (!origin || !window || !accessibility) continue; // Explicit lifetime retirement.
             const auto result = accessibility->complete_invoke(origin, true);
-            if (FAILED(result)) OutputDebugStringW(L"AETHER_UIA_TERMINAL_INVOKED_EVENT_UNAVAILABLE\n");
+            if (FAILED(result)) {
+                OutputDebugStringW(L"AETHER_UIA_TERMINAL_INVOKED_EVENT_UNAVAILABLE\n");
+                diagnostic("accessibility-invocation", "AETHER_UIA_TERMINAL_INVOKED_EVENT_UNAVAILABLE");
+            }
         }
     }
     std::vector<PendingInvocation> take_ready_invocations() {
@@ -2418,18 +3005,51 @@ class ActivityWindow {
         }
         return true; // Sender can now produce its actual exit/error record.
     }
+    void complete_native_key(const security::ActivityCompletion &reply) {
+        const auto key = pending_keys.find(reply.ticket);
+        if (key == pending_keys.end()) return; // Already retired local capture scope.
+        // Queue admission leaves the original MSG/layout/state in custody.
+        // Only an actual final result can retire or default it.
+        if (reply.key_outcome == security::KeyDispatchOutcome::deferred) return;
+        const auto value = key->second;
+        pending_keys.erase(key);
+        if (reply.key_outcome == security::KeyDispatchOutcome::cancelled) {
+            retire_key_scope(value.input, value.generation);
+            return;
+        }
+        if (reply.key_outcome == security::KeyDispatchOutcome::unhandled && value.generation == native_key_generation &&
+            !shutting_down && !terminal_activation_mode && !power_suspended && window &&
+            IsWindowVisible(window) && !IsIconic(window) &&
+            GetForegroundWindow() == window && GetFocus() == window) {
+            if (value.ime) translate_ime_key(value, reply.ticket);
+            if (window && value.generation == native_key_generation)
+                DefWindowProcW(window, value.message, value.wp, value.lp);
+        }
+    }
     void completed() {
+        observe_read_diagnostics();
         if (consuming_terminal_activations) return;
         if (consume_terminal_activations()) return;
         if (consuming_soft_input) return;
         if (consume_streamed_text_edit()) return;
         if (consume_soft_input()) return;
         auto replies = session.consume();
+        if (const auto request = session.take_finish_request(); request && window && !shutting_down &&
+            !terminal_activation_mode && !session.publication().exited) {
+            if (request->activity != session.snapshot().activity_object ||
+                request->window_generation != session.snapshot().window_generation)
+                fail("Native Activity finish notice does not match its committed Activity incarnation");
+            close(); // UI-owned retirement and the existing reserved ordered close command.
+        }
         if (terminal_activation_mode) {
             // Stored terminal failures are surfaced by consume(). A genuine
             // final exit publication must also be allowed to close this HWND.
-            if (window && session.publication().exited) check_win(DestroyWindow(window), "Destroy terminal window");
+            if (window && session.publication().exited) check_win(destroy_activity_window(), "Destroy terminal window");
             return;
+        }
+        if (!replies.empty() && std::all_of(replies.begin(), replies.end(), [](const auto &reply) { return reply.key_final; })) {
+            for (const auto &reply : replies) complete_native_key(reply);
+            return; // Historical key results do not republish View/text/geometry state.
         }
         if (accessibility_state_generation == UINT64_MAX) fail("Accessibility state identity exhausted");
         ++accessibility_state_generation;
@@ -2437,6 +3057,9 @@ class ActivityWindow {
         // its exposed identity. ACK success/metrics are no longer event sources.
         // consume() still exposes the latest state, not historical snapshots.
         for (const auto &reply : replies) {
+            if (reply.key_final) continue;
+            if (reply.kind == security::ActivityCommandKind::refresh)
+                last_refresh_unavailable = reply.read_unavailable;
             std::shared_ptr<AccessibilityInvocation> requested_origin;
             std::uint64_t requested_view = 0;
             for (auto &entry : pending_invocations)
@@ -2466,8 +3089,12 @@ class ActivityWindow {
         // Hold the entire historical batch before any acknowledgement can
         // enter a native callback. Reentrant publication then sees old records
         // before newer completions, preserving the real global event order.
-        for (auto &reply : replies) hold_text_edits(reply);
+        for (auto &reply : replies) if (!reply.key_final) hold_text_edits(reply);
         for (auto &reply : replies) {
+            if (reply.key_final) {
+                complete_native_key(reply);
+                continue;
+            }
             if (reply.kind == security::ActivityCommandKind::prepare_accessibility_metadata &&
                 reply.ticket == accessibility_metadata_ticket) {
                 accessibility_metadata_ticket = 0;
@@ -2548,19 +3175,7 @@ class ActivityWindow {
                     else { ime_error("AETHER_IME_GUEST_DECLINED"); retire_ime(); }
                 }
             }
-            const auto key = pending_keys.find(reply.ticket);
-            if (key != pending_keys.end()) {
-                const auto value = key->second;
-                pending_keys.erase(key);
-                if (!reply.handled && value.generation == native_key_generation &&
-                    !shutting_down && !terminal_activation_mode && !power_suspended && window &&
-                    IsWindowVisible(window) && !IsIconic(window) &&
-                    GetForegroundWindow() == window && GetFocus() == window) {
-                    if (value.ime) translate_ime_key(value, reply.ticket);
-                    if (window && value.generation == native_key_generation)
-                        DefWindowProcW(window, value.message, value.wp, value.lp);
-                }
-            }
+            complete_native_key(reply);
         }
         // Bookkeeping precedes external UIA callbacks. Current semantic
         // content is already available even while placement/configuration waits.
@@ -2581,7 +3196,7 @@ class ActivityWindow {
             pending_invocations = {};
             retire_and_deliver_terminal_invocations(std::move(deliveries));
             if (!window) return;
-            check_win(DestroyWindow(window), "DestroyWindow");
+            check_win(destroy_activity_window(), "DestroyWindow");
             return;
         }
         if (text_publication_pending()) return;
@@ -2607,7 +3222,52 @@ class ActivityWindow {
         if (accessibility_metadata_pending) request_accessibility_metadata();
         exercise();
     }
+    void initialize_window(HWND hwnd) {
+        if (initialization_started) return;
+        initialization_started = true; // Partial native setup is never replayed.
+        session.bind_clipboard_window(hwnd);
+        try { native_ime = std::make_shared<NativeIme>(hwnd); }
+        catch (const std::exception &) { ime_error("AETHER_IME_CONTEXT_UNAVAILABLE"); }
+        try { input_pane = std::make_shared<InputPane>(hwnd, input_pane_message); }
+        catch (const std::exception &) { ime_error("AETHER_SOFT_INPUT_UNAVAILABLE"); }
+        if (!report.installed_id.empty()) {
+            try {
+                file_drop = std::make_unique<FileDrop>(hwnd, FileDropCallbacks{
+                    [this](POINT point) { return native_drop_begin(point); },
+                    [this](std::uint64_t generation, POINT point) { return native_drop_over(generation, point); },
+                    [this](FileDropCapture capture) { return native_drop_accept(std::move(capture)); },
+                    [this](std::uint64_t generation) { if (native_drop && native_drop->generation == generation) native_drop.reset(); }});
+            } catch (const std::exception &) { drop_diagnostic("AETHER_DROP_NATIVE_UNAVAILABLE"); }
+        }
+        accessibility = std::make_unique<WindowAccessibility>(hwnd, accessibility_action_message);
+        set_dpi(GetDpiForWindow(hwnd));
+        report.initial_dpi = dpi;
+        power_notification = RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
+        check_win(power_notification != nullptr, "RegisterSuspendResumeNotification");
+        check_win(SetTimer(hwnd, read_timer, 1000, nullptr) != 0, "SetTimer");
+        window_initialized = true;
+    }
     LRESULT message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        if (msg == NativeWindowContext::viewport_request_message) {
+            if (native_context) native_context->service_viewport_request(static_cast<std::uint64_t>(wp));
+            return 0;
+        }
+        if (msg == NativeWindowContext::surface_request_message) {
+            if (native_context) native_context->service_surface_request(static_cast<std::uint64_t>(wp));
+            return 0;
+        }
+        if (retiring_native_presentation) {
+            if (msg == WM_CLOSE) return 0;
+            // DXGI may synchronously message this UI owner while join_io waits.
+            // Do not republish a closed context or call framework services.
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        if (!window_initialized && msg != WM_CREATE && msg != WM_DESTROY && msg != WM_NCDESTROY) {
+            if (msg == WM_CLOSE) return 0;
+            if (msg == WM_SIZE) { resize_native_presentation(); return 0; }
+            if (msg == WM_PAINT) { PaintScope paint(hwnd); return 0; }
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
         if (terminal_activation_mode && msg != WM_DESTROY && msg != WM_NCDESTROY && msg != WM_CLOSE &&
             msg != completion_message && msg != WM_GETOBJECT && msg != WM_PAINT)
             return DefWindowProcW(hwnd, msg, wp, lp);
@@ -2616,26 +3276,7 @@ class ActivityWindow {
             return DefWindowProcW(hwnd, msg, wp, lp);
         switch (msg) {
         case WM_CREATE:
-            session.bind_clipboard_window(hwnd);
-            try { native_ime = std::make_shared<NativeIme>(hwnd); }
-            catch (const std::exception &) { ime_error("AETHER_IME_CONTEXT_UNAVAILABLE"); }
-            try { input_pane = std::make_shared<InputPane>(hwnd, input_pane_message); }
-            catch (const std::exception &) { ime_error("AETHER_SOFT_INPUT_UNAVAILABLE"); }
-            if (!report.installed_id.empty()) {
-                try {
-                    file_drop = std::make_unique<FileDrop>(hwnd, FileDropCallbacks{
-                        [this](POINT point) { return native_drop_begin(point); },
-                        [this](std::uint64_t generation, POINT point) { return native_drop_over(generation, point); },
-                        [this](FileDropCapture capture) { return native_drop_accept(std::move(capture)); },
-                        [this](std::uint64_t generation) { if (native_drop && native_drop->generation == generation) native_drop.reset(); }});
-                } catch (const std::exception &) { drop_diagnostic("AETHER_DROP_NATIVE_UNAVAILABLE"); }
-            }
-            accessibility = std::make_unique<WindowAccessibility>(hwnd, accessibility_action_message);
-            set_dpi(GetDpiForWindow(hwnd));
-            report.initial_dpi = dpi;
-            power_notification = RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE);
-            check_win(power_notification != nullptr, "RegisterSuspendResumeNotification");
-            check_win(SetTimer(hwnd, read_timer, 1000, nullptr) != 0, "SetTimer");
+            if (!defer_window_initialization) initialize_window(hwnd);
             return 0;
         case WM_IME_SETCONTEXT:
             if (native_ime) lp &= ~static_cast<LPARAM>(ISC_SHOWUICOMPOSITIONWINDOW);
@@ -2738,6 +3379,7 @@ class ActivityWindow {
             position_ime(true);
             return 0;
         case WM_SIZE:
+            resize_native_presentation();
             ++report.resizes;
             if (wp == SIZE_MINIMIZED) {
                 session.retire_clipboard_window();
@@ -2811,35 +3453,53 @@ class ActivityWindow {
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
         case WM_MOUSEMOVE: {
-            if (power_suspended || configuration_ticket || placement_ticket)
-                return 0;
             // Suppress touch-promoted mouse messages; the pointer path already delivered them.
             if ((static_cast<ULONG_PTR>(GetMessageExtraInfo()) & 0xffffff00u) == 0xff515700u)
                 return 0;
-            if (touch_down || (msg != WM_LBUTTONDOWN && !mouse_down) ||
+            if (msg == WM_LBUTTONUP && pointer_starting && starting_pointer_source == 0x2002) {
+                pointer_start_cancelled = true; // A reentrant UP cannot precede its queued DOWN.
+                return 0;
+            }
+            if (!pointer_input_ready()) return 0;
+            if (touch_down || (msg == WM_LBUTTONDOWN && (mouse_down || pointer_starting)) || (msg != WM_LBUTTONDOWN && !mouse_down) ||
                 (msg == WM_LBUTTONDOWN && !in_viewport(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))))
                 return 0;
-            if (msg != WM_LBUTTONDOWN && !in_viewport(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))) {
+            if (msg != WM_LBUTTONDOWN && (GetCapture() != hwnd ||
+                ((!owned_pointer || !owned_pointer->native_producer) && !in_viewport(GET_X_LPARAM(lp), GET_Y_LPARAM(lp))))) {
                 cancel_pointer();
-                if (GetCapture() == hwnd)
-                    ReleaseCapture();
                 synchronize();
                 return 0;
             }
             if (msg == WM_LBUTTONDOWN) {
+                auto capture = capture_pointer_down(
+                    viewport_pointer(PointerAction::down, 0, 0x2002, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
+                if (!capture) return 0;
+                pointer_starting = true; pointer_start_cancelled = false;
+                starting_pointer_source = 0x2002; starting_pointer_id = 0;
+                struct End {
+                    ActivityWindow &owner;
+                    ~End() { owner.pointer_starting = false; owner.starting_pointer_source = owner.starting_pointer_id = 0; }
+                } end{*this};
                 retire_ime();
                 retire_native_keys();
-                mouse_down = true;
                 SetFocus(hwnd);
                 SetCapture(hwnd);
+                const auto position = viewport_pointer(PointerAction::down, 0, 0x2002, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+                capture->point.x = position.x; capture->point.y = position.y;
+                // Both operations can synchronously reenter this owner. Commit
+                // a DOWN only after their actual focus/capture result is known.
+                if (GetCapture() != hwnd || GetFocus() != hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd) ||
+                    shutting_down || !pointer_input_ready() || mouse_down || touch_down ||
+                    !in_viewport(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)) ||
+                    !begin_pointer(*capture)) {
+                    if (!mouse_down && GetCapture() == hwnd) ReleaseCapture();
+                    return 0;
+                }
+            } else {
+                send_owned_pointer(msg == WM_LBUTTONUP ? PointerAction::up : PointerAction::move,
+                    GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             }
-            const auto action = msg == WM_LBUTTONDOWN ? PointerAction::down
-                                : msg == WM_LBUTTONUP ? PointerAction::up
-                                                      : PointerAction::move;
-            (void)session.pointer(
-                viewport_pointer(action, 0, 0x2002, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)));
             if (msg == WM_LBUTTONUP) {
-                mouse_down = false;
                 if (GetCapture() == hwnd)
                     ReleaseCapture();
             }
@@ -2849,46 +3509,74 @@ class ActivityWindow {
         case WM_POINTERDOWN:
         case WM_POINTERUPDATE:
         case WM_POINTERUP: {
-            if (power_suspended || configuration_ticket || placement_ticket)
-                return 0;
             POINTER_INFO pointer{};
             check_win(GetPointerInfo(GET_POINTERID_WPARAM(wp), &pointer), "GetPointerInfo");
-            if (pointer.pointerType != PT_TOUCH || !(pointer.pointerFlags & POINTER_FLAG_PRIMARY))
+            if (pointer.pointerType != PT_TOUCH ||
+                (msg == WM_POINTERDOWN && !(pointer.pointerFlags & POINTER_FLAG_PRIMARY)))
                 return 0;
-            if (pointer.pointerFlags & POINTER_FLAG_CANCELED) {
-                cancel_pointer();
-                synchronize();
+            if (msg == WM_POINTERUP && pointer_starting && starting_pointer_source == 0x1002 &&
+                starting_pointer_id == pointer.pointerId) {
+                pointer_start_cancelled = true;
                 return 0;
             }
+            if (pointer.pointerFlags & POINTER_FLAG_CANCELED) {
+                if (pointer_starting && starting_pointer_source == 0x1002 && starting_pointer_id == pointer.pointerId)
+                    pointer_start_cancelled = true;
+                if (touch_down && touch_id == pointer.pointerId) {
+                    cancel_pointer();
+                    synchronize();
+                }
+                return 0;
+            }
+            if (owned_pointer && !pointer_identity_current()) cancel_pointer();
+            if (msg == WM_POINTERDOWN ? (mouse_down || touch_down || pointer_starting) : (!touch_down || touch_id != pointer.pointerId))
+                return 0;
+            if (!pointer_input_ready()) return 0;
             POINT point = pointer.ptPixelLocation;
             check_win(ScreenToClient(hwnd, &point), "ScreenToClient");
             if (msg == WM_POINTERDOWN && !in_viewport(point.x, point.y))
                 return 0;
             if (msg == WM_POINTERDOWN) {
+                auto capture = capture_pointer_down(
+                    viewport_pointer(PointerAction::down, 0, 0x1002, point.x, point.y));
+                if (!capture) return 0;
+                pointer_starting = true; pointer_start_cancelled = false;
+                starting_pointer_source = 0x1002; starting_pointer_id = pointer.pointerId;
+                struct End {
+                    ActivityWindow &owner;
+                    ~End() { owner.pointer_starting = false; owner.starting_pointer_source = owner.starting_pointer_id = 0; }
+                } end{*this};
                 retire_ime();
                 retire_native_keys();
-                touch_id = pointer.pointerId;
-                touch_down = true;
                 SetFocus(hwnd);
-            }
-            if (!touch_down || touch_id != pointer.pointerId)
-                return 0;
-            if (!in_viewport(point.x, point.y)) {
+                const auto position = viewport_pointer(PointerAction::down, 0, 0x1002, point.x, point.y);
+                capture->point.x = position.x; capture->point.y = position.y;
+                if (GetFocus() != hwnd || !IsWindowVisible(hwnd) || IsIconic(hwnd) || shutting_down ||
+                    !pointer_input_ready() || mouse_down || touch_down || !in_viewport(point.x, point.y) ||
+                    !begin_pointer(*capture, pointer.pointerId))
+                    return 0;
+            } else if ((!owned_pointer || !owned_pointer->native_producer) && !in_viewport(point.x, point.y)) {
                 cancel_pointer();
                 synchronize();
                 return 0;
+            } else {
+                send_owned_pointer(msg == WM_POINTERUP ? PointerAction::up : PointerAction::move, point.x, point.y);
             }
-            const auto action = msg == WM_POINTERDOWN ? PointerAction::down
-                                : msg == WM_POINTERUP ? PointerAction::up
-                                                      : PointerAction::move;
-            (void)session.pointer(viewport_pointer(action, touch_id, 0x1002, point.x, point.y));
-            if (msg == WM_POINTERUP)
-                touch_down = false;
             synchronize();
             return 0;
         }
         case WM_CAPTURECHANGED:
+            if (pointer_starting && starting_pointer_source == 0x2002 && GetCapture() != hwnd)
+                pointer_start_cancelled = true;
+            if (mouse_down && GetCapture() != hwnd) cancel_pointer();
+            synchronize();
+            return 0;
         case WM_POINTERCAPTURECHANGED:
+            if (pointer_starting && starting_pointer_source == 0x1002 && starting_pointer_id == GET_POINTERID_WPARAM(wp))
+                pointer_start_cancelled = true;
+            if (touch_down && touch_id == GET_POINTERID_WPARAM(wp)) cancel_pointer();
+            synchronize();
+            return 0;
         case WM_CANCELMODE:
             cancel_pointer();
             synchronize();
@@ -2899,17 +3587,40 @@ class ActivityWindow {
         case WM_SYSKEYUP: {
             const auto queued = std::exchange(captured_key, std::nullopt);
             const bool up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+            const bool exact_capture = queued && queued->message == msg && queued->wp == wp && queued->lp == lp;
+            const auto reject_transition = [&] {
+                // A lost release or genuinely new DOWN terminates this physical
+                // origin even when no new guest command is eligible. A rejected
+                // autorepeat does not invent a replacement first DOWN.
+                if (exact_capture && (up || !(lp & (LPARAM(1) << 30))))
+                    for (auto &first : first_key_downs)
+                        if (first && first->physical == queued->physical) first.reset();
+            };
+            if (exact_capture) {
+                const auto &input = queued->input;
+                const auto &publication = session.snapshot();
+                if (!input.root || queued->generation != native_key_generation ||
+                    input.capture_generation != native_key_generation || input.root != publication.content ||
+                    input.window_generation != publication.window_generation || input.input_generation != publication.input_generation) {
+                    retire_key_scope(input, queued->generation);
+                    return 0; // Never retarget a captured MSG into a later publication.
+                }
+            }
             // A key held before placement still receives its release; only
             // new key-down actions wait for authoritative geometry.
-            if (power_suspended || configuration_ticket || (placement_ticket && !up))
+            if (power_suspended || configuration_ticket || ((placement_ticket || !native_surface_placement_ready()) && !up)) {
+                reject_transition();
                 return 0;
+            }
             // Focus loss cancels guest input without pausing a still-active
             // Activity. A queued key-down must not edit that unfocused app.
             // Keep releases flowing so a previously delivered down can retire.
             const bool native_eligible = !shutting_down && IsWindowVisible(hwnd) && !IsIconic(hwnd) &&
                                          GetForegroundWindow() == hwnd && GetFocus() == hwnd;
-            if (!up && !native_eligible)
+            if (!up && !native_eligible) {
+                reject_transition();
                 return 0;
+            }
             const auto vk = static_cast<std::uint32_t>(wp);
             auto normalized = vk;
             if (vk == VK_SHIFT)
@@ -2925,7 +3636,7 @@ class ActivityWindow {
                 ((GetKeyState(VK_NUMLOCK) & 1) ? 0x200000u : 0u) |
                 ((GetKeyState(VK_SCROLL) & 1) ? 0x400000u : 0u);
             std::uint32_t repeat = 0;
-            if (vk < repeats.size()) {
+            if (!exact_capture && vk < repeats.size()) {
                 if (up)
                     repeats[vk] = 0;
                 else if (lp & (LPARAM(1) << 30))
@@ -2939,13 +3650,44 @@ class ActivityWindow {
                                      ? 160u : android_keycode(normalized);
             KeyInput input{up, keycode, modifiers, repeat};
             auto generation = native_key_generation;
-            if (queued && queued->message == msg && queued->wp == wp && queued->lp == lp) {
+            if (exact_capture) {
                 input = queued->input;
-                input.repeat = repeat;
                 generation = queued->generation;
             }
+            auto first = first_key_downs.end();
+            const bool first_down = !up && !(lp & (LPARAM(1) << 30));
+            if (exact_capture) {
+                first = std::find_if(first_key_downs.begin(), first_key_downs.end(), [&](const auto &candidate) {
+                    return candidate && candidate->physical == queued->physical;
+                });
+                if (first != first_key_downs.end() && !same_key_scope((*first)->input, input)) {
+                    const auto retired = (*first)->input;
+                    retire_key_scope(retired, retired.capture_generation);
+                    first = first_key_downs.end();
+                }
+                input.repeat = 0;
+                if (!up && !first_down) {
+                    const auto observed = std::max(1u, static_cast<unsigned>(LOWORD(lp)));
+                    // Generic VK_SHIFT/CONTROL/MENU merge left and right keys.
+                    // Only this exact captured physical tuple owns its count.
+                    input.repeat = first == first_key_downs.end() ? observed
+                        : std::min(65535u, (*first)->input.repeat + observed);
+                }
+                if (first != first_key_downs.end())
+                    check_win(input.event_time_ms >= (*first)->input.event_time_ms, "Captured keyboard uptime regressed");
+                if (first_down) {
+                    if (first == first_key_downs.end())
+                        first = std::find_if(first_key_downs.begin(), first_key_downs.end(), [](const auto &candidate) { return !candidate; });
+                    check_win(first != first_key_downs.end(), "First key-down capture capacity exhausted");
+                    input.down_time_known = true; input.down_time_ms = input.event_time_ms;
+                } else if (first != first_key_downs.end()) {
+                    input.down_time_known = true; input.down_time_ms = (*first)->input.down_time_ms;
+                }
+            }
+            check_win(valid_key_input(input), "Captured key metadata exceeds the supported profile");
             NativeKey native{msg, wp, lp, generation};
-            if (queued && queued->message == msg && queued->wp == wp && queued->lp == lp) {
+            native.input = input;
+            if (exact_capture) {
                 native.original = queued->original;
                 native.layout = queued->layout;
                 native.keyboard = queued->keyboard;
@@ -2953,8 +3695,15 @@ class ActivityWindow {
                 native.allow_character = !up && msg == WM_KEYDOWN &&
                     !(input.meta & ~(key_lock_meta_mask | 1u)); // Shift/locks only; no shortcut text credits.
                 native.editor = ime_target();
+                native.physical = queued->physical;
             }
             const auto ticket = session.key(input);
+            // Gated/rejected Windows messages never become a known first DOWN.
+            // The bounded slot is committed only after actual command admission.
+            if (exact_capture && first != first_key_downs.end()) {
+                if (up) first->reset();
+                else *first = FirstKeyDown{queued->physical, input};
+            }
             if (native_eligible) pending_keys.emplace(ticket, std::move(native));
             return 0; // The completion applies an unhandled native default exactly once.
         }
@@ -2994,10 +3743,7 @@ class ActivityWindow {
             if (update_presentation()) publish_accessibility();
             position_ime();
             if (!window || shutting_down || terminal_activation_mode) return 0;
-            ++report.timer_reads;
-            request_accessibility_metadata(); // One coalesced explicit callback phase, not a snapshot side effect.
-            if (!accessibility_metadata_ticket)
-                (void)session.refresh(); // Coalesces a pending read; never replays input/writes.
+            request_periodic_read();
             return 0;
         case completion_message:
             completed();
@@ -3007,9 +3753,11 @@ class ActivityWindow {
         case WM_PAINT: {
             PaintScope paint(hwnd);
             render();
-            if (buffer.dc && paint.dc)
+            if (buffer.dc && paint.dc) {
                 check_win(BitBlt(paint.dc, 0, 0, buffer.width, buffer.height, buffer.dc, 0, 0, SRCCOPY),
                           "BitBlt");
+                observe_window(WindowObservationKind::buffer_copied);
+            }
             return 0;
         }
         case exercise_message:
@@ -3019,6 +3767,14 @@ class ActivityWindow {
             close();
             return 0;
         case WM_DESTROY:
+            retire_native_presentation();
+            if (!initialization_started) {
+                session.set_notification(nullptr, 0);
+                session.abort();
+                shutting_down = true;
+                PostQuitMessage(0);
+                return 0;
+            }
             pending_invocations = {};
             session.retire_clipboard_window();
             if (file_drop) file_drop->retire();
@@ -3056,6 +3812,7 @@ class ActivityWindow {
             PostQuitMessage(0);
             return 0;
         case WM_NCDESTROY:
+            retire_window_observation();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             window = nullptr;
             report.closed = true;
@@ -3065,32 +3822,8 @@ class ActivityWindow {
         }
     }
 
-  public:
-    ActivityWindow(security::ActivityDispatcher &session, WindowReport &report,
-                   const std::shared_ptr<const apk::Artwork> &presentation,
-                   const std::filesystem::path &developer_output_root)
-        : session(session), report(report), developer_output_root(developer_output_root) {
-        if (presentation) {
-            icon_bytes = apk::icon_file(presentation->bitmap, presentation->renderer_version);
-            report.display_name = presentation->label;
-            report.icon_sha256 = apk::sha256(icon_bytes);
-        }
-    }
-    ~ActivityWindow() {
-        session.set_notification(nullptr, 0);
-        if (window) {
-            shutting_down = true;
-            session.retire_clipboard_window();
-            DestroyWindow(window);
-        }
-        if (large_icon)
-            DestroyIcon(large_icon);
-        if (small_icon)
-            DestroyIcon(small_icon);
-        if (registered)
-            UnregisterClassW(window_class, instance);
-    }
-    void run() {
+    void create_window(bool defer, int width, int height) {
+        if (window) fail("Activity HWND is already created");
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = procedure;
@@ -3099,16 +3832,97 @@ class ActivityWindow {
         wc.lpszClassName = window_class;
         registered = RegisterClassExW(&wc);
         check_win(registered != 0, "RegisterClassEx");
-        const auto title =
-            utf16((report.display_name.empty() ? report.package : report.display_name) + " - Aether");
-        const auto hwnd = CreateWindowExW(0, window_class, title.c_str(), WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                          CW_USEDEFAULT, session.snapshot().requested_orientation == 1 ? 380 : 560,
-                                            session.snapshot().requested_orientation == 1 ? 560 : 380,
-                                            nullptr, nullptr, instance, this);
-        if (failure)
-            std::rethrow_exception(failure);
+        const auto name = report.display_name.empty() ? report.package : report.display_name;
+        const auto title = utf16(name.empty() ? "Aether" : name + " - Aether");
+        defer_window_initialization = defer;
+        const auto hwnd = CreateWindowExW(0, window_class, title.c_str(),
+                                          WS_OVERLAPPEDWINDOW | (native_context ? WS_CLIPCHILDREN : 0),
+                                          CW_USEDEFAULT, CW_USEDEFAULT, width, height,
+                                          nullptr, nullptr, instance, this);
+        if (failure) std::rethrow_exception(failure);
         check_win(hwnd != nullptr, "CreateWindowEx");
         report.created = true;
+    }
+  public:
+    ActivityWindow(security::ActivityDispatcher &session, WindowReport &report,
+                   const std::shared_ptr<const apk::Artwork> &presentation,
+                   const std::filesystem::path &developer_output_root, WindowDiagnosticSink diagnostics,
+                   WindowObservationSink observations, std::optional<ActivityObservationOrigin> origin)
+        : session(session), report(report), diagnostics(std::move(diagnostics)), observations(std::move(observations)),
+          observation_binding(std::move(origin)), developer_output_root(developer_output_root),
+          native_context(session.graphics_window_context()) {
+        if (presentation) {
+            icon_bytes = apk::icon_file(presentation->bitmap, presentation->renderer_version);
+            report.display_name = presentation->label;
+            report.icon_sha256 = apk::sha256(icon_bytes);
+        }
+    }
+    ~ActivityWindow() {
+        observe_read_diagnostics();
+        retire_window_observation();
+        session.set_notification(nullptr, 0);
+        retire_native_presentation();
+        if (window) {
+            shutting_down = true;
+            if (window_initialized) session.retire_clipboard_window();
+            destroy_activity_window();
+        }
+        if (large_icon)
+            DestroyIcon(large_icon);
+        if (small_icon)
+            DestroyIcon(small_icon);
+        if (registered)
+            UnregisterClassW(window_class, instance);
+    }
+    void prepare() {
+        if (!native_context) return; // Fixture startup retains its previous HWND ordering.
+        create_window(true, 560, 380);
+        RECT client{};
+        check_win(GetClientRect(window, &client), "Read hidden Activity client extent");
+        check_win(client.right > 0 && client.bottom > 0, "Prepare nonempty native presentation");
+        native_context->bind_viewport_owner(window, [this](const ViewportRequest &request) {
+            return admit_viewport(request);
+        });
+        const auto width = (std::min)(client.right, static_cast<LONG>(HostSurface::maximum_dimension));
+        const auto height = (std::min)(client.bottom, static_cast<LONG>(HostSurface::maximum_dimension));
+        // A real hidden child backs the future producer/presentation path. It
+        // neither replaces GDI content nor advertises Java Surface availability.
+        native_child = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_CLIPSIBLINGS,
+                                       0, 0, width, height, window, nullptr, instance, nullptr);
+        check_win(native_child != nullptr, "Create hidden native presentation child");
+        check_win(SetPropW(native_child, native_presentation_owner, this), "Bind native presentation child owner");
+        SetLastError(0);
+        native_child_previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(native_child, GWLP_WNDPROC,
+            reinterpret_cast<LONG_PTR>(native_presentation_procedure)));
+        check_win(native_child_previous != nullptr, "Subclass native presentation child");
+        native_surface = std::make_unique<HostSurface>(native_child);
+        native_context->publish(native_surface->snapshot());
+        native_context->bind_surface_owner(window, [this](const NativeSurfaceRequest &request) {
+            return realize_native_surface(request);
+        });
+    }
+    void run() {
+        check_preparation();
+        const bool portrait = session.snapshot().requested_orientation == 1;
+        if (!window) create_window(false, portrait ? 380 : 560, portrait ? 560 : 380);
+        else {
+            // A startup callback may already own an actual admitted producer.
+            // Preserve its real client geometry until explicit layout admission.
+            if (launch_viewport) {
+                const auto &frozen = *launch_viewport;
+                if (session.snapshot().requested_orientation != frozen.orientation ||
+                    session.snapshot().configuration != frozen.admission.configuration ||
+                    !same_viewport_geometry(frozen, sample_viewport(frozen.orientation)))
+                    fail("AETHER_VIEWPORT: startup geometry/configuration changed before presentation");
+            } else if (!admitted_surface)
+                check_win(SetWindowPos(window, nullptr, 0, 0, portrait ? 380 : 560, portrait ? 560 : 380,
+                                       SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE), "Set initialized Activity extent");
+            initialize_window(window);
+        }
+        const auto hwnd = window;
+        const auto title =
+            utf16((report.display_name.empty() ? report.package : report.display_name) + " - Aether");
+        check_win(SetWindowTextW(hwnd, title.c_str()), "Set Activity window title");
         set_icons();
         if (!report.app_user_model_id.empty()) {
             ComPtr<IPropertyStore> properties;
@@ -3145,6 +3959,7 @@ class ActivityWindow {
         } else {
             ShowWindow(hwnd, SW_SHOWNORMAL);
             UpdateWindow(hwnd);
+            observe_window(WindowObservationKind::visible);
         }
         MSG msg{};
         for (;;) {
@@ -3166,34 +3981,73 @@ class ActivityWindow {
             captured_key = std::move(key); // Only the exact queued dispatch may use this Unicode snapshot.
             DispatchMessageW(&msg);
             captured_key.reset();
+            if (!report.selftest && window && msg.hwnd == window && window_initialized && !shutting_down && !terminal_activation_mode &&
+                msg.message != WM_CLOSE && msg.message != WM_DESTROY && msg.message != WM_NCDESTROY)
+                observe_window(WindowObservationKind::ordinary_message);
         }
         if (failure)
             std::rethrow_exception(failure);
+    }
+    void check_preparation() const {
+        if (failure) std::rethrow_exception(failure);
+        if (native_context && (!window || native_presentation_retired))
+            fail("Native presentation was retired before Activity startup completed");
     }
 };
 } // namespace
 
 namespace {
+void wait_activity_startup(HANDLE completion) {
+    using Clock = security::AwakeDeadlineClock;
+    const auto deadline = Clock::now() + std::chrono::seconds(30);
+    for (;;) {
+        const auto now = Clock::now();
+        if (now >= deadline) fail("Activity startup timed out after 30000 milliseconds");
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const auto wait = remaining > 0 ? static_cast<DWORD>((std::min)(remaining + 1, std::int64_t{30000})) : 0;
+        const auto result = MsgWaitForMultipleObjectsEx(1, &completion, wait, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE);
+        if (result == WAIT_OBJECT_0) {
+            if (Clock::now() >= deadline) fail("Activity startup timed out after 30000 milliseconds");
+            return;
+        }
+        if (result == WAIT_OBJECT_0 + 1) {
+            // PeekMessage dispatches synchronous sent traffic (including DXGI
+            // window association) itself. Never remove/dispatch queued input,
+            // close, exercise or ordinary framework work during preparation.
+            MSG sent{};
+            PeekMessageW(&sent, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            continue;
+        }
+        if (result == WAIT_TIMEOUT) continue; // Recheck the original absolute awake deadline.
+        check_win(FALSE, "Wait for Activity startup sent-message boundary");
+    }
+}
 WindowReport run_window(security::ActivityDispatcher &session, bool selftest, std::string installed_id = {},
                         std::shared_ptr<const apk::Artwork> presentation = {},
                         security::InstalledRelaunch relaunch = {},
-                        const std::filesystem::path &developer_output_root = {}) {
-    // Startup precedes HWND creation; subsequent I/O never blocks the window thread.
-    check_win(WaitForSingleObject(session.completion_event(), 30000) == WAIT_OBJECT_0, "Activity startup");
-    (void)session.consume();
+                        const std::filesystem::path &developer_output_root = {}, WindowDiagnosticSink diagnostics = {},
+                        WindowObservationSink observations = {}, std::optional<ActivityObservationOrigin> origin = {}) {
     WindowReport report;
     report.installed_id = std::move(installed_id);
     report.relaunch = std::move(relaunch);
     if (!report.installed_id.empty())
         report.app_user_model_id = "Aether.App." + report.installed_id;
     report.selftest = selftest;
-    report.apk_sha256 = session.snapshot().apk_hash;
-    report.package = session.snapshot().package;
-    report.activity = session.snapshot().activity;
     report.window_process = GetCurrentProcessId();
-    report.worker_process = session.publication().process_id;
     {
-        ActivityWindow window(session, report, presentation, developer_output_root);
+        ActivityWindow window(session, report, presentation, developer_output_root, std::move(diagnostics),
+                              std::move(observations), std::move(origin));
+        // Installed graphics needs a genuine UI-owned backing HWND before an
+        // early native EGL display/context call. Ordinary UI features remain
+        // inactive until the actual worker startup publication is consumed.
+        window.prepare();
+        wait_activity_startup(session.completion_event());
+        window.check_preparation();
+        (void)session.consume();
+        report.apk_sha256 = session.snapshot().apk_hash;
+        report.package = session.snapshot().package;
+        report.activity = session.snapshot().activity;
+        report.worker_process = session.publication().process_id;
         window.run();
     }
     const auto &state = session.snapshot();
@@ -3245,9 +4099,11 @@ WindowReport run_fixture_window(const std::filesystem::path &path, bool selftest
                                                         : security::ActivityMode::normal, developer_output_root);
     return run_window(session, selftest, {}, {}, {}, developer_output_root);
 }
-WindowReport run_installed_window(security::InstalledActivity application) {
+WindowReport run_installed_window(security::InstalledActivity application, WindowDiagnosticSink diagnostics,
+                                  WindowObservationSink observations) {
     const auto id = application.id;
     const auto relaunch = application.relaunch;
+    auto origin = capture_activity_observation_origin(application);
     check_win(application.package != nullptr, "Installed artwork package");
     const auto presentation =
         apk::inspect_package(*application.package, {}, {.modern = application.icon_renderer >= 2,
@@ -3255,7 +4111,8 @@ WindowReport run_installed_window(security::InstalledActivity application) {
                              apk::ScanScope::installation)
             .presentation;
     security::ActivityDispatcher session(std::move(application));
-    return run_window(session, false, id, presentation, relaunch);
+    return run_window(session, false, id, presentation, relaunch, {}, std::move(diagnostics),
+                      std::move(observations), std::move(origin));
 }
 InstalledCloseResult request_installed_window_close(
     std::string_view app_id, const std::filesystem::path &expected_launcher,
@@ -3337,8 +4194,67 @@ InstalledCloseResult request_installed_window_close(
     }
     return search.result;
 }
+std::string window_observation_summary_json(const WindowObservationSummary &summary) {
+    std::ostringstream out;
+    out << std::boolalpha;
+    const auto facts = [&](const WindowObservationFacts &value) {
+        out << "{\"hwnd\":" << value.hwnd << ",\"transportSession\":" << value.transport_session
+            << ",\"hostPid\":" << value.host_pid << ",\"workerPid\":" << value.worker_pid
+            << ",\"activityObject\":" << value.activity << ",\"contentRoot\":" << value.content
+            << ",\"windowGeneration\":" << value.window_generation << ",\"inputGeneration\":" << value.input_generation
+            << ",\"sourceViewRevision\":" << value.source_view_revision
+            << ",\"attachmentIncarnation\":" << value.attachment_incarnation
+            << ",\"visualEpoch\":" << value.visual_epoch << ",\"renderRevision\":" << value.render_revision
+            << ",\"awake100ns\":" << value.awake_100ns << ",\"lifecycle\":" << value.lifecycle
+            << ",\"visible\":" << value.visible << ",\"iconic\":" << value.iconic
+            << ",\"workerExited\":" << value.worker_exited << ",\"finishing\":" << value.finishing
+            << ",\"terminal\":" << value.terminal << ",\"lastRefreshUnavailable\":" << value.last_refresh_unavailable
+            << ",\"readFailures\":" << value.read_failures << ",\"readRecoveries\":" << value.read_recoveries << '}';
+    };
+    const auto epoch = [&](const WindowObservationEpoch &value) {
+        out << "{\"recorded\":" << value.recorded << ",\"hasVisibleSample\":" << value.has_visible_sample
+            << ",\"hasPresent\":" << value.has_present << ",\"hasVisiblePresent\":" << value.has_visible_present
+            << ",\"hasPostpresentMessage\":" << value.has_postpresent_message
+            << ",\"visibilityInterrupted\":" << value.visibility_interrupted << ",\"retired\":" << value.retired
+            << ",\"replacementObserved\":" << value.replacement_observed
+            << ",\"terminalObserved\":" << value.terminal_observed
+            << ",\"firstVisibleAt\":" << value.first_visible_at << ",\"firstPresentAt\":" << value.first_present_at
+            << ",\"firstVisiblePresentAt\":" << value.first_visible_present_at
+            << ",\"lastPresentAt\":" << value.last_present_at
+            << ",\"lastOrdinaryMessageAt\":" << value.last_ordinary_message_at << ",\"retiredAt\":" << value.retired_at
+            << ",\"observations\":" << value.observations << ",\"bufferCopies\":" << value.buffer_copies
+            << ",\"genuinePresents\":" << value.genuine_presents << ",\"ordinaryMessages\":" << value.ordinary_messages
+            << ",\"first\":";
+        facts(value.first);
+        out << ",\"last\":";
+        facts(value.last);
+        out << '}';
+    };
+    const auto sample = [&](const WindowObservationSample &value) {
+        out << "{\"recorded\":" << value.recorded << ",\"facts\":";
+        facts(value.facts);
+        out << '}';
+    };
+    out << "{\"schemaVersion\":1,\"clock\":\"host-awake-100ns\",\"sampledObservationsOnly\":true"
+        << ",\"observationsSeen\":" << summary.observations_seen << ",\"epochsSeen\":" << summary.epochs_seen
+        << ",\"epochsWithDetailOmitted\":" << summary.epochs_with_detail_omitted
+        << ",\"unboundEvents\":" << summary.unbound_events << ",\"staleEvents\":" << summary.stale_events
+        << ",\"captureLosses\":" << summary.capture_losses << ",\"observationFailures\":" << summary.observation_failures
+        << ",\"countersSaturated\":" << summary.counters_saturated << ",\"current\":";
+    epoch(summary.current);
+    out << ",\"firstPresented\":";
+    epoch(summary.first_presented);
+    out << ",\"firstVisibleSample\":";
+    sample(summary.first_visible);
+    out << ",\"lastOrdinaryMessageSample\":";
+    sample(summary.last_ordinary_message);
+    out << ",\"retirementSample\":";
+    sample(summary.retirement);
+    out << '}';
+    return out.str();
+}
 bool WindowReport::passed() const {
-    return !checks.empty() &&
+    return !diagnostic_retention_failures && !checks.empty() &&
            std::all_of(checks.begin(), checks.end(), [](const auto &check) { return check.passed; });
 }
 std::string WindowReport::json() const {
@@ -3367,6 +4283,8 @@ std::string WindowReport::json() const {
         << ",\"coalescedReads\":" << coalesced_reads << ",\"readFailures\":" << read_failures
         << ",\"recoveredReads\":" << recovered_reads << ",\"peakPending\":" << peak_pending
         << ",\"responsiveTicks\":" << responsive_ticks << '}'
+        << ",\"diagnosticRetentionFailures\":" << diagnostic_retention_failures
+        << ",\"windowObservations\":" << window_observation_summary_json(window_observations)
         << ",\"resultText\":" << json_quote(narrow(result_text))
         << ",\"managedTrace\":" << json_quote(narrow(trace))
         << ",\"capturePath\":" << json_quote(capture_path) << ",\"window\":{\"messages\":" << messages
@@ -3412,6 +4330,8 @@ std::string WindowReport::text(bool verbose) const {
         << " key events; " << jni.native_calls << " translated native calls.\n";
     if (!ime_diagnostic.empty()) out << "Native IME: " << ime_diagnostic << '\n';
     if (!text_edit_diagnostic.empty()) out << "TextEdit: " << text_edit_diagnostic << '\n';
+    if (diagnostic_retention_failures)
+        out << "Fault retention failed for " << diagnostic_retention_failures << " observations.\n";
     if (verbose || !passed())
         for (const auto &check : checks)
             out << (check.passed ? "  PASS " : "  FAIL ") << check.name << '\n';

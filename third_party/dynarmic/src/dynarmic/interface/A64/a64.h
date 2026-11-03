@@ -42,6 +42,15 @@ public:
     void ClearCache();
 
     /**
+     * Synchronously discards translations and releases their reusable storage.
+     * Owner-only: no active generated-code/native return stack may retain a
+     * cache address. Returns false during execution; never runs guest code.
+     * Preserves architectural state, prelude and constant-pool addresses.
+     * The x64 backend decommits unused Windows code pages; OS errors propagate.
+     */
+    bool TrimCache();
+
+    /**
      * Invalidate the code cache at a range of addresses.
      * @param start_address The starting address of the range to invalidate.
      * @param length The length (in bytes) of the range to invalidate.

@@ -13,9 +13,27 @@ constexpr std::uint32_t maximum_records = 65536, maximum_steps = 262144, maximum
 struct Region {
     std::uint32_t begin, end, count;
 };
+enum class NamingKind { none, inner, enclosing_class, enclosing_method };
+struct NamingAnnotation {
+    NamingKind kind = NamingKind::none;
+    bool valid = true;
+    Index reference = no_index;
+};
+struct AnnotationItem {
+    Index type;
+    NamingAnnotation naming;
+};
+struct NamingSet {
+    bool valid = true, inner_present = false;
+    Index name = no_index, enclosing_class = no_index, enclosing_method = no_index;
+};
+struct Directory {
+    Index owner;
+    std::uint32_t class_annotations;
+};
 class Validator {
   public:
-    Validator(apk::Bytes bytes, const DexImage &image) : view_(bytes, "dex-annotations"), image_(image) {
+    Validator(apk::Bytes bytes, DexImage &image) : view_(bytes, "dex-annotations"), image_(image) {
         // The inventory has already validated the map, uniqueness, counts and ordering.
         const auto map = view_.u32(52), count = view_.u32(map);
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -30,22 +48,43 @@ class Validator {
         each(0x2004, 1, [&](std::uint32_t &at) {
             const auto start = at;
             range(at, 1, 0x2004);
-            if (view_.u8(at++) > 2)
+            const auto visibility = view_.u8(at++);
+            if (visibility > 2)
                 bad("VALUE", "Invalid annotation visibility");
-            items_.emplace(start, annotation(at, 0));
+            NamingAnnotation naming;
+            const auto type = annotation(at, 0, visibility == 2 ? &naming : nullptr);
+            items_.emplace(start, AnnotationItem{type, naming});
         });
         each(0x1003, 4, [&](std::uint32_t &at) {
             const auto start = at, count = table(at, 4, 0x1003, maximum_records);
             Index previous = 0;
+            NamingSet naming;
             for (std::uint32_t i = 0; i < count; ++i, at += 4) {
                 const auto found = items_.find(view_.u32(at));
                 if (found == items_.end())
                     bad("REFERENCE", "Annotation set offset does not name a complete annotation item");
-                if (i && found->second <= previous)
+                if (i && found->second.type <= previous)
                     bad("ORDER", "Annotation types are not strictly sorted in their set");
-                previous = found->second;
+                previous = found->second.type;
+                const auto &item = found->second.naming;
+                naming.valid = naming.valid && item.valid;
+                switch (item.kind) {
+                case NamingKind::none: break;
+                case NamingKind::inner:
+                    if (naming.inner_present)
+                        bad("ORDER", "Duplicate InnerClass annotation");
+                    naming.inner_present = true;
+                    naming.name = item.reference;
+                    break;
+                case NamingKind::enclosing_class:
+                    naming.enclosing_class = item.reference;
+                    break;
+                case NamingKind::enclosing_method:
+                    naming.enclosing_method = item.reference;
+                    break;
+                }
             }
-            sets_.insert(start);
+            sets_.emplace(start, naming);
         });
         each(0x1002, 4, [&](std::uint32_t &at) {
             const auto start = at, count = table(at, 4, 0x1002, 255);
@@ -56,7 +95,8 @@ class Validator {
         each(0x2006, 4, [&](std::uint32_t &at) {
             const auto start = at;
             range(at, 16, 0x2006);
-            set(view_.u32(at), true);
+            const auto class_annotations = view_.u32(at);
+            set(class_annotations, true);
             const auto fields = view_.u32(at + 4), methods = view_.u32(at + 8),
                        parameters = view_.u32(at + 12);
             if (fields > image_.fields.size() || methods > image_.methods.size() ||
@@ -101,9 +141,11 @@ class Validator {
                     }
                 }
             }
-            directories_.emplace(start, owner);
+            directories_.emplace(start, Directory{owner, class_annotations});
         });
         const auto count = view_.u32(96), table_at = view_.u32(100);
+        if (count != image_.classes.size())
+            bad("OWNER", "Class annotation inventory differs from class definitions");
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto at = table_at + i * 32, offset = view_.u32(at + 20);
             if (!offset)
@@ -111,8 +153,29 @@ class Validator {
             const auto directory = directories_.find(offset);
             if (directory == directories_.end())
                 bad("REFERENCE", "Class annotations do not name a complete directory");
-            if (directory->second != no_index && directory->second != view_.u32(at))
+            if (directory->second.owner != no_index && directory->second.owner != view_.u32(at))
                 bad("OWNER", "Annotation directory members belong to another class");
+            auto &definition = image_.classes[i];
+            if (definition.type != view_.u32(at))
+                bad("OWNER", "Class annotation definition order differs from its owner");
+            if (!directory->second.class_annotations)
+                continue;
+            const auto &naming = sets_.at(directory->second.class_annotations);
+            if (!naming.valid)
+                bad("NAMING", "Invalid SYSTEM class-naming annotation shape or value type");
+            if (naming.enclosing_class != no_index && naming.enclosing_method != no_index)
+                bad("NAMING", "Class has both EnclosingClass and EnclosingMethod annotations");
+            if (naming.enclosing_class != no_index &&
+                (image_.types[naming.enclosing_class].front() != 'L' ||
+                 naming.enclosing_class == definition.type))
+                bad("OWNER", "EnclosingClass does not name another class");
+            if (naming.enclosing_method != no_index &&
+                image_.methods[naming.enclosing_method].owner == definition.type)
+                bad("OWNER", "EnclosingMethod belongs to the class it encloses");
+            definition.inner_class_present = naming.inner_present;
+            definition.inner_class_name = naming.name;
+            definition.enclosing_class = naming.enclosing_class;
+            definition.enclosing_method = naming.enclosing_method;
         }
     }
 
@@ -141,7 +204,7 @@ class Validator {
         }
         bad("VALUE", "Unterminated annotation ULEB128");
     }
-    Index annotation(std::uint32_t &at, unsigned depth) {
+    Index annotation(std::uint32_t &at, unsigned depth, NamingAnnotation *naming = nullptr) {
         if (depth > maximum_depth)
             bad("LIMIT", "Annotation nesting exceeds 32");
         const auto type = leb(at), count = leb(at);
@@ -149,8 +212,20 @@ class Validator {
             bad("REFERENCE", "Annotation type is not a class descriptor");
         if (count > image_.strings.size())
             bad("LIMIT", "Annotation element count exceeds the string table");
+        if (naming) {
+            const auto &descriptor = image_.types[type];
+            if (descriptor == "Ldalvik/annotation/InnerClass;")
+                naming->kind = NamingKind::inner;
+            else if (descriptor == "Ldalvik/annotation/EnclosingClass;")
+                naming->kind = NamingKind::enclosing_class;
+            else if (descriptor == "Ldalvik/annotation/EnclosingMethod;")
+                naming->kind = NamingKind::enclosing_method;
+            else
+                naming = nullptr;
+        }
         consume(count);
         Index previous = 0;
+        unsigned naming_fields = 0;
         for (std::uint32_t i = 0; i < count; ++i) {
             const auto name = leb(at);
             if (name >= image_.strings.size() || image_.strings[name].empty())
@@ -158,11 +233,33 @@ class Validator {
             if (i && name <= previous)
                 bad("ORDER", "Annotation element names are not strictly sorted");
             previous = name;
-            value(at, depth);
+            const auto encoded = value(at, depth);
+            if (!naming)
+                continue;
+            const auto &element = image_.strings[name];
+            if (naming->kind == NamingKind::inner && element == u"name") {
+                naming_fields |= 1;
+                naming->valid = naming->valid && (encoded.type == 0x17 || encoded.type == 0x1e);
+                if (encoded.type == 0x17)
+                    naming->reference = static_cast<Index>(encoded.bits);
+            } else if (naming->kind == NamingKind::inner && element == u"accessFlags") {
+                naming_fields |= 2;
+                naming->valid = naming->valid && encoded.type == 4;
+            } else if (naming->kind != NamingKind::inner && element == u"value") {
+                naming_fields |= 1;
+                const auto expected = naming->kind == NamingKind::enclosing_class ? 0x18 : 0x1a;
+                naming->valid = naming->valid && encoded.type == expected;
+                if (encoded.type == expected)
+                    naming->reference = static_cast<Index>(encoded.bits);
+            } else {
+                naming->valid = false;
+            }
         }
+        if (naming)
+            naming->valid = naming->valid && naming_fields == (naming->kind == NamingKind::inner ? 3u : 1u);
         return type;
     }
-    void value(std::uint32_t &at, unsigned depth) {
+    EncodedValue value(std::uint32_t &at, unsigned depth) {
         consume(1);
         range(at, 1, 0x2004);
         const auto header = view_.u8(at++);
@@ -181,12 +278,12 @@ class Validator {
                 for (std::uint32_t i = 0; i < count; ++i)
                     value(at, depth + 1);
             }
-            return;
+            return {static_cast<std::uint8_t>(kind), 0};
         }
         if (kind == 0x1e || kind == 0x1f) {
             if (arg > (kind == 0x1f ? 1u : 0u))
                 bad("VALUE", "Invalid encoded null or boolean annotation");
-            return;
+            return {static_cast<std::uint8_t>(kind), kind == 0x1f ? arg : 0};
         }
         const unsigned width = kind == 0                                                       ? 1
                                : (kind == 2 || kind == 3)                                      ? 2
@@ -206,6 +303,7 @@ class Validator {
             ((kind == 0x19 || kind == 0x1b) && bits >= image_.fields.size()) ||
             (kind == 0x1a && bits >= image_.methods.size()))
             bad("REFERENCE", "Annotation value reference is out of range");
+        return {static_cast<std::uint8_t>(kind), bits};
     }
     std::uint32_t table(std::uint32_t &at, std::uint32_t width, std::uint16_t kind, std::uint32_t maximum) {
         range(at, 4, kind);
@@ -247,15 +345,16 @@ class Validator {
                 bad("VALUE", "Nonzero annotation section padding");
     }
     apk::View view_;
-    const DexImage &image_;
+    DexImage &image_;
     std::map<std::uint16_t, Region> regions_;
-    std::map<std::uint32_t, Index> items_, directories_;
-    std::set<std::uint32_t> sets_;
+    std::map<std::uint32_t, AnnotationItem> items_;
+    std::map<std::uint32_t, Directory> directories_;
+    std::map<std::uint32_t, NamingSet> sets_;
     std::map<std::uint32_t, std::uint32_t> parameter_lists_;
     std::uint32_t steps_ = 0, records_ = 0;
 };
 } // namespace
-void validate_annotations(std::span<const std::uint8_t> bytes, const DexImage &image) {
+void validate_annotations(std::span<const std::uint8_t> bytes, DexImage &image) {
     Validator(bytes, image).run();
 }
 } // namespace aether::dex

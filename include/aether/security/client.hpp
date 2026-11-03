@@ -4,11 +4,14 @@
 #include "aether/host/drop_text.hpp"
 #include "aether/host/time_service.hpp"
 #include "aether/host/clipboard_service.hpp"
+#include "aether/android/native_surface.hpp"
+#include "aether/android/viewport.hpp"
 #include "aether/security/worker.hpp"
 
-namespace aether::android { struct TextEditObservation; struct SoftInputObservation; }
+namespace aether::android { struct TextEditObservation; struct SoftInputObservation; struct ActivityFinishRequest; }
 namespace aether::security {
 struct ActivityTerminalActivations;
+struct ActivityKeyResult;
 // Single owner-thread worker provider. Guest descriptors map to opaque, non-reused
 // broker tokens, never Windows handles. Transport failure permanently closes the client.
 class BrokerClient final : public host::TimeService, public host::FileService, public host::DocumentService,
@@ -25,9 +28,18 @@ class BrokerClient final : public host::TimeService, public host::FileService, p
     // Commands received while waiting are validated/queued, never executed.
     void send_text_edit_observation(const android::TextEditObservation &observation, std::uint64_t context);
     bool send_soft_input_observation(const android::SoftInputObservation &observation, std::uint64_t context);
+    // Activity-only typed RPC. No broker capability or host-handle delegation.
+    // Its exact request/context must be acknowledged once within the original deadline.
+    android::NativeSurfaceAdmission request_native_surface(const android::NativeSurfaceRequest &, std::uint64_t context);
+    // Host geometry precedes resource selection; later binding acknowledges the
+    // actual committed content identity. Neither phase grants drawing or Surface custody.
+    android::ViewportAdmission request_viewport(const android::ViewportRequest &, std::uint64_t context);
     // One terminal attempt; receipt acknowledges bounded host custody only.
     void send_terminal_view_activations(const ActivityTerminalActivations &batch, std::uint64_t context);
     // Trusted final cleanup, including an empty terminal batch. Sends no IPC.
+    // Historical enrolled key origin; receipt transfers host custody, not handling.
+    void send_key_result(const ActivityKeyResult &);
+    void send_finish_request(const android::ActivityFinishRequest &);
     void retire_activity_channel() noexcept;
     std::vector<std::uint8_t> read_package();
     void verify_package(std::span<const std::uint8_t> bytes);
@@ -57,9 +69,15 @@ class BrokerClient final : public host::TimeService, public host::FileService, p
     host::FileResult rename_path(const host::FilePathRef&,const host::FilePathRef&,host::FileRenameInfo&) noexcept override;
     host::FileResult read(int descriptor, std::span<std::uint8_t> output) noexcept override;
     host::FileResult write(int descriptor, std::span<const std::uint8_t> input) noexcept override;
+    host::FileResult truncate(int descriptor, std::uint64_t size) noexcept override;
+    // One bounded wire chunk, like read/write; positive short counts retain
+    // their actual prefix and leave continuation to the caller.
+    host::FileResult read_at(int descriptor, std::uint64_t offset, std::span<std::uint8_t> output) noexcept override;
+    host::FileResult write_at(int descriptor, std::uint64_t offset, std::span<const std::uint8_t> input) noexcept override;
     host::FileResult close(int descriptor) noexcept override;
     host::FileResult flush(int descriptor) noexcept override;
     host::FileResult metadata(int descriptor, host::FileMetadata &output) noexcept override;
+    host::FileResult metadata_path(const host::FilePathRef &, host::FilePathMetadata &) noexcept override;
     host::FileResult remove(host::FileAccessScope scope, std::string_view name, host::FileRemoveMode mode, bool directory_required = false) noexcept override;
     host::FileResult seek(int descriptor, std::int64_t offset, unsigned whence) noexcept override;
     host::FileResult access(host::FileAccessScope scope,std::string_view name,std::uint32_t mode) noexcept override;

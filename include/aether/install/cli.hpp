@@ -12,6 +12,8 @@ struct AppLaunchFailure {
     std::filesystem::path store; // Trusted host-only locator; never exported.
     std::string app_id;
     AppSessionFailure failure = AppSessionFailure::failed;
+    std::optional<DiagnosticFault> diagnostic;
+    std::string retention_error;
 };
 using AppLaunchObserver = std::function<void(const AppLaunchFailure &)>;
 struct OpenLinkOptions;

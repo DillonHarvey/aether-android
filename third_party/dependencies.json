@@ -525,6 +525,69 @@
           "result": "Same37BMP decimal ten-digit ranges as retained16.0.0 classification; supplementary code points are not single Java chars."
         }
       ]
+    },
+    {
+      "name": "android-framework-resource-data",
+      "version": "API35",
+      "revision": "1f359de81be0287e8be26dfb0af2a694423e728c",
+      "license": "Apache-2.0 (framework resource metadata and listed layout XML only; retained core/res NOTICE)",
+      "scope": "runtime-resource-data",
+      "provenance": "third_party/ANDROID_RESOURCE_DATA.md",
+      "files": [
+        {
+          "path": "third_party/android-resources/api35/resources.arsc",
+          "source": "https://android.googlesource.com/platform/prebuilts/sdk/+/1f359de81be0287e8be26dfb0af2a694423e728c/35/public/android.jar",
+          "member": "resources.arsc",
+          "sha256": "4f59c3c6541189c2d9cbe262eb90cd3815a7dbf0657d5b60319ea90db4cf36ad"
+        },
+        {
+          "path": "third_party/android-resources/api35/res/layout/screen_simple.xml",
+          "source": "https://android.googlesource.com/platform/prebuilts/sdk/+/1f359de81be0287e8be26dfb0af2a694423e728c/35/public/android.jar",
+          "member": "res/layout/screen_simple.xml",
+          "sha256": "f0e0ba8d708ea776c88cc848cd1fade489fa99dfbab4a0a70f3c181f428a1276"
+        },
+        {
+          "path": "third_party/android-resources/api35/res/layout/screen_simple_overlay_action_mode.xml",
+          "source": "https://android.googlesource.com/platform/prebuilts/sdk/+/1f359de81be0287e8be26dfb0af2a694423e728c/35/public/android.jar",
+          "member": "res/layout/screen_simple_overlay_action_mode.xml",
+          "sha256": "3495ad0c68a1b4ee86db6d317986902e0d1f51dc63b956affe69232ecd7ab4fb"
+        },
+        {
+          "path": "third_party/android-resources/api35/res/layout/action_mode_bar.xml",
+          "source": "https://android.googlesource.com/platform/prebuilts/sdk/+/1f359de81be0287e8be26dfb0af2a694423e728c/35/public/android.jar",
+          "member": "res/layout/action_mode_bar.xml",
+          "sha256": "14b4ee3d744de661eae96094d6a0456b24a00d76e560003121ca13a0c25d0a67"
+        },
+        {
+          "path": "third_party/licenses/android-framework-res-Apache-2.0.txt",
+          "source": "https://android.googlesource.com/platform/frameworks/base/+/4e43ad12e1b211f15152e9c5b16b0fe88e6b93f3/core/res/NOTICE",
+          "sha256": "38751245389e1e23f73e6f5384b5cbe7fa972cc4410c5adc9c04b082a0b9561a"
+        }
+      ]
+    },
+    {
+      "name": "android-bootstrap-direct-class-presence",
+      "version": "15-robolectric-12650502",
+      "license": "Apache-2.0 publisher declaration; class-name metadata only, no implementation code",
+      "scope": "runtime-class-presence-metadata",
+      "provenance": "docs/adr/0484-bootstrap-class-presence-profile.md",
+      "carrier": {
+        "url": "https://repo.maven.apache.org/maven2/org/robolectric/android-all/15-robolectric-12650502/android-all-15-robolectric-12650502.jar",
+        "bytes": 184872954,
+        "etag": "\"1bf3898ebc30aebf9ccd915ec1c1dfa3\"",
+        "centralDirectorySha256": "73def6cd1ca6b964b16a07b915b9dacde37010eb3425734b419639a0a84672e8",
+        "centralDirectoryBytes": 7300341,
+        "fullBodyHashVerified": false
+      },
+      "files": [
+        {
+          "path": "src/android/bootstrap_direct_classes.inc",
+          "source": "https://repo.maven.apache.org/maven2/org/robolectric/android-all/15-robolectric-12650502/android-all-15-robolectric-12650502.jar",
+          "transformation": "Complete direct android/widget,android/webkit,android/app class names; sorted unique descriptors only",
+          "sha256": "c3e5c9e3d3ea28202c4e18a845b0a2cdf97dea665473ea30a7a191f792e09fc9"
+        }
+      ],
+      "licenseText": "third_party/licenses/android-framework-res-Apache-2.0.txt"
     }
   ]
 }

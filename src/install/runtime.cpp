@@ -1515,7 +1515,7 @@ bool is_runtime_command(const std::vector<std::string> &arguments) {
     return false;
 }
 int runtime_cli(const std::vector<std::string> &arguments, bool json) {
-    std::string action, root_text, store_text, bundle_text;
+    std::string action, root_text, store_text, bundle_text, relocated_store_text;
     bool command = false, yes = false;
     std::set<std::string> options;
     for (std::size_t n = 0; n < arguments.size(); ++n) {
@@ -1529,10 +1529,11 @@ int runtime_cli(const std::vector<std::string> &arguments, bool json) {
                 yes = true;
                 continue;
             }
-            require((arg == "--root" || arg == "--store" || arg == "--bundle") && n + 1 < arguments.size() &&
+            require((arg == "--root" || arg == "--store" || arg == "--bundle" || arg == "--to-store") && n + 1 < arguments.size() &&
                         !arguments[n + 1].empty() && !arguments[n + 1].starts_with('-'),
                     "AETHER_CLI_USAGE", "Unknown runtime option or missing path");
-            (arg == "--root" ? root_text : arg == "--store" ? store_text : bundle_text) = arguments[++n];
+            (arg == "--root" ? root_text : arg == "--store" ? store_text
+                : arg == "--to-store" ? relocated_store_text : bundle_text) = arguments[++n];
         } else if (!command && arg == "runtime")
             command = true;
         else {
@@ -1542,13 +1543,15 @@ int runtime_cli(const std::vector<std::string> &arguments, bool json) {
     }
     const bool read_only = action == "status" || action == "check-removal";
     require(read_only || action == "prepare" || action == "finalize" || action == "repair" ||
-                action == "forget-store" || action == "remove" || action == "upgrade",
+                action == "forget-store" || action == "relocate-empty-store" || action == "remove" || action == "upgrade",
             "AETHER_CLI_USAGE",
-            "Use runtime status, prepare, finalize, check-removal, forget-store, repair, upgrade or remove");
+            "Use runtime status, prepare, finalize, check-removal, forget-store, relocate-empty-store, repair, upgrade or remove");
     require(!yes || !read_only, "AETHER_CLI_USAGE", "Read-only runtime commands do not accept --yes");
     require(read_only || yes, "AETHER_INSTALL_CONFIRMATION_REQUIRED", "Runtime changes require --yes");
-    require((action == "forget-store") == !store_text.empty(), "AETHER_CLI_USAGE",
-            "Only forget-store requires --store");
+    require((action == "forget-store" || action == "relocate-empty-store") == !store_text.empty(), "AETHER_CLI_USAGE",
+            "Only forget-store and relocate-empty-store require --store");
+    require((action == "relocate-empty-store") == !relocated_store_text.empty(), "AETHER_CLI_USAGE",
+            "Only relocate-empty-store requires --to-store");
     require((action == "upgrade") == !bundle_text.empty(), "AETHER_CLI_USAGE",
             "Only runtime upgrade requires --bundle PATH");
     require(action != "prepare" || !root_text.empty(), "AETHER_CLI_USAGE",
@@ -1602,6 +1605,53 @@ int runtime_cli(const std::vector<std::string> &arguments, bool json) {
             state.record.phase = Phase::ready;
             state.commit();
             output = describe(state.record, {}, true, true, false);
+        } else if (action == "relocate-empty-store") {
+            // Explicit owner-directed reference repair, not automatic discovery or
+            // proof of an unrecorded old store identity. Populated stores need a
+            // separate migration of their path-bound Windows registrations.
+            require(state.record.phase == Phase::ready, "AETHER_RUNTIME_STATE",
+                    "Only a ready runtime can relocate an empty store reference");
+            const std::filesystem::path store(utf16(store_text));
+            const std::filesystem::path relocated(utf16(relocated_store_text));
+            validate_path(store);
+            validate_path(relocated);
+            const auto at = std::find_if(state.record.stores.begin(), state.record.stores.end(),
+                                         [&](const auto &known) { return same_path(known, store); });
+            require(at != state.record.stores.end() && !same_path(store, default_store_root()) &&
+                        !same_path(relocated, default_store_root()), "AETHER_RUNTIME_STORE",
+                    "Relocation requires a tracked nondefault store and a nondefault destination");
+            require(missing(store), "AETHER_RUNTIME_STORE",
+                    "The original store directory must be absent; existing material is preserved");
+            require(!below(relocated, default_store_root()) &&
+                        !below(default_store_root(), relocated) &&
+                        !below(relocated, root) && !below(root, relocated) &&
+                        !below(relocated, store) && !below(store, relocated) &&
+                        std::none_of(state.record.stores.begin(), state.record.stores.end(),
+                                     [&](const auto &known) {
+                                         return !same_path(known, store) &&
+                                                (below(relocated, known) || below(known, relocated));
+                                     }), "AETHER_RUNTIME_STORE",
+                    "Relocated stores must not overlap runtime binaries or enrolled stores");
+            require(!missing(relocated / L"registry.log"), "AETHER_RUNTIME_STORE",
+                    "The relocated store must have an existing readable journal");
+            // Keep verified non-reparse directory and journal handles alive until
+            // the catalogue commit; the read snapshot excludes store mutations.
+            auto held = ancestors(relocated);
+            auto destination = detail::hold_directory(relocated, false, false);
+            verify_resolved_path(destination.get(), relocated);
+            auto journal = detail::private_file(relocated / L"registry.log", GENERIC_READ,
+                                                OPEN_EXISTING, 16u * 1024u * 1024u, FILE_SHARE_READ);
+            PackageStore packages(relocated);
+            require(packages.list().empty(), "AETHER_RUNTIME_DEPENDENCIES",
+                    "Installed, pending or retained apps require a full store migration");
+            require(missing(store), "AETHER_RUNTIME_STORE",
+                    "The original store reappeared; its reference was preserved");
+            output = "{\"schemaVersion\":1,\"operation\":\"runtime-relocate-empty-store\","
+                     "\"state\":\"ready\",\"fromStore\":" + json_quote(store_text) +
+                     ",\"toStore\":" + json_quote(relocated_store_text) +
+                     ",\"storeFilesPreserved\":true}";
+            *at = relocated;
+            state.commit();
         } else if (action == "forget-store") {
             require(state.record.phase == Phase::ready, "AETHER_RUNTIME_STATE",
                     "Only a ready runtime can forget an empty store");

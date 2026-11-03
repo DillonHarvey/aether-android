@@ -33,6 +33,18 @@ class Archive {
     const std::vector<ArchiveEntry> &entries() const;
     std::uint64_t buffer_limit() const;
     std::vector<std::uint8_t> read(std::size_t index);
+    // Runtime admission for one complete held member. working_bytes includes
+    // the returned vector object/capacity and declared fixed extractor state;
+    // immutable archive backing/catalog and caller callback storage are separate.
+    // The memory-backed extractor allocates no dictionary or read buffer. This
+    // is object-storage accounting, not a claim about compiler stack-frame size;
+    // the process/job retains authority over actual committed stack memory.
+    // The required host callback debits initialization, extraction and CRC byte
+    // work before each synchronous stage. It must not reenter or yield on a soft
+    // quantum; terminal failure/cancellation propagates without replay.
+    std::vector<std::uint8_t> read_admitted(
+        std::size_t index, std::size_t working_bytes,
+        const std::function<void(std::uint64_t)> &charge_work);
     // Zero-copy access to a stored member after full CRC validation. The caller
     // must retain the original immutable backing bytes for the view's lifetime.
     // Deflated members are refused, never silently materialized or extracted.

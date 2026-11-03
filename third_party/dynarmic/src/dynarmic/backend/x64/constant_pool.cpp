@@ -28,6 +28,7 @@ Xbyak::Address ConstantPool::GetConstant(const Xbyak::AddressFrame& frame, u64 l
     if (iter == constant_info.end()) {
         ASSERT(insertion_point < pool.size());
         ConstantT& target_constant = pool[insertion_point];
+        code.PrepareCodeWrite(&target_constant, sizeof(target_constant));
         target_constant = constant;
         iter = constant_info.insert({constant, &target_constant}).first;
         ++insertion_point;

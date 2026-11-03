@@ -4,6 +4,7 @@
 #include "aether/apk/string_pool.hpp"
 #include "aether/common/text.hpp"
 #include <algorithm>
+#include <array>
 #include <set>
 #include <tuple>
 
@@ -130,6 +131,12 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
             result.strings_ = parse_string_pool(document.slice(offset, current.size), "resources",
                                                 "RESOURCES", extended, optimized ? &styled : nullptr);
             result.styled_strings_.insert(styled.begin(), styled.end());
+            if (optimized) {
+                result.sources_.push_back({std::string(container), 0, static_cast<std::uint32_t>(result.strings_.size())});
+                result.metadata_bytes_ += sizeof(ResourceSource) + container.size();
+                if (result.metadata_bytes_ > 64 * 1024 * 1024)
+                    bad("Resource source metadata exceeds 64 MiB", "LIMIT");
+            }
             for (const auto &text : result.strings_)
                 result.decoded_bytes_ += text.size();
             have_strings = true;
@@ -207,6 +214,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         "UNSUPPORTED");
             }
             std::map<unsigned, std::uint32_t> specs;
+            std::map<unsigned, std::size_t> specification_offsets;
             std::map<unsigned, std::uint16_t> declared_configurations, actual_configurations;
             std::set<unsigned> definitions;
             std::set<std::pair<unsigned, std::vector<std::uint8_t>>> configurations;
@@ -234,6 +242,7 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                     if (!id || id > types.size() || count > 65536 ||
                         part.size != 16 + std::uint64_t(count) * 4 || !specs.emplace(id, count).second)
                         bad("Invalid or duplicate type specification");
+                    specification_offsets.emplace(id, at + 16);
                     if (compiled_names && types[id - 1].starts_with('?'))
                         bad("A resource type placeholder cannot have a definition");
                     if (runtime_selection)
@@ -395,6 +404,14 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                         if (value_type == 3 && data >= result.strings_.size())
                             bad("Resource string index is out of bounds");
                         const auto resource_id = (package_id << 24) | (std::uint32_t(id) << 16) | entry_id;
+                        const auto native_flags = view.u32(specification_offsets.at(id) + std::size_t(entry_id) * 4);
+                        if (optimized) {
+                            const auto [declaration, fresh] = result.declared_flags_.try_emplace(resource_id, native_flags);
+                            if (!fresh) declaration->second |= native_flags;
+                            else {
+                                result.metadata_bytes_ += sizeof(std::pair<const std::uint32_t, std::uint32_t>) + 4 * sizeof(void *);
+                            }
+                        }
                         if (result.entries_.size() >= (extended ? 131072u : 65536u) &&
                             !result.entries_.contains(resource_id))
                             bad("Resource entry quota exceeded", "LIMIT");
@@ -410,6 +427,10 @@ ResourceTable ResourceTable::parse(Bytes bytes, std::string_view container,
                                                     types[id - 1], keys[key], std::string(container),
                                                     density,       sdk, orientation,
                                                     width_dp, height_dp, smallest_width_dp};
+                            candidate.complex = (entry_flags & 1) != 0;
+                            candidate.native_flags = native_flags;
+                            candidate.source_data = data;
+                            candidate.source_id = optimized ? 1u : 0u;
                             const auto old = result.entries_.find(resource_id);
                             if (old == result.entries_.end()) {
                                 result.entries_.emplace(resource_id, std::move(candidate));
@@ -529,6 +550,7 @@ void ResourceTable::merge(ResourceTable other) {
     if (other.encoded_bytes_ > encoded_limit - encoded_bytes_ ||
         other.decoded_bytes_ > 16 * 1024 * 1024 - decoded_bytes_ || other.chunks_ > 8192 - chunks_ ||
         other.entries_.size() > (extended ? 131072u : 65536u) - entries_.size() ||
+        other.sources_.size() > UINT32_MAX - sources_.size() ||
         other.strings_.size() > string_limit - strings_.size() ||
         other.metadata_bytes_ > 64 * 1024 * 1024 - metadata_bytes_ || other.bag_items_ > 262144 - bag_items_)
         bad("Combined resource tables exceed package-wide quotas", "LIMIT");
@@ -557,7 +579,19 @@ void ResourceTable::merge(ResourceTable other) {
                    (!extended && !names.emplace(id >> 24, entry.type, entry.name).second))
             bad("Default resource identity is ambiguous across APK members", "UNSUPPORTED");
     }
+    // Source slots are distinct even when two tables use the same package ID.
+    // Preserve original encoded data; only internal merged string indices rebase.
+    const auto source_base = static_cast<std::uint32_t>(sources_.size());
+    for (const auto &[id, flags] : other.declared_flags_) {
+        const auto [declaration, fresh] = declared_flags_.try_emplace(id, flags);
+        if (!fresh) declaration->second |= flags;
+        const auto old = entries_.find(id);
+        if (old != entries_.end()) old->second.native_flags |= declaration->second;
+    }
     for (auto &[id, entry] : other.entries_) {
+        if (entry.source_id) entry.source_id += source_base;
+        const auto declaration = declared_flags_.find(id);
+        if (declaration != declared_flags_.end()) entry.native_flags |= declaration->second;
         const auto incoming_bag = other.bags_.find(id);
         if (incoming_bag != other.bags_.end())
             for (auto &item : incoming_bag->second.items)
@@ -590,6 +624,10 @@ void ResourceTable::merge(ResourceTable other) {
     packages_.merge(other.packages_);
     for (const auto index : other.styled_strings_)
         styled_strings_.insert(static_cast<std::uint32_t>(strings_.size()) + index);
+    for (auto &source : other.sources_) {
+        source.string_base += static_cast<std::uint32_t>(strings_.size());
+        sources_.push_back(std::move(source));
+    }
     strings_.insert(strings_.end(), std::make_move_iterator(other.strings_.begin()),
                     std::make_move_iterator(other.strings_.end()));
     entries_.merge(other.entries_);
@@ -599,6 +637,40 @@ void ResourceTable::merge(ResourceTable other) {
     decoded_bytes_ += other.decoded_bytes_;
     chunks_ += other.chunks_;
     metadata_bytes_ += other.metadata_bytes_;
+}
+std::optional<std::uint32_t> ResourceTable::declaration_flags(std::uint32_t id) const noexcept {
+    const auto found = declared_flags_.find(id);
+    if (found == declared_flags_.end()) return {};
+    return found->second;
+}
+std::u16string ResourceTable::pooled_string(std::uint32_t source_id, std::uint32_t original_index,
+                                           std::size_t maximum_code_units) const {
+    if (!source_id || source_id > sources_.size())
+        bad("Resource string has no actual bound ARSC source", "UNSUPPORTED");
+    const auto &source = sources_[source_id - 1];
+    if (original_index >= source.string_count || source.string_base > strings_.size() ||
+        original_index >= strings_.size() - source.string_base)
+        bad("Original resource string index exceeds its source pool");
+    const auto index = source.string_base + original_index;
+    if (styled_strings_.contains(index))
+        bad("Styled resource text requires an implemented span consumer", "UNSUPPORTED");
+    const auto &encoded = strings_[index];
+    // parse_string_pool already validated/normalized this UTF-8. Count its
+    // UTF16 units before allocating an owned decoded string for the caller.
+    std::size_t units = 0;
+    for (const auto byte : encoded) {
+        const auto character = static_cast<unsigned char>(byte);
+        if ((character & 0xc0) != 0x80) {
+            const auto additional = character >= 0xf0 ? 2u : 1u;
+            if (units > maximum_code_units || additional > maximum_code_units - units)
+                bad("Resource string exceeds its caller's admitted code-unit budget", "LIMIT");
+            units += additional;
+        }
+    }
+    auto result = unicode(encoded);
+    if (result.size() != units)
+        bad("Decoded resource text length disagrees with its retained pool");
+    return result;
 }
 std::uint32_t ResourceTable::identifier(std::string_view name, std::string_view type,
                                         std::string_view package) const {
@@ -673,6 +745,99 @@ std::u16string ResourceTable::text(ResourceValue value, bool strip_styles) const
     if (!strip_styles && styled_strings_.contains(value.data))
         bad("Styled resource text requires an implemented span consumer", "UNSUPPORTED");
     return unicode(strings_[value.data]);
+}
+StyleAttributeResult ResourceTable::style_attribute(
+    std::uint32_t style, std::uint32_t attribute,
+    const std::function<void(std::uint64_t)> &charge_work) const {
+    // One bounded path covers both scalar style aliases and inherited bags.
+    // No global platform resource names or assumed default values enter here.
+    StyleAttributeResult result;
+    bool complete = optimized_runtime_;
+    std::uint32_t unproven_style = 0;
+    const auto charge = [&] { if (charge_work) charge_work(1); };
+    const auto incomplete = [&](std::uint32_t boundary) {
+        if (result.status != StyleAttributeStatus::found)
+            result.status = StyleAttributeStatus::unresolved;
+        result.unresolved_style = boundary;
+        result.provenance_complete = false;
+        return result;
+    };
+    std::array<std::uint32_t, 32> visited{};
+    for (std::size_t depth = 0; depth < visited.size(); ++depth) {
+        charge(); // One actual style/alias hop, including an unresolved lookup.
+        for (std::size_t previous = 0; previous < depth; ++previous) {
+            charge();
+            if (visited[previous] == style) {
+                if (result.status == StyleAttributeStatus::found) return incomplete(style);
+                bad("Cyclic style attribute inheritance or reference");
+            }
+        }
+        visited[depth] = style;
+        const auto entry = entries_.find(style);
+        if (entry == entries_.end())
+            return incomplete(style);
+        const auto &selected = entry->second;
+        result.native_flags |= selected.native_flags;
+        if (!optimized_runtime_) {
+            complete = false;
+            if (!unproven_style) unproven_style = style;
+        }
+        if (entry->second.value_type == 1) {
+            style = entry->second.data;
+            continue;
+        }
+        const auto found = bags_.find(style);
+        if (found == bags_.end()) {
+            if (result.status == StyleAttributeStatus::found) return incomplete(style);
+            bad("Style is not a retained complex value", "UNSUPPORTED");
+        }
+        if (found->second.duplicate_keys) {
+            if (result.status == StyleAttributeStatus::found) return incomplete(style);
+            bad("Resource bag requires a duplicate-attribute consumer: " + std::to_string(style),
+                "UNSUPPORTED");
+        }
+        if (result.status != StyleAttributeStatus::found) {
+            for (const auto &item : found->second.items) {
+                charge();
+                if (item.key != attribute) continue;
+                result.status = StyleAttributeStatus::found;
+                result.value = item.value;
+                result.source_style = style;
+                result.source_id = selected.source_id;
+                result.density = selected.density;
+                // Nonstring encoded bits are already independent of the
+                // merged pool, even if source custody cannot be proved.
+                if (item.value.type != 3) result.source_data = item.value.data;
+                if (!selected.source_id || selected.source_id > sources_.size()) {
+                    complete = false;
+                    if (!unproven_style) unproven_style = style;
+                } else if (item.value.type == 3) {
+                    const auto &source = sources_[selected.source_id - 1];
+                    // Bag strings use merged indices internally. Their actual
+                    // encoded source index belongs to the defining bag, not to
+                    // the first requested child or a later resource reference.
+                    if (item.value.data < source.string_base ||
+                        item.value.data - source.string_base >= source.string_count) {
+                        complete = false;
+                        if (!unproven_style) unproven_style = style;
+                    } else {
+                        result.source_data = item.value.data - source.string_base;
+                    }
+                }
+                break;
+            }
+        }
+        if (!found->second.parent) {
+            result.provenance_complete = complete;
+            result.unresolved_style = unproven_style;
+            return result;
+        }
+        // Child values stay conclusive. Continue only to collect the actual
+        // participating ancestry flags; an unknown parent cannot replace them.
+        style = found->second.parent;
+    }
+    if (result.status == StyleAttributeStatus::found) return incomplete(style);
+    bad("Style attribute inheritance or reference exceeds 32 levels", "LIMIT");
 }
 std::vector<ResourceBagItem> ResourceTable::bag(std::uint32_t id) const {
     std::set<std::uint32_t> visited;

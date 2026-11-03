@@ -38,17 +38,33 @@ Fault NativeJumps::invoke(unsigned operation,a64::ServiceState &state,bool full_
     if(!memory_.accessible(stack-16,16,a64::Permission::write))return Fault::write;
     if(lr%4 || !memory_.accessible(lr,4,a64::Permission::execute))return Fault::execute;
     auto value=static_cast<std::uint32_t>(state.registers[1]);if(!value)value=1;
+    bool resumed_signal=false;
     if(get(image,4)){
         // Match Bionic's SIG_SETMASK policy before restoring registers. Any
         // newly unblocked handler runs on the current stack, not the target one.
         std::array<std::uint64_t,31> args{};args[0]=2;args[1]=address+40;
         if(threads_.change_signal_mask(args))return Fault::invalid_call;
+        const auto interrupted_pc=state.pc,interrupted_sp=state.stack_pointer;
         const auto fault=signals_.deliver_pending(state,true);if(fault!=Fault::none)return fault;
+        if(state.resume){
+            const auto &restored=*state.resume;
+            if(restored.pc!=interrupted_pc || restored.sp!=interrupted_sp)return Fault::none;
+            state.registers=restored.registers;state.vectors=restored.vectors;
+            state.stack_pointer=restored.sp;state.pc=restored.pc;state.pstate=restored.pstate;
+            state.fpsr=restored.fpsr;state.fpcr=restored.fpcr;
+            resumed_signal=true;
+        }
     }
     for(unsigned i=0;i<12;++i)state.registers[19+i]=get(image,8+i);
     for(unsigned i=0;i<8;++i)state.vectors[8+i][0]=get(image,20+i);
     state.registers[18]=(state.registers[18]&~std::uint64_t{0x3fff})|get(image,7);
     state.stack_pointer=stack;state.registers[0]=value;
+    if(resumed_signal){
+        auto &restored=*state.resume;
+        restored.registers=state.registers;restored.vectors=state.vectors;
+        restored.sp=state.stack_pointer;restored.pc=state.pc;restored.pstate=state.pstate;
+        restored.fpsr=state.fpsr;restored.fpcr=state.fpcr;
+    }
     // The authenticated service trampoline's RET uses restored x30 to reach
     // the original call site. It does not return to the longjmp caller.
     return Fault::none;

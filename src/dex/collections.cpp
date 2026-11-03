@@ -22,9 +22,9 @@ std::optional<HostClass> collection_class(std::string_view type) {
     static constexpr std::array<std::string_view, 2> empty_interfaces{"Ljava/util/RandomAccess;", "Ljava/io/Serializable;"};
     static constexpr std::array<std::string_view, 1> empty_iterator_interfaces{"Ljava/util/ListIterator;"};
     static constexpr std::array<std::string_view,1> live_interfaces{"Ljava/util/Iterator;"};
-    if (type == live_iterator_type || type == queue_iterator_type)
+    if (type == live_iterator_type || type == queue_iterator_type || type == virtual_list_iterator_type)
         return HostClass{"Ljava/lang/Object;",live_interfaces};
-    if (type == live_list_iterator_type)
+    if (type == live_list_iterator_type || type == virtual_list_list_iterator_type)
         return HostClass{"Ljava/lang/Object;",empty_iterator_interfaces};
     if (type == empty_list_type || type == singleton_list_type)
         return HostClass{"Ljava/util/AbstractList;", empty_interfaces};
@@ -63,6 +63,8 @@ std::optional<HostClass> collection_class(std::string_view type) {
         return HostClass{"Ljava/lang/Object;", {}, true, true};
     if (type == "Ljava/util/AbstractList;")
         return HostClass{"Ljava/util/AbstractCollection;", abstract_list_interfaces, true};
+    if (type == "Ljava/util/AbstractSequentialList;")
+        return HostClass{"Ljava/util/AbstractList;", {}, true};
     if (type == "Ljava/util/AbstractCollection;")
         return HostClass{"Ljava/lang/Object;", collection_interfaces, true};
     if (type == "Ljava/util/List;")
@@ -507,6 +509,107 @@ std::optional<Value> ManagedList::invoke(ManagedRuntime &runtime, std::string_vi
         return indexed ? Value::nothing() : Value::word(1);
     }
     return {};
+}
+bool virtual_list_iterator_method(std::string_view name, std::string_view signature,
+                                  bool bidirectional) noexcept {
+    if ((name == "hasNext" && signature == "()Z") ||
+        (name == "next" && signature == "()Ljava/lang/Object;") ||
+        (name == "remove" && signature == "()V")) return true;
+    return bidirectional &&
+        (((name == "hasPrevious") && signature == "()Z") ||
+         ((name == "nextIndex" || name == "previousIndex") && signature == "()I") ||
+         (name == "previous" && signature == "()Ljava/lang/Object;") ||
+         ((name == "set" || name == "add") && signature == "(Ljava/lang/Object;)V"));
+}
+VirtualListIterator::VirtualListIterator(ObjectId backing, std::uint32_t cursor,
+                                       std::uint32_t expected_mod_count, bool bidirectional)
+    : backing_(backing), cursor_(cursor), expected_mod_count_(expected_mod_count), bidirectional_(bidirectional) {
+    if (!backing || cursor > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+        (!bidirectional && cursor))
+        throw DexError("AETHER_DEX_COLLECTION_STATE", "Invalid virtual list iterator backing or cursor");
+}
+std::optional<Value> VirtualListIterator::invoke(
+    ManagedRuntime &runtime, std::string_view name, std::string_view signature, std::span<const Value> args,
+    const std::function<std::uint32_t(ObjectId)> &read_mod_count) {
+    if (!virtual_list_iterator_method(name, signature, bidirectional_)) return {};
+    const bool value_argument = name == "set" || name == "add";
+    if (!read_mod_count || args.size() != (value_argument ? 2u : 1u) ||
+        args[0].kind != ValueKind::reference || (value_argument && args[1].kind != ValueKind::reference))
+        throw DexError("AETHER_DEX_SIGNATURE", "Invalid virtual list iterator invocation");
+    runtime.retain(backing_);
+    struct ReleaseBacking {
+        ManagedRuntime &runtime; ObjectId backing;
+        ~ReleaseBacking() { runtime.release(backing); }
+    } release_backing{runtime, backing_};
+    const auto check = [&] {
+        if (read_mod_count(backing_) != expected_mod_count_)
+            runtime.raise("Ljava/util/ConcurrentModificationException;");
+    };
+    const auto is_bounds = [&](const JavaException &exception) {
+        return runtime.assignable(exception.object, "Ljava/lang/IndexOutOfBoundsException;");
+    };
+    if (name == "hasNext") {
+        // The Java base iterator observes size without a fail-fast check here.
+        const auto position = cursor_; // Left operand is read before size() can reenter.
+        const auto result = runtime.invoke_virtual_named(backing_, "size", "()I");
+        if (result.kind != ValueKind::word ||
+            result.bits > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
+            throw DexError("AETHER_DEX_COLLECTION_STATE", "Virtual list size is not a nonnegative Java int");
+        return Value::word(position != result.bits);
+    }
+    if (name == "hasPrevious") return Value::word(cursor_ != 0);
+    if (name == "nextIndex") return Value::word(cursor_);
+    if (name == "previousIndex") return Value::word(cursor_ - 1);
+    if (name == "next" || name == "previous") {
+        check();
+        const auto position = name == "next" ? cursor_ : cursor_ - 1;
+        const std::array parameters{Value::word(position)};
+        try {
+            const auto result = runtime.invoke_virtual_named(backing_, "get", "(I)Ljava/lang/Object;", parameters);
+            if (result.kind != ValueKind::reference)
+                throw DexError("AETHER_DEX_SIGNATURE", "Virtual list get returned a non-reference");
+            last_ = position;
+            cursor_ = name == "next" ? position + 1 : position;
+            return result;
+        } catch (const JavaException &exception) {
+            runtime.retain(exception.object);
+            ReleaseBacking release_exception{runtime, exception.object};
+            if (!is_bounds(exception)) throw;
+            check();
+            runtime.raise("Ljava/util/NoSuchElementException;");
+        }
+    }
+    if (name != "add" && (!last_ || std::bit_cast<std::int32_t>(*last_) < 0))
+        runtime.raise("Ljava/lang/IllegalStateException;");
+    check();
+    try {
+        if (name == "remove") {
+            const std::array parameters{Value::word(*last_)};
+            (void)runtime.invoke_virtual_named(backing_, "remove", "(I)Ljava/lang/Object;", parameters);
+            // Read the actual current iterator state after possible reentry,
+            // as the Java base implementation does following the virtual call.
+            const auto current_last = last_ ? std::bit_cast<std::int32_t>(*last_) : -1;
+            if (current_last < std::bit_cast<std::int32_t>(cursor_))
+                --cursor_;
+            last_.reset();
+        } else if (name == "set") {
+            const std::array parameters{Value::word(*last_), args[1]};
+            (void)runtime.invoke_virtual_named(backing_, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", parameters);
+        } else {
+            const auto position = cursor_;
+            const std::array parameters{Value::word(position), args[1]};
+            (void)runtime.invoke_virtual_named(backing_, "add", "(ILjava/lang/Object;)V", parameters);
+            last_.reset();
+            cursor_ = position + 1;
+        }
+        expected_mod_count_ = read_mod_count(backing_);
+        return Value::nothing();
+    } catch (const JavaException &exception) {
+        runtime.retain(exception.object);
+        ReleaseBacking release_exception{runtime, exception.object};
+        if (!is_bounds(exception)) throw;
+        runtime.raise("Ljava/util/ConcurrentModificationException;");
+    }
 }
 std::optional<Value> LiveListIterator::invoke(ManagedRuntime &runtime,ManagedList &list,std::string_view name,
                                              std::string_view signature,std::span<const Value> args,CollectionBudget budget) {

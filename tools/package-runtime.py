@@ -46,7 +46,22 @@ def main():
         for path in sorted((project / "third_party" / "licenses").glob("*.txt"))
     ]
     payload = bytearray()
-    # Contract 58: actual synchronous CPU exception provenance has a separate architectural snapshot;
+    # Contract 73: owned native pipes, pollable endpoints and full-frame I/O signal/restart joins;
+    # contract 72: owned MotionEvent copies, captured uptime/DPI and physical-pixel getters;
+    # contract 71: managed touch targets/listeners/interception and captured pointer identity;
+    # contract 70: actual MATCH_PARENT FrameLayout chains with separate root/consumer identity;
+    # contract 69: real root SurfaceView lifecycle, authenticated JNI windows and producer-pinned EGL;
+    # contract 68: bounded Activity native-surface admission transport and renderer consumer retirement;
+    # contract 67: bounded native producer/reference core; managed Surface admission remains pending;
+    # contract 66: early Activity presentation custody and broker renderer binding before EGL;
+    # contract 65: owned native Loopers, eventfd readiness/callbacks and full-frame wait continuation;
+    # contract 64: authenticated app AssetManager and archive-backed native asset operations;
+    # contract 63: bounded APS2 and RELR relocation decoding through the existing ELF loader;
+    # contract 62: parent-first bootstrap class ownership during app DEX linking;
+    # contract 61: captured first memory-failure causes and supported cache-abort provenance;
+    # contract 60: pending signal metadata and full service/checkpoint context restoration;
+    # contract 59: synchronous guest signal frames and authenticated context restoration;
+    # contract 58: actual synchronous CPU exception provenance has a separate architectural snapshot;
     # contract 57: owned writable TLS register state survives same-thread native reentry;
     # contract 56: direct SVC counter failures retain typed trap origin and detail;
     # contract 55: queued cache invalidation survives architectural CPU reset;
@@ -93,7 +108,7 @@ def main():
     # explicit installed playback consent/routing and per-app sessions;
     # committed historical icon aliases and matching cleanup;
     # catalogue schema 5, package schemas 1-14, stable paths and existing LPAC policy.
-    manifest = bytearray(number(58) + number(len(files)))
+    manifest = bytearray(number(139) + number(len(files)))
     for name, source in files:
         data = source.read_bytes()
         if not 0 < len(data) <= 256 * 1024 * 1024:

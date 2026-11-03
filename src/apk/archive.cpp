@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <exception>
 #include <miniz.h>
+#include <miniz_tinfl.h>
 #include <numeric>
 #include <set>
 
@@ -287,6 +288,52 @@ std::vector<std::uint8_t> Archive::read(std::size_t index) {
     const ArchiveRange range{0, impl_->entries[index].bytes};
     auto result = read_ranges(index, std::span(&range, 1));
     return std::move(result.ranges.front());
+}
+std::vector<std::uint8_t> Archive::read_admitted(
+    std::size_t index, std::size_t working_bytes,
+    const std::function<void(std::uint64_t)> &charge_work) {
+    if (index >= impl_->entries.size())
+        invalid("Invalid archive member index");
+    if (!charge_work)
+        invalid("Admitted archive reads require host-owned work accounting");
+    const auto &entry = impl_->entries[index];
+    if (entry.directory)
+        invalid("Admitted archive reads require a regular member");
+    if (entry.bytes > impl_->buffer_bytes)
+        limit("Archive member exceeds its existing in-memory buffer limit");
+    if (entry.data_offset > impl_->bytes.size() ||
+        entry.compressed_bytes > impl_->bytes.size() - entry.data_offset)
+        invalid("Admitted archive member exceeds its held input extent");
+    if (!entry.compressed_bytes && entry.bytes)
+        invalid("Nonempty archive member has no compressed input");
+    // These are the declared fixed objects in miniz's memory extractor. It
+    // borrows compressed bytes from init_mem backing and writes directly into
+    // our final output, so no Deflate dictionary, read_ranges or order vector
+    // exists. Scalar/compiler call frames remain under the process stack cap.
+    constexpr auto fixed_bytes = sizeof(std::vector<std::uint8_t>) + sizeof(tinfl_decompressor) +
+                                 sizeof(mz_zip_archive_file_stat) + 8 * sizeof(mz_uint32) + sizeof(std::uint8_t);
+    if (working_bytes < fixed_bytes || entry.bytes > working_bytes - fixed_bytes)
+        limit("Archive extraction exceeds its admitted working bytes");
+    charge_work(entry.bytes); // Actual value-initialization of the owned output.
+    std::vector<std::uint8_t> output(entry.bytes);
+    if (output.capacity() > working_bytes - fixed_bytes)
+        limit("Archive output capacity exceeds its admitted working bytes");
+    // The existing archive is always init_mem-backed. no_alloc therefore
+    // borrows compressed input and has no internal dynamic allocation. The
+    // extractor visits compressed input, output and its own output CRC.
+    charge_work(std::uint64_t(entry.compressed_bytes) + 2 * std::uint64_t(entry.bytes));
+    std::uint8_t empty_output = 0; // Stable nonnull base for a zero-length Deflate result.
+    if (!mz_zip_reader_extract_to_mem_no_alloc(&impl_->zip, static_cast<mz_uint>(index),
+                                              output.empty() ? &empty_output : output.data(), output.size(), 0, nullptr, 0))
+        invalid("ZIP member failed admitted decompression, size or CRC validation");
+    // miniz returns early for empty members, before CRC validation. Retain the
+    // existing stream reader's explicit complete-member CRC guarantee, also
+    // independently of miniz's optional internal CRC build setting.
+    charge_work(output.size());
+    const auto crc = mz_crc32(MZ_CRC32_INIT, output.data(), output.size());
+    if (crc != entry.crc32)
+        invalid("ZIP member failed admitted CRC validation");
+    return output;
 }
 void Archive::stream(std::size_t index, const std::function<void(std::uint64_t, Bytes)> &visitor) {
     if (index >= impl_->entries.size())

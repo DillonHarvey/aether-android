@@ -10,10 +10,12 @@ struct NativeSleepDuration {
 };
 class NativeSleeping {
   public:
-    NativeSleeping(a64::GuestMemory &memory,NativeThreads &threads,NativeSignals &signals):memory_(memory),threads_(threads),signals_(signals){}
-    // sleep, usleep, nanosleep. No managed Scheduler runs inside a native frame.
-    a64::Fault invoke(unsigned operation,a64::Address error,std::array<std::uint64_t,31> &,bool full_frame,a64::ServiceState *frame=nullptr);
+    NativeSleeping(a64::GuestMemory &memory,NativeThreads &threads,NativeSignals &signals,const a64::AppContext &app):memory_(memory),threads_(threads),signals_(signals),app_(app){}
+    // sleep, usleep, nanosleep. Only an admitted factory child may retain an
+    // owned continuation; no scheduler switch occurs inside this invocation.
+    a64::Fault invoke(unsigned operation,a64::Address error,std::array<std::uint64_t,31> &,bool full_frame,a64::ServiceState *frame=nullptr,bool allow_deferred=false);
   private:
-    a64::GuestMemory &memory_;NativeThreads &threads_;NativeSignals &signals_;
+    struct DeferredSleep;
+    a64::GuestMemory &memory_;NativeThreads &threads_;NativeSignals &signals_;const a64::AppContext &app_;
 };
 }

@@ -349,6 +349,36 @@ android::ViewBounds rectangle(Reader &in) {
     return result;
 }
 } // namespace
+std::vector<std::uint8_t> encode_activity_finish_request(const ActivityFinishRequest &request) {
+    require(request.ordinal && request.ordinal != UINT64_MAX && request.activity && request.window_generation,
+            "Invalid Activity finish request identity");
+    Writer out{{}, 32};
+    out.number(1); out.number(request.ordinal); out.number(request.activity); out.number(request.window_generation);
+    return out.bytes;
+}
+ActivityFinishRequest decode_activity_finish_request(std::span<const std::uint8_t> bytes) {
+    require(bytes.size() == 32, "Invalid Activity finish request length");
+    Reader in{bytes}; require(in.number() == 1, "Unsupported Activity finish request version");
+    ActivityFinishRequest request{in.number(), in.number(), in.number()}; in.finish();
+    (void)encode_activity_finish_request(request); return request;
+}
+std::vector<std::uint8_t> encode_activity_key_result(const ActivityKeyResult &result) {
+    require(result.origin && result.origin != UINT64_MAX &&
+            (result.outcome == KeyDispatchOutcome::handled || result.outcome == KeyDispatchOutcome::unhandled ||
+             result.outcome == KeyDispatchOutcome::cancelled), "Invalid final key result");
+    Writer out{{}, 24};
+    out.number(1); out.number(result.origin); out.number(static_cast<std::uint64_t>(result.outcome));
+    return out.bytes;
+}
+ActivityKeyResult decode_activity_key_result(std::span<const std::uint8_t> bytes) {
+    require(bytes.size() == 24, "Invalid final key result length");
+    Reader in{bytes};
+    require(in.number() == 1, "Unsupported final key result version");
+    ActivityKeyResult result{in.number(), static_cast<KeyDispatchOutcome>(in.number())};
+    in.finish();
+    (void)encode_activity_key_result(result);
+    return result;
+}
 std::vector<std::uint8_t> encode_activity_terminal_activations(const ActivityTerminalActivations &batch) {
     require(batch.reason == ActivityTerminalReason::guest_exit || batch.reason == ActivityTerminalReason::failure,
             "Invalid activation terminal reason");
@@ -481,7 +511,7 @@ android::SoftInputObservation decode_activity_soft_input_observation(std::span<c
 }
 std::vector<std::uint8_t> ActivityCommand::encode() const {
     Writer out{{}, activity_command_limit};
-    out.number(17);
+    out.number(20);
     out.number(static_cast<std::uint64_t>(kind));
     switch (kind) {
     case ActivityCommandKind::refresh:
@@ -606,11 +636,20 @@ std::vector<std::uint8_t> ActivityCommand::encode() const {
         out.number(static_cast<std::uint64_t>(signal));
         break;
     case ActivityCommandKind::pointer:
+        require(android::valid_pointer_context(pointer), "Invalid pointer capture context");
         out.number(static_cast<std::uint64_t>(pointer.action));
         out.number(pointer.pointer);
         out.number(pointer.source);
         out.scalar(pointer.x);
         out.scalar(pointer.y);
+        out.number(pointer.root);
+        out.number(pointer.native_producer);
+        out.number(pointer.native_width);
+        out.number(pointer.native_height);
+        out.number(pointer.time_known);
+        out.number(pointer.down_time_ms);
+        out.number(pointer.event_time_ms);
+        out.number(pointer.capture_dpi);
         break;
     case ActivityCommandKind::key:
         require(android::valid_key_input(key), "Invalid key input");
@@ -620,6 +659,11 @@ std::vector<std::uint8_t> ActivityCommand::encode() const {
         out.number(key.repeat);
         out.number(static_cast<std::uint32_t>(key.character_status));
         out.number(key.unicode);
+        out.number(key.root); out.number(key.window_generation);
+        out.number(key.input_generation); out.number(key.capture_generation);
+        out.number(key.event_time_known); out.number(key.down_time_known);
+        out.number(key.down_time_ms); out.number(key.event_time_ms);
+        out.number(key.source_known); out.number(key.source);
         break;
     case ActivityCommandKind::place:
         require(placements.size() <= 256, "Too many placements");
@@ -637,7 +681,7 @@ std::vector<std::uint8_t> ActivityCommand::encode() const {
 ActivityCommand ActivityCommand::decode(std::span<const std::uint8_t> bytes) {
     require(bytes.size() <= activity_command_limit, "Activity command exceeds limit");
     Reader in{bytes};
-    require(in.number() == 17, "Unsupported Activity command version");
+    require(in.number() == 20, "Unsupported Activity command version");
     const auto kind = in.number();
     require(kind <= static_cast<std::uint64_t>(ActivityCommandKind::collection_selection), "Unknown Activity command");
     ActivityCommand result;
@@ -783,6 +827,15 @@ ActivityCommand ActivityCommand::decode(std::span<const std::uint8_t> bytes) {
         require(action <= 3, "Invalid pointer action");
         result.pointer = {static_cast<android::PointerAction>(action), in.word(), in.word(), in.scalar(),
                           in.scalar()};
+        result.pointer.root = in.number();
+        result.pointer.native_producer = in.number();
+        result.pointer.native_width = in.word();
+        result.pointer.native_height = in.word();
+        result.pointer.time_known = in.boolean();
+        result.pointer.down_time_ms = in.number();
+        result.pointer.event_time_ms = in.number();
+        result.pointer.capture_dpi = in.word();
+        require(android::valid_pointer_context(result.pointer), "Invalid pointer capture context");
         require(result.pointer.pointer <= 65535 && std::abs(result.pointer.x) <= 65536 &&
                     std::abs(result.pointer.y) <= 65536 &&
                     (result.pointer.source == 0x1002 || result.pointer.source == 0x2002),
@@ -793,6 +846,11 @@ ActivityCommand ActivityCommand::decode(std::span<const std::uint8_t> bytes) {
         result.key = {in.boolean(), in.word(), in.word(), in.word()};
         result.key.character_status = static_cast<android::KeyCharacterStatus>(in.word());
         result.key.unicode = in.word();
+        result.key.root = in.number(); result.key.window_generation = in.number();
+        result.key.input_generation = in.number(); result.key.capture_generation = in.number();
+        result.key.event_time_known = in.boolean(); result.key.down_time_known = in.boolean();
+        result.key.down_time_ms = in.number(); result.key.event_time_ms = in.number();
+        result.key.source_known = in.boolean(); result.key.source = in.word();
         require(android::valid_key_input(result.key), "Invalid key input");
         break;
     case ActivityCommandKind::place: {
@@ -811,6 +869,15 @@ ActivityCommand ActivityCommand::decode(std::span<const std::uint8_t> bytes) {
     return result;
 }
 void ActivityState::validate() const {
+    require((!content && !finishing) || activity_object, "Activity content/finish has no actual owner");
+    require(static_cast<std::uint64_t>(key_outcome) <= static_cast<std::uint64_t>(KeyDispatchOutcome::deferred) &&
+            (key_outcome == KeyDispatchOutcome::none || (handled == (key_outcome == KeyDispatchOutcome::handled))),
+            "Invalid key completion outcome");
+    require((window_generation == 0) == (input_generation == 0) && (!content || window_generation),
+            "Activity capture generations are absent or inconsistent with its content");
+    require(!viewport_geometry_revision ||
+                (attachment_revision && activity_object && content && window_generation),
+            "Viewport geometry has no complete actual Activity content attachment");
     require(static_cast<std::uint64_t>(accessibility_metadata_status) <=
                 static_cast<std::uint64_t>(android::AccessibilityMetadataStatus::mutated),
             "Unknown accessibility metadata status");
@@ -842,7 +909,7 @@ void ActivityState::validate() const {
     std::size_t description_units = 0;
     std::set<std::uint64_t> text_edit_revisions;
     for (const auto &[id, view] : views) {
-        require(id && view.object == id && view.kind <= android::ViewKind::edit_text &&
+        require(id && view.object == id && view.kind <= android::ViewKind::view &&
                     view.text.size() <= 65536 && (view.orientation == 0 || view.orientation == 1) &&
                     view.children.size() <= 256,
                 "Invalid view fields");
@@ -919,7 +986,8 @@ void ActivityState::validate() const {
                 "Nested or invalid ScrollView");
         bounds(view.bounds);
         require(!view.parent || views.contains(view.parent), "Unknown view parent");
-        require(view.kind == android::ViewKind::linear_layout || view.kind == android::ViewKind::scroll_view || view.children.empty(),
+        require(view.kind == android::ViewKind::linear_layout || view.kind == android::ViewKind::scroll_view ||
+                    view.kind == android::ViewKind::frame_layout || view.children.empty(),
                 "Leaf view has children");
         std::set<dex::ObjectId> children;
         for (auto child : view.children)
@@ -943,6 +1011,13 @@ void ActivityState::validate() const {
     for (const auto &[id, view] : views) {
         (void)view;
         visit(visit, id);
+    }
+    // Base View construction is represented distinctly. This profile has no
+    // generic measurement/Canvas consumer, so no rooted leaf may reach a host
+    // text/widget renderer merely by using an otherwise valid wire value.
+    for(const auto &[id, view]:views) if(view.kind==android::ViewKind::view) {
+        for(auto ancestor=id;ancestor;ancestor=views.at(ancestor).parent)
+            require(ancestor!=content,"AETHER_VIEW_RENDER_UNSUPPORTED: generic View is not renderable");
     }
     // Collection metadata is copied evidence only. Raw Android factory int32
     // values remain intact; native pattern eligibility is a separate decision.
@@ -980,13 +1055,16 @@ void ActivityState::validate() const {
 std::vector<std::uint8_t> ActivityState::encode() const {
     validate();
     Writer out{{}, activity_state_limit};
-    out.number(20);
+    out.number(27);
     out.text(apk_hash, 64);
     out.text(package, 255);
     out.text(activity, 512);
     out.number(static_cast<std::uint64_t>(lifecycle));
     out.number(content);
+    out.number(activity_object); out.number(finishing);
+    out.number(window_generation); out.number(input_generation);
     out.number(handled);
+    out.number(static_cast<std::uint64_t>(key_outcome));
     out.number(std::bit_cast<std::uint32_t>(requested_orientation));
     out.number(configuration.screen_width_dp);
     out.number(configuration.screen_height_dp);
@@ -1108,12 +1186,14 @@ std::vector<std::uint8_t> ActivityState::encode() const {
     out.number(accessibility_metadata_attempt);
     out.number(static_cast<std::uint64_t>(accessibility_metadata_status));
     out.number(accessibility_invalidation_revision);
+    out.number(attachment_revision);
+    out.number(viewport_geometry_revision);
     return out.bytes;
 }
 ActivityState ActivityState::decode(std::span<const std::uint8_t> bytes) {
     require(bytes.size() <= activity_state_limit, "Activity state exceeds limit");
     Reader in{bytes};
-    require(in.number() == 20, "Unsupported Activity state version");
+    require(in.number() == 27, "Unsupported Activity state version");
     ActivityState result;
     result.apk_hash = in.text(64);
     result.package = in.text(255);
@@ -1122,7 +1202,10 @@ ActivityState ActivityState::decode(std::span<const std::uint8_t> bytes) {
     require(lifecycle <= static_cast<std::uint64_t>(android::Lifecycle::failed), "Invalid lifecycle state");
     result.lifecycle = static_cast<android::Lifecycle>(lifecycle);
     result.content = in.number();
+    result.activity_object = in.number(); result.finishing = in.boolean();
+    result.window_generation = in.number(); result.input_generation = in.number();
     result.handled = in.boolean();
+    result.key_outcome = static_cast<KeyDispatchOutcome>(in.number());
     result.requested_orientation = std::bit_cast<std::int32_t>(in.word());
     result.configuration = {in.word(), in.word(), in.word(), in.word()};
     require(result.configuration.valid(), "Invalid Activity display configuration");
@@ -1160,7 +1243,7 @@ ActivityState ActivityState::decode(std::span<const std::uint8_t> bytes) {
         view.object = in.number();
         view.parent = in.number();
         const auto kind = in.number();
-        require(kind <= static_cast<std::uint64_t>(android::ViewKind::edit_text), "Unknown view type");
+        require(kind <= static_cast<std::uint64_t>(android::ViewKind::view), "Unknown view type");
         view.kind = static_cast<android::ViewKind>(kind);
         view.id = std::bit_cast<std::int32_t>(in.word());
         const auto orientation = in.number();
@@ -1274,6 +1357,8 @@ ActivityState ActivityState::decode(std::span<const std::uint8_t> bytes) {
             "Unknown accessibility metadata status");
     result.accessibility_metadata_status = static_cast<android::AccessibilityMetadataStatus>(metadata_status);
     result.accessibility_invalidation_revision = in.number();
+    result.attachment_revision = in.number();
+    result.viewport_geometry_revision = in.number();
     in.finish();
     result.validate();
     return result;

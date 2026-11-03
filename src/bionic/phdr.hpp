@@ -14,6 +14,7 @@ class NativePhdr {
     void runner(GuestPosixServices::PhdrRunner);
     a64::Fault invoke(a64::ServiceState &,bool full_frame) noexcept;
     std::string_view rejection()const noexcept{return rejection_;}
+    bool switch_safe() const noexcept { return depth_==0; }
   private:
     static constexpr a64::Address cache_base=0x3e100000;
     static constexpr std::size_t slot_bytes=0x4000,slot_count=16;

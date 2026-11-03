@@ -18,9 +18,214 @@
 #include <iostream>
 #include <exception>
 #include <set>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace aether::install {
 namespace {
+// UI callbacks enqueue fixed diagnostic codes only. One host-owned writer
+// persists them in order; closing/failing a session drains it before reporting.
+class SessionFaults {
+    AppLaunchFailure &failure_;
+    std::string hash_;
+    std::uint64_t generation_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<DiagnosticFault> pending_;
+    bool stopping_ = false;
+    std::exception_ptr write_error_, event_error_;
+    std::uint64_t lost_events_ = 0;
+    std::thread writer_;
+    // Observations are reduced on the launching/UI thread. The background
+    // writer only receives the final bounded summary, never mutable UI state.
+    host::WindowObservationReducer window_observations_;
+    bool window_summary_attempted_ = false;
+    void queue_window_summary() {
+        if (window_summary_attempted_) return;
+        window_summary_attempted_ = true;
+        const auto &summary = window_observations_.summary();
+        const auto encoded = summary.observations_seen
+            ? host::window_observation_summary_json(summary)
+            : std::string("{\"schemaVersion\":1,\"observationsSeen\":0}");
+        constexpr std::size_t fragment_bytes = 1536;
+        if (encoded.size() > 16 * 1024)
+            throw InstallError("AETHER_WINDOW_OBSERVATION_LIMIT", "Window observation summary exceeds existing fault capture bounds");
+        const auto parts = (encoded.size() + fragment_bytes - 1) / fragment_bytes;
+        for (std::size_t part = 0; part < parts; ++part) {
+            auto fault = capture_fault({}, "installed-window-observation", hash_, generation_);
+            fault.code = "AETHER_WINDOW_OBSERVATION_PART";
+            fault.message = "schema=1; part=" + std::to_string(part + 1) +
+                "; parts=" + std::to_string(parts) + "; payload=" +
+                encoded.substr(part * fragment_bytes, fragment_bytes);
+            {
+                std::lock_guard lock(mutex_);
+                if (write_error_) std::rethrow_exception(write_error_);
+                if (stopping_ || pending_.size() >= 1024)
+                    throw InstallError("AETHER_FAULT_QUEUE_FULL", "Window observation summary could not all be retained");
+                pending_.push_back(std::move(fault));
+            }
+            wake_.notify_one();
+        }
+    }
+    void write_loop() noexcept {
+        for (;;) {
+            DiagnosticFault fault;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                if (pending_.empty()) return;
+                fault = std::move(pending_.front());
+                pending_.pop_front();
+            }
+            try { retain_fault(failure_.store, failure_.app_id, fault); }
+            catch (...) {
+                std::lock_guard lock(mutex_);
+                if (!write_error_) write_error_ = std::current_exception();
+                const auto discarded = static_cast<std::uint64_t>(pending_.size()) + 1;
+                lost_events_ = discarded > UINT64_MAX - lost_events_ ? UINT64_MAX : lost_events_ + discarded;
+                // No retry of a failed/possibly partial write.
+                pending_.clear();
+                stopping_ = true;
+                return;
+            }
+        }
+    }
+  public:
+    SessionFaults(AppLaunchFailure &failure, const security::InstalledActivity &application)
+        : failure_(failure), hash_(application.diagnostic_package_sha256),
+          generation_(application.diagnostic_package_generation) {
+        auto start = capture_fault({}, "installed-session", hash_, generation_);
+        start.code = "AETHER_SESSION_STARTED";
+        start.message = "Session admitted; absence of a later terminal record means completion is unknown.";
+        // Reserve durable evidence before any guest execution. Retention failure
+        // is explicit and never silently launches an unrecorded session.
+        retain_fault(failure_.store, failure_.app_id, start);
+        writer_ = std::thread([this] { write_loop(); });
+    }
+    ~SessionFaults() { drain(); }
+    void drain() noexcept {
+        { std::lock_guard lock(mutex_); stopping_ = true; }
+        wake_.notify_one();
+        if (writer_.joinable()) writer_.join();
+    }
+    void event(std::string_view stage, std::string_view code) {
+        try {
+            auto fault = capture_fault({}, stage, hash_, generation_);
+            fault.code = std::string(code);
+            fault.message = "Host observed diagnostic event (fixed code; no input payload collected).";
+            {
+                std::lock_guard lock(mutex_);
+                if (write_error_) std::rethrow_exception(write_error_);
+                if (stopping_ || pending_.size() >= 1024)
+                    throw InstallError("AETHER_FAULT_QUEUE_FULL", "Fault queue is full; diagnostic events could not all be retained");
+                pending_.push_back(std::move(fault));
+            }
+            wake_.notify_one();
+        } catch (...) {
+            std::lock_guard lock(mutex_);
+            if (lost_events_ != UINT64_MAX) ++lost_events_;
+            if (!event_error_) event_error_ = std::current_exception();
+            throw;
+        }
+    }
+    void window_observation(const host::WindowObservation &observation) noexcept {
+        window_observations_.observe(observation);
+    }
+    void finish(std::exception_ptr error, const host::WindowReport *report) noexcept {
+        try { queue_window_summary(); }
+        catch (...) {
+            std::lock_guard lock(mutex_);
+            if (lost_events_ != UINT64_MAX) ++lost_events_;
+            if (!event_error_) event_error_ = std::current_exception();
+        }
+        drain();
+        try {
+            auto fault = capture_fault(error, "installed-activity-session", hash_, generation_);
+            if (!error) {
+                fault.code = report && report->passed() ? "AETHER_SESSION_COMPLETED" : "AETHER_APP_SESSION_INCOMPLETE";
+                fault.message = "Session terminal outcome; ";
+                if (report) {
+                    fault.message += "read_failures=" + std::to_string(report->read_failures) +
+                        "; recovered_reads=" + std::to_string(report->recovered_reads) +
+                        "; ime_rejected=" + std::to_string(report->ime_rejected) +
+                        "; text_edit_failed=" + std::to_string(report->text_edit_failed) +
+                        "; text_edit_gaps=" + std::to_string(report->text_edit_gaps) +
+                        "; diagnostic_retention_failures=" + std::to_string(report->diagnostic_retention_failures);
+                    for (const auto &check : report->checks)
+                        if (!check.passed) {
+                            if (fault.causes.size() < 16) fault.causes.push_back("Window check did not pass: " + check.name.substr(0, 512));
+                            else fault.message_truncated = true;
+                        }
+                }
+            }
+            failure_.diagnostic = fault; // Keep evidence available even if disk fails.
+            if (lost_events_ || (report && report->diagnostic_retention_failures))
+                failure_.retention_error = "AETHER_FAULT_EVENTS_LOST: event capture failures=" +
+                    std::to_string(lost_events_ ? lost_events_ : report->diagnostic_retention_failures);
+            if (write_error_) std::rethrow_exception(write_error_);
+            if (lost_events_) {
+                auto lost = capture_fault(event_error_, "diagnostic-event-retention", hash_, generation_);
+                lost.code = "AETHER_FAULT_EVENTS_LOST";
+                lost.message = "Events not queued/captured=" + std::to_string(lost_events_);
+                // The bounded captured event error remains represented as a cause.
+                if (event_error_) {
+                    const auto captured = capture_fault(event_error_, "diagnostic-event-retention", hash_, generation_);
+                    lost.causes.clear();
+                    lost.causes.push_back(captured.code + ": additional event capture failure; primary session fault is preserved separately");
+                }
+                // Keep the full primary exception chain in its own record.
+                // Loss evidence is a separate record rather than displacing it.
+                retain_fault(failure_.store, failure_.app_id, lost);
+            }
+            retain_fault(failure_.store, failure_.app_id, fault);
+            if (lost_events_ || (report && report->diagnostic_retention_failures))
+                failure_.retention_error = "AETHER_FAULT_EVENTS_LOST: event capture failures=" +
+                    std::to_string(lost_events_ ? lost_events_ : report->diagnostic_retention_failures);
+        } catch (const std::exception &retention) {
+            if (!failure_.retention_error.empty()) failure_.retention_error += "; ";
+            failure_.retention_error += "AETHER_FAULT_RETENTION_FAILED: " + std::string(retention.what());
+            std::cerr << failure_.retention_error << '\n';
+        } catch (...) {
+            if (!failure_.retention_error.empty()) failure_.retention_error += "; ";
+            failure_.retention_error += "AETHER_FAULT_RETENTION_FAILED: non-standard retention failure";
+            std::cerr << failure_.retention_error << '\n';
+        }
+    }
+};
+void capture_launch_failure(AppLaunchFailure &failure, std::exception_ptr error) noexcept {
+    try {
+        failure.diagnostic = capture_fault(error, "installed-launch-preparation");
+        retain_fault(failure.store, failure.app_id, *failure.diagnostic);
+    } catch (const std::exception &retention) {
+        failure.retention_error = "AETHER_FAULT_RETENTION_FAILED: " + std::string(retention.what());
+        std::cerr << failure.retention_error << '\n';
+    } catch (...) {
+        failure.retention_error = "AETHER_FAULT_RETENTION_FAILED: non-standard capture failure";
+    }
+}
+host::WindowReport recorded_window(security::InstalledActivity application, AppLaunchFailure &failure) {
+    std::optional<SessionFaults> faults;
+    try { faults.emplace(failure, application); }
+    catch (...) {
+        try {
+            failure.diagnostic = capture_fault(std::current_exception(), "diagnostic-session-start");
+            failure.retention_error = "AETHER_FAULT_RETENTION_FAILED: " + failure.diagnostic->message;
+        } catch (...) { failure.retention_error = "AETHER_FAULT_RETENTION_FAILED: diagnostic initialization failed"; }
+        throw; // No automatic retry of a failed initial history write.
+    }
+    try {
+        auto report = host::run_installed_window(std::move(application),
+            [&](std::string_view stage, std::string_view code) { faults->event(stage, code); },
+            [&](const host::WindowObservation &observation) noexcept { faults->window_observation(observation); });
+        faults->finish({}, &report);
+        return report;
+    } catch (...) {
+        faults->finish(std::current_exception(), nullptr);
+        throw;
+    }
+}
 void usage(bool condition, const char *message) {
     if (!condition)
         throw InstallError("AETHER_CLI_USAGE", message);
@@ -80,7 +285,7 @@ int open_link_cli(const OpenLinkOptions &options, bool json, const AppLaunchObse
         if (observer) try { observer(failure); } catch (...) { /* Preserve the session result. */ }
     };
     bool passed = false;
-    try { passed = host::run_installed_window(std::move(*application)).passed(); }
+    try { passed = recorded_window(std::move(*application), failure).passed(); }
     catch (...) {
         application.reset();
         notify();
@@ -89,7 +294,7 @@ int open_link_cli(const OpenLinkOptions &options, bool json, const AppLaunchObse
         std::throw_with_nested(std::runtime_error("AETHER_OPEN_LINK_SESSION_FAILED: The selected app session failed; review local diagnostics."));
     }
     application.reset();
-    if (!passed) { failure.failure = AppSessionFailure::incomplete; notify(); }
+    if (!passed || !failure.retention_error.empty()) { failure.failure = AppSessionFailure::incomplete; notify(); passed = false; }
     if (json)
         std::cout << "{\"schemaVersion\":1,\"operation\":\"open-link\",\"launched\":true,\"passed\":"
                   << (passed ? "true" : "false") << "}\n";
@@ -151,14 +356,14 @@ int open_file_cli(const OpenFileOptions &options, bool json, const AppLaunchObse
         if (observer) try { observer(failure); } catch (...) { /* Preserve the original session result. */ }
     };
     bool passed = false;
-    try { passed = host::run_installed_window(std::move(*application)).passed(); }
+    try { passed = recorded_window(std::move(*application), failure).passed(); }
     catch (...) {
         application.reset();
         notify();
         std::throw_with_nested(std::runtime_error("AETHER_OPEN_FILE_SESSION_FAILED: The selected app session failed; review local diagnostics."));
     }
     application.reset();
-    if (!passed) { failure.failure = AppSessionFailure::incomplete; notify(); }
+    if (!passed || !failure.retention_error.empty()) { failure.failure = AppSessionFailure::incomplete; notify(); passed = false; }
     if (json)
         std::cout << "{\"schemaVersion\":1,\"operation\":\"open-file\",\"launched\":true,\"passed\":"
                   << (passed ? "true" : "false") << "}\n";
@@ -292,7 +497,7 @@ int dispatch_open_file(const OpenFileOptions &options, bool json,
                        const AppLaunchObserver &observer, const FileOpenHandler &handler) {
     return open_file_cli(options, json, observer, handler);
 }
-std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool json,
+static std::optional<int> dispatch_cli_impl(const std::vector<std::string> &arguments, bool json,
                               const AppLaunchObserver &launch_observer, const OpenLinkHandler &open_link_handler,
                               const FileOpenHandler &open_file_handler) {
     std::string command;
@@ -600,17 +805,17 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
         };
         host::WindowReport report;
         try {
-            report = host::run_installed_window(std::move(application));
+            report = recorded_window(std::move(application), failure);
         } catch (...) {
             notify();
             throw;
         }
         std::cout << (json ? report.json() : report.text(options.contains("--verbose"))) << '\n';
-        if (!report.passed()) {
+        if (!report.passed() || !failure.retention_error.empty()) {
             failure.failure = AppSessionFailure::incomplete;
             notify();
         }
-        return report.passed() ? 0 : 1;
+        return report.passed() && failure.retention_error.empty() ? 0 : 1;
     }
     const auto access = command == "list" || command == "info" || (command == "settings" && !(allow || deny))
                             ? PackageStore::Access::read
@@ -657,5 +862,50 @@ std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool 
         }
     }
     return 0;
+}
+std::optional<int> dispatch_cli(const std::vector<std::string> &arguments, bool json,
+                              const AppLaunchObserver &launch_observer,
+                              const OpenLinkHandler &open_link_handler,
+                              const FileOpenHandler &open_file_handler) {
+    bool reported = false;
+    const AppLaunchObserver observer = [&](const AppLaunchFailure &failure) {
+        reported = true;
+        if (launch_observer) launch_observer(failure);
+    };
+    try { return dispatch_cli_impl(arguments, json, observer, open_link_handler, open_file_handler); }
+    catch (...) {
+        // Preparation/permission/installation errors happen before a live
+        // window exists. Retain them too, without recording argument payloads.
+        const auto operation_error = std::current_exception();
+        try {
+        if (!reported) {
+            const auto command = std::find_if(arguments.begin(), arguments.end(), [](const auto &value) {
+                return value != "--json" && value != "--verbose";
+            });
+            const bool writable = command != arguments.end() &&
+                (*command == "launch" || *command == "relaunch" || *command == "uninstall" ||
+                 *command == "settings" || *command == "register" || *command == "update");
+            if (writable) {
+                std::string id;
+                auto store = default_store_root();
+                for (std::size_t n = 0; n + 1 < arguments.size(); ++n) {
+                    if (arguments[n] == "--app-id") id = arguments[n + 1];
+                    if (arguments[n] == "--store") store = std::filesystem::absolute(utf16(arguments[n + 1])).lexically_normal();
+                }
+                if (valid_app_id(id)) {
+                    try {
+                        if (*command == "relaunch") store = registered_shell_store(id);
+                        AppLaunchFailure failure{store, id};
+                        capture_launch_failure(failure, operation_error);
+                        // Read-only queries still never write diagnostics. A
+                        // failed mutation/launch reports its persistence status.
+                        observer(failure);
+                    } catch (...) { /* Preserve the actual operation exception. */ }
+                }
+            }
+        }
+        } catch (...) { /* Diagnostic setup cannot replace the operation error. */ }
+        std::rethrow_exception(operation_error);
+    }
 }
 } // namespace aether::install

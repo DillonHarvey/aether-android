@@ -59,10 +59,24 @@ struct ActivityCommand {
 };
 inline constexpr std::array<std::string_view, 8> activity_probes{
     "touches", "keys", "lastSource", "lastAction", "lastKey", "lastRepeat", "lastX", "lastY"};
+// A stale capture is cancellation, not an app-declined native default.
+using KeyDispatchOutcome = android::KeyDispatchOutcome;
+using ActivityFinishRequest = android::ActivityFinishRequest;
+std::vector<std::uint8_t> encode_activity_finish_request(const ActivityFinishRequest &);
+ActivityFinishRequest decode_activity_finish_request(std::span<const std::uint8_t>);
+struct ActivityKeyResult {
+    std::uint64_t origin = 0;
+    KeyDispatchOutcome outcome = KeyDispatchOutcome::none;
+};
+std::vector<std::uint8_t> encode_activity_key_result(const ActivityKeyResult &);
+ActivityKeyResult decode_activity_key_result(std::span<const std::uint8_t>);
 struct ActivityState {
     std::string apk_hash, package, activity;
     android::Lifecycle lifecycle = android::Lifecycle::empty;
     dex::ObjectId content = 0;
+    dex::ObjectId activity_object = 0;
+    bool finishing = false;
+    std::uint64_t window_generation = 0, input_generation = 0;
     std::map<dex::ObjectId, android::ViewState> views;
     std::u16string trace;
     std::array<std::uint32_t, activity_probes.size()> probes{};
@@ -71,6 +85,7 @@ struct ActivityState {
     jni::Metrics jni;
     a64::Metrics cpu;
     bool handled = false;
+    KeyDispatchOutcome key_outcome = KeyDispatchOutcome::none;
     std::int32_t requested_orientation = -1; // Requested virtual display policy, never inferred from HWND.
     android::DisplayConfiguration configuration;
     std::vector<android::SoftInputRequest> soft_input_requests;
@@ -81,6 +96,10 @@ struct ActivityState {
     // each View's preparation tag; no managed/native handles enter the wire.
     std::uint64_t accessibility_metadata_attempt = 0, accessibility_invalidation_revision = 0;
     android::AccessibilityMetadataStatus accessibility_metadata_status = android::AccessibilityMetadataStatus::none;
+    // Actual logical content commits and the trusted viewport binding are
+    // distinct from semantic View revisions and completed rendered output.
+    // Zero geometry denotes no current binding, including legacy native paths.
+    std::uint64_t attachment_revision = 0, viewport_geometry_revision = 0;
     std::vector<std::uint8_t> encode() const;
     static ActivityState decode(std::span<const std::uint8_t> bytes);
     void validate() const;

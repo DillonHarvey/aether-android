@@ -12,6 +12,7 @@
 #include <mcl/assert.hpp>
 #include <mcl/bit_cast.hpp>
 #include <mcl/stdint.hpp>
+#include <mcl/scope_exit.hpp>
 
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/backend/x64/block_of_code.h"
@@ -168,7 +169,7 @@ static PrologueInformation GetPrologueInformation() {
 }
 
 struct ExceptionHandler::Impl final {
-    Impl(BlockOfCode& code) {
+    Impl(BlockOfCode& code) : code_(code) {
         const auto prolog_info = GetPrologueInformation();
 
         code.align(16);
@@ -231,6 +232,10 @@ struct ExceptionHandler::Impl final {
 
     void SetCallback(std::function<FakeCall(u64)> new_cb) {
         cb = new_cb;
+        const bool was_writing = code_.IsWritingEnabled();
+        if (!was_writing) code_.EnableWriting();
+        SCOPE_EXIT { if (!was_writing) code_.DisableWriting(); };
+        code_.PrepareCodeWrite(&except_info->ExceptionHandler, sizeof(except_info->ExceptionHandler));
         except_info->ExceptionHandler = cb ? exception_handler_with_cb_offset : exception_handler_without_cb_offset;
     }
 
@@ -239,6 +244,7 @@ struct ExceptionHandler::Impl final {
     }
 
 private:
+    BlockOfCode& code_;
     RUNTIME_FUNCTION* rfuncs;
     std::function<FakeCall(u64)> cb;
     UNW_EXCEPTION_INFO* except_info;

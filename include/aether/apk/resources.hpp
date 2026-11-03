@@ -1,5 +1,6 @@
 #pragma once
 #include "aether/apk/inspect.hpp"
+#include <functional>
 #include <map>
 #include <set>
 
@@ -21,6 +22,20 @@ struct ResourceParseOptions {
 struct ResourceValue {
     std::uint32_t data = 0;
     std::uint8_t type = 0;
+};
+enum class StyleAttributeStatus { found, absent, unresolved };
+struct StyleAttributeResult {
+    StyleAttributeStatus status = StyleAttributeStatus::absent;
+    ResourceValue value;
+    std::uint32_t unresolved_style = 0;
+    // Actual defining bag/source facts, distinct from the merged value.data.
+    // native_flags includes every observed participating ancestor; only complete
+    // provenance proves that no unresolved ancestor flags remain omitted.
+    std::uint32_t native_flags = 0, source_id = 0, source_data = 0, source_style = 0;
+    std::uint16_t density = 0;
+    // SDK bags use the authenticated SDK source rather than an app source slot.
+    // Old three-member aggregate producers remain explicitly incomplete.
+    bool sdk_source = false, provenance_complete = false;
 };
 struct ResourceBagItem {
     std::uint32_t key = 0;
@@ -44,6 +59,15 @@ struct ResourceEntry {
     std::uint16_t density = 0, sdk = 0;
     std::uint8_t orientation = 0;
     std::uint16_t width_dp = 0, height_dp = 0, smallest_width_dp = 0;
+    // Encoded FLAG_COMPLEX, independent of symbolic type names and value type.
+    bool complex = false;
+    // Actual selected source facts. data remains the internal merged-pool value;
+    // source_data retains the original encoded pool index/reference/scalar bits.
+    std::uint32_t native_flags = 0, source_data = 0, source_id = 0;
+};
+struct ResourceSource {
+    std::string container;
+    std::uint32_t string_base = 0, string_count = 0;
 };
 class ResourceTable {
   public:
@@ -56,9 +80,21 @@ class ResourceTable {
     void merge(ResourceTable other);
     const std::string &package_name() const noexcept { return package_; }
     const std::map<std::uint32_t, ResourceEntry> &entries() const noexcept { return entries_; }
+    // source_id is a one-based slot in this actual held ARSC source registry.
+    // AssetManager assigns its own positive cookie when binding these sources.
+    std::span<const ResourceSource> sources() const noexcept { return sources_; }
+    std::optional<std::uint32_t> declaration_flags(std::uint32_t id) const noexcept;
+    std::u16string pooled_string(std::uint32_t source_id, std::uint32_t original_index,
+                                std::size_t maximum_code_units) const;
+
     std::uint32_t identifier(std::string_view name, std::string_view type, std::string_view package) const;
     std::u16string text(std::uint32_t id, bool strip_styles = false) const;
     std::u16string text(ResourceValue value, bool strip_styles = false) const;
+    // Child overrides are conclusive without resolving a missing parent. Only
+    // a complete parent-zero chain proves absence; unresolved IDs retain their
+    // identity for a separately authenticated platform-style consumer.
+    StyleAttributeResult style_attribute(std::uint32_t style, std::uint32_t attribute,
+                                        const std::function<void(std::uint64_t)> &charge_work = {}) const;
     std::vector<ResourceBagItem> bag(std::uint32_t id) const;
     std::string_view container(std::uint32_t id) const;
     const ResourceEntry &value(std::uint32_t id) const;
@@ -75,6 +111,9 @@ class ResourceTable {
     std::vector<std::string> strings_;
     std::set<std::uint32_t> styled_strings_;
     std::map<std::uint32_t, ResourceEntry> entries_;
+    std::vector<ResourceSource> sources_;
+    std::map<std::uint32_t, std::uint32_t> declared_flags_;
+
     std::map<std::uint32_t, Bag> bags_;
     std::size_t bag_items_ = 0;
     std::size_t encoded_bytes_ = 0, decoded_bytes_ = 0, chunks_ = 0, metadata_bytes_ = 0;

@@ -43,12 +43,12 @@ std::string_view session_failure_code(AppSessionFailure failure) noexcept {
                                                     : "AETHER_APP_SESSION_FAILED";
 }
 bool AppDiagnostics::passed() const {
-    return std::none_of(checks.begin(), checks.end(),
+    return faults.complete && fault_retention_error.empty() && std::none_of(checks.begin(), checks.end(),
                         [](const auto &check) { return check.status == "fail"; });
 }
 std::string AppDiagnostics::json() const {
     std::ostringstream out;
-    out << "{\"schemaVersion\":1,\"operation\":\"diagnostics\",\"passed\":" << (passed() ? "true" : "false")
+    out << "{\"schemaVersion\":2,\"operation\":\"diagnostics\",\"passed\":" << (passed() ? "true" : "false")
         << ",\"readOnlyInspection\":true,\"guestExecution\":false,\"app\":{\"appId\":" << json_quote(app.id)
         << ",\"packageId\":" << json_quote(app.package_id)
         << ",\"versionName\":" << json_quote(app.version_name) << ",\"versionCode\":" << app.version_code
@@ -84,6 +84,13 @@ std::string AppDiagnostics::json() const {
             << ",\"causeEstablished\":false,\"currentPackageAttributionEstablished\":false}";
     else
         out << "null";
+    out << ",\"faultHistory\":" << fault_history_json(faults)
+        << ",\"currentFault\":" << (current_fault ? fault_json(*current_fault) : "null")
+        << ",\"faultRetentionError\":" << json_quote(fault_retention_error)
+        << ",\"inspectionFaults\":[";
+    for (std::size_t n = 0; n < inspection_faults.size(); ++n)
+        out << (n ? "," : "") << fault_json(inspection_faults[n]);
+    out << "],\"diagnosticTextUntrusted\":true,\"reviewBeforeSharing\":true";
     out << ",\"checks\":[";
     for (std::size_t index = 0; index < checks.size(); ++index) {
         const auto &check = checks[index];
@@ -91,7 +98,7 @@ std::string AppDiagnostics::json() const {
             << ",\"status\":" << json_quote(check.status) << ",\"code\":" << json_quote(check.code)
             << ",\"detail\":" << json_quote(check.detail) << '}';
     }
-    out << "],\"excluded\":[\"host-paths\",\"private-app-files\",\"audit-logs\",\"environment\","
+    out << "],\"excluded\":[\"private-app-files\",\"audit-logs\",\"environment\","
            "\"memory\"],\"notAssessed\":[\"runtime-readiness\",\"worker-isolation\","
            "\"Android-API-behavior\",\"Windows-UI-and-pins\"]}";
     return out.str();
@@ -104,12 +111,17 @@ std::string AppDiagnostics::text() const {
     if (session_failure)
         out << "Previous app session: " << session_failure_code(*session_failure)
             << " [" << session_failure_stage << "]\n"
-               "The failure cause is unknown. Current package diagnostics are inspected separately; "
-               "they do not identify the package version that failed.\n";
+               "Review retained fault records below. Each admitted session records its own package hash; "
+               "historical errors do not prove the current package fails.\n";
     for (const auto &check : checks)
         out << check.name << ": " << check.status << (check.code.empty() ? "" : " [" + check.code + "]")
             << " - " << check.detail << '\n';
-    out << "Read-only inspection; no APK execution or private app data collected.\n"
+    out << fault_history_text(faults);
+    if (current_fault) out << "\nCurrent session diagnostic (untrusted text): " << fault_json(*current_fault) << '\n';
+    if (!fault_retention_error.empty()) out << "\nFault retention did not complete: " << fault_retention_error << '\n';
+    for (const auto &fault : inspection_faults) out << "\nInspection error: " << fault_json(fault) << '\n';
+    out << "Diagnostic messages may contain app-provided text or technical paths. Redaction is best-effort; review before sharing.\n";
+    out << "Read-only inspection; no APK execution or private app files collected.\n"
            "Runtime readiness, worker isolation, Android behavior and Windows UI are not assessed.\n";
     return out.str();
 }

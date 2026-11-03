@@ -1129,6 +1129,9 @@ void *const AutoGrow = (void*)1; //-V566
 void *const DontSetProtectRWE = (void*)2; //-V566
 
 class CodeArray {
+public:
+	using WriteObserver = void(*)(void*, const void*, size_t);
+private:
 	enum Type {
 		USER_BUF = 1, // use userPtr(non alignment, non protect)
 		ALLOC_BUF, // use new(alignment, protect)
@@ -1160,6 +1163,8 @@ class CodeArray {
 	Allocator defaultAllocator_;
 #endif
 	Allocator *alloc_;
+	void *writeObserverContext_ = 0;
+	WriteObserver writeObserver_ = 0;
 protected:
 	size_t maxSize_;
 	uint8_t *top_;
@@ -1228,6 +1233,14 @@ public:
 	}
 	bool setProtectModeRE(bool throwException = true) { return setProtectMode(PROTECT_RE, throwException); }
 	bool setProtectModeRW(bool throwException = true) { return setProtectMode(PROTECT_RW, throwException); }
+	void setWriteObserver(void *context, WriteObserver observer)
+	{
+		// Moving AutoGrow buffers have an additional raw-copy write path.
+		// An observed fixed buffer must retain its original allocation identity.
+		if (observer && type_ == AUTO_GROW) XBYAK_THROW(ERR_BAD_PARAMETER)
+		writeObserverContext_ = observer ? context : 0;
+		writeObserver_ = observer;
+	}
 	void resetSize()
 	{
 		size_ = 0;
@@ -1243,6 +1256,7 @@ public:
 				XBYAK_THROW(ERR_CODE_IS_TOO_BIG)
 			}
 		}
+		if (writeObserver_) writeObserver_(writeObserverContext_, top_ + size_, 1);
 		top_[size_++] = static_cast<uint8_t>(code);
 	}
 	void db(const uint8_t *code, size_t codeSize)
@@ -1300,6 +1314,10 @@ public:
 	{
 		assert(offset < maxSize_);
 		if (size != 1 && size != 2 && size != 4 && size != 8) XBYAK_THROW(ERR_BAD_PARAMETER)
+		if (writeObserver_) {
+			if (offset >= maxSize_ || size > maxSize_ - offset) XBYAK_THROW(ERR_OFFSET_IS_TOO_BIG)
+			writeObserver_(writeObserverContext_, top_ + offset, size);
+		}
 		uint8_t *const data = top_ + offset;
 		for (size_t i = 0; i < size; i++) {
 			data[i] = static_cast<uint8_t>(disp >> (i * 8));

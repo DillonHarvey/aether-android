@@ -369,8 +369,11 @@ struct Parser {
         result.outgoing = view.u16(start + 4);
         const auto tries = view.u16(start + 6);
         const auto debug = view.u32(start + 8), count = view.u32(start + 12);
-        if (result.registers > 256 || result.incoming > result.registers || result.outgoing > 256)
-            bad("LIMIT", "Code item exceeds the 256-register frame/call bound");
+        // registers_size/outs_size are metadata, not an allocated live frame.
+        // Keep structural validity here; the execution verifier enforces the
+        // bounded frame/call profile before allocating registers for a method.
+        if (result.incoming > result.registers)
+            bad("CODE", "Incoming register count exceeds the declared frame");
         if (!count || count > 65536 || count > 4 * 1024 * 1024 - code_units)
             bad("LIMIT", "Code item exceeds the 65536-unit method or 4 Mi-unit file bound");
         if (tries > 4096)

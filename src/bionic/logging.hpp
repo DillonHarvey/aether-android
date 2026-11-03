@@ -22,7 +22,8 @@ class NativeLogging {
     a64::Address syslog_tag_=0;
     std::uint32_t syslog_options_=0,syslog_mask_=0xff;
 };
-// Operations: vsnprintf, snprintf, __vsnprintf_chk, __snprintf_chk, __vsprintf_chk.
+// Operations 0-4: vsnprintf, snprintf, __vsnprintf_chk, __snprintf_chk,
+// __vsprintf_chk. Operation 5: sprintf (actual rendered span preflight).
 class NativeFormatting {
   public:
     explicit NativeFormatting(a64::GuestMemory &memory):memory_(memory){}

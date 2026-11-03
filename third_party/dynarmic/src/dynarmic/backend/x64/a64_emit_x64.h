@@ -7,6 +7,7 @@
 
 #include <array>
 #include <map>
+#include <memory>
 #include <optional>
 #include <tuple>
 
@@ -48,6 +49,7 @@ public:
     BlockDescriptor Emit(IR::Block& block);
 
     void ClearCache() override;
+    void TrimCache() override;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
@@ -63,7 +65,10 @@ protected:
     static_assert(sizeof(FastDispatchEntry) == 0x10);
     static constexpr u64 fast_dispatch_table_mask = 0xFFFFF0;
     static constexpr size_t fast_dispatch_table_size = 0x100000;
-    std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+    // Aether: this immutable optional optimization owns its table only when
+    // enabled. Generated code retains this allocation's address for its life.
+    using FastDispatchTable = std::array<FastDispatchEntry, fast_dispatch_table_size>;
+    std::unique_ptr<FastDispatchTable> fast_dispatch_table;
     void ClearFastDispatchTable();
 
     void (*memory_read_128)();

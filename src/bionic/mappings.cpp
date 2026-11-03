@@ -52,6 +52,65 @@ Fault NativeMappings::invoke(MappingOperation operation,Address errno_address,st
         // A zero-length mprotect changes nothing, even with unsupported prot bits.
         if(operation==MappingOperation::protect && !length){r[0]=0;return Fault::none;}
 
+        if(operation==MappingOperation::remap){
+            const auto flags=static_cast<std::uint32_t>(r[3]);
+            if(flags&~7U)return fail(22);
+            if((flags&6U) && !(flags&1U))return fail(22);
+            if(flags&6U)return reject("mremap: fixed replacement and DONTUNMAP are unsupported");
+            // The admitted mmap profile contains private anonymous mappings;
+            // Linux's zero-old-size shared duplication is not applicable.
+            if(!length || !r[2])return fail(22);
+            std::uint64_t new_size=0;
+            if(!rounded(length,size) || !rounded(r[2],new_size) ||
+                size>a64::GuestMemory::maximum_bytes || new_size>a64::GuestMemory::maximum_bytes)
+                return fail(12);
+            if(address<first || address>=limit || size>limit-address)
+                return reject("mremap: source is outside the owned mapping arena");
+            const auto end=address+size;
+            auto source=owned_.upper_bound(address);
+            if(source==owned_.begin())return fail(14);
+            --source;
+            const auto source_start=source->first,source_end=source_start+source->second;
+            if(address<source_start || end>source_end)return fail(14);
+            // Growth requires one protection domain, as a Linux VMA expansion
+            // does. Shrink retains the actual permissions of every kept view.
+            auto cursor=address;
+            std::optional<a64::Permission> permission;
+            while(cursor<end){
+                const auto view=memory_.mapping(cursor);
+                if(!view || view->address>cursor)return fail(14);
+                if(new_size>size && permission && *permission!=view->permissions)return fail(14);
+                permission=view->permissions;
+                cursor=std::min(end,view->address+view->size);
+            }
+            Address target=address;
+            if(new_size>size){
+                const auto growth=new_size-size;
+                const bool vacant=new_size<=limit-address &&
+                    memory_.find_free(end,end+growth,static_cast<std::size_t>(growth))==end;
+                if(!vacant){
+                    if(!(flags&1U))return fail(12);
+                    const auto selected=memory_.find_free(first,limit,static_cast<std::size_t>(new_size));
+                    if(!selected)return fail(12);
+                    target=*selected;
+                }
+            }
+            if(target==address && new_size==size){r[0]=address;return Fault::none;}
+            auto next=owned_;
+            next.erase(source_start);
+            if(target==address)next.emplace(source_start,address-source_start+new_size);
+            else {
+                if(source_start<address)next.emplace(source_start,address-source_start);
+                next.emplace(target,new_size);
+            }
+            if(end<source_end)next.emplace(end,source_end-end);
+            if(next.size()>4096)return fail(12);
+            // Both the ownership map and GuestMemory replacement views are
+            // completely prepared before either live representation changes.
+            memory_.remap_range(address,static_cast<std::size_t>(size),target,static_cast<std::size_t>(new_size));
+            owned_.swap(next);r[0]=target;return Fault::none;
+        }
+
         const auto protection=operation==MappingOperation::unmap?0U:static_cast<std::uint32_t>(r[2]);
         if(operation!=MappingOperation::unmap && (protection&~7U))return fail(22);
         if((protection&6U)==6U)return fail(1); // No writable/executable guest mappings.

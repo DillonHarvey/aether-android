@@ -355,8 +355,10 @@ void EmitX64::EmitTerminal(IR::Terminal terminal, IR::LocationDescriptor initial
 }
 
 void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    const auto pending = patch_information.find(target_desc);
+    if (pending == patch_information.end()) return;
     const CodePtr save_code_ptr = code.getCurr();
-    const PatchInformation& patch_info = patch_information[target_desc];
+    const PatchInformation& patch_info = pending->second;
 
     for (CodePtr location : patch_info.jg) {
         code.SetCodePtr(location);
@@ -392,6 +394,15 @@ void EmitX64::ClearCache() {
     patch_information.clear();
 
     PerfMapClear();
+}
+
+void EmitX64::TrimCache() {
+    // Virtual dispatch also clears the architecture-specific target caches.
+    ClearCache();
+    // clear() retains robin-map bucket capacity. Rehashing an empty table to
+    // zero constructs no replacement buckets and destroys the old allocation.
+    block_descriptors.rehash(0);
+    patch_information.rehash(0);
 }
 
 void EmitX64::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations) {

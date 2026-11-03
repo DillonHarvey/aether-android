@@ -43,8 +43,22 @@ LauncherSelection select_launcher(const ManifestInfo &manifest);
 // execution-profile query, not admission or permission: only unspecified,
 // landscape and portrait are supported; unresolved/other values throw InspectError.
 std::int32_t requested_orientation(const ManifestInfo &manifest, std::size_t selected_activity);
+// Retained Activity theme after real alias-target selection and application
+// fallback. Unknown/default theme facts remain typed for the consuming profile.
+ManifestInteger activity_theme(const ManifestInfo &manifest, std::size_t selected_activity);
 // Raw declared Android configChanges mask, inherited from an alias target.
 // Target-SDK compatibility rules are applied separately by the runtime.
 std::uint32_t handled_configuration_changes(const ManifestInfo &manifest, std::size_t selected_activity);
+struct SelectedNativeEntry {
+    std::string library, function;
+};
+// NativeActivity execution-profile query only: validate the real alias target,
+// then use the selected component's own metadata (aliases do not inherit it).
+// Default absent keys and refuse supplied unsupported values. Does not load
+// code, select an Activity, or grant installation/execution permission.
+SelectedNativeEntry selected_native_entry(const ManifestInfo &manifest, std::size_t selected_activity);
+// Decode a trusted already-selected component's retained values. This has the
+// same value validation as selected_native_entry; it grants no code execution.
+SelectedNativeEntry decode_native_entry(const ManifestNativeEntry &entry);
 std::string_view launcher_status_name(LauncherStatus status);
 } // namespace aether::apk

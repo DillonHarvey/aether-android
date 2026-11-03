@@ -32,6 +32,101 @@ MAX_IMAGE = 512 * 1024 * 1024
 MAX_FILE = 256 * 1024 * 1024
 MAX_METADATA = 8 * 1024 * 1024
 MAX_NOTICE = 4 * 1024 * 1024
+SOURCE_INPUTS = (
+    ("tools/verify-distribution.py", MAX_METADATA),
+    ("tools/package-runtime.py", MAX_METADATA),
+    ("CMakeLists.txt", MAX_METADATA),
+    ("CMakePresets.json", MAX_METADATA),
+    ("src/install/runtime_bundle.cpp", MAX_METADATA),
+    ("src/install/runtime.cpp", MAX_METADATA),
+    ("include/aether/install/runtime_setup.hpp", MAX_METADATA),
+    ("include/aether/apk/archive.hpp", MAX_METADATA),
+    ("src/apk/archive.cpp", MAX_METADATA),
+    ("include/aether/apk/inspect.hpp", MAX_METADATA),
+    ("src/apk/manifest.cpp", MAX_METADATA),
+    ("src/apk/package.cpp", MAX_METADATA),
+    ("include/aether/apk/resources.hpp", MAX_METADATA),
+    ("src/apk/resources.cpp", MAX_METADATA),
+    ("include/aether/apk/runtime_bitmap.hpp", MAX_METADATA),
+    ("src/apk/runtime_bitmap.cpp", MAX_METADATA),
+    ("include/aether/apk/runtime_xml.hpp", MAX_METADATA),
+    ("src/apk/runtime_xml.cpp", MAX_METADATA),
+    ("include/aether/apk/runtime_path.hpp", MAX_METADATA),
+    ("src/apk/runtime_path.cpp", MAX_METADATA),
+    ("include/aether/apk/runtime_vector.hpp", MAX_METADATA),
+    ("src/apk/runtime_vector.cpp", MAX_METADATA),
+    ("include/aether/android/framework.hpp", MAX_METADATA),
+    ("include/aether/android/viewport.hpp", MAX_METADATA),
+    ("include/aether/android/display_configuration.hpp", MAX_METADATA),
+    ("src/android/framework.cpp", MAX_METADATA),
+    ("src/android/bundle.hpp", MAX_METADATA),
+    ("src/android/bundle.cpp", MAX_METADATA),
+    ("include/aether/android/software_canvas.hpp", MAX_METADATA),
+    ("src/android/software_canvas.cpp", MAX_METADATA),
+    ("include/aether/android/view_geometry.hpp", MAX_METADATA),
+    ("src/android/view_geometry.cpp", MAX_METADATA),
+    ("include/aether/android/dimension_value.hpp", MAX_METADATA),
+    ("src/android/dimension_value.cpp", MAX_METADATA),
+    ("include/aether/android/view_attributes.hpp", MAX_METADATA),
+    ("src/android/view_attributes.cpp", MAX_METADATA),
+    ("include/aether/android/styleable_arrays.hpp", MAX_METADATA),
+    ("src/android/styleable_arrays.cpp", MAX_METADATA),
+    ("include/aether/android/widget_attributes.hpp", MAX_METADATA),
+    ("src/android/widget_attributes.cpp", MAX_METADATA),
+    ("include/aether/android/view_configuration.hpp", MAX_METADATA),
+    ("src/android/view_configuration.cpp", MAX_METADATA),
+    ("src/android/registry.cpp", MAX_METADATA),
+    ("include/aether/android/sdk_resources.hpp", MAX_METADATA),
+    ("src/android/sdk_resources.cpp", MAX_METADATA),
+    ("include/aether/android/sdk_resource_image.hpp", MAX_METADATA),
+    ("src/android/sdk_resource_image.cpp", MAX_METADATA),
+    ("include/aether/android/styled_attributes.hpp", MAX_METADATA),
+    ("src/android/styled_attributes.cpp", MAX_METADATA),
+    ("src/security/activity_runtime.cpp", MAX_METADATA),
+    ("include/aether/android/xml_cursor.hpp", MAX_METADATA),
+    ("src/android/xml_cursor.cpp", MAX_METADATA),
+    ("include/aether/android/inflater_factory.hpp", MAX_METADATA),
+    ("src/android/inflater_factory.cpp", MAX_METADATA),
+    ("include/aether/android/managed_log.hpp", MAX_METADATA),
+    ("src/android/managed_log.cpp", MAX_METADATA),
+    ("include/aether/android/configuration_override.hpp", MAX_METADATA),
+    ("src/android/configuration_override.cpp", MAX_METADATA),
+    ("include/aether/android/context_lineage.hpp", MAX_METADATA),
+    ("src/android/context_lineage.cpp", MAX_METADATA),
+    ("include/aether/android/xml_view_constructor.hpp", MAX_METADATA),
+    ("src/android/xml_view_constructor.cpp", MAX_METADATA),
+    ("include/aether/android/bootstrap_class_presence.hpp", MAX_METADATA),
+    ("src/android/bootstrap_class_presence.cpp", MAX_METADATA),
+    ("src/android/bootstrap_direct_classes.inc", MAX_METADATA),
+    ("include/aether/android/view_child_storage.hpp", MAX_METADATA),
+    ("src/android/view_child_storage.cpp", MAX_METADATA),
+    ("src/android/array_maps.hpp", MAX_METADATA),
+    ("src/android/array_maps.cpp", MAX_METADATA),
+    ("include/aether/common/android_process_identity.hpp", MAX_METADATA),
+    ("src/bionic/file_metadata.hpp", MAX_METADATA),
+    ("src/bionic/file_metadata.cpp", MAX_METADATA),
+    ("include/aether/dex/runtime.hpp", MAX_METADATA),
+    ("src/dex/runtime.cpp", MAX_METADATA),
+    ("src/dex/thread_locals.hpp", MAX_METADATA),
+    ("src/dex/thread_locals.cpp", MAX_METADATA),
+    ("src/jni/bridge.cpp", MAX_METADATA),
+    ("include/aether/jni/bridge.hpp", MAX_METADATA),
+    ("include/aether/android/native.hpp", MAX_METADATA),
+    ("src/android/native.cpp", MAX_METADATA),
+    ("src/android/native_assets.hpp", MAX_METADATA),
+    ("src/android/native_assets.cpp", MAX_METADATA),
+    ("include/aether/security/viewport_protocol.hpp", MAX_METADATA),
+    ("src/security/viewport_protocol.cpp", MAX_METADATA),
+    ("src/security/activity_host.cpp", MAX_METADATA),
+    ("include/aether/host/window_observation.hpp", MAX_METADATA),
+    ("src/install/cli.cpp", MAX_METADATA),
+    ("src/host/windows/window.cpp", MAX_METADATA),
+    ("cmake/sdk_resources.rc.in", MAX_METADATA),
+    ("third_party/android-resources/api35/resources.arsc", MAX_FILE),
+    ("third_party/android-resources/api35/res/layout/screen_simple.xml", MAX_METADATA),
+    ("third_party/android-resources/api35/res/layout/screen_simple_overlay_action_mode.xml", MAX_METADATA),
+    ("third_party/android-resources/api35/res/layout/action_mode_bar.xml", MAX_METADATA),
+)
 MAGIC = b"AETHERBUNDLE2\0\0\0"
 
 
@@ -94,6 +189,31 @@ def read_bounded(path, limit):
         f"File changed during reading: {path}",
     )
     return data
+
+
+def read_source_input(project, name, bound, source_hashes, source_limits):
+    """Bind one bounded final input without caching its contents or retrying."""
+    data = read_bounded(project / name, bound)
+    sha256 = digest(data)
+    if name in source_hashes:
+        require(
+            source_hashes[name] == sha256 and source_limits[name] == bound,
+            "CHANGED",
+            f"Source input changed between reads: {name}",
+        )
+    source_hashes[name] = sha256
+    source_limits[name] = bound
+    return data
+
+
+def recheck_source_inputs(project, source_hashes, source_limits):
+    """Compare final bounded reads to captured bytes; do not attest compiler inputs."""
+    for name, bound in source_limits.items():
+        require(
+            digest(read_bounded(project / name, bound)) == source_hashes[name],
+            "CHANGED",
+            f"Source input changed during distribution verification: {name}",
+        )
 
 
 def decode_manifest(data, name):
@@ -265,7 +385,7 @@ def inspect_bundle(data, expected):
         cursor += length
         return result
 
-    require(number() == 58, "CONTRACT", "Expected current compatibility contract 58")
+    require(number() == 139, "CONTRACT", "Expected current compatibility contract 139")
     count = number()
     require(7 <= count <= 96, "LIMIT", "Invalid manifest file count")
     files = {}
@@ -315,20 +435,13 @@ def inspect_bundle(data, expected):
 
 def verify(project, build, bundle, report):
     source_hashes = report["sourceHashes"]
+    source_limits = {}
 
     def source(name, bound=MAX_METADATA):
-        data = read_bounded(project / name, bound)
-        source_hashes[name] = digest(data)
-        return data
+        return read_source_input(project, name, bound, source_hashes, source_limits)
 
-    for name in (
-        "tools/verify-distribution.py",
-        "tools/package-runtime.py",
-        "CMakeLists.txt",
-        "src/install/runtime_bundle.cpp",
-        "src/install/runtime.cpp",
-    ):
-        source(name)
+    for name, bound in SOURCE_INPUTS:
+        source(name, bound)
     documents = {name: decode_manifest(source(name), name) for name in MANIFESTS}
     fixture = decode_manifest(source(NOTICE_MANIFEST), NOTICE_MANIFEST)
     notices = notice_inventory(
@@ -366,15 +479,17 @@ def verify(project, build, bundle, report):
     data = read_bounded(bundle, MAX_IMAGE)
     report.update(bundleBytes=len(data), bundleSha256=digest(data))
     report["files"] = inspect_bundle(data, expected)
+    recheck_source_inputs(project, source_hashes, source_limits)
     report.update(
         fileCount=len(expected),
         executableCount=len(EXECUTABLES),
         noticeCount=len(notices),
         shellLibraryCount=1,
-        compatibilityContract=58,
+        compatibilityContract=139,
         wholeImageDigestMatches=True,
         currentBuildMatches=True,
         retainedNoticeProvenanceMatches=True,
+        sourceInputsRechecked=True,
     )
 
 
@@ -424,6 +539,7 @@ def main(arguments=None):
         "passed": False,
         "createdUtc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "sourceHashes": {},
+        "sourceInputsRechecked": False,
         "publisherAuthenticated": False,
         "publicReleaseCleared": False,
         "licenceClearanceEstablished": False,
@@ -432,6 +548,7 @@ def main(arguments=None):
         "uploaded": False,
         "limitations": [
             "Current source/build byte identity only; no publisher or legal clearance",
+            "Recorded source hashes and final rereads do not establish which inputs the compiler consumed",
             "Not a full vendor integrity check, symbol SBOM or executable safety analysis",
             "No installed-runtime layout, Windows UI or clean-machine acceptance",
         ],

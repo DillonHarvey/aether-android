@@ -1,6 +1,7 @@
 #include "aether/common/text.hpp"
 #include "local_calendar.hpp"
 #include "file_transport.hpp"
+#include "file_metadata_transport.hpp"
 #include "aether/security/broker.hpp"
 #include "aether/security/worker.hpp"
 #include "aether/apk/inspect.hpp"
@@ -545,6 +546,37 @@ host::FileResult Broker::file_request(const Frame &request, Frame &response) {
     auto &file_paths=file_paths_->positions;
     if (!policy_.private_storage || !files_)
         return {-1, FileError::denied};
+    if (request.header.operation == Operation::file_path_metadata) {
+        const auto decoded = file_metadata_transport::decode_request(request.payload);
+        host::FilePathRef ref;
+        ref.name = decoded.name; ref.directory_required = decoded.directory_required;
+        std::optional<file_transport::Position> position;
+        if (decoded.kind == 0) {
+            ref.scope = static_cast<host::FileAccessScope>(decoded.base);
+            position = file_transport::position(ref.scope, ref.name);
+        } else {
+            const auto descriptor = descriptors_.find(decoded.base);
+            if (descriptor == descriptors_.end()) return {-1, FileError::bad_descriptor};
+            const auto held = file_paths.find(decoded.base);
+            if (held == file_paths.end() || !held->second.directory) return {-1, FileError::not_directory};
+            if (held->second.unlinked) return {-1, FileError::missing};
+            ref.directory = descriptor->second;
+            position = file_transport::position(ref.scope, ref.name, &held->second);
+        }
+        if (!position) return {-1, FileError::invalid};
+        response.payload.reserve(file_metadata_transport::metadata_bytes);
+        host::FilePathMetadata value;
+        const auto result = files_->metadata_path(ref, value);
+        if ((result.error == FileError::none && (result.value != 0 || !host::valid_file_path_metadata(value))) ||
+            (result.error != FileError::none && result.value != -1))
+            throw ProtocolError("AETHER_BROKER_STORAGE: invalid path metadata result");
+        if (result.error == FileError::none) {
+            if ((ref.directory_required || ref.name.empty()) && !value.directory)
+                throw ProtocolError("AETHER_BROKER_STORAGE: path metadata lost its directory requirement");
+            file_metadata_transport::append_metadata(response.payload, value);
+        }
+        return result;
+    }
     if(request.header.operation==Operation::file_rename){
         namespace ft=file_transport;
         struct Endpoint {host::FilePathRef ref;std::string name;ft::Position position;};
@@ -820,6 +852,37 @@ host::FileResult Broker::file_request(const Frame &request, Frame &response) {
     if (found == descriptors_.end())
         return {-1, FileError::bad_descriptor};
     const auto descriptor = found->second;
+    if (request.header.operation == Operation::file_truncate || request.header.operation == Operation::file_read_at ||
+        request.header.operation == Operation::file_write_at) {
+        constexpr auto chunk_limit = maximum_payload - 24;
+        const bool truncating = request.header.operation == Operation::file_truncate;
+        const bool reading = request.header.operation == Operation::file_read_at;
+        if (request.payload.size() < (truncating ? 16u : 24u)) return {-1, FileError::invalid};
+        const auto offset = read_u64(request.payload, 8);
+        const auto count = truncating ? 0 : read_u64(request.payload, 16);
+        if ((truncating && request.payload.size() != 16) || (!truncating && count > chunk_limit) ||
+            (reading && request.payload.size() != 24) ||
+            (!truncating && !reading && request.payload.size() != 24 + count)) return {-1, FileError::invalid};
+        if (offset > host::private_file_size_limit ||
+            (!truncating && !reading && count > host::private_file_size_limit - offset)) return {-1, FileError::quota};
+        if (const auto path = file_paths.find(token); path != file_paths.end() && path->second.directory)
+            return {-1, FileError::is_directory};
+        std::vector<std::uint8_t> bytes;
+        if (reading) bytes.resize(static_cast<std::size_t>(count)); // All output storage precedes the provider call.
+        const auto result = truncating ? files_->truncate(descriptor, offset) : reading ? files_->read_at(descriptor, offset, bytes) :
+            files_->write_at(descriptor, offset, std::span(request.payload).subspan(24));
+        if (static_cast<std::uint64_t>(result.error) > static_cast<std::uint64_t>(FileError::not_empty) ||
+            (result.error != FileError::none && result.value != -1) ||
+            (result.error == FileError::none && (result.value < 0 ||
+                (truncating ? result.value != 0 : static_cast<std::uint64_t>(result.value) > count) ||
+                (reading && static_cast<std::uint64_t>(result.value) > host::private_file_size_limit - offset))))
+            throw ProtocolError("AETHER_BROKER_STORAGE: invalid positioned-I/O provider result");
+        if (reading && result.error == FileError::none) {
+            bytes.resize(static_cast<std::size_t>(result.value));
+            response.payload = std::move(bytes);
+        }
+        return result;
+    }
     if (request.header.operation == Operation::file_metadata) {
         if (request.payload.size() != 8) return {-1, FileError::invalid};
         host::FileMetadata value;
@@ -990,7 +1053,18 @@ Frame Broker::execute(const Frame &request, AuditTicket ticket) {
     ++next_sequence_;
     ++requests;
     Frame response{{header.operation, header.sequence, policy_.session, 0, Status::denied}, {}};
-    if (header.operation == Operation::monotonic_time || header.operation == Operation::uptime ||
+    if (header.operation == Operation::monotonic_local_admission) {
+        if (!request.payload.empty()) {
+            response.header.status = Status::invalid;
+        } else if (!policy_.interactive) {
+            response.header.status = Status::unsupported;
+        } else if (policy_.monotonic_time) {
+            // The authenticated session owns this immutable elapsed-time grant.
+            // Local reads remain actual Windows QPC samples, not broker RPCs.
+            append_u64(response.payload, monotonic_local_admission_version);
+            response.header.status = Status::ok;
+        }
+    } else if (header.operation == Operation::monotonic_time || header.operation == Operation::uptime ||
         header.operation == Operation::elapsed_realtime || header.operation == Operation::thread_cpu ||
         header.operation == Operation::process_start_uptime) {
         if (!request.payload.empty()) {
@@ -1058,13 +1132,21 @@ Frame Broker::execute(const Frame &request, AuditTicket ticket) {
         response.payload = std::move(payload);
     } else if ((header.operation >= Operation::file_open && header.operation <= Operation::file_close) ||
                header.operation == Operation::file_root || header.operation == Operation::file_flush || header.operation == Operation::file_lock || header.operation == Operation::file_access ||
-               header.operation == Operation::file_metadata || header.operation == Operation::file_seek || header.operation == Operation::file_remove ||
+               header.operation == Operation::file_metadata || header.operation == Operation::file_path_metadata ||
+               header.operation == Operation::file_truncate || header.operation == Operation::file_read_at || header.operation == Operation::file_write_at ||
+               header.operation == Operation::file_seek || header.operation == Operation::file_remove ||
                header.operation == Operation::file_open_scoped || header.operation == Operation::file_path || header.operation == Operation::file_rename ||
                header.operation == Operation::file_data_observe || header.operation == Operation::file_directory) {
         host::FileResult result;
         std::vector<std::uint8_t> payload;
         try {
-            if (header.operation == Operation::file_remove || header.operation == Operation::file_open_scoped || header.operation == Operation::file_path || header.operation == Operation::file_rename)
+            if (header.operation == Operation::file_read_at)
+                payload.reserve(maximum_payload);
+            else if (header.operation == Operation::file_truncate || header.operation == Operation::file_write_at)
+                payload.reserve(16);
+            else if (header.operation == Operation::file_path_metadata)
+                payload.reserve(file_metadata_transport::success_bytes);
+            else if (header.operation == Operation::file_remove || header.operation == Operation::file_open_scoped || header.operation == Operation::file_path || header.operation == Operation::file_rename)
                 payload.reserve(header.operation==Operation::file_rename?file_transport::rename_reply_bytes:16);
             result = file_request(request, response);
         } catch (const ProtocolError &) {

@@ -21,6 +21,51 @@ template <class T> Index next(const T &values) {
         bad("LIMIT", "Linked identifier table exceeds 1048576 entries");
     return static_cast<Index>(values.size());
 }
+bool provider_name_character(char value) noexcept {
+    return value == '$' || value == '-' || value == '_' ||
+           (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+           (value >= '0' && value <= '9');
+}
+// Consume one complete canonical type without allocating or trusting a DEX
+// parser's prior validation: these references did not come from a DEX file.
+std::string_view provider_type(std::string_view text, std::size_t &position, bool allow_void) {
+    const auto begin = position;
+    std::size_t dimensions = 0;
+    while (position < text.size() && text[position] == '[') {
+        ++position;
+        if (++dimensions > 255)
+            bad("DESCRIPTOR", "Provider array type exceeds 255 dimensions");
+    }
+    if (position == text.size())
+        bad("DESCRIPTOR", "Incomplete provider type descriptor");
+    const auto kind = text[position++];
+    if (kind == 'L') {
+        bool component = false;
+        for (;;) {
+            if (position == text.size())
+                bad("DESCRIPTOR", "Unterminated provider class descriptor");
+            const auto value = text[position++];
+            if (value == ';') {
+                if (!component)
+                    bad("DESCRIPTOR", "Empty provider class-name component");
+                break;
+            }
+            if (value == '/') {
+                if (!component)
+                    bad("DESCRIPTOR", "Empty provider class-name component");
+                component = false;
+            } else {
+                if (!provider_name_character(value))
+                    bad("DESCRIPTOR", "Unsupported provider class-name character");
+                component = true;
+            }
+        }
+    } else if (std::string_view("ZBSCIJFDV").find(kind) == std::string_view::npos ||
+               (kind == 'V' && (dimensions || !allow_void))) {
+        bad("DESCRIPTOR", "Invalid provider value type");
+    }
+    return text.substr(begin, position - begin);
+}
 } // namespace
 struct Linker::Impl {
     LinkLimits limits;
@@ -28,7 +73,7 @@ struct Linker::Impl {
     DexImage &image;
     bool failed = false, finished = false;
     std::uint64_t accounted = 0;
-    // Keys borrow immutable identities in the append-only target deques, never
+    // Keys borrow immutable identities in the append-only stable tables, never
     // the consumed input. Declaration upgrades preserve these identity fields.
     // These indexes are destroyed before owned_image (or the caller's target).
     std::map<std::u16string_view, Index> strings;
@@ -96,7 +141,89 @@ struct Linker::Impl {
             table(value.static_values);
         }
     }
-    void add(DexImage input, std::string name) {
+    Index intern_provider_method(std::string_view owner, std::string_view name,
+                                 std::string_view descriptor) {
+        ready();
+        failed = true;
+        if (owner.empty() || owner.front() != 'L')
+            bad("METHOD", "Provider method owner must be a class descriptor");
+        std::size_t position = 0;
+        (void)provider_type(owner, position, false);
+        if (position != owner.size())
+            bad("DESCRIPTOR", "Trailing provider owner descriptor data");
+        if (name.empty() || name.size() > 1024 || descriptor.size() > 1024 ||
+            (name != "<init>" && !std::all_of(name.begin(), name.end(), provider_name_character)))
+            bad("METHOD", "Invalid or unsupported provider method name");
+        if (descriptor.empty() || descriptor.front() != '(')
+            bad("PROTOTYPE", "Provider method requires a canonical prototype");
+        position = 1;
+        std::size_t parameter_count = 0;
+        std::uint32_t argument_words = 0;
+        while (position < descriptor.size() && descriptor[position] != ')') {
+            const auto parameter = provider_type(descriptor, position, false);
+            argument_words += type_words(parameter);
+            if (argument_words > 255)
+                bad("PROTOTYPE", "Provider argument word count exceeds 255");
+            ++parameter_count;
+        }
+        if (position == descriptor.size())
+            bad("PROTOTYPE", "Unterminated provider method parameters");
+        ++position;
+        const auto return_type = provider_type(descriptor, position, true);
+        if (position != descriptor.size() || (name == "<init>" && return_type != "V"))
+            bad("PROTOTYPE", "Invalid provider method return descriptor");
+
+        // A pre-existing tuple needs neither new metadata nor a new ID. This
+        // also preserves a later DEX file's references to the exact same tuple.
+        const auto known_owner = types.find(owner);
+        const auto known_prototype = prototypes.find(descriptor);
+        if (known_owner != types.end() && known_prototype != prototypes.end()) {
+            const auto found = methods.find(Member{known_owner->second, name, known_prototype->second});
+            if (found != methods.end()) {
+                failed = false;
+                return found->second;
+            }
+        }
+        const auto intern_type = [&](std::string_view value) {
+            const auto found = types.find(value);
+            if (found != types.end()) return found->second;
+            const auto index = next(image.types);
+            charge(sizeof(std::string) + value.size());
+            image.types.emplace_back(value);
+            types.emplace(image.types.back(), index);
+            return index;
+        };
+        const auto owner_index = intern_type(owner);
+        Index prototype_index;
+        if (known_prototype != prototypes.end()) {
+            prototype_index = known_prototype->second;
+        } else {
+            prototype_index = next(image.prototypes);
+            charge(sizeof(Prototype) + parameter_count * sizeof(Index) + descriptor.size());
+            Prototype prototype;
+            prototype.descriptor = descriptor;
+            prototype.argument_words = argument_words;
+            prototype.parameters.reserve(parameter_count);
+            position = 1;
+            while (descriptor[position] != ')')
+                prototype.parameters.push_back(intern_type(provider_type(descriptor, position, false)));
+            prototype.return_type = intern_type(return_type);
+            image.prototypes.push_back(std::move(prototype));
+            prototypes.emplace(image.prototypes.back().descriptor, prototype_index);
+        }
+        const auto index = next(image.methods);
+        charge(method_metadata_charge + name.size());
+        Method reference;
+        reference.owner = owner_index;
+        reference.prototype = prototype_index;
+        reference.name = name;
+        image.methods.push_back(std::move(reference));
+        const auto &target = image.methods.back();
+        methods.emplace(Member{target.owner, target.name, target.prototype}, index);
+        failed = false;
+        return index;
+    }
+    void add(DexImage input, std::string name, const Linker::ParentClass &parent) {
         ready();
         failed = true;
         if (image.sources.size() >= limits.files)
@@ -109,6 +236,24 @@ struct Linker::Impl {
         catch(const std::bad_alloc &) {
             detail::note_class_load_allocation(ClassLoadAllocationPhase::link_account);throw;
         }
+        // Account and structurally parse the complete original file first.
+        // Delegation changes definition ownership, not the input's identity,
+        // operand indices, or its aggregate metadata/resource budget.
+        std::vector<bool> parent_types(input.types.size(), false);
+        if (parent)
+            for (const auto &definition : input.classes)
+                parent_types.at(definition.type) = parent(input.types.at(definition.type));
+        for (auto &field : input.fields)
+            if (parent_types.at(field.owner)) {
+                field.declared = false;
+                field.flags = 0;
+            }
+        for (auto &method : input.methods)
+            if (parent_types.at(method.owner)) {
+                method.declared = method.direct = false;
+                method.flags = 0;
+                method.code.reset();
+            }
         auto map = std::make_shared<IndexMap>();
         map->source = name;
         map->version = input.version;
@@ -211,6 +356,8 @@ struct Linker::Impl {
         }
         input.methods.clear();
         for (auto &value : input.classes) {
+            if (parent_types.at(value.type))
+                continue;
             value.type = mapped(map->types, value.type);
             if (image.classes.size() >= 65536)
                 bad("LIMIT", "Linked class count exceeds 65536");
@@ -218,6 +365,15 @@ struct Linker::Impl {
                 bad("DUPLICATE", "Duplicate class definition: " + image.types[value.type]);
             if (value.superclass != no_index)
                 value.superclass = mapped(map->types, value.superclass);
+            if (value.inner_class_name != no_index) {
+                if (!value.inner_class_present)
+                    bad("CLASS", "Inner class name has no naming annotation");
+                value.inner_class_name = mapped(map->strings, value.inner_class_name);
+            }
+            if (value.enclosing_class != no_index)
+                value.enclosing_class = mapped(map->types, value.enclosing_class);
+            if (value.enclosing_method != no_index)
+                value.enclosing_method = mapped(map->methods, value.enclosing_method);
             const auto translate = [](std::vector<Index> &values, const std::vector<Index> &mapping) {
                 for (auto &index : values)
                     index = mapped(mapping, index);
@@ -304,7 +460,13 @@ struct Linker::Impl {
 Linker::Linker(LinkLimits limits) : impl_(std::make_unique<Impl>(limits)) {}
 Linker::Linker(DexImage &target, LinkLimits limits) : impl_(std::make_unique<Impl>(limits, &target)) {}
 Linker::~Linker() = default;
-void Linker::add(DexImage image, std::string source) { impl_->add(std::move(image), std::move(source)); }
+void Linker::add(DexImage image, std::string source, const ParentClass &parent) {
+    impl_->add(std::move(image), std::move(source), parent);
+}
+Index Linker::intern_provider_method(std::string_view owner, std::string_view name,
+                                   std::string_view descriptor) {
+    return impl_->intern_provider_method(owner, name, descriptor);
+}
 void Linker::validate() { impl_->validate(); }
 DexImage Linker::finish() { return impl_->finish(); }
 } // namespace aether::dex

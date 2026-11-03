@@ -15,7 +15,7 @@ namespace aether::dex {
 class Scheduler final {
   public:
     using TaskId = std::uint64_t;
-    enum class State { runnable, running, sleeping, parked, completed, cancelled, failed };
+    enum class State { runnable, running, sleeping, parked, completed, cancelled, failed, prepared };
     struct Limits {
         std::size_t contexts = 16;
         std::size_t stack_reserve = 1024 * 1024;
@@ -35,9 +35,51 @@ class Scheduler final {
     ~Scheduler();
     Scheduler(const Scheduler &) = delete;
     Scheduler &operator=(const Scheduler &) = delete;
+    struct SwitchHooks {
+        using Callback = void (*)(void *context, TaskId task) noexcept;
+        void *context = nullptr;
+        Callback enter = nullptr, leave = nullptr;
+    };
     TaskId submit(std::function<void()> callback,std::optional<std::int32_t> inherited_priority={});
+    // Trusted host admission only. Both callbacks are required together, and
+    // context is borrowed and must outlive the retained task through release,
+    // including close/cancellation. Callback captures are destroyed before the
+    // terminal leave hook, so they cannot be its sole context owner.
+    // Hooks must not allocate or enter checked Scheduler/runtime/CPU APIs: enter
+    // runs immediately before the actual fiber switch, leave immediately after
+    // root identity restoration. Fallible capsule preparation belongs outside
+    // these allocation-free commit hooks, before each run_one/close admission.
+    // Hooked execution requires a valid slice clock. close() may resume only a
+    // cancelled task to unwind after clock failure; accounting stays explicitly
+    // unavailable, and its checkpoint runs before any guest work resumes.
+    // Empty hooks preserve ordinary tasks; hooks alone enable no native task.
+    TaskId submit(std::function<void()> callback,std::optional<std::int32_t> inherited_priority,SwitchHooks hooks);
+    // Reserve the same bounded task/fiber resources without making work runnable.
+    // Captures and borrowed hooks follow the submit contract. No entry or hook
+    // executes before publish; cancel/release/close may discard prepared work
+    // without entering its fiber or calling either switch hook. Cancelling
+    // prepared work clears its hooks, ending the borrowed-context obligation.
+    TaskId prepare(std::function<void()> callback,std::optional<std::int32_t> inherited_priority={});
+    TaskId prepare(std::function<void()> callback,std::optional<std::int32_t> inherited_priority,SwitchHooks hooks);
+    // Allocation-free trusted same-owner commit, from root or its current task.
+    // False leaves state unchanged for a foreign owner/fiber/token, closed
+    // scheduler, unknown ID or non-prepared task. No process/provider/clock call
+    // occurs here; the eventual task-entry checkpoint still enforces termination.
+    bool publish(TaskId task) noexcept;
+    // Pre-publication rollback from any current owned context. Removes only a
+    // still-prepared task, before destroying captures; no hook or entry runs.
+    // Invalid ownership/identity/state returns false without a mutation.
+    bool discard_prepared(TaskId task) noexcept;
     // External owner main only. Resume at most one ready context; never wait.
     bool run_one();
+    TaskId prepare_targeted(std::function<void()>,std::optional<std::int32_t>,SwitchHooks);
+    // One retained logical-main stack, still included in the context bound.
+    // Targeted only; its CPU time belongs to main rather than a background task.
+    TaskId prepare_main(std::function<void()>,SwitchHooks);
+    bool run_main(TaskId task);
+    bool run_one(TaskId task,std::int32_t priority);
+    void cancel_and_unwind(TaskId task);
+    bool release_terminal(TaskId task) noexcept;
     void yield();
     void sleep_for(std::chrono::milliseconds duration);
     // A coalesced permit is consumed before checking a timed park's deadline.
@@ -50,6 +92,8 @@ class Scheduler final {
     void wake(TaskId task);
     std::optional<std::chrono::steady_clock::time_point> next_deadline() const;
     // Terminal contexts retain status/exception and occupy a slot until release.
+    // A prepared context can also be released directly; its stack never entered.
+    // Started runnable/parked contexts must unwind cancellation before release.
     void release(TaskId task);
     void close();
     // Narrow Android priority bridge: 0 restores the owner's initial Win32
@@ -69,6 +113,7 @@ class Scheduler final {
     std::exception_ptr exception(TaskId task) const;
     std::size_t size() const;
   private:
+    TaskId admit(std::function<void()>,std::optional<std::int32_t>,SwitchHooks,bool prepared,bool target_only=false,bool logical_main=false);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

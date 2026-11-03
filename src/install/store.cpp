@@ -1097,7 +1097,7 @@ struct PackageStore::Impl {
         for (const auto &entry : std::filesystem::directory_iterator(app_path))
             require(entry.path().filename() == package_path(app, path).filename() ||
                         entry.path().filename() == L"data" || entry.path().filename() == L"audit" ||
-                        entry.path().filename() == L"session.lock",
+                        entry.path().filename() == L"session.lock" || entry.path().filename() == L"faults",
                     "AETHER_INSTALL_PATH",
                     "Unexpected app material prevents removal; unrelated files are preserved");
         for (const auto *name : {L"data", L"audit"}) {
@@ -1123,6 +1123,20 @@ struct PackageStore::Impl {
                 data.reset();
                 io(RemoveDirectoryW(data_path.c_str()) != FALSE,
                    "Cannot remove the app's empty data directory");
+            }
+        }
+        const auto faults_path = app_path / L"faults";
+        if (!missing(faults_path)) {
+            auto faults = open_directory(faults_path, false, true);
+            for (const auto &entry : std::filesystem::directory_iterator(faults_path)) {
+                require(entry.path().filename() == L"history.bin", "AETHER_INSTALL_PATH",
+                        "Unknown diagnostic material prevents removal; evidence was preserved");
+                auto file = open_file(entry.path(), FILE_READ_ATTRIBUTES, OPEN_EXISTING, 16 * 1024 * 1024, 0, true);
+            }
+            if (!app.keep_data) {
+                delete_file(faults_path / L"history.bin", 16 * 1024 * 1024, true);
+                faults.reset();
+                io(RemoveDirectoryW(faults_path.c_str()) != FALSE, "Cannot remove the empty diagnostic directory");
             }
         }
         // This profile is derived only from the recorded opaque ID. Windows reports
@@ -1174,6 +1188,7 @@ AppDiagnostics PackageStore::diagnostics(std::string_view id) const {
     report.app = impl_->find(id);
     const auto &app = report.app;
     report.lifecycle = state_name(app.state);
+    report.faults = read_faults(impl_->path, app.id);
     auto add = [&](std::string name, std::string status, std::string code, std::string detail) {
         report.checks.push_back({std::move(name), std::move(status), std::move(code), std::move(detail)});
     };
@@ -1211,6 +1226,7 @@ AppDiagnostics PackageStore::diagnostics(std::string_view id) const {
                       "details.");
         } catch (const std::exception &error) {
             report.observed_signature.reset();
+            report.inspection_faults.push_back(capture_fault(std::current_exception(), "diagnostics-package", app.sha256, app.package_generation));
             const auto *install = dynamic_cast<const InstallError *>(&error);
             const auto *inspect = dynamic_cast<const apk::InspectError *>(&error);
             add("package", "fail",
@@ -1254,6 +1270,7 @@ AppDiagnostics PackageStore::diagnostics(std::string_view id) const {
             const auto *install = dynamic_cast<const InstallError *>(&error);
             add("windowsRegistration", "fail", install ? install->code : "AETHER_DIAGNOSTICS_WINDOWS",
                 "Windows registration could not be inspected; conflicting material is preserved.");
+            report.inspection_faults.push_back(capture_fault(std::current_exception(), "diagnostics-windows-registration", app.sha256, app.package_generation));
         }
     }
     return report;
@@ -1747,7 +1764,7 @@ security::InstalledActivity PackageStore::prepare_launch(std::string_view id) {
             std::move(audio_icon),
             {},
             std::move(notification_aumid),
-            {}};
+            {}, app.sha256, app.package_generation};
 }
 security::InstalledActivity PackageStore::prepare_launch(std::string_view id, const apk::IntentValue &intent,
                                                         const apk::ActivityIntentPolicy &policy,

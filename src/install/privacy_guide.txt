@@ -1,6 +1,6 @@
 # Aether privacy and permissions
 
-This guide describes the current Windows x64 development build and its installed Android-app path, reviewed on 2026-10-29. Aether is experimental: installation eligibility and a successful diagnostic report do not establish that an app works. See the [tested apps and limits](COMPATIBILITY_MATRIX.md) and [release status](ALPHA_READINESS.md).
+This guide describes the current Windows x64 development build and its installed Android-app path, reviewed on 2026-10-30. Aether is experimental: installation eligibility and a successful diagnostic report do not establish that an app works. See the [tested apps and limits](COMPATIBILITY_MATRIX.md) and [release status](ALPHA_READINESS.md).
 
 Read this build's guide offline through **Privacy...** in runtime setup, app settings or diagnostics, or **Permissions**, then **Privacy** in the APK installer. You can also open `aether-shell.exe privacy` or print it with `aether.exe privacy`; `aether.exe privacy --json` includes the source document's checksum. Reading the guide does not install or run an app, change permissions or save a report. The text is embedded when Aether is built, so an older installed build retains its own guide until upgraded. Project-document references below are descriptive text in the native view; it opens no links or browser.
 
@@ -12,13 +12,15 @@ The current installation, launch, settings and report flows run locally and have
 
 Windows accessibility tools can read the supported app window's displayed view names and text, control hierarchy, screen bounds, enabled state and focus through UI Automation. They can request supported clicks and keyboard focus through the same isolated app logic used by input. This does not grant the Android app access to other Windows applications or private host files. Unsupported editing, selection, scrolling and other accessibility operations remain unavailable. This accessibility projection is local; Aether does not upload its contents or add view text to diagnostic reports or the security audit.
 
+Apps can obtain cryptographic random bytes from Windows through Aether's intrinsic random-data service, including the supported guest /dev/urandom descriptor. This opens no Windows file or device and reveals no personal file, clock, network or other app data. It does not grant app-private file access. Unsupported random-device operations remain unavailable.
+
 ## Permissions you can choose
 
 Android permissions declared inside an APK do not grant access to Windows resources. An APK signature identifies the signing certificate when its format is supported; it does not authenticate a publisher name, make an app safe or grant permissions.
 
 | Choice | What it permits in an installed app | Default and effect |
 |---|---|---|
-| Monotonic clock | Elapsed-time queries through Aether's host | Selected by default in the installer and granted by your Install decision. The CLI still requires an explicit grant. The current installed Activity path cannot launch without it. It is not a calendar, location or network permission. |
+| Monotonic clock | Elapsed-time queries through Aether's host | Selected by default in the installer and granted by your Install decision. The CLI still requires an explicit grant. The current installed Activity path cannot launch without it. After one broker authorization for the current session, supported monotonic reads use fresh Windows performance-counter values inside the isolated worker. The audit records that authorization, not each local read. It is not a calendar, location or network permission. |
 | Wall-clock date and time | Current UTC time and conversion using Windows local timezone rules, including the timezone name, through Aether's broker | Denied unless separately granted. Independent of elapsed-time permission; no location, network or calendar-event access. |
 | App-private files | Bounded file operations in this app's own Aether data directory | Denied unless granted. It does not expose Documents, Downloads, another app's data or arbitrary host paths. |
 | Sound playback | Supported sound output through Windows, attributed to this app in Windows volume controls | Denied unless separately selected. Windows remembers the app's volume and mute choices. This does not permit microphone recording or loopback capture; some Android audio APIs remain unsupported. |
@@ -51,6 +53,7 @@ Windows resolves the actual user folders. The usual runtime destination is `%LOC
 | APK, app icon and per-app data | The selected package and app-created files stay in the app's opaque-ID directory. Updates preserve private data and permissions; successful update cleanup removes retired package material. Interrupted cleanup may need explicit repair. |
 | Installation journal (`registry.log`) | Records app identity, package/version/checksums, signing state, permission decisions, lifecycle and Windows registration metadata. Removal adds a history record; it does not erase the journal or compact earlier records. |
 | Per-app security audit (`audit/`) | Records request types, sizes, results, app/session IDs, process IDs, timestamps and hash links. These are operational records, not copies of request payloads or private file contents. |
+| Per-app fault history (`faults/history.bin`) | Host-retained startup/session exceptions, nested causes, fixed-code UI/input/read events, UTC event times, exact admitted package hash/generation and collecting Aether version/configuration. Records are append-only and never automatically pruned. Explicit delete-data removal also deletes this owned history; keep-data retains it. |
 | Windows registrations | Start shortcuts, app-specific uninstall entries and optional Explorer registration identify the installed app and shared launcher. These are ordinary Windows-visible metadata. |
 | Windows Notification Center | Notifications you allow can contain app-provided titles and message text. Windows owns their display and lock-screen visibility. Messages can remain after the app closes; uninstall clears only this app's retained notifications before unregistering it. |
 | Runtime catalogue | Records the installed runtime's payload and enrolled store locations so upgrades and removal can check dependencies. |
@@ -62,14 +65,20 @@ The store uses Windows access controls for the current user and SYSTEM, with gue
 
 ## Reviewing and saving diagnostics
 
-The app's diagnostics dialog inspects installation, package, signing, format admission, permissions and Windows registrations without running the APK or reading private app files. A report includes the app/package IDs, version, lifecycle, package size/hash, signing certificate fingerprints, grants and check results. It excludes host paths, private files, audit records, environment and memory. Identifiers and hashes can link reports to an app or installation; the report is not anonymous.
+The app's diagnostics dialog inspects installation, package, signing, format admission, permissions and Windows registrations without running the APK or reading private app files. Reports also include bounded retained fault history and current inspection errors. Session startup is recorded before guest execution; terminal failures are retained before the failure dialog opens. Closing that dialog does not erase the history. An interrupted session can have a start record without a terminal record; this means its outcome is unknown, not successful.
+
+Fault messages can originate in an Android app or worker and are untrusted diagnostic text. The collector repairs malformed text and performs best-effort profile-name, assigned-credential and URI credential/query redaction. This cannot guarantee that every app-provided secret or technical path is removed. Review messages before sharing a report. No private-file contents, clipboard/drag payloads, environment dump or process memory are collected. Nothing is uploaded.
+
+Fault history is limited to 16 MiB per app without automatic deletion. Capture retains up to 16 KiB per message and 64 KiB of nested message text, with explicit truncation flags. The existing 512-byte worker terminal-message transport still applies and marks omitted text. A bounded background writer drains fixed-code window events before session reporting; capture/queue/write failures are explicit and never treated as successful retention. If the initial history record cannot be saved, the launch is refused instead of proceeding without evidence. Power loss, host termination, exhausted memory or unavailable storage can prevent the final record; no system can guarantee capture of every possible failure.
+
+Default JSON export includes a newest subset within 24 KiB, with total/exported/omitted record counts; each exported fault is limited to 6 KiB and marks shortened text. Full captured records remain in local history. A report's successful static checks do not establish runtime compatibility or erase historical failures. The in-memory current fault remains available in the failure dialog even when disk retention fails. Installation/package/signing metadata and check results remain included as before.
 
 The **Troubleshoot** dialog offers two optional choices, initially unchecked:
 
 - **Windows and Aether build details:** Windows build and native architecture, plus the collecting Aether build's version, configuration and compiler.
 - **Audit session summaries:** selected-app session IDs, source-file hashes, completion state and request/result counts. Raw records, their process IDs and absolute timestamps are excluded. Active apps and unsafe sources produce unavailable findings instead of relaxed access checks.
 
-Collect captures a preview. Save writes that capture to a new JSON file only when its choices still match. Reopening the dialog resets the optional choices. No private file contents, raw logs, host paths, usernames, environment or memory are included in the troubleshooting bundle. Audit hashes do not authenticate who wrote a log, explain a crash or identify the APK version used by a retained session.
+Collect captures a preview. Save writes that capture to a new JSON file only when its choices still match. Reopening the dialog resets the optional choices. No private file contents, raw audit records, environment dump or memory are collected. Retained fault text has the review/redaction limitations described above. Audit hashes do not authenticate who wrote a log, explain a crash or identify the APK version used by a retained session.
 
 The CLI equivalent, `aether.exe troubleshoot --app-id ID`, previews collection scope; optional flags select build details and/or audit summaries. `--yes` explicitly collects them, and `--output PATH` saves that captured report. [Exact commands and bounds](WINDOWS_NATIVE_INTEGRATION.md#current-commands) are documented separately.
 
@@ -77,7 +86,7 @@ Review a captured report before sharing it. Aether does not send it anywhere. Sa
 
 ## Removing an app or Aether
 
-The app's uninstall confirmation offers **keep data** or **delete data**. Both remove that app's package, owned Windows registrations and isolation profile. Keep data retains its private data and audits; it does not provide an implemented restore/reinstall feature. Delete data also removes those owned files after validation. Unknown or changed material can block cleanup and requires explicit resolution. Neither option securely overwrites disk contents, erases installation history or deletes exported reports or the original APK you selected.
+The app's uninstall confirmation offers **keep data** or **delete data**. Both remove that app's package, owned Windows registrations and isolation profile. Keep data retains its private data, audits and fault history; it does not provide an implemented restore/reinstall feature. Delete data also removes those owned files after validation. Unknown or changed material can block cleanup and requires explicit resolution. Neither option securely overwrites disk contents, erases installation history or deletes exported reports or the original APK you selected.
 
 A retained-data record can later be removed with the explicit delete-data command. Removing the shared runtime is blocked while installed apps, pending operations, retained data or unreadable tracked stores remain. Aether does not silently delete all apps to remove itself. See [uninstall and recovery commands](WINDOWS_NATIVE_INTEGRATION.md).
 

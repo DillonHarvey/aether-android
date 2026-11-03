@@ -4,7 +4,7 @@
 namespace aether::bionic {
 class NativeDescriptors;
 class NativeAccess;
-enum class FileMetadataOperation {read_link,read_link_at,descriptor_stat,descriptor_seek,user_id};
+enum class FileMetadataOperation {read_link,read_link_at,descriptor_stat,descriptor_seek,user_id,path_stat,path_lstat,path_stat_at,truncate,read_at,write_at,change_mode,change_owner};
 class NativeFileMetadata {
   public:
     NativeFileMetadata(a64::GuestMemory &,const a64::AppContext &,NativeDescriptors &,NativeAccess &,std::string_view package);

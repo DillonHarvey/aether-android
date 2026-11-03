@@ -6,6 +6,7 @@
 #include "aether/security/activity_session.hpp"
 #include "aether/security/activity_launch.hpp"
 #include "aether/security/worker_progress.hpp"
+#include "aether/security/startup_work.hpp"
 #include "aether/security/apk_session.hpp"
 #include "aether/security/audio_session.hpp"
 #include "aether/security/graphics_session.hpp"
@@ -48,6 +49,36 @@ using namespace aether::security;
 void require(bool value, const char *message) {
     if (!value)
         throw std::runtime_error(message);
+}
+std::string worker_exception_chain(const std::exception &error, unsigned depth = 0) {
+    // Keep collection bounded independently of the unchanged wire quota. The
+    // final compactor marks omitted bytes rather than silently losing a cause.
+    constexpr std::size_t collection_limit = 8192;
+    const auto *text = error.what();
+    std::size_t length = 0;
+    while (length < collection_limit && text[length]) ++length;
+    std::string message(text, length);
+    if (length == collection_limit)
+        message += " [exception text truncated]";
+    const auto *nested = dynamic_cast<const std::nested_exception *>(&error);
+    if (nested && nested->nested_ptr()) {
+        if (depth == 15) {
+            message += "; caused by: [exception chain depth limit]";
+        } else {
+            try {
+                nested->rethrow_nested();
+            } catch (const std::exception &cause) {
+                const auto details = worker_exception_chain(cause, depth + 1);
+                message += "; caused by: ";
+                const auto available = message.size() < collection_limit ? collection_limit - message.size() : 0;
+                message.append(details, 0, available);
+                if (details.size() > available) message += " [exception chain text truncated]";
+            } catch (...) {
+                message += "; caused by: [non-standard exception]";
+            }
+        }
+    }
+    return message;
 }
 struct Client final : a64::GuestServices {
     HANDLE reader, writer;
@@ -234,11 +265,11 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
             path = utf16(read_text(boot.payload, offset, 2048));
         require(offset == boot.payload.size(), "Trailing APK boot configuration");
     } else if (scenario == 20) {
-        require(path_size == 0 && (boot.payload.size() == 64 || boot.payload.size() == 72) &&
+        require(path_size == 0 && (boot.payload.size() == 64 || boot.payload.size() == 72 || boot.payload.size() == 104) &&
                     (boot.payload.size() == 64 || read_u64(boot.payload, 64) <= 1),
                 "Invalid installed package mapping fields");
     } else if (scenario == installed_intent_scenario) {
-        require(path_size == 0 && boot.payload.size() == 80 && read_u64(boot.payload, 64) <= 1 &&
+        require(path_size == 0 && (boot.payload.size() == 80 || boot.payload.size() == 112) && read_u64(boot.payload, 64) <= 1 &&
                     read_u64(boot.payload, 72) && read_u64(boot.payload, 72) <= activity_launch_limit,
                 "Invalid resolved installed package mapping fields");
     } else if (scenario == 28) {
@@ -343,6 +374,13 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
     if (scenario == 20 || scenario == installed_intent_scenario) {
         require(lpac && path_size == 0 && (app_id & (std::uint64_t{1} << 63)) && allowed == 1,
                 "Invalid installed Activity startup policy");
+        std::optional<StartupWorkPolicy> startup_work;
+        if(boot.payload.size()==104 || boot.payload.size()==112){
+            const auto offset=boot.payload.size()-32;
+            startup_work=StartupWorkPolicy{read_u64(boot.payload,offset),read_u64(boot.payload,offset+8),
+                read_u64(boot.payload,offset+16),read_u64(boot.payload,offset+24)};
+            require(valid_startup_work_policy(*startup_work),"Invalid installed startup resource admission");
+        }
         WorkerProgressWriter progress(reinterpret_cast<HANDLE>(read_u64(boot.payload, 56)));
         ScopedWorkerFaultCapture faults(progress);
         progress.stage(100, "installed_package_map");
@@ -378,7 +416,7 @@ int run(HANDLE reader, HANDLE writer, bool lpac, std::uint64_t &session) {
         return run_activity_worker(reader, writer, session, app_id, false, true,
                             {static_cast<const std::uint8_t *>(view.get()), static_cast<std::size_t>(size)}, &progress,
                             boot.payload.size() >= 72 && read_u64(boot.payload, 64) != 0,
-                            launch ? &*launch : nullptr);
+                            launch ? &*launch : nullptr,startup_work?&*startup_work:nullptr);
     }
     if (scenario == 10) {
         BrokerClient client(reader, writer, session);
@@ -530,7 +568,7 @@ int wmain(int argc, wchar_t **argv) {
     } catch (const std::exception &error) {
         if (writer && session) {
             try {
-                const auto message = bounded_worker_error(error.what());
+                const auto message = bounded_worker_error(worker_exception_chain(error));
                 write_pipe_frame(writer.get(), {{Operation::finished, 0, session,
                                                  static_cast<std::uint32_t>(message.size()), Status::invalid},
                                                 {message.begin(), message.end()}});
@@ -539,6 +577,16 @@ int wmain(int argc, wchar_t **argv) {
             }
         }
         std::cerr << "AETHER_WORKER_REFUSED: " << error.what() << '\n';
+        return 1;
+    } catch (...) {
+        if (writer && session) {
+            try {
+                constexpr std::string_view message = "AETHER_WORKER_REFUSED: non-standard exception";
+                write_pipe_frame(writer.get(), {{Operation::finished, 0, session,
+                                                 static_cast<std::uint32_t>(message.size()), Status::invalid},
+                                                {message.begin(), message.end()}});
+            } catch (...) { /* Never replace the original terminal outcome. */ }
+        }
         return 1;
     }
 }

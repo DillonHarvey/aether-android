@@ -1,4 +1,5 @@
 #include "aether/security/worker_progress.hpp"
+#include "aether/a64/guest_cpu.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -180,6 +181,69 @@ void WorkerProgressWriter::stage(std::uint32_t numeric,std::string_view label) n
     refresh_native_stack();
     write(2,numeric,0,0,0,{},{},label);
 }
+void WorkerProgressWriter::native_initialization(std::uint32_t stage_value,std::string_view module,std::uint64_t entry) noexcept {
+    if(stage_value<1 || stage_value>6 || !entry || entry%4)return;
+    if(initialization_context_valid_){
+        if(module.empty() || module.size()>=initialization_stack_[0].module.size() ||
+           !printable(std::span<const char>{module.data(),module.size()})){
+            initialization_context_valid_=false;initialization_depth_=0;
+        }else if(stage_value&1U){
+            if(initialization_depth_==initialization_stack_.size()){
+                initialization_context_valid_=false;initialization_depth_=0;
+            }else{
+                auto &frame=initialization_stack_[initialization_depth_++];
+                frame={};frame.stage=stage_value;frame.entry=entry;
+                frame.module_size=static_cast<std::uint32_t>(module.size());
+                std::copy(module.begin(),module.end(),frame.module.begin());
+            }
+        }else if(!initialization_depth_){
+            initialization_context_valid_=false;
+        }else{
+            const auto &frame=initialization_stack_[initialization_depth_-1];
+            if(frame.stage+1!=stage_value || frame.entry!=entry || frame.module_size!=module.size() ||
+               !std::equal(module.begin(),module.end(),frame.module.begin())){
+                initialization_context_valid_=false;initialization_depth_=0;
+            }else --initialization_depth_;
+        }
+    }
+    // Kind4 extends the version2 record vocabulary without changing layout.
+    // Older readers ignore unknown kinds; no record authorizes guest work.
+    write(4,stage_value,0,0,entry,module,{},{});
+}
+void WorkerProgressWriter::native_work(std::uint32_t stage_value,std::uint64_t actual_work,
+                                      const a64::Metrics *cpu,bool retained_context) noexcept {
+    if(stage_value!=1 && stage_value!=2)return;
+    if(!retained_context){initialization_depth_=0;initialization_context_valid_=true;}
+    if(!view_ || !valid_header(static_cast<Layout *>(view_)->header) ||
+       sequence_>=static_cast<std::uint64_t>(std::numeric_limits<LONG64>::max())/2)return;
+    std::array<std::uint64_t,10> values{};
+    std::uint32_t flags=0;
+    if(cpu){
+        flags|=1;
+        values[0]=cpu->guest_ticks;values[1]=cpu->compiled_blocks;values[2]=cpu->compile_nanoseconds;
+        values[3]=cpu->execution_nanoseconds;values[4]=cpu->cache_invalidations;values[5]=cpu->last_compiled_pc;
+    }
+    ULONGLONG awake=0;QueryUnbiasedInterruptTimePrecise(&awake);
+    FILETIME created{},exited{},kernel{},user{};
+    if(awake && GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user)){
+        flags|=2;values[6]=(std::uint64_t{user.dwHighDateTime}<<32)|user.dwLowDateTime;
+        values[7]=(std::uint64_t{kernel.dwHighDateTime}<<32)|kernel.dwLowDateTime;values[8]=awake;
+    }
+    const InitializationFrame *active=nullptr;
+    if(retained_context && initialization_context_valid_ && initialization_depth_){
+        active=&initialization_stack_[initialization_depth_-1];flags|=4;values[9]=active->entry;
+    }
+    const auto sequence=++sequence_;auto &record=static_cast<Layout *>(view_)->records[(sequence-1)%record_count];
+    const auto committed=static_cast<LONG64>(sequence*2);
+    InterlockedExchange64(&record.commit,committed-1);MemoryBarrier();
+    record.stage=stage_value;record.method=flags;record.pc=0;record.instructions=actual_work;
+    record.owner_length=static_cast<std::uint32_t>(sizeof(values));
+    std::memcpy(record.owner.data(),values.data(),sizeof(values));
+    record.name.fill(0);record.name_length=active?copy_label(
+        {active->module.data(),active->module_size},record.name):0;
+    record.label.fill(0);record.label_length=0;record.kind=5;record.reserved=0;
+    MemoryBarrier();InterlockedExchange64(&record.commit,committed);
+}
 std::string WorkerProgress::summary_after_exit() const {
     if(!view_ || !valid_header(static_cast<const Layout *>(view_)->header))return {};
     struct Snapshot {std::uint64_t sequence;Record record;};
@@ -188,25 +252,64 @@ std::string WorkerProgress::summary_after_exit() const {
     for(std::size_t slot=0;slot<record_count;++slot) {
         Record record{};std::memcpy(&record,&layout.records[slot],sizeof(record));
         if(record.commit<=0 || (record.commit&1) || record.reserved ||
-           (record.kind!=1 && record.kind!=2 && record.kind!=3))continue;
+           (record.kind!=1 && record.kind!=2 && record.kind!=3 && record.kind!=4 && record.kind!=5))continue;
         const auto sequence=static_cast<std::uint64_t>(record.commit)/2;
         if((sequence-1)%record_count!=slot || record.owner_length>record.owner.size() || record.name_length>record.name.size() || record.label_length>record.label.size())continue;
         if(record.kind==1 && (record.stage>static_cast<std::uint32_t>(dex::RuntimeProgressStage::native_exit) || record.label_length))continue;
         if(record.kind==2 && (record.owner_length || record.name_length || record.method || record.pc || record.instructions))continue;
         if(record.kind==3 && (record.stage<1 || record.stage>static_cast<std::uint32_t>(dex::RuntimeAllocationPhase::dex_code_storage_publish) || record.label_length))continue;
-        if(!printable(std::span(record.owner).first(record.owner_length)) || !printable(std::span(record.name).first(record.name_length)) || !printable(std::span(record.label).first(record.label_length)))continue;
+        if(record.kind==4 && (record.stage<1 || record.stage>6 || record.method || record.pc ||
+            !record.instructions || record.instructions%4 || !record.owner_length || record.name_length || record.label_length))continue;
+        if(record.kind==5){
+            if((record.stage!=1 && record.stage!=2) || (record.method&~7U) || record.pc ||
+               record.owner_length!=80 || record.label_length)continue;
+            std::array<std::uint64_t,10> values{};std::memcpy(values.data(),record.owner.data(),sizeof(values));
+            if(!(record.method&1U) && std::any_of(values.begin(),values.begin()+6,[](auto value){return value!=0;}))continue;
+            if((record.method&2U)?!values[8]:std::any_of(values.begin()+6,values.begin()+9,[](auto value){return value!=0;}))continue;
+            if(record.method&4U){if(!values[9] || values[9]%4 || !record.name_length)continue;}
+            else if(values[9] || record.name_length)continue;
+        }
+        if((record.kind!=5 && !printable(std::span(record.owner).first(record.owner_length))) || !printable(std::span(record.name).first(record.name_length)) || !printable(std::span(record.label).first(record.label_length)))continue;
         records[count++]={sequence,record};
     }
     std::sort(records.begin(),records.begin()+count,[](const auto &left,const auto &right){return left.sequence<right.sequence;});
     std::string output;output.reserve(mapping_bytes);
     for(std::size_t n=0;n<count;++n) {
-        const auto &record=records[n].record;std::array<char,384> line{};std::size_t used=0;
+        const auto &record=records[n].record;std::array<char,768> line{};std::size_t used=0;
         auto text=[&](std::string_view value){const auto size=std::min(value.size(),line.size()-used);std::memcpy(line.data()+used,value.data(),size);used+=size;};
         auto number=[&](std::uint64_t value){const auto result=std::to_chars(line.data()+used,line.data()+line.size(),value);if(result.ec==std::errc{})used=static_cast<std::size_t>(result.ptr-line.data());};
-        text("#");number(records[n].sequence);text(record.kind==3?" allocation_label phase=":" stage=");number(record.stage);
-        if(record.kind==2){text(" ");text({record.label.data(),record.label_length});}
+        text("#");number(records[n].sequence);text(record.kind==3?" allocation_label phase=":record.kind==4?" native_initialization stage=":record.kind==5?" native_work stage=":" stage=");number(record.stage);
+        if(record.kind==5){
+            std::array<std::uint64_t,10> values{};std::memcpy(values.data(),record.owner.data(),sizeof(values));
+            text(record.stage==1?" before_resume":" after_resume");text(" actual_work=");number(record.instructions);
+            text(" flags=");number(record.method);
+            constexpr std::array<std::string_view,10> names{" native_ticks="," blocks="," compile_ns="," run_wall_ns=",
+                " cache_clears="," last_compiled_pc=0x"," user_100ns="," kernel_100ns="," awake_100ns="," active_init_entry=0x"};
+            for(std::size_t i=0;i<values.size();++i){
+                text(names[i]);
+                if(i==5 || i==9){const auto encoded=std::to_chars(line.data()+used,line.data()+line.size(),values[i],16);
+                    if(encoded.ec==std::errc{})used=static_cast<std::size_t>(encoded.ptr-line.data());}
+                else number(values[i]);
+            }
+            if(record.method&4U){text(" module_prefix=");text({record.name.data(),record.name_length});}
+        }
+        else if(record.kind==4){
+            constexpr std::array<std::string_view,6> stages{"initializer_begin","initializer_end","finalizer_begin","finalizer_end","JNI_OnLoad_begin","JNI_OnLoad_end"};
+            text(" ");text(stages[record.stage-1]);text(" module_prefix=");text({record.owner.data(),record.owner_length});text(" entry=0x");
+            const auto encoded=std::to_chars(line.data()+used,line.data()+line.size(),record.instructions,16);
+            if(encoded.ec==std::errc{})used=static_cast<std::size_t>(encoded.ptr-line.data());
+        }
+        else if(record.kind==2){text(" ");text({record.label.data(),record.label_length});}
         else {text(" method=");number(record.method);text(" pc=");number(record.pc);text(" instructions=");number(record.instructions);text(" ");text({record.owner.data(),record.owner_length});text(".");text({record.name.data(),record.name_length});}
-        text("\n");if(used>mapping_bytes-output.size())break;output.append(line.data(),used);
+        text("\n");
+        // Larger numeric snapshots must not displace the newest evidence with
+        // older ring entries. Keep a whole-line suffix inside the same bound.
+        while(used>mapping_bytes-output.size()){
+            const auto newline=output.find('\n');
+            if(newline==std::string::npos){output.clear();break;}
+            output.erase(0,newline+1);
+        }
+        output.append(line.data(),used);
     }
     NativeFault fault{};std::memcpy(&fault,&layout.fault,sizeof(fault));
     if(fault.commit==2 && fault.code==EXCEPTION_STACK_OVERFLOW && fault.thread && fault.rip && fault.rsp &&

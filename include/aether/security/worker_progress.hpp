@@ -1,9 +1,11 @@
 #pragma once
 #include "aether/dex/runtime.hpp"
 #include "aether/host/windows/unique_handle.hpp"
+#include <array>
 #include <string>
 #include <string_view>
 
+namespace aether::a64 { struct Metrics; }
 namespace aether::security {
 // Diagnostic-only anonymous section. The caller must prove worker termination
 // before reading; records never authorize work or extend a deadline.
@@ -31,6 +33,14 @@ class WorkerProgressWriter final:public dex::RuntimeProgressSink {
     void report(const dex::RuntimeProgress &) noexcept override;
     void allocation_failure(const dex::RuntimeAllocationFailure &) noexcept override;
     void stage(std::uint32_t numeric,std::string_view label) noexcept;
+    // Fixed diagnostic ring only. entry is an actual validated guest function
+    // address, never a sampled PC or a managed instruction count. Stages1..6
+    // mirror ELF initializer/finalizer and JNI_OnLoad begin/normal-end events.
+    void native_initialization(std::uint32_t stage,std::string_view module,std::uint64_t entry) noexcept;
+    // One fixed snapshot before/after a retained-main resume. CPU is borrowed
+    // only for this call; false retained_context proves terminal stack unwind.
+    void native_work(std::uint32_t stage,std::uint64_t actual_work,const a64::Metrics *cpu,
+                     bool retained_context) noexcept;
     bool prepare_native_stack() noexcept override;
   private:
     friend class ScopedWorkerFaultCapture;
@@ -39,6 +49,14 @@ class WorkerProgressWriter final:public dex::RuntimeProgressSink {
     std::uint64_t sequence_=0;
     DWORD fault_owner_=0;
     std::uint64_t image_base_=0,cached_stack_base_=0,cached_allocation_base_=0;
+    struct InitializationFrame {
+        std::uint32_t stage=0,module_size=0;
+        std::uint64_t entry=0;
+        std::array<char,128> module{};
+    };
+    std::array<InitializationFrame,32> initialization_stack_{};
+    std::size_t initialization_depth_=0;
+    bool initialization_context_valid_=true;
     void refresh_native_stack() noexcept;
     void capture_native_fault(EXCEPTION_POINTERS *) noexcept;
     void write(std::uint32_t kind,std::uint32_t stage,std::uint32_t method,std::uint32_t pc,

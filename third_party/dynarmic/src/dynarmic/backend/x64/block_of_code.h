@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include <mcl/bit/bit_field.hpp>
 #include <mcl/stdint.hpp>
@@ -47,9 +48,16 @@ public:
     void EnableWriting();
     /// Change permissions to RX. This is required to support systems with W^X enforced.
     void DisableWriting();
+    // Actual writes, including old constants/patch locations, must prepare the
+    // complete range before the first store. No guessed emission-size bound.
+    void PrepareCodeWrite(const void* address, size_t size);
+    bool IsWritingEnabled() const noexcept;
 
     /// Clears this block of code and resets code pointer to beginning.
     void ClearCache();
+    /// Quiescent only: retain the sealed prelude and reservation, and decommit
+    /// whole Windows tail pages. A decommit error leaves committed_size intact.
+    void TrimCache();
     /// Calculates how much space is remaining to use.
     size_t SpaceRemaining() const;
     /// Ensure at least codesize bytes of code cache memory are committed at the current code_ptr.
@@ -187,6 +195,16 @@ private:
 
 #ifdef _WIN32
     size_t committed_size = 0;
+#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+    // Construct before ConstantPool: its initial commit/zero stores are writes.
+    const size_t protection_page_size;
+    std::vector<u64> writable_pages;
+    std::vector<size_t> dirty_pages;
+    size_t dirty_count = 0;
+    bool writing_enabled = true;
+    void CommitCodeExtent(size_t required_size);
+    void MarkWritablePages(size_t first, size_t last);
+#    endif
 #endif
 
     ConstantPool constant_pool;

@@ -272,6 +272,53 @@ struct HostFileService::Impl {
             static_cast<std::uint64_t>(standard.EndOfFile.QuadPart)>maximum_file))return {-1,FileError::denied};
         return {0,FileError::none};
     }
+    FileResult inspect_data_file(const File &file, HANDLE handle, BY_HANDLE_FILE_INFORMATION &identity,
+                                 FILE_STANDARD_INFO &standard) noexcept {
+        if (GetFileType(handle) != FILE_TYPE_DISK) return {-1, FileError::denied};
+        if (!GetFileInformationByHandle(handle, &identity) ||
+            !GetFileInformationByHandleEx(handle, FileStandardInfo, &standard, sizeof(standard)))
+            return {-1, error(GetLastError())};
+        const auto links = file.unlinked ? 0U : 1U;
+        const auto index = (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32) | identity.nFileIndexLow;
+        if ((identity.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+            standard.Directory || identity.nNumberOfLinks != links || standard.NumberOfLinks != links ||
+            standard.EndOfFile.QuadPart < 0 || standard.AllocationSize.QuadPart < 0 ||
+            static_cast<std::uint64_t>(standard.EndOfFile.QuadPart) > maximum_file ||
+            !file.index || index != file.index)
+            return {-1, FileError::denied};
+        return {0, FileError::none};
+    }
+    FileResult independent_data_handle(const File &file, bool writing, HANDLE &output) noexcept {
+        BY_HANDLE_FILE_INFORMATION original{};
+        FILE_STANDARD_INFO original_standard{};
+        const auto checked = inspect_data_file(file, file.handle, original, original_standard);
+        if (checked.error != FileError::none) return checked;
+        FILE_ID_DESCRIPTOR id{};
+        id.dwSize = sizeof(id); id.Type = FileIdType;
+        id.FileId.QuadPart = std::bit_cast<LONGLONG>(file.index);
+        // Open the already-held actual object by its broker-private identity,
+        // never by a stale pathname or a caller-supplied native file index.
+        const auto handle = OpenFileById(root, &id,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE | (writing ? FILE_WRITE_DATA : FILE_READ_DATA),
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, FILE_FLAG_OPEN_REPARSE_POINT);
+        if (handle == INVALID_HANDLE_VALUE) {
+            const auto failure = GetLastError();
+            if (failure == ERROR_INVALID_FUNCTION || failure == ERROR_INVALID_PARAMETER ||
+                failure == ERROR_NOT_SUPPORTED || failure == ERROR_CALL_NOT_IMPLEMENTED)
+                return {-1, FileError::unsupported};
+            return {-1, error(failure)};
+        }
+        struct Close { HANDLE value; ~Close() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); } } close{handle};
+        BY_HANDLE_FILE_INFORMATION actual{};
+        FILE_STANDARD_INFO actual_standard{};
+        const auto verified = inspect_data_file(file, handle, actual, actual_standard);
+        if (verified.error != FileError::none) return verified;
+        if (actual.dwVolumeSerialNumber != original.dwVolumeSerialNumber)
+            return {-1, FileError::denied};
+        output = handle;
+        close.value = INVALID_HANDLE_VALUE;
+        return {0, FileError::none};
+    }
     FileResult snapshot_directory(HANDLE handle,std::size_t parent,NamespaceSnapshot &snapshot) {
         alignas(FILE_ID_BOTH_DIR_INFO) std::array<std::uint8_t,4096> buffer{};bool restart=true;
         for(;;){
@@ -592,6 +639,75 @@ FileResult HostFileService::write(int descriptor, std::span<const std::uint8_t> 
         return {-1, error(GetLastError())};
     return {count, FileError::none};
 }
+FileResult HostFileService::truncate(int descriptor, std::uint64_t size) noexcept {
+    const auto file = impl_->find(descriptor);
+    if (file && file->directory) return {-1, FileError::is_directory};
+    if (!file || !file->write) return {-1, FileError::bad_descriptor};
+    if (size > maximum_file) return {-1, FileError::quota};
+    BY_HANDLE_FILE_INFORMATION identity{};
+    FILE_STANDARD_INFO standard{};
+    const auto checked = impl_->inspect_data_file(*file, file->handle, identity, standard);
+    if (checked.error != FileError::none) return checked;
+    FILE_END_OF_FILE_INFO end{};
+    end.EndOfFile.QuadPart = static_cast<LONGLONG>(size);
+    // The explicit EOF information class changes length without moving the
+    // shared descriptor cursor, including a cursor beyond the new end.
+    // Normal NTFS reads beyond valid data length return zero; no privileged
+    // valid-data override or synthetic guest read contents are used here.
+    if (!SetFileInformationByHandle(file->handle, FileEndOfFileInfo, &end, sizeof(end)))
+        return {-1, error(GetLastError())};
+    return {0, FileError::none};
+}
+FileResult HostFileService::read_at(int descriptor, std::uint64_t offset, std::span<std::uint8_t> output) noexcept {
+    try {
+        const auto file = impl_->find(descriptor);
+        if (file && file->directory) return {-1, FileError::is_directory};
+        if (!file || !file->read) return {-1, FileError::bad_descriptor};
+        if (output.size() > maximum_file) return {-1, FileError::invalid};
+        if (offset > maximum_file) return {-1, FileError::quota};
+        if (output.empty()) {
+            BY_HANDLE_FILE_INFORMATION identity{}; FILE_STANDARD_INFO standard{};
+            return impl_->inspect_data_file(*file, file->handle, identity, standard);
+        }
+        // Allocate before any I/O. An unsuccessful native read must not expose
+        // partially changed output to the caller.
+        std::vector<std::uint8_t> bytes(output.size());
+        HANDLE handle = INVALID_HANDLE_VALUE;
+        const auto opened = impl_->independent_data_handle(*file, false, handle);
+        if (opened.error != FileError::none) return opened;
+        struct Close { HANDLE value; ~Close() { CloseHandle(value); } } close{handle};
+        LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) return {-1, error(GetLastError())};
+        DWORD count = 0;
+        if (!ReadFile(handle, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr))
+            return {-1, error(GetLastError())};
+        if (count > bytes.size()) return {-1, FileError::io};
+        std::copy_n(bytes.begin(), count, output.begin());
+        return {count, FileError::none};
+    } catch (...) { return {-1, FileError::io}; }
+}
+FileResult HostFileService::write_at(int descriptor, std::uint64_t offset, std::span<const std::uint8_t> input) noexcept {
+    const auto file = impl_->find(descriptor);
+    if (file && file->directory) return {-1, FileError::is_directory};
+    if (!file || !file->write) return {-1, FileError::bad_descriptor};
+    if (offset > maximum_file || input.size() > maximum_file - offset) return {-1, FileError::quota};
+    if (input.empty()) {
+        BY_HANDLE_FILE_INFORMATION identity{}; FILE_STANDARD_INFO standard{};
+        return impl_->inspect_data_file(*file, file->handle, identity, standard);
+    }
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    const auto opened = impl_->independent_data_handle(*file, true, handle);
+    if (opened.error != FileError::none) return opened;
+    struct Close { HANDLE value; ~Close() { CloseHandle(value); } } close{handle};
+    LARGE_INTEGER position{}; position.QuadPart = static_cast<LONGLONG>(offset);
+    if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN)) return {-1, error(GetLastError())};
+    DWORD count = 0;
+    // Exactly one actual write. A short successful count is never replayed or
+    // converted into a failure that conceals committed bytes.
+    if (!WriteFile(handle, input.data(), static_cast<DWORD>(input.size()), &count, nullptr))
+        return {-1, error(GetLastError())};
+    return {count, FileError::none};
+}
 FileResult HostFileService::metadata(int descriptor, FileMetadata &output) noexcept {
     const auto file = impl_->find(descriptor);
     if (!file) return {-1, FileError::bad_descriptor};
@@ -634,6 +750,74 @@ FileResult HostFileService::metadata(int descriptor, FileMetadata &output) noexc
     value.identity = static_cast<std::uint64_t>(identified.value);
     output = value;
     return {0, FileError::none};
+}
+FileResult HostFileService::metadata_path(const FilePathRef &path, FilePathMetadata &output) noexcept {
+    try {
+        if (path.directory < -1) return {-1, FileError::bad_descriptor};
+        Impl::Resolved resolved;
+        const auto walked = impl_->resolve(path.scope, path.name, path.directory, resolved);
+        if (walked.error != FileError::none) return walked;
+        // An empty final component observes the already-held logical root or
+        // directory. Only a real leaf needs a transient attribute-only handle.
+        HANDLE handle = resolved.base;
+        struct Close {
+            HANDLE value = INVALID_HANDLE_VALUE;
+            ~Close() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+        } close;
+        if (!resolved.leaf.empty()) {
+            const auto status = Impl::relative_open(resolved.base, resolved.leaf,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE, 1u, 0, handle);
+            if (status < 0) return {-1, error(RtlNtStatusToDosError(status))};
+            close.value = handle;
+        }
+        BY_HANDLE_FILE_INFORMATION identity{};
+        FILE_STANDARD_INFO standard{};
+        const auto checked = impl_->inspect_object(handle, identity, standard);
+        if (checked.error != FileError::none) return checked;
+        const bool directory = standard.Directory != FALSE;
+        if (path.directory_required && !directory) return {-1, FileError::not_directory};
+        FILE_BASIC_INFO basic{};
+        if (!GetFileInformationByHandleEx(handle, FileBasicInfo, &basic, sizeof(basic)))
+            return {-1, error(GetLastError())};
+        if ((basic.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+            ((basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) != directory)
+            return {-1, FileError::denied};
+        if (standard.EndOfFile.QuadPart < 0 || standard.AllocationSize.QuadPart < 0)
+            return {-1, FileError::io};
+        FilePathMetadata value;
+        value.directory = directory;
+        auto &file = value.file;
+        file.size = static_cast<std::uint64_t>(standard.EndOfFile.QuadPart);
+        file.allocated_bytes = static_cast<std::uint64_t>(standard.AllocationSize.QuadPart);
+        file.links = standard.NumberOfLinks;
+        file.readonly = (basic.FileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
+        const auto convert = [](LARGE_INTEGER ticks, std::int64_t &seconds, std::uint32_t &nanoseconds) {
+            if (ticks.QuadPart < 0) return false;
+            constexpr std::int64_t epoch = 116444736000000000, frequency = 10'000'000;
+            const auto delta = ticks.QuadPart - epoch;
+            seconds = delta / frequency;
+            auto fraction = delta % frequency;
+            if (fraction < 0) { --seconds; fraction += frequency; }
+            nanoseconds = static_cast<std::uint32_t>(fraction * 100);
+            return true;
+        };
+        if (!convert(basic.LastAccessTime, file.access_seconds, file.access_nanoseconds) ||
+            !convert(basic.LastWriteTime, file.modified_seconds, file.modified_nanoseconds) ||
+            !convert(basic.ChangeTime, file.changed_seconds, file.changed_nanoseconds))
+            return {-1, FileError::io};
+        const auto index = (static_cast<std::uint64_t>(identity.nFileIndexHigh) << 32) | identity.nFileIndexLow;
+        if (!index) return {-1, FileError::denied};
+        const auto identified = impl_->opaque_identity(index);
+        if (identified.error != FileError::none) return identified;
+        file.identity = static_cast<std::uint64_t>(identified.value);
+        if (!valid_file_path_metadata(value)) return {-1, FileError::io};
+        if (close.value != INVALID_HANDLE_VALUE) {
+            close.value = INVALID_HANDLE_VALUE;
+            if (!CloseHandle(handle)) return {-1, error(GetLastError())};
+        }
+        output = value;
+        return {0, FileError::none};
+    } catch (...) { return {-1, FileError::io}; }
 }
 FileResult HostFileService::remove(FileAccessScope scope,std::string_view name,FileRemoveMode mode,bool directory_required) noexcept {
     if(!valid_file_remove(scope,name,mode))return {-1,FileError::denied};

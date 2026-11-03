@@ -41,7 +41,7 @@ std::wstring safe_report_text(std::string_view content) {
         if (result.size() >= 30000) {
             if (result.back() >= 0xd800 && result.back() <= 0xdbff)
                 result.pop_back();
-            result += L"\r\n[Display truncated. Save report for the complete findings.]";
+            result += L"\r\n[Display truncated. Save report for exported findings; full retained records remain local.]";
             break;
         }
     }
@@ -138,6 +138,8 @@ struct TroubleshootingDialog {
     std::future<Observation> &parent_read;
     bool &parent_collecting;
     std::optional<AppSessionFailure> session_failure;
+    std::optional<DiagnosticFault> current_fault;
+    std::string retention_error;
     TroubleshootingOptions choices;
     std::optional<TroubleshootingReport> shown;
     std::future<CollectionResult> collection;
@@ -161,7 +163,7 @@ struct TroubleshootingDialog {
         parent_collecting = true;
         try {
             collection = std::async(std::launch::async, [path = root, identity = id, options = choices,
-                                                         failure = session_failure,
+                                                         failure = session_failure, fault = current_fault, retention = retention_error,
                                                          prior = std::move(parent_read)]() mutable {
                 try {
                     if (prior.valid())
@@ -169,6 +171,8 @@ struct TroubleshootingDialog {
                     PackageStore store(path);
                     auto report = collect_troubleshooting(store, identity, options);
                     report.diagnostics.session_failure = failure;
+                    report.diagnostics.current_fault = fault;
+                    report.diagnostics.fault_retention_error = retention;
                     return CollectionResult{std::move(report), {}};
                 } catch (const std::exception &error) {
                     return CollectionResult{{}, error_code(error)};
@@ -316,6 +320,8 @@ struct AppDialog {
     std::filesystem::path root;
     std::string id;
     std::optional<AppSessionFailure> session_failure;
+    std::optional<DiagnosticFault> current_fault;
+    std::string retention_error;
     bool settings = false, editing = false, fresh = false, choosing = false, closed = false,
          collecting_bundle = false;
     std::uint32_t draft = 0;
@@ -385,7 +391,7 @@ struct AppDialog {
         else if (settings && editing)
             status = L"Your permission choices stay selected. Apply permissions saves them once.";
         else
-            status = L"App status updates automatically. Reports exclude private files, logs and host paths.";
+            status = L"App status updates automatically. Reports include retained diagnostic messages; review before sharing.";
         text(window, IDC_APP_READ_STATUS, status);
         text(window, IDC_APP_ACTION_STATUS, action);
         EnableWindow(GetDlgItem(window, IDC_APP_SAVE), !busy && fresh && shown.has_value());
@@ -431,6 +437,8 @@ struct AppDialog {
             if (result.report) {
                 shown = std::move(result.report);
                 shown->session_failure = session_failure;
+                shown->current_fault = current_fault;
+                shown->fault_retention_error = retention_error;
                 if (!editing)
                     adopt(window);
             }
@@ -531,7 +539,7 @@ struct AppDialog {
         choosing = true;
         render(window);
         try {
-            TroubleshootingDialog dialog{root, id, read, collecting_bundle, session_failure};
+            TroubleshootingDialog dialog{root, id, read, collecting_bundle, session_failure, current_fault, retention_error};
             bundles_exported += dialog.show(window);
         } catch (...) {
             choosing = false;
@@ -650,7 +658,8 @@ struct AppDialog {
 } // namespace
 
 int show_app_dialog(const std::filesystem::path &root, const std::string &id, bool settings, bool json,
-                    std::optional<AppSessionFailure> session_failure) {
+                    std::optional<AppSessionFailure> session_failure,
+                    std::optional<DiagnosticFault> current_fault, std::string retention_error) {
     const auto initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     if (FAILED(initialized))
         throw InstallError("AETHER_SHELL_DIALOG", "Cannot initialize native app controls");
@@ -661,6 +670,8 @@ int show_app_dialog(const std::filesystem::path &root, const std::string &id, bo
     state.root = root;
     state.id = id;
     state.session_failure = session_failure;
+    state.current_fault = std::move(current_fault);
+    state.retention_error = std::move(retention_error);
     if (session_failure)
         state.action = L"Session failure review. Save report writes only after you choose a new destination.";
     state.settings = settings;

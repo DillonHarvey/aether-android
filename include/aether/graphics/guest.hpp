@@ -4,6 +4,7 @@
 namespace aether::host {
 class HostSurface;
 }
+namespace aether::android { class NativeWindows; }
 namespace aether::graphics {
 class GraphicsChannel;
 struct SharedWindowGrant;
@@ -60,10 +61,19 @@ class GuestGraphicsServices final : public a64::GuestServices, public elf::Impor
     std::uint64_t attach_window(std::unique_ptr<host::HostSurface> surface);
     void detach_window(std::uint64_t token);
     void bind_shared_window(const SharedWindowGrant &grant);
+    // Installed worker only: bind the same authenticated Java/NDK producer
+    // registry before the first graphics call. Direct developer paths omit it.
+    void set_native_windows(std::shared_ptr<android::NativeWindows>);
+    // Before a trusted UI re-admission, retire a deleted current window through
+    // the real channel so worker and renderer lifetime ledgers stay identical.
+    void prepare_native_surface_admission();
     void shutdown();
 
   private:
     struct Impl;
+    struct NativeWindowBindings;
+    // Keep producer pins until Impl has drained its renderer on destruction.
+    std::unique_ptr<NativeWindowBindings> native_windows_;
     std::unique_ptr<Impl> impl_;
 };
 } // namespace aether::graphics

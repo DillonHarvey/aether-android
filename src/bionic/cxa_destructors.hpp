@@ -15,6 +15,7 @@ class NativeCxaDestructors {
     a64::Fault register_callback(std::array<std::uint64_t,31> &) noexcept;
     a64::Fault finalize(a64::ServiceState &,bool full_frame) noexcept;
     std::string_view rejection()const noexcept{return rejection_;}
+    bool switch_safe() const noexcept { return depth_==0; }
   private:
     struct Record {a64::Address function,argument,dso;};
     a64::GuestMemory &memory_;

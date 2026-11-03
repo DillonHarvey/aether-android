@@ -57,5 +57,8 @@ struct InstalledActivity {
     // Exact user-approved read-only document for this admitted launch only.
     // Neither an Intent flag nor a persisted private-files grant supplies it.
     std::optional<host::PreparedDocumentSource> read_document;
+    // Host-only attribution captured from the held admitted registry generation.
+    std::string diagnostic_package_sha256;
+    std::uint64_t diagnostic_package_generation = 0;
 };
 } // namespace aether::security

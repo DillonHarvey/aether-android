@@ -1,5 +1,7 @@
 #include "mutexes.hpp"
+#include "threads.hpp"
 #include <array>
+#include <utility>
 namespace aether::bionic {
 namespace {
 using a64::Fault;using a64::Address;
@@ -74,6 +76,72 @@ a64::Fault NativeMutexes::validate_wait(a64::Address address, std::uint32_t tid)
     if (get(bytes, 0, 2) != ((type << 14) | 1) || (type && get(bytes, 4, 4) != tid))
         return Fault::unsupported_service;
     return Fault::none;
+}
+
+bool NativeMutexes::lock_ready(a64::Address address,std::uint32_t tid) const noexcept {
+    // Match op1's validation before classifying contention. Errors must wake a
+    // waiter rather than leave it parked on storage that can never be acquired.
+    if(address%4)return true;
+    std::array<std::uint8_t,40> bytes{};
+    if(!memory_.read(address,bytes) || !memory_.accessible(address,bytes.size(),a64::Permission::write))return true;
+    const auto state=static_cast<unsigned>(get(bytes,0,2)),type=state>>14;
+    if(state==0xffff || (state&0x2000) || type>2)return true;
+    const auto found=held_.find(address);
+    if(found==held_.end())return true; // Unlocked, invalid/unowned storage, or held quota: all immediate.
+    const auto &held=found->second;
+    const auto expected=(held.type<<14)|1|((held.type==1?(held.depth-1):0)<<2);
+    if(state!=expected || (type && get(bytes,4,4)!=held.owner))return true;
+    // Recursive self-lock either succeeds or reports EAGAIN at depth2048.
+    // Normal/error-check self-trylock and all other-owner trylocks are EBUSY.
+    return held.owner==tid && type==1;
+}
+
+struct NativeMutexes::DeferredLock final : a64::DeferredService {
+    NativeMutexes &p;NativeThreads &threads;std::shared_ptr<ProcessState> process;
+    Address address,tls,stack_top;std::uint32_t tid;std::uint64_t invocation;
+    std::shared_ptr<a64::ThreadRegisterState> owner;
+    DeferredLock(NativeMutexes &p,NativeThreads &threads,const a64::ServiceState &frame,std::shared_ptr<ProcessState> process):
+        p(p),threads(threads),process(std::move(process)),address(frame.registers[0]),tls(frame.trusted_tls),
+        stack_top(frame.stack_top),tid(threads.tid()),invocation(frame.invocation),owner(threads.thread_register_state(tls)){}
+    bool ready() const noexcept override {
+        if(process->exit_status() || !threads.signal_snapshot(tid,owner))return true;
+        if(p.lock_ready(address,tid))return true;
+        // lock_ready mirrors trylock. A blocking error-check self-lock instead
+        // reports EDEADLK immediately; normal self-lock remains a real deadlock.
+        const auto found=p.held_.find(address);
+        return found!=p.held_.end() && found->second.owner==tid && found->second.type==2;
+    }
+    std::optional<std::chrono::steady_clock::time_point> deadline() const noexcept override {return {};}
+    a64::DeferredServiceResult resume(a64::ServiceState &frame) noexcept override {
+        if(process->exit_status())return {Fault::process_exit,true};
+        if(!owner || threads.tid()!=tid || threads.tls()!=tls || frame.trusted_tls!=tls ||
+           frame.invocation!=invocation || frame.stack_top!=stack_top || threads.thread_register_state(tls)!=owner ||
+           !threads.signal_snapshot(tid,owner))return {Fault::invalid_call,true};
+        std::array<std::uint64_t,31> args{};args[0]=address;
+        const auto fault=p.invoke(1,tid,args);
+        if(fault!=Fault::none)return {fault,true};
+        if(args[0]!=16){frame.registers[0]=args[0];return {Fault::none,true};}
+        const auto found=p.held_.find(address);
+        if(found!=p.held_.end() && found->second.owner==tid && found->second.type==2){
+            frame.registers[0]=35;return {Fault::none,true};
+        }
+        // No owner/depth or guest-storage mutation occurred on EBUSY. The
+        // outside-noexcept CPU boundary owns parking; no peer is pumped here.
+        return {Fault::none,false};
+    }
+};
+Fault NativeMutexes::invoke_lock(a64::ServiceState &frame,NativeThreads &threads,bool allow_deferred,
+                                std::shared_ptr<ProcessState> process) noexcept {
+    if(!process)return Fault::invalid_call;
+    if(!threads.factory_execution_active() || !allow_deferred)return invoke(0,threads.tid(),frame.registers);
+    if(!frame.invocation || frame.trusted_tls!=threads.tls() || frame.resume || frame.deferred ||
+       !threads.signal_snapshot(threads.tid(),threads.thread_register_state(frame.trusted_tls)))return Fault::invalid_call;
+    try {
+        // Allocate the complete operation before any lock attempt can acquire
+        // ownership or increment a recursive depth. Cancellation owns no lock.
+        frame.deferred=std::make_shared<DeferredLock>(*this,threads,frame,std::move(process));
+        return Fault::none;
+    }catch(...){rejection_="pthread mutex continuation allocation failed";return Fault::unsupported_service;}
 }
 
 a64::Fault NativeMutexes::invoke(unsigned operation,std::uint32_t tid,std::array<std::uint64_t,31> &r)noexcept{try{return call(operation,tid,r);}catch(...){rejection_="pthread mutex host state allocation failed";return a64::Fault::unsupported_service;}}

@@ -39,6 +39,22 @@ target_compile_definitions(aether_options INTERFACE UNICODE _UNICODE WIN32_LEAN_
 target_compile_options(aether_options INTERFACE /W4 /WX /permissive- /utf-8 /EHsc /sdl)
 target_link_options(aether_options INTERFACE /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA)
 
+# Keep the public compatibility-build identity tied to the installed contract.
+# Reading this header at configure time avoids importing Windows setup APIs into
+# framework providers, and changing the authoritative revision reconfigures it.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/aether/install/runtime_setup.hpp")
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/include/aether/install/runtime_setup.hpp"
+    AETHER_RUNTIME_CONTRACT_LINE REGEX "^inline constexpr std::uint64_t current_runtime_compatibility = [0-9]+;$")
+list(LENGTH AETHER_RUNTIME_CONTRACT_LINE AETHER_RUNTIME_CONTRACT_COUNT)
+if(NOT AETHER_RUNTIME_CONTRACT_COUNT EQUAL 1)
+    message(FATAL_ERROR "Expected one authoritative Aether runtime compatibility revision.")
+endif()
+list(GET AETHER_RUNTIME_CONTRACT_LINE 0 AETHER_RUNTIME_CONTRACT_VALUE)
+if(NOT AETHER_RUNTIME_CONTRACT_VALUE MATCHES "= ([0-9]+);$")
+    message(FATAL_ERROR "Cannot read the authoritative Aether runtime compatibility revision.")
+endif()
+set(AETHER_RUNTIME_COMPATIBILITY "${CMAKE_MATCH_1}")
 configure_file(include/aether/build_info.hpp.in generated/aether/build_info.hpp @ONLY)
 add_library(aether_core STATIC
     src/common/text.cpp
@@ -71,6 +87,10 @@ add_library(aether_core STATIC
     src/apk/native_inventory.cpp
     src/apk/signature_report.cpp
     src/apk/artwork.cpp
+    src/apk/runtime_bitmap.cpp
+    src/apk/runtime_xml.cpp
+    src/apk/runtime_path.cpp
+    src/apk/runtime_vector.cpp
     src/apk/drawable.cpp
     src/apk/vector.cpp
     src/apk/preview.cpp
@@ -97,7 +117,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_
         --output "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_content.hpp"
     DEPENDS tools/compile-privacy.py src/install/privacy_guide.txt
     VERBATIM)
-add_library(aether_install STATIC src/install/store.cpp src/install/cli.cpp src/install/open_link.cpp src/install/open_file.cpp src/install/file_activation.cpp src/install/link_activation.cpp src/install/link_registration.cpp src/install/shell.cpp src/install/explorer.cpp src/install/runtime.cpp
+add_library(aether_install STATIC src/install/store.cpp src/install/cli.cpp src/install/faults.cpp src/install/open_link.cpp src/install/open_file.cpp src/install/file_activation.cpp src/install/link_activation.cpp src/install/link_registration.cpp src/install/shell.cpp src/install/explorer.cpp src/install/runtime.cpp
     src/install/runtime_bundle.cpp src/install/runtime_registration.cpp src/install/diagnostics.cpp
     src/install/troubleshooting.cpp src/install/privacy.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/aether/privacy_content.hpp")
@@ -115,8 +135,9 @@ add_library(aether_elf STATIC src/elf/image.cpp src/elf/guest_loader.cpp src/elf
 target_include_directories(aether_elf PUBLIC include)
 target_link_libraries(aether_elf PUBLIC aether_a64 PRIVATE aether_core)
 
-add_library(aether_bionic STATIC src/bionic/guest_posix.cpp src/bionic/logging.cpp src/bionic/access.cpp src/bionic/executing.cpp src/bionic/string_memory.cpp src/bionic/file_metadata.cpp src/bionic/removing.cpp src/bionic/opening.cpp src/bionic/creating.cpp src/bionic/renaming.cpp src/bionic/error_strings.cpp src/bionic/properties.cpp src/bionic/dynamic_linker.cpp src/bionic/mappings.cpp src/bionic/threads.cpp src/bionic/thread_specific.cpp src/bionic/thread_attributes.cpp src/bionic/zlib.cpp src/bionic/mutexes.cpp src/bionic/rwlocks.cpp src/bionic/stdio.cpp src/bionic/integers.cpp src/bionic/floating.cpp src/bionic/float_conversion.cpp src/bionic/scanning.cpp src/bionic/locale.cpp src/bionic/ctype.cpp src/bionic/unicode.cpp src/bionic/collation.cpp src/bionic/wide_memory.cpp src/bionic/once.cpp src/bionic/phdr.cpp src/bionic/cxa_destructors.cpp src/bionic/abort_message.cpp src/bionic/multibyte.cpp src/bionic/signals.cpp src/bionic/conditions.cpp src/bionic/calendar.cpp src/bionic/calendar_format.cpp src/bionic/descriptors.cpp src/bionic/polling.cpp src/bionic/sleeping.cpp src/bionic/jumps.cpp)
+add_library(aether_bionic STATIC src/bionic/guest_posix.cpp src/bionic/standard_library.cpp src/bionic/runtime_services.cpp src/bionic/futex.cpp src/bionic/input_queue.cpp src/bionic/logging.cpp src/bionic/access.cpp src/bionic/executing.cpp src/bionic/string_memory.cpp src/bionic/file_metadata.cpp src/bionic/removing.cpp src/bionic/opening.cpp src/bionic/creating.cpp src/bionic/renaming.cpp src/bionic/error_strings.cpp src/bionic/properties.cpp src/bionic/dynamic_linker.cpp src/bionic/mappings.cpp src/bionic/threads.cpp src/bionic/thread_specific.cpp src/bionic/thread_attributes.cpp src/bionic/zlib.cpp src/bionic/mutexes.cpp src/bionic/rwlocks.cpp src/bionic/stdio.cpp src/bionic/integers.cpp src/bionic/floating.cpp src/bionic/float_conversion.cpp src/bionic/scanning.cpp src/bionic/locale.cpp src/bionic/ctype.cpp src/bionic/unicode.cpp src/bionic/collation.cpp src/bionic/wide_memory.cpp src/bionic/once.cpp src/bionic/phdr.cpp src/bionic/cxa_destructors.cpp src/bionic/abort_message.cpp src/bionic/multibyte.cpp src/bionic/signals.cpp src/bionic/conditions.cpp src/bionic/calendar.cpp src/bionic/calendar_format.cpp src/bionic/descriptors.cpp src/bionic/polling.cpp src/bionic/looper.cpp src/bionic/sleeping.cpp src/bionic/jumps.cpp)
 target_include_directories(aether_bionic PUBLIC include PRIVATE third_party/boost)
+target_sources(aether_bionic PRIVATE src/bionic/math_services.cpp)
 target_link_libraries(aether_bionic PUBLIC aether_elf PRIVATE aether_core aether_host_entropy aether_host_process aether_angle_zlib)
 
 add_library(aether_native STATIC src/elf/selftest.cpp)
@@ -156,16 +177,28 @@ add_library(aether_dex STATIC src/dex/scheduler.cpp src/dex/image.cpp src/dex/co
 target_include_directories(aether_dex PUBLIC include)
 target_link_libraries(aether_dex PUBLIC aether_options PRIVATE aether_core aether_host_process aether_host_entropy aether_host_regex)
 
+add_library(aether_android_native STATIC src/android/native.cpp src/android/native_assets.cpp src/android/native_window.cpp src/android/native_configuration.cpp)
+target_include_directories(aether_android_native PUBLIC include)
+target_link_libraries(aether_android_native PUBLIC aether_elf PRIVATE aether_core)
+target_link_libraries(aether_graphics PRIVATE aether_android_native)
 add_library(aether_jni STATIC src/jni/bridge.cpp)
 target_include_directories(aether_jni PUBLIC include)
-target_link_libraries(aether_jni PUBLIC aether_dex aether_bionic PRIVATE aether_audio)
+target_link_libraries(aether_jni PUBLIC aether_dex aether_bionic PRIVATE aether_audio aether_graphics aether_android_native)
 
 add_library(aether_managed STATIC src/dex/selftest.cpp)
 target_link_libraries(aether_managed PUBLIC aether_jni PRIVATE aether_core)
 
-add_library(aether_android STATIC src/android/bundle.cpp src/android/component_names.cpp src/android/intent_categories.cpp src/android/intents.cpp src/android/uris.cpp src/android/framework.cpp src/android/preferences.cpp src/android/registry.cpp src/android/selftest.cpp)
+add_library(aether_android STATIC src/android/bundle.cpp src/android/component_names.cpp src/android/intent_categories.cpp src/android/intents.cpp src/android/uris.cpp src/android/framework.cpp src/android/styled_attributes.cpp src/android/sdk_resources.cpp src/android/sdk_resource_image.cpp src/android/preferences.cpp src/android/registry.cpp src/android/selftest.cpp)
+target_sources(aether_android PRIVATE src/android/xml_cursor.cpp src/android/inflater_factory.cpp
+    src/android/bootstrap_class_presence.cpp
+    src/android/view_child_storage.cpp
+    src/android/array_maps.cpp
+    src/android/xml_view_constructor.cpp src/android/view_geometry.cpp src/android/software_canvas.cpp
+    src/android/dimension_value.cpp src/android/view_attributes.cpp src/android/styleable_arrays.cpp
+    src/android/widget_attributes.cpp src/android/view_configuration.cpp src/android/managed_log.cpp
+    src/android/configuration_override.cpp src/android/context_lineage.cpp)
 target_include_directories(aether_android PUBLIC include)
-target_link_libraries(aether_android PUBLIC aether_jni PRIVATE aether_core)
+target_link_libraries(aether_android PUBLIC aether_jni PRIVATE aether_core aether_android_native)
 
 add_library(aether_window STATIC src/host/windows/window.cpp src/host/windows/input.cpp
     src/host/windows/accessibility.cpp src/host/windows/text_layout.cpp src/host/windows/native_ime.cpp src/host/windows/input_pane.cpp src/host/windows/file_drop.cpp)
@@ -176,6 +209,31 @@ target_link_libraries(aether_window PUBLIC aether_android PRIVATE aether_core us
 add_executable(aether apps/aether-cli/main.cpp)
 target_link_libraries(aether PRIVATE aether_apk_signing aether_core aether_a64 aether_native aether_managed aether_android aether_window aether_graphics_selftest aether_audio_selftest aether_install)
 enable_language(RC)
+# Resource metadata and listed layout XML only; original NOTICE/provenance retained.
+# RC embeds immutable bytes in .rsrc rather than copying/expanding a table on the heap.
+set(AETHER_SDK_RESOURCE_TABLE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/android-resources/api35/resources.arsc")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${AETHER_SDK_RESOURCE_TABLE}")
+file(SHA256 "${AETHER_SDK_RESOURCE_TABLE}" AETHER_SDK_RESOURCE_SHA256)
+if(NOT AETHER_SDK_RESOURCE_SHA256 STREQUAL "4f59c3c6541189c2d9cbe262eb90cd3815a7dbf0657d5b60319ea90db4cf36ad")
+    message(FATAL_ERROR "SDK35 resource metadata differs from its pinned provenance")
+endif()
+function(aether_pin_sdk_resource variable relative expected_hash)
+    set(aether_sdk_file "${CMAKE_CURRENT_SOURCE_DIR}/third_party/android-resources/api35/${relative}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${aether_sdk_file}")
+    file(SHA256 "${aether_sdk_file}" aether_sdk_hash)
+    if(NOT "${aether_sdk_hash}" STREQUAL "${expected_hash}")
+        message(FATAL_ERROR "SDK35 resource member differs from pinned provenance: ${relative}")
+    endif()
+    set("${variable}" "${aether_sdk_file}" PARENT_SCOPE)
+endfunction()
+aether_pin_sdk_resource(AETHER_SDK_LAYOUT_SCREEN_SIMPLE "res/layout/screen_simple.xml"
+    "f0e0ba8d708ea776c88cc848cd1fade489fa99dfbab4a0a70f3c181f428a1276")
+aether_pin_sdk_resource(AETHER_SDK_LAYOUT_SCREEN_SIMPLE_OVERLAY "res/layout/screen_simple_overlay_action_mode.xml"
+    "3495ad0c68a1b4ee86db6d317986902e0d1f51dc63b956affe69232ecd7ab4fb")
+aether_pin_sdk_resource(AETHER_SDK_LAYOUT_ACTION_MODE_BAR "res/layout/action_mode_bar.xml"
+    "14b4ee3d744de661eae96094d6a0456b24a00d76e560003121ca13a0c25d0a67")
+configure_file(cmake/sdk_resources.rc.in generated/sdk_resources.rc @ONLY)
+target_sources(aether PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/sdk_resources.rc")
 set(AETHER_PACKAGE_ICON "${CMAKE_CURRENT_BINARY_DIR}/generated/shell/package.ico")
 set(AETHER_BUNDLE_ICON "${CMAKE_CURRENT_BINARY_DIR}/generated/shell/bundle.ico")
 add_custom_command(OUTPUT "${AETHER_PACKAGE_ICON}" "${AETHER_BUNDLE_ICON}"
@@ -221,18 +279,19 @@ add_custom_target(aether_distribution ALL
         aether_icon_worker aether_shell_icons
     VERBATIM)
 
-add_library(aether_security STATIC src/security/worker_progress.cpp src/security/protocol.cpp src/security/broker.cpp src/security/worker.cpp
+add_library(aether_security STATIC src/security/startup_work.cpp src/security/worker_progress.cpp src/security/protocol.cpp src/security/broker.cpp src/security/worker.cpp
     src/security/audit.cpp src/security/audit_file.cpp
     src/security/client.cpp src/security/notification_client.cpp src/security/audio_protocol.cpp src/security/audio_broker.cpp src/security/audio_client.cpp
-    src/security/storage.cpp src/security/apk_result.cpp src/security/activity_protocol.cpp src/security/activity_launch.cpp)
+    src/security/storage.cpp src/security/apk_result.cpp src/security/activity_protocol.cpp src/security/activity_launch.cpp
+    src/security/native_surface_protocol.cpp src/security/viewport_protocol.cpp)
 target_include_directories(aether_security PUBLIC include)
 target_link_libraries(aether_security PUBLIC aether_core PRIVATE aether_runtime_permissions userenv advapi32 OneCoreUAP)
 add_library(aether_isolated_apk STATIC src/security/apk_runtime.cpp src/security/apk_selftest.cpp)
 target_link_libraries(aether_isolated_apk PUBLIC aether_security PRIVATE aether_android)
 target_link_libraries(aether PRIVATE aether_isolated_apk)
 add_library(aether_activity_host STATIC src/security/activity_host.cpp src/security/activity_dispatcher.cpp
-    src/host/windows/clipboard_service.cpp)
-target_link_libraries(aether_activity_host PUBLIC aether_security PRIVATE aether_host_audio aether_host_notifications user32)
+    src/host/windows/clipboard_service.cpp src/host/windows/native_window_context.cpp)
+target_link_libraries(aether_activity_host PUBLIC aether_security PRIVATE aether_host_audio aether_host_notifications aether_host_entropy user32)
 add_library(aether_activity_runtime STATIC src/security/activity_runtime.cpp)
 target_link_libraries(aether_activity_runtime PUBLIC aether_security PRIVATE aether_android aether_audio)
 target_link_libraries(aether_window PRIVATE aether_activity_host)
@@ -244,11 +303,14 @@ add_library(aether_isolated_graphics STATIC src/security/graphics_protocol.cpp s
     src/security/graphics_result.cpp src/security/graphics_selftest.cpp src/security/graphics_window_protocol.cpp
     src/security/graphics_window_runtime.cpp)
 target_link_libraries(aether_isolated_graphics PUBLIC aether_security PRIVATE aether_graphics_selftest d3d11)
+target_link_libraries(aether_activity_host PRIVATE aether_isolated_graphics)
+target_link_libraries(aether_activity_runtime PRIVATE aether_isolated_graphics aether_graphics)
 target_link_libraries(aether PRIVATE aether_isolated_graphics)
 add_library(aether_graphics_window STATIC src/graphics/window.cpp src/security/graphics_window_session.cpp)
 target_link_libraries(aether_graphics_window PUBLIC aether_graphics_selftest PRIVATE aether_isolated_graphics aether_window)
 target_link_libraries(aether PRIVATE aether_graphics_window)
 add_executable(aether_worker apps/aether-worker/main.cpp apps/aether-worker/probes.cpp apps/aether-worker/async_probe.cpp apps/aether-worker/stream_probe.cpp apps/aether-worker/uuid_probe.cpp apps/aether-worker/regex_probe.cpp apps/aether-worker/progress_probe.cpp apps/aether-worker/nano_time_probe.cpp apps/aether-worker/preferences_probe.cpp apps/aether-worker/native_fault_probe.cpp apps/aether-worker/process_exit_probe.cpp)
+target_sources(aether_worker PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/sdk_resources.rc")
 target_link_libraries(aether_worker PRIVATE aether_isolated_graphics aether_isolated_audio aether_isolated_apk aether_activity_runtime aether_a64 aether_host_audio aether_angle userenv ws2_32)
 set_target_properties(aether_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/runtime")
 add_custom_target(aether_runtime_directory

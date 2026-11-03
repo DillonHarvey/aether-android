@@ -119,6 +119,20 @@ public:
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
+    bool TrimCache() {
+        if (is_executing) return false;
+        std::unique_lock lock{invalidation_mutex};
+        // No surviving translation target may refer to the decommitted tail.
+        // Reset only native dispatch hints, not architectural/exclusive state.
+        jit_state.ResetRSB();
+        emitter.TrimCache();
+        invalid_cache_ranges.clear();
+        invalidate_entire_cache = false;
+        ClearHalt(HaltReason::CacheInvalidation);
+        block_of_code.TrimCache();
+        return true;
+    }
+
     void InvalidateCacheRange(u64 start_address, size_t length) {
         std::unique_lock lock{invalidation_mutex};
         const auto end_address = static_cast<u64>(start_address + length - 1);
@@ -300,7 +314,10 @@ private:
             Optimization::ConstantPropagation(ir_block);
             Optimization::DeadCodeElimination(ir_block);
         }
-        if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
+        // Checked memory exits and the count-one fallback contract require the
+        // frontend's per-instruction/256-cycle boundaries. Do not merge an
+        // opaque interpreter tail beyond those boundaries in this profile.
+        if (conf.HasOptimization(OptimizationFlag::MiscIROpt) && !conf.check_halt_on_memory_access) {
             Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
         }
         Optimization::IdentityRemovalPass(ir_block);
@@ -363,6 +380,10 @@ HaltReason Jit::Step() {
 
 void Jit::ClearCache() {
     impl->ClearCache();
+}
+
+bool Jit::TrimCache() {
+    return impl->TrimCache();
 }
 
 void Jit::InvalidateCacheRange(u64 start_address, size_t length) {

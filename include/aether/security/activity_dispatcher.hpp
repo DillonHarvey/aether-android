@@ -25,6 +25,9 @@ struct ActivityCompletion {
     std::uint64_t ticket = 0;
     ActivityCommandKind kind = ActivityCommandKind::refresh;
     bool handled = false, read_unavailable = false;
+    KeyDispatchOutcome key_outcome = KeyDispatchOutcome::none;
+    // Final historical key result, not another command ACK or state publication.
+    bool key_final = false;
     // Per-request preparation outcome; never inferred from a later mailbox state.
     std::uint64_t accessibility_metadata_attempt = 0;
     std::uint64_t accessibility_invalidation_revision = 0;
@@ -54,6 +57,8 @@ struct ActivityDispatchMetrics {
 };
 struct ActivityPublication {
     std::shared_ptr<const ActivityState> state, last_live;
+    // Host-owned connection identity; never accepted from a guest state payload.
+    std::uint64_t transport_session = 0;
     // Receipt floor captured only with a genuine final worker snapshot.
     std::uint64_t text_edit_observation_revision = 0;
     std::uint32_t process_id = 0;
@@ -85,6 +90,11 @@ class ActivityDispatcher final {
     std::uint64_t refresh();
     void close();
     void abort() noexcept;
+    // UI-owned presentation lifetime. Headless/developer dispatch has no binding.
+    std::shared_ptr<host::NativeWindowContext> graphics_window_context() const;
+    // Cancel and drain I/O while pumping synchronous sent messages required by
+    // DXGI. Must finish before the UI invalidates its HostSurface/HWND.
+    void join_io();
     HANDLE completion_event() const noexcept;
     void set_notification(HWND window, UINT message); // Host-only HWND; detached before destruction.
     // UI-owner registration/lifetime only; no HWND or clipboard identity enters guest IPC.
@@ -93,6 +103,9 @@ class ActivityDispatcher final {
     // Called on the UI thread. Commits the latest immutable validated state and
     // returns ordered acknowledgements, including unhandled native key decisions.
     std::vector<ActivityCompletion> consume();
+    // Actual finish custody, independent of snapshots and command ACKs.
+    // UI owner takes it once and uses the existing ordered close path.
+    std::optional<ActivityFinishRequest> take_finish_request();
     // One bounded mid-callback record. Receipt follows actual UI consumption,
     // not extraction; the worker remains paused until receipt or cancellation.
     std::shared_ptr<const android::TextEditObservation> take_text_edit_observation();

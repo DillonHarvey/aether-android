@@ -50,7 +50,9 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
 }
 
 A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
-        : EmitX64(code), conf(conf), jit_interface{jit_interface} {
+        : EmitX64(code), conf(conf), jit_interface{jit_interface}
+        , fast_dispatch_table(conf.HasOptimization(OptimizationFlag::FastDispatch)
+                                  ? std::make_unique<FastDispatchTable>() : nullptr) {
     GenMemory128Accessors();
     GenFastmemFallbacks();
     GenTerminalHandlers();
@@ -158,13 +160,20 @@ void A64EmitX64::ClearCache() {
     fastmem_patch_info.clear();
 }
 
+void A64EmitX64::TrimCache() {
+    EmitX64::TrimCache();
+    fastmem_patch_info.rehash(0);
+    // Keep do_not_fastmem: these fallback decisions are semantic, not targets.
+    // FastDispatch's allocation also stays fixed for its generated prelude.
+}
+
 void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
     InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
 }
 
 void A64EmitX64::ClearFastDispatchTable() {
     if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        fast_dispatch_table.fill({});
+        fast_dispatch_table->fill({});
     }
 }
 
@@ -206,7 +215,7 @@ void A64EmitX64::GenTerminalHandlers() {
         terminal_handler_fast_dispatch_hint = code.getCurr<const void*>();
         calculate_location_descriptor();
         code.L(rsb_cache_miss);
-        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table.data()));
+        code.mov(r12, reinterpret_cast<u64>(fast_dispatch_table->data()));
         code.mov(rbp, rbx);
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(rbp, r12);
@@ -225,7 +234,7 @@ void A64EmitX64::GenTerminalHandlers() {
 
         code.align();
         fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table.data()));
+        code.mov(code.ABI_PARAM2, reinterpret_cast<u64>(fast_dispatch_table->data()));
         if (code.HasHostFeature(HostFeature::SSE42)) {
             code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
         }

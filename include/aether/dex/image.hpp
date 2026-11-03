@@ -105,6 +105,10 @@ struct Class {
     std::uint32_t flags = 0;
     std::vector<Index> interfaces, static_fields, instance_fields, direct_methods, virtual_methods;
     std::vector<EncodedValue> static_values;
+    // Actual direct SYSTEM naming annotations. An absent InnerClass differs
+    // from its encoded null name (anonymous); all references are image-local.
+    bool inner_class_present = false;
+    Index inner_class_name = no_index, enclosing_class = no_index, enclosing_method = no_index;
 };
 struct DexImage {
     std::string sha256;

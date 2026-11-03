@@ -19,6 +19,9 @@ class NativeLocale {
     // newlocale, duplocale, freelocale, uselocale, setlocale, localeconv, MB_CUR_MAX.
     a64::Fault invoke(unsigned,std::array<std::uint64_t,31>&) noexcept;
     std::string_view rejection() const noexcept{return rejection_;}
+    // Pure observation: only a live owned C/C.UTF-8 locale is valid for an
+    // explicit-locale time API. Null and LC_GLOBAL_LOCALE are not handles.
+    bool valid_time_locale(a64::Address) const noexcept;
   private:
     struct Object {a64::Address address=0;unsigned mode=0;};
     a64::GuestMemory &memory_;

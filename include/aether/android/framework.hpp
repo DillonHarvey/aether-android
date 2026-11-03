@@ -2,7 +2,12 @@
 #include "aether/android/input.hpp"
 #include "aether/android/drag.hpp"
 #include "aether/android/display_configuration.hpp"
+#include "aether/android/viewport.hpp"
 #include "aether/android/profile.hpp"
+#include "aether/common/android_process_identity.hpp"
+#include "aether/android/native_surface.hpp"
+#include "aether/android/native_window.hpp"
+#include "aether/android/native_activity.hpp"
 #include "aether/apk/resources.hpp"
 #include "aether/apk/intent_value.hpp"
 #include "aether/dex/runtime.hpp"
@@ -35,7 +40,7 @@ struct ImeConversionTarget {
     std::int32_t unchanged_prefix = -1; // Genuine native UTF-16 prefix, or no evidence.
     std::string previous_composition_sha256; // Complete prior native composition, explicit UTF-16LE bytes.
 };
-enum class ViewKind { linear_layout, text, button, checkbox, scroll_view, edit_text };
+enum class ViewKind { linear_layout, text, button, checkbox, scroll_view, edit_text, surface_view, frame_layout, native_content, view = 9 };
 inline constexpr std::size_t view_activation_limit = 256;
 struct ViewActivation {
     std::uint64_t revision = 0;
@@ -144,10 +149,57 @@ using SoftInputObserver = std::function<bool(const SoftInputObservation &)>;
 // Trusted C++ sink only. The record is borrowed synchronously for this call;
 // retaining it requires an explicit copy. The sink must not reenter the session.
 using TextEditObserver = std::function<void(const TextEditObservation &)>;
+// Trusted held-package member read only; no host pathname or guest reentry.
+// nullopt means the selected member is absent. Integrity errors propagate.
+using ResourceFileReader = std::function<std::optional<std::vector<std::uint8_t>>(
+    std::string_view container, std::string_view path, std::size_t max_bytes)>;
+// Trusted software-session query behavior only; this is not an Android user,
+// encryption state, host lock observation or storage/capability permission.
+enum class ImplicitComponentQueryPolicy { unknown, interactive_session_both_classes };
+// Trusted accessibility Binder lookup availability only; absence is neither a
+// disabled accessibility-state value nor a claim about other Android services.
+enum class AccessibilityBackendAvailability { unknown, service_absent };
+
+// Immutable held-manifest facts. A literal (including empty) is distinct
+// from an absent name and from an unresolved typed resource reference.
+struct PackageMetadata {
+    std::optional<std::u16string> version_name;
+    std::optional<std::uint32_t> version_name_resource;
+    std::uint32_t version_code = 0, version_code_major = 0;
+    // Raw held-manifest title provenance. Empty literals stay distinct from
+    // absent labels; unresolved typed values never become fallback text.
+    apk::DisplayValue activity_label, application_label;
+    std::u16string activity_name;
+    // False means title provenance is unknown, including unmodeled alias
+    // inheritance. It must not be presented as a known null or empty title.
+    bool activity_label_bound = false;
+    // Original application metadata, independent of Activity label provenance.
+    // Missing metadata and a known absent manifest attribute remain distinct.
+    apk::ManifestBoolean supports_rtl;
+    std::optional<std::uint32_t> application_target_sdk;
+    bool supports_rtl_bound = false;
+    // Complete held base/split declaration inventory only. Unknown names or
+    // absent source evidence must never become a known missing service.
+    std::vector<std::string> declared_services;
+    bool service_inventory_bound = false;
+    // Original held declarations and ordered raw meta-data, including aliases,
+    // duplicate keys and unresolved typed names/values. This flag proves only
+    // raw inventory completeness, never a partially resolved Bundle.
+    std::vector<apk::Activity> activities;
+    std::vector<std::vector<apk::ManifestMetaDataEntry>> activity_meta_data;
+    bool activity_meta_data_bound = false;
+    // Aligned raw configChanges values preserve absence/unsupported kinds.
+    std::vector<apk::ManifestInteger> activity_config_changes;
+    std::vector<apk::ManifestInteger> activity_recreate_on_config_changes;
+    apk::ManifestBoolean application_enabled;
+    bool application_enabled_bound = false;
+};
 struct FrameworkMetrics {
     std::uint64_t api_calls = 0, lifecycle_callbacks = 0, managed_clicks = 0;
     std::uint64_t denied_permissions = 0, unsupported_services = 0, view_revision = 0;
     std::uint64_t pointer_events = 0, key_events = 0;
+    // Accepted backend attempts and actual transport drops, never delivery proof.
+    std::uint64_t android_log_attempts = 0, android_log_transport_drops = 0;
 };
 // One activity and retained view tree per runtime. No Windows handles enter the guest.
 // WindowSignal is the host-independent boundary used by the later Win32 event adapter.
@@ -158,6 +210,39 @@ class ActivitySession final : public dex::HostInterface {
                     DisplayConfiguration configuration = {}, host::NotificationService *notifications = nullptr,
                     host::DocumentService *documents = nullptr, host::ClipboardService *clipboard = nullptr);
     ~ActivitySession();
+    // Initial owner binding, before any Activity construction; no reads/replay.
+    void set_resource_file_reader(ResourceFileReader);
+    // One initial trusted held-manifest binding; no package enumeration.
+    void set_package_metadata(PackageMetadata);
+    // Bind once before Application/guest work; only implicit PM matching uses it.
+    void set_component_query_policy(ImplicitComponentQueryPolicy);
+    // Bind once before all framework queries or guest work. These virtual
+    // Android facts grant no host permission and expose no guest setter.
+    void set_process_identity(AndroidProcessIdentity);
+    void set_accessibility_backend_availability(AccessibilityBackendAvailability);
+    // Exact effective manifest theme; absent/default/unresolved stays unknown.
+    // Target SDK is bound before Application/default Context theme initialization.
+    void set_target_sdk(std::uint32_t);
+    void set_activity_theme(apk::ManifestInteger);
+    // Initial trusted host lease only, before any Application/Theme/Activity.
+    // Exact pixels and explicit virtual-display policy, never inverse-dp guesses.
+    // No physical attachment, frame or visibility is granted by this binding.
+    void set_launch_viewport(ViewportAdmission);
+    // Initial trusted native lifecycle binding, before Activity construction.
+    // No replay; terminal cleanup releases the sink without guest callbacks.
+    // Save results are copied into the original callback Bundle; all other
+    // lifecycle stages require an empty result.
+    void set_native_activity_observer(NativeActivityObserver);
+    void set_native_activity_pointer_observer(NativeActivityPointerObserver);
+    void set_native_activity_key_observer(NativeActivityKeyObserver);
+    void set_key_completion_observer(NativeKeyCompletionObserver);
+    // Trusted ordered native completion, delivered later by the managed main
+    // queue. The entry roots the original receivers and never requeues input.
+    std::unique_ptr<dex::ManagedMainEntry> make_native_pointer_completion(const NativeActivityInputCompletion &);
+    std::unique_ptr<dex::ManagedMainEntry> make_native_activity_work(const NativeActivityHostWork &);
+    bool finishing() const noexcept;
+    std::optional<ActivityFinishRequest> pending_finish_request() const;
+    void acknowledge_finish_request(std::uint64_t ordinal);
     // Registration never replays history. The sink remains installed until
     // replaced/unset or session destruction; captured resources must outlive it.
     // Capture/sink failures are sticky, including errors in noexcept cleanup:
@@ -212,6 +297,9 @@ class ActivitySession final : public dex::HostInterface {
                 std::uint32_t target_sdk = 35, std::string_view component_name = {});
     std::int32_t requested_orientation() const noexcept;
     const DisplayConfiguration &display_configuration() const noexcept;
+    // Trusted capture metadata, not guest-visible dispatch authority.
+    std::uint64_t window_generation() const noexcept;
+    std::uint64_t input_generation() const noexcept;
     // The caller composes selected resources before handing over a configuration.
     // Application identity/services survive any required Activity recreation.
     void configure(const DisplayConfiguration &configuration, apk::ResourceTable resources);
@@ -239,10 +327,18 @@ class ActivitySession final : public dex::HostInterface {
     void place_views(std::span<const ViewPlacement> placements);
     bool pointer(const PointerInput &event);
     bool key(const KeyInput &event);
+    KeyDispatchOutcome dispatch_key(const KeyInput &event, std::uint64_t request);
+    // Pure pre-dispatch observation for the transport's cancelled-vs-unhandled
+    // witness. Never infer cancellation from state changed by a real callback.
+    bool key_capture_current(const KeyInput &event) const noexcept;
     void close();
     Lifecycle state() const noexcept;
     dex::ObjectId activity() const noexcept;
     dex::ObjectId content_view() const noexcept;
+    // Successful logical content-root commit incarnation; zero before the first
+    // commit. Pair with the actual Activity, window generation and content root.
+    // This is not physical View attachment, callback delivery or visibility.
+    std::uint64_t attachment_revision() const noexcept;
     const std::map<dex::ObjectId, ViewState> &views() const noexcept;
     std::map<dex::ObjectId, ViewState> snapshot_views() const;
     const std::vector<std::string> &events() const noexcept;
@@ -250,7 +346,28 @@ class ActivitySession final : public dex::HostInterface {
     bool write_standard_output(dex::ManagedRuntime &, bool error, std::u16string_view) override;
     const FrameworkMetrics &metrics() const noexcept;
     const apk::ResourceTable &resources() const noexcept;
+    // Trusted JNI join: only this session's rooted canonical manager is valid.
+    bool owns_asset_manager(dex::ObjectId object) const noexcept;
+    // Preparation runs under the existing admitted managed-work owner. The
+    // publication/validation callbacks only inspect fixed live provider state.
+    void prepare_native_asset_manager_sources();
+    std::uint64_t publish_native_asset_manager(dex::ObjectId object) const noexcept;
+    bool owns_native_asset_manager(std::uint64_t token) const noexcept;
+    // The actual session registry is shared with JNI/EGL. No producer exists
+    // until the observer acknowledges this root's real host backing.
+    std::shared_ptr<NativeWindows> native_windows() const;
+    std::shared_ptr<NativeWindowProducer> surface_producer(dex::ObjectId object) const;
+    void set_native_surface_observer(std::function<NativeSurfaceAdmission(const NativeSurfaceRequest &)>);
+    // Normal owner execution only: may admit backing and invoke managed
+    // callbacks. Snapshots never call this operation.
+    void reconcile_native_surface();
     std::optional<dex::HostClass> class_info(std::string_view descriptor) const override;
+    // Opted-in hosted initialization lifecycle, including source-proven classes
+    // with no own body; actual superclass initialization remains mandatory.
+    // Unknown static effects are unsupported, never inferred absent.
+    void initialize_class(dex::ManagedRuntime &, std::string_view descriptor) override;
+    dex::HostBootstrapClassPresence bootstrap_class_presence(dex::ManagedRuntime &,
+        std::string_view descriptor) const override;
     bool method_is_static(const dex::DexImage &, dex::Index method) const override;
     std::optional<dex::Value> static_field(dex::ManagedRuntime &, dex::Index) override;
     dex::Value invoke(dex::ManagedRuntime &, dex::Index, std::span<const dex::Value>) override;
@@ -269,6 +386,8 @@ class ActivitySession final : public dex::HostInterface {
                      std::int32_t requested_orientation, std::uint32_t config_changes,
                      std::uint32_t target_sdk, std::string_view component_name);
     dex::Value invoke_api(dex::ManagedRuntime &, const ApiSupport &, std::span<const dex::Value>);
+    dex::Value invoke_static_api_body(dex::ManagedRuntime &, const ApiSupport &, std::span<const dex::Value>);
+    dex::Value invoke_api_body(dex::ManagedRuntime &, const ApiSupport &, std::span<const dex::Value>);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

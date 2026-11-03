@@ -1,7 +1,29 @@
-﻿#include "aether/android/framework.hpp"
+#include "aether/android/framework.hpp"
+#include "aether/android/native.hpp"
+#include "aether/android/styled_attributes.hpp"
+#include "aether/android/sdk_resources.hpp"
+#include "aether/android/sdk_resource_image.hpp"
+#include "aether/android/view_geometry.hpp"
+#include "aether/android/view_child_storage.hpp"
+#include "aether/android/dimension_value.hpp"
+#include "aether/android/view_attributes.hpp"
+#include "aether/android/styleable_arrays.hpp"
+#include "aether/android/widget_attributes.hpp"
+#include "aether/android/view_configuration.hpp"
+#include "aether/android/inflater_factory.hpp"
+#include "aether/android/xml_view_constructor.hpp"
+#include "aether/android/managed_log.hpp"
+#include "aether/android/configuration_override.hpp"
+#include "aether/android/context_lineage.hpp"
+#include "aether/android/bootstrap_class_presence.hpp"
+#include "aether/android/xml_cursor.hpp"
 #include "aether/common/text.hpp"
+#include "aether/build_info.hpp"
 #include "aether/apk/inspect.hpp"
+#include "aether/apk/runtime_bitmap.hpp"
+#include "aether/apk/runtime_vector.hpp"
 #include "bundle.hpp"
+#include "array_maps.hpp"
 #include "preferences.hpp"
 #include "component_names.hpp"
 #include "intents.hpp"
@@ -11,8 +33,10 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <set>
 #include <exception>
 
@@ -21,9 +45,20 @@ using dex::ObjectId;
 using dex::Value;
 namespace {
 constexpr std::string_view handler_type = "Landroid/os/Handler;", looper_type = "Landroid/os/Looper;";
+constexpr std::string_view handler_callback_type = "Landroid/os/Handler$Callback;", message_type = "Landroid/os/Message;";
+constexpr std::string_view build_type = "Landroid/os/Build;";
+constexpr std::string_view log_type = "Landroid/util/Log;";
+constexpr std::string_view inflate_exception_type = "Landroid/view/InflateException;";
 constexpr std::string_view factory_type = "Landroid/app/AppComponentFactory;";
 constexpr std::string_view application_info_type = "Landroid/content/pm/ApplicationInfo;";
+constexpr std::string_view activity_info_type = "Landroid/content/pm/ActivityInfo;";
 constexpr std::string_view package_item_type = "Landroid/content/pm/PackageItemInfo;";
+constexpr std::string_view package_info_type = "Landroid/content/pm/PackageInfo;";
+constexpr std::string_view component_info_type = "Landroid/content/pm/ComponentInfo;";
+constexpr std::string_view service_info_type = "Landroid/content/pm/ServiceInfo;";
+constexpr std::string_view session_package_manager_type = "Laether/android/PackageManager;";
+constexpr std::string_view application_package_manager_type = "Landroid/app/ApplicationPackageManager;";
+constexpr std::string_view package_missing_type = "Landroid/content/pm/PackageManager$NameNotFoundException;";
 constexpr std::string_view file_type = "Ljava/io/File;";
 constexpr std::string_view application_type = "Landroid/app/Application;";
 constexpr std::string_view lifecycle_type = "Landroid/app/Application$ActivityLifecycleCallbacks;";
@@ -31,12 +66,42 @@ constexpr std::string_view component_callbacks_type = "Landroid/content/Componen
 constexpr std::string_view component_callbacks2_type = "Landroid/content/ComponentCallbacks2;";
 constexpr std::string_view context_impl_type = "Landroid/app/ContextImpl;";
 constexpr std::string_view resolver_type = "Landroid/content/ContentResolver;";
+constexpr std::string_view broadcast_receiver_type = "Landroid/content/BroadcastReceiver;";
 constexpr std::string_view session_resolver_type = "Laether/android/ContentResolver;";
 constexpr std::string_view content_interface_type = "Landroid/content/ContentInterface;";
 constexpr std::string_view activity_thread_type = "Landroid/app/ActivityThread;";
 constexpr std::string_view app_bind_type = "Landroid/app/ActivityThread$AppBindData;";
 constexpr std::string_view loaded_apk_type = "Landroid/app/LoadedApk;";
 constexpr std::string_view configuration_type = "Landroid/content/res/Configuration;";
+constexpr std::string_view display_metrics_type = "Landroid/util/DisplayMetrics;";
+constexpr std::string_view window_configuration_type = "Landroid/app/WindowConfiguration;";
+constexpr std::string_view view_configuration_type = "Landroid/view/ViewConfiguration;";
+constexpr std::string_view view_root_impl_type = "Landroid/view/ViewRootImpl;";
+constexpr std::string_view view_stub_type = "Landroid/view/ViewStub;";
+constexpr std::string_view stub_listener_type = "Landroid/view/ViewStub$OnInflateListener;";
+constexpr std::string_view layout_inflater_type = "Landroid/view/LayoutInflater;";
+constexpr std::string_view resources_impl_carrier_type = "Laether/android/ResourcesImpl;";
+constexpr std::string_view phone_inflater_type = "Lcom/android/internal/policy/PhoneLayoutInflater;";
+constexpr std::string_view layout_factory_type = "Landroid/view/LayoutInflater$Factory;";
+constexpr std::string_view layout_factory2_type = "Landroid/view/LayoutInflater$Factory2;";
+constexpr std::string_view layout_filter_type = "Landroid/view/LayoutInflater$Filter;";
+constexpr std::string_view inflater_filter_cache_type = "Laether/android/InflaterFilterCache;";
+constexpr std::string_view content_capture_options_type = "Landroid/content/ContentCaptureOptions;";
+constexpr std::string_view autofill_options_type = "Landroid/content/AutofillOptions;";
+constexpr std::string_view autofill_client_type = "Landroid/view/autofill/AutofillManager$AutofillClient;";
+constexpr std::string_view autofill_controller_type = "Landroid/view/autofill/AutofillClientController;";
+constexpr std::string_view typed_value_type = "Landroid/util/TypedValue;";
+constexpr std::string_view typed_array_type = "Landroid/content/res/TypedArray;";
+constexpr std::string_view theme_type = "Landroid/content/res/Resources$Theme;";
+constexpr std::string_view theme_wrapper_type = "Landroid/view/ContextThemeWrapper;";
+constexpr std::string_view native_activity_type = "Landroid/app/NativeActivity;";
+constexpr std::string_view action_bar_type = "Landroid/app/ActionBar;";
+constexpr std::string_view window_type = "Landroid/view/Window;";
+constexpr std::string_view session_window_type = "Laether/android/Window;";
+constexpr std::string_view window_callback_type = "Landroid/view/Window$Callback;";
+constexpr std::string_view back_dispatcher_type = "Landroid/window/OnBackInvokedDispatcher;";
+constexpr std::string_view session_back_dispatcher_type = "Laether/android/OnBackInvokedDispatcher;";
+constexpr std::string_view native_content_type = "Landroid/app/NativeActivity$NativeContentView;";
 constexpr std::string_view notification_type = "Landroid/app/Notification;";
 constexpr std::string_view notification_builder_type = "Landroid/app/Notification$Builder;";
 constexpr std::string_view notification_channel_type = "Landroid/app/NotificationChannel;";
@@ -66,16 +131,396 @@ constexpr std::string_view editable_input_connection_type = "Lcom/android/intern
 constexpr std::string_view editor_info_type = "Landroid/view/inputmethod/EditorInfo;";
 constexpr std::string_view input_type_type = "Landroid/text/InputType;";
 constexpr std::string_view key_callback_type = "Landroid/view/KeyEvent$Callback;";
+constexpr std::string_view key_event_type = "Landroid/view/KeyEvent;";
 constexpr std::string_view key_listener_type = "Landroid/view/View$OnKeyListener;";
+constexpr std::string_view touch_listener_type = "Landroid/view/View$OnTouchListener;";
+constexpr std::string_view motion_event_type = "Landroid/view/MotionEvent;";
 constexpr std::string_view input_method_manager_type = "Landroid/view/inputmethod/InputMethodManager;";
 constexpr std::string_view window_token_type = "Laether/android/WindowToken;";
 constexpr std::string_view window_binder_type = "Landroid/os/IBinder;";
+constexpr std::string_view binder_type = "Landroid/os/Binder;";
+constexpr std::string_view binder_interface_type = "Landroid/os/IInterface;";
+constexpr std::string_view binder_work_source_interface_type = "Lcom/android/internal/os/BinderInternal$WorkSourceProvider;";
+constexpr std::string_view binder_warn_supplier_type = "Laether/internal/android/BinderWarnSupplier;";
+constexpr std::string_view binder_work_source_type = "Laether/internal/android/BinderWorkSourceProvider;";
+constexpr std::string_view accessibility_manager_type = "Landroid/view/accessibility/AccessibilityManager;";
+constexpr std::string_view accessibility_client_interface_type = "Landroid/view/accessibility/IAccessibilityManagerClient;";
+constexpr std::string_view accessibility_client_stub_type = "Landroid/view/accessibility/IAccessibilityManagerClient$Stub;";
+constexpr std::string_view accessibility_client_type = "Landroid/view/accessibility/AccessibilityManager$1;";
+constexpr std::string_view accessibility_my_callback_type = "Landroid/view/accessibility/AccessibilityManager$MyCallback;";
+constexpr std::string_view process_type = "Landroid/os/Process;";
+constexpr std::string_view user_handle_type = "Landroid/os/UserHandle;";
 constexpr std::string_view drag_event_type = "Landroid/view/DragEvent;";
 constexpr std::string_view drag_listener_type = "Landroid/view/View$OnDragListener;";
 constexpr std::string_view clip_data_type = "Landroid/content/ClipData;";
 constexpr std::string_view clip_item_type = "Landroid/content/ClipData$Item;";
 constexpr std::string_view clip_description_type = "Landroid/content/ClipDescription;";
 constexpr std::string_view drag_permissions_type = "Landroid/view/DragAndDropPermissions;";
+constexpr std::string_view surface_view_type = "Landroid/view/SurfaceView;";
+constexpr std::string_view surface_holder_type = "Landroid/view/SurfaceHolder;";
+constexpr std::string_view surface_holder_impl_type = "Laether/android/SurfaceHolder;";
+constexpr std::string_view surface_callback_type = "Landroid/view/SurfaceHolder$Callback;";
+constexpr std::string_view surface_type = "Landroid/view/Surface;";
+constexpr std::string_view rect_type = "Landroid/graphics/Rect;";
+constexpr std::string_view bitmap_type = "Landroid/graphics/Bitmap;";
+constexpr std::string_view bitmap_factory_type = "Landroid/graphics/BitmapFactory;";
+constexpr std::string_view drawable_type = "Landroid/graphics/drawable/Drawable;";
+constexpr std::string_view drawable_constant_type = "Landroid/graphics/drawable/Drawable$ConstantState;";
+constexpr std::string_view vector_drawable_type = "Landroid/graphics/drawable/VectorDrawable;";
+constexpr std::string_view color_drawable_type = "Landroid/graphics/drawable/ColorDrawable;";
+constexpr std::string_view vector_state_type = "Laether/android/VectorDrawableState;";
+constexpr std::string_view xml_parser_type = "Landroid/content/res/XmlBlock$Parser;";
+constexpr std::string_view xml_resource_parser_type = "Landroid/content/res/XmlResourceParser;";
+constexpr std::string_view xml_pull_type = "Lorg/xmlpull/v1/XmlPullParser;";
+constexpr std::string_view attribute_set_type = "Landroid/util/AttributeSet;";
+constexpr std::string_view xml_utility_type = "Landroid/util/Xml;";
+constexpr std::string_view porter_duff_mode_type = "Landroid/graphics/PorterDuff$Mode;";
+// Android SDK35 declaration order. These are Java ordinals, not nativeInt codes.
+constexpr std::array<std::string_view, 18> porter_duff_mode_names{
+    "CLEAR", "SRC", "DST", "SRC_OVER", "DST_OVER", "SRC_IN", "DST_IN", "SRC_OUT", "DST_OUT",
+    "SRC_ATOP", "DST_ATOP", "XOR", "DARKEN", "LIGHTEN", "MULTIPLY", "SCREEN", "ADD", "OVERLAY"};
+std::optional<std::size_t> porter_duff_mode_index(std::string_view name) {
+    const auto found = std::find(porter_duff_mode_names.begin(), porter_duff_mode_names.end(), name);
+    if (found == porter_duff_mode_names.end()) return {};
+    return static_cast<std::size_t>(found - porter_duff_mode_names.begin());
+}
+constexpr std::string_view frame_layout_type = "Landroid/widget/FrameLayout;";
+constexpr std::string_view layout_params_type = "Landroid/view/ViewGroup$LayoutParams;";
+constexpr std::string_view margin_params_type = "Landroid/view/ViewGroup$MarginLayoutParams;";
+constexpr std::string_view frame_params_type = "Landroid/widget/FrameLayout$LayoutParams;";
+constexpr std::string_view linear_params_type = "Landroid/widget/LinearLayout$LayoutParams;";
+class LayoutParamsState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::int32_t width = 0, height = 0;
+    std::int32_t left = 0, top = 0, right = 0, bottom = 0, gravity = -1;
+    std::uint32_t weight_bits = 0;
+    bool left_undefined = false, right_undefined = false, rtl_compatibility = false;
+    std::int32_t layout_direction = 0;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Public values only: retained copies cannot keep gesture, View, Activity or
+// native producer custody alive, or authenticate a new input dispatch.
+struct MotionSample {
+    PointerAction action = PointerAction::move;
+    std::uint32_t pointer = 0, source = 0;
+    float x = 0, y = 0;
+    bool time_known = false, down_time_known = false;
+    std::uint64_t down_time_ms = 0, event_time_ms = 0;
+};
+class MotionObjectState final : public dex::HostObjectState {
+  public:
+    MotionSample sample;
+    bool borrowed = false, recycled = false;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Immutable public values only. Neither an original KeyEvent nor a copy pins
+// its captured window or conveys authority to redispatch host input.
+struct KeySample {
+    bool up = false;
+    std::uint32_t code = 0, meta = 0, repeat = 0;
+    KeyCharacterStatus character_status = KeyCharacterStatus::none;
+    std::uint32_t unicode = 0;
+    bool event_time_known = false, down_time_known = false, source_known = false;
+    std::uint64_t down_time_ms = 0, event_time_ms = 0;
+    std::uint32_t source = 0;
+};
+class KeyObjectState final : public dex::HostObjectState {
+  public:
+    const KeySample sample;
+    explicit KeyObjectState(KeySample value) : sample(value) {}
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+std::optional<std::uint32_t> layout_constant(std::string_view owner, std::string_view name) {
+    if (owner != layout_params_type && owner != margin_params_type && owner != frame_params_type && owner != linear_params_type) return {};
+    if (name == "MATCH_PARENT" || name == "FILL_PARENT") return UINT32_MAX;
+    if (name == "WRAP_CONTENT") return UINT32_MAX - 1;
+    return {};
+}
+// Mutable public values only; snapshots do not confer package query authority.
+constexpr std::array<std::string_view, 7> typed_value_int_fields{
+    "type", "data", "assetCookie", "resourceId", "changingConfigurations", "density", "sourceResourceId"};
+std::optional<std::size_t> typed_value_field_index(std::string_view name) {
+    const auto found = std::find(typed_value_int_fields.begin(), typed_value_int_fields.end(), name);
+    if (found == typed_value_int_fields.end()) return {};
+    return static_cast<std::size_t>(found - typed_value_int_fields.begin());
+}
+// Immutable identities of the actual sources held by this AssetManager. Cookies
+// are positive positions in this list, independent of resource package IDs.
+struct AssetSourceBinding {
+    std::string container;
+    std::uint32_t source_id = 0, string_count = 0;
+    bool sdk = false;
+};
+class AssetManagerObjectState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    const void *native_source_instance = nullptr;
+    std::uint64_t native_configuration_origin = 0;
+    mutable std::uint64_t native_issued_token = 0;
+    // Distinct Java manager, sharing the actual immutable source-set owner.
+    std::array<Value, 1> references{Value::reference(0)};
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class AssetSourcesState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    mutable bool native_prepared = false;
+    mutable std::uint64_t native_issued_token = 0;
+    const std::uint8_t *sdk_data = nullptr;
+    std::size_t sdk_size = 0;
+    std::vector<AssetSourceBinding> bindings;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override {
+        std::size_t result = sizeof(*this) + bindings.capacity() * sizeof(AssetSourceBinding);
+        for (const auto &binding : bindings) result += binding.container.capacity() + 1;
+        return result;
+    }
+};
+std::uint32_t java_configuration_flags(std::uint32_t native_flags) noexcept {
+    // SDK35 ActivityInfo.CONFIG_NATIVE_BITS, indexed by the Java output bit.
+    constexpr std::array<std::uint32_t, 16> bits{
+        0x2, 0x1, 0x4, 0x8, 0x10, 0x20, 0x40, 0x80,
+        0x800, 0x1000, 0x200, 0x2000, 0x100, 0x4000, 0x10000, 0x20000};
+    std::uint32_t result = 0;
+    for (std::size_t index = 0; index < bits.size(); ++index)
+        if (native_flags & bits[index]) result |= std::uint32_t{1} << index;
+    return result;
+}
+class TypedValueState final : public dex::HostObjectState {
+  public:
+    std::array<std::uint32_t, 7> numbers{0, 0, 0, 0, UINT32_MAX, 0, 0};
+    std::array<Value, 1> references{Value::reference(0)};
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class LoadedApkDirectoryState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual shared app data-directory File.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ApplicationPackageManagerState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual constructor ContextImpl.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class PackageInfoState final : public dex::HostObjectState {
+  public:
+    std::array<Value, 2> references{Value::reference(0), Value::reference(0)};
+    std::uint32_t version_code = 0, version_code_major = 0;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ActivityInfoState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::uint32_t config_changes = 0;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual complete returned metadata Bundle, or known null.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ApplicationInfoState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::uint32_t target_sdk = 0;
+    bool target_known = false, rtl_known = false, supports_rtl = false;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Actual Resources ownership and application-order layers. No resource-table
+// views or parsed string-pool indices survive within this state.
+class ThemeState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual owning Resources.
+    std::vector<ThemeStyleLayer> layers;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this) + layers.capacity() * sizeof(ThemeStyleLayer); }
+};
+// Immutable ordered theme cells retain no resource-table indices or guest
+// references. Recycling replaces their state to refund vector capacity.
+struct TypedArrayCell {
+    std::uint32_t attribute = 0;
+    StyledAttributeSnapshot snapshot;
+};
+class TypedArrayState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    bool recycled = false;
+    std::vector<TypedArrayCell> cells;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual target Resources, including after recycle.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this) + cells.capacity() * sizeof(TypedArrayCell); }
+};
+// Immutable public bitmap pixels, premultiplied RGBA8. No package/producer
+// custody is retained; replacing this state releases its exact managed charge.
+class BitmapObjectState final : public dex::HostObjectState {
+  public:
+    std::uint32_t width = 0, height = 0, density = 0;
+    bool has_alpha = false, recycled = false;
+    std::vector<std::uint8_t> rgba;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this) + rgba.capacity(); }
+};
+// Runtime geometry never aliases the frozen launcher-icon renderer. This
+// managed carrier owns the parsed model and source facts exactly once; each
+// returned Drawable traces its actual carrier instead of a native shared_ptr.
+struct DrawableSourceFacts {
+    std::uint32_t requested_id = 0, resource_id = 0, source_id = 0, source_data = 0, cookie = 0;
+    std::uint32_t selected_flags = 0, reference_flags = 0;
+    std::uint16_t source_density = 0;
+    std::uint32_t target_density = 0;
+    std::uint8_t value_type = 0;
+    bool sdk = false;
+    apk::ResourceConfiguration configuration;
+};
+enum class ResourceFailure {
+    sdk_absent, sdk_configuration, sdk_scalar, app_configuration, app_absent,
+    app_source, app_type, cyclic_reference, reference_depth,
+    drawable_theme, drawable_format, drawable_absent, vector_dimension,
+    xml_type, xml_absent, xml_sdk_backing
+};
+// Throw only fixed error facts while uncharged native parse scratch is live.
+// Java exception/message allocation occurs after that scratch has unwound.
+struct DeferredResourceFailure { ResourceFailure cause; };
+struct ProviderWorkCharge {
+    dex::ManagedRuntime &runtime;
+    void operator()(std::uint64_t count) const { runtime.charge_provider_work(count); }
+};
+class ProviderStorageReservation final {
+  public:
+    explicit ProviderStorageReservation(dex::ManagedRuntime &runtime) : runtime_(runtime) {}
+    ~ProviderStorageReservation() { runtime_.release_provider_storage(bytes_); }
+    ProviderStorageReservation(const ProviderStorageReservation &) = delete;
+    ProviderStorageReservation &operator=(const ProviderStorageReservation &) = delete;
+    std::size_t bytes() const noexcept { return bytes_; }
+    void resize(std::size_t bytes) {
+        if (bytes > bytes_) runtime_.reserve_provider_storage(bytes - bytes_);
+        else runtime_.release_provider_storage(bytes_ - bytes);
+        bytes_ = bytes;
+    }
+    void publish(ObjectId object, std::unique_ptr<dex::HostObjectState> metadata) {
+        runtime_.set_host_state_with_storage(object, std::move(metadata), bytes_);
+    }
+  private:
+    dex::ManagedRuntime &runtime_;
+    std::size_t bytes_ = 0;
+};
+class VectorDrawableState final : public dex::HostObjectState {
+  public:
+    VectorDrawableState(const void *owner_value, const DrawableSourceFacts &facts, ObjectId theme)
+        : owner(owner_value), source(facts), references{Value::reference(theme)} {}
+    const void *const owner;
+    const DrawableSourceFacts source;
+    // XML dependency facts accumulate during parsing; selected origin is fixed.
+    std::uint32_t dependency_flags = 0;
+    std::string container, path;
+    // Captured explicit Theme identity; type-attribute resolution remains
+    // unsupported until its actual bag/reference provenance is available.
+    std::array<Value, 1> references;
+    apk::RuntimeVector vector;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override {
+        return sizeof(*this) + container.capacity() + 1 + path.capacity() + 1 + vector.storage_bytes();
+    }
+};
+class DrawableObjectState final : public dex::HostObjectState {
+  public:
+    const void *owner;
+    std::array<Value, 1> references;
+    explicit DrawableObjectState(const void *session_owner, ObjectId carrier)
+        : owner(session_owner), references{Value::reference(carrier)} {}
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ColorDrawableObjectState final : public dex::HostObjectState {
+  public:
+    ColorDrawableObjectState(const void *owner_value, const DrawableSourceFacts &facts,
+                             std::uint32_t value, ObjectId theme)
+        : owner(owner_value), source(facts), color(value), references{Value::reference(theme)} {}
+    const void *const owner;
+    const DrawableSourceFacts source;
+    const std::uint32_t color;
+    std::array<Value, 1> references;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class XmlParserState final : public dex::HostObjectState {
+  public:
+    explicit XmlParserState(const void *session_owner) : owner(session_owner) {}
+    XmlParserState(const void *session_owner, ObjectId resources, apk::RuntimeXmlDocument &&document,
+                   XmlCursorSource source, const apk::ResourceConfiguration &configuration,
+                   std::uint32_t selected_resource, std::uint32_t source_value)
+        : owner(session_owner), references{Value::reference(resources)}, source_configuration(configuration),
+          resolved_resource(selected_resource), source_data(source_value), cursor_(std::in_place, std::move(document), source) {}
+    const void *const owner;
+    std::array<Value, 1> references{Value::reference(0)};
+    const apk::ResourceConfiguration source_configuration{};
+    const std::uint32_t resolved_resource = 0, source_data = 0;
+    mutable bool started = false, decrement_depth = false;
+    mutable std::uint32_t event_type = 0, depth = 0;
+    bool closed() const noexcept { return !cursor_; }
+    const XmlCursor &cursor() const {
+        if (!cursor_) throw apk::InspectError("AETHER_XML_CURSOR_CLOSED", "runtime-xml-cursor", "XML parser is closed");
+        return *cursor_;
+    }
+    std::uint32_t advance(const XmlWorkCharge &charge) const {
+        if (!started) { started = true; return 0; }
+        if (!cursor_) return 1;
+        const auto event = cursor_->next(charge);
+        if (decrement_depth) { --depth; decrement_depth = false; }
+        switch (event) {
+        case XmlCursorEvent::start_document: event_type = 0; break;
+        case XmlCursorEvent::end_document: event_type = 1; break;
+        case XmlCursorEvent::start_tag: ++depth; event_type = 2; break;
+        case XmlCursorEvent::end_tag: decrement_depth = true; event_type = 3; break;
+        case XmlCursorEvent::text: event_type = 4; break;
+        default: throw apk::InspectError("AETHER_XML_CURSOR_STATE", "runtime-xml-cursor", "Namespace event escaped ordinary XML pull traversal");
+        }
+        return event_type;
+    }
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override {
+        return sizeof(*this) + (cursor_ ? cursor_->storage_bytes() - sizeof(XmlCursor) : 0);
+    }
+  private:
+    // Progress changes neither capacity nor managed roots. Closing replaces the
+    // actual host state so the runtime refunds the recorded document charge.
+    mutable std::optional<XmlCursor> cursor_;
+};
+class SurfaceObjectState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::shared_ptr<NativeWindowProducer> producer;
+    std::uint32_t generation = 0;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class SurfaceHolderState final : public dex::HostObjectState {
+  public:
+    // Canonical View, Surface and frame, followed by a bounded callback list.
+    std::array<Value, 67> references;
+    std::size_t count = 0;
+    std::uint64_t revision = 0;
+    const void *owner = nullptr;
+    SurfaceHolderState() { references.fill(Value::reference(0)); }
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class SurfaceRectState final : public dex::HostObjectState {
+  public:
+    std::int32_t left = 0, top = 0, right = 0, bottom = 0;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
 std::optional<std::uint32_t> drag_action_constant(std::string_view owner, std::string_view name) {
     if (owner != drag_event_type) return {};
     if (name == "ACTION_DRAG_STARTED") return 1;
@@ -116,11 +561,50 @@ class AccessibilityObjectState final : public dex::HostObjectState {
     std::span<const Value> values() const noexcept override { return references; }
     std::size_t bytes() const noexcept override { return sizeof(*this); }
 };
+// Private software-backend properties; no Java RenderNode or native handle is
+// issued. SDK35 RenderProperties defaults are an identity transform, unit alpha
+// and bounds clipping. Later drawing must consume these facts under its own admission.
+struct SoftwareViewNode {
+    float alpha = 1.0f, scale_x = 1.0f, scale_y = 1.0f;
+    float translation_x = 0.0f, translation_y = 0.0f, translation_z = 0.0f;
+    float rotation = 0.0f, rotation_x = 0.0f, rotation_y = 0.0f, elevation = 0.0f;
+    bool clip_to_bounds = true, clip_to_outline = false, allow_force_dark = true;
+};
 class ViewObjectState final : public dex::HostObjectState {
   public:
     bool selected = false;
+    // Actual generic View XML constructor state. These fields grant neither
+    // physical attachment nor support for the guarded presentation pipeline.
+    bool xml_initialized = false;
+    std::uint32_t source_layout_id = 0;
+    std::int32_t visibility = 0, focusable_mode = 16;
+    std::int32_t raw_layout_direction = 0;
+    bool layout_direction_resolved = false, padding_resolved = false, drawables_resolved = false;
+    std::int32_t resolved_text_direction = 0, resolved_text_alignment = 0;
+    std::int32_t padding_left = 0, padding_top = 0, padding_right = 0, padding_bottom = 0;
+    std::int32_t minimum_width = 0, minimum_height = 0;
+    std::int32_t over_scroll_mode = 0, touch_slop = 0;
+    std::uint32_t ambiguous_gesture_multiplier = 0;
+    std::int32_t padding_start = 0, padding_end = 0;
+    std::optional<SoftwareViewNode> software_node;
+    bool group_constructor = false, group_children_initialized = false, surface_constructor = false;
+    bool view_context_constructor = false;
+    bool stub_constructor = false;
+    std::uint32_t stub_inflated_id = 0, stub_layout_resource = 0;
+    bool will_not_draw = false, layout_requested = false, drawing_invalidated = false;
+    bool drawn = false, has_bounds = false, drawing_cache_valid = false, drawing_dirty = false, last_is_opaque = false;
+    bool clip_children = false, clip_to_padding = false, animation_cache = false;
+    bool always_drawn_with_cache = false, split_motion_events = false;
+    std::int32_t descendant_focusability = 0, persistent_drawing_cache = 0, layout_mode = 0;
+    bool measure_all_children = false, baseline_aligned = false, use_largest_child = false;
+    bool allow_inconsistent_measurement = false;
+    std::int32_t linear_gravity = 0, baseline_child_index = 0, show_dividers = 0, divider_padding = 0;
+    std::uint32_t weight_sum_bits = 0;
     // Checked listener, description, text, watchers, key listener, drag listener.
-    std::array<Value, 6> references;
+    // Slot6 holder; 7 LayoutParams; 8 touch listener; 9 constructor Context;
+    // 10 actual first Resources; 11 node's actual Class identity (binary name source).
+    // Stub-only slots12 weak wrapper,13 explicit inflater,14 inflate listener.
+    std::array<Value, 15> references;
     std::size_t watcher_count = 0;
     std::int32_t mode = 0;
     bool broadcasting = false, ime_consumes_input = false, show_soft_input_on_focus = true;
@@ -149,7 +633,8 @@ class EditableState final : public dex::HostObjectState {
 class EditorInfoState final : public dex::HostObjectState {
   public:
     std::array<Value, 3> references{Value::reference(0), Value::reference(0), Value::reference(0)};
-    std::int32_t input_type = 0, ime_options = 0, initial_start = -1, initial_end = -1, initial_caps = 0, field_id = 0;
+    std::int32_t input_type = 0, ime_options = 0, action_id = 0, initial_start = -1, initial_end = -1,
+        initial_caps = 0, field_id = 0;
     std::span<const Value> values() const noexcept override { return references; }
     std::size_t bytes() const noexcept override { return sizeof(*this); }
 };
@@ -168,6 +653,11 @@ struct ManagedRoot {
     ObjectId object;
     ManagedRoot(dex::ManagedRuntime &runtime, ObjectId object) : runtime(runtime), object(object) { runtime.retain(object); }
     ~ManagedRoot() { runtime.release(object); }
+    void reset(ObjectId next) {
+        runtime.retain(next);
+        runtime.release(object);
+        object = next;
+    }
 };
 struct ImeBinding {
     ManagedRoot owner, connection, buffer;
@@ -225,15 +715,102 @@ class NotificationManagerState final : public dex::HostObjectState {
         return result;
     }
 };
+constexpr std::array<std::string_view, configuration_field_count> configuration_field_names{
+    "fontScale", "mcc", "mnc", "touchscreen", "keyboard", "keyboardHidden", "hardKeyboardHidden",
+    "navigation", "navigationHidden", "orientation", "screenLayout", "colorMode", "uiMode",
+    "screenWidthDp", "screenHeightDp", "smallestScreenWidthDp", "densityDpi"};
+std::optional<std::size_t> configuration_field_index(std::string_view name) noexcept {
+    for (std::size_t index = 0; index < configuration_field_names.size(); ++index)
+        if (configuration_field_names[index] == name) return index;
+    return {};
+}
 class ConfigurationState final : public dex::HostObjectState {
   public:
-    explicit ConfigurationState(DisplayConfiguration value) : value(value) {}
+    ConfigurationState() : value{0, 0, 0, 0} { known.fill(UINT32_MAX); }
+    explicit ConfigurationState(DisplayConfiguration source, ObjectId window = 0)
+        : value(source), references{Value::reference(window)}, remainder_origin(1) {
+        set(ConfigurationField::orientation, source.orientation());
+        set(ConfigurationField::width_dp, source.screen_width_dp);
+        set(ConfigurationField::height_dp, source.screen_height_dp);
+        set(ConfigurationField::smallest_dp, source.smallest_screen_width_dp);
+        set(ConfigurationField::density_dpi, source.density_dpi);
+        // Only the size classification is proved by the admitted DP facts.
+        numbers[static_cast<std::size_t>(ConfigurationField::screen_layout)] = source.layout_size();
+        known[static_cast<std::size_t>(ConfigurationField::screen_layout)] = 0x0fu;
+    }
+    void set(ConfigurationField field, std::uint32_t bits) noexcept {
+        const auto index = static_cast<std::size_t>(field); numbers[index] = bits; known[index] = UINT32_MAX;
+    }
+    const void *owner = nullptr;
     DisplayConfiguration value;
+    std::array<Value, 1> references{Value::reference(0)};
+    std::array<std::uint32_t, configuration_field_count> numbers{}, known{};
+    // Only immutable, unexposed fields are represented by this source token.
+    // All exposed scalar bits and WindowConfiguration/Rect values are separate.
+    std::uint64_t remainder_origin = 0; // Zero is the SDK undefined-default domain.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ResourcesManagerState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    ConfigurationValueFacts baseline;
+    std::uint64_t source_origin = 0;
+    // One rooted original Impl followed by weak cached Impls. Each raw key is
+    // an immutable value snapshot, never a reference to mutable guest input.
+    std::vector<Value> references;
+    std::vector<ConfigurationValueFacts> override_keys;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override {
+        return sizeof(*this) + references.capacity() * sizeof(Value) +
+            override_keys.capacity() * sizeof(ConfigurationValueFacts);
+    }
+};
+class ResourcesObjectState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual shared Impl.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ResourcesImplState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    static constexpr std::size_t configuration_slot = 0, assets_slot = 1, metrics_slot = 2;
+    std::array<Value, 3> references{Value::reference(0), Value::reference(0), Value::reference(0)};
+    std::uint64_t source_origin = 0;
+    bool table_compatible = false;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class DisplayMetricsState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    ViewportAdmission source;
+    std::uint32_t density_bits = 0;
     std::span<const Value> values() const noexcept override { return {}; }
     std::size_t bytes() const noexcept override { return sizeof(*this); }
 };
+class WindowConfigurationState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::uint64_t geometry_revision = 0, remainder_origin = 1;
+    std::array<Value, 1> references{Value::reference(0)};
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ViewConfigurationState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)}; // Actual constructor Resources.
+    std::uint64_t geometry_revision = 0;
+    std::int32_t density_key = 0;
+    ViewConfigurationParameters parameters;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
 // Logical Android paths, never Windows paths or directory authority.
-enum class PrivateFileKind { canonical_root, root_alias, relative_path, data_path, lexical_path };
+enum class PrivateFileKind { canonical_root, root_alias, relative_path, data_path, data_root, lexical_path };
 bool private_file_segment(std::u16string_view segment) {
     return !segment.empty() && segment.size() <= 127 && segment.front() != u'.' &&
         segment.back() != u'.' && segment.find(u"..") == std::u16string_view::npos &&
@@ -368,22 +945,174 @@ class LifecycleState final : public dex::HostObjectState {
     std::span<const Value> values()const noexcept override{return callbacks;}
     std::size_t bytes()const noexcept override{return sizeof(*this);}
 };
+class AutofillControllerState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)};
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class InflaterState final : public dex::HostObjectState {
+  public:
+    static constexpr std::size_t context_slot = 0, factory_slot = 1, factory2_slot = 2,
+        private_slot = 3, filter_slot = 4, filter_cache_slot = 5, constructor_args_slot = 6;
+    const void *owner = nullptr;
+    std::array<Value, 7> references{Value::reference(0), Value::reference(0), Value::reference(0),
+        Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0)};
+    bool factory_set = false;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class InflaterFilterCacheState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    struct Decision { std::string name; bool allowed = false; };
+    std::vector<Decision> decisions;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override {
+        auto result = sizeof(*this) + decisions.capacity() * sizeof(Decision);
+        for (const auto &decision : decisions) result += decision.name.capacity() + 1;
+        return result;
+    }
+};
+class ContextWrapperState final : public dex::HostObjectState {
+  public:
+    static constexpr std::size_t base_slot = 0, theme_slot = 1, inflater_slot = 2,
+        override_slot = 3, resources_slot = 4;
+    const void *owner = nullptr;
+    // Ordinary wrappers use mBase only. The platform ThemeWrapper constructor
+    // authenticates the additional real fields; this never represents Activity.
+    std::array<Value, 5> references{Value::reference(0), Value::reference(0), Value::reference(0),
+        Value::reference(0), Value::reference(0)};
+    std::uint32_t theme_resource = 0;
+    bool platform_theme_wrapper_constructed = false;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class ContextImplState final : public dex::HostObjectState {
+  public:
+    static constexpr std::size_t resources_slot = 0, outer_slot = 1, theme_slot = 2, inflater_slot = 3, autofill_slot = 4, capture_slot = 5, package_manager_slot = 6, files_slot = 7, autofill_options_slot = 8;
+    const void *owner = nullptr;
+    std::array<Value, 9> references{Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0)};
+    // Native creation provenance only; this is not a strong reference to the
+    // source Context, which the SDK configuration-context constructor does not retain.
+    std::uint64_t lineage = 0;
+    std::uint32_t theme_resource = 0;
+    std::optional<std::uint32_t> user_id;
+    std::int32_t device_id = 0;
+    bool own_permission_parameters_known = false;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
 class ActivityIntentState final : public dex::HostObjectState {
   public:
-    explicit ActivityIntentState(ObjectId intent = 0) : references{Value::reference(intent)} {}
-    std::array<Value, 1> references;
+    explicit ActivityIntentState(ObjectId intent = 0, ObjectId window = 0, ObjectId title = 0, bool known_title = true)
+        : references{Value::reference(intent), Value::reference(window), Value::reference(title), Value::reference(0),
+            Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0), Value::reference(0)}, title_known(known_title) {}
+    const void *owner = nullptr;
+    static constexpr std::size_t base_slot = 3, inflater_slot = 4, application_slot = 5, theme_slot = 6, autofill_slot = 7, resources_slot = 8, native_assets_slot = 9;
+    // Final slot retains the actual manager captured by NativeActivity creation,
+    // not a replacement for its Context/Resources getters.
+    std::array<Value, 10> references; // Intent, Window, title, base, inflater, Application, Theme, autofill, Resources, native assets.
+    bool title_known = true, base_attached = false;
+    std::uint32_t theme_resource = 0;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Policy identity and callback custody only. This does not create a host
+// surface, decor hierarchy, feature state or an installed event-delivery route.
+class WindowState final : public dex::HostObjectState {
+  public:
+    static constexpr std::size_t context_slot = 0, callback_slot = 1, decor_slot = 2,
+        content_parent_slot = 3, back_dispatcher_slot = 4, inflater_slot = 5;
+    const void *owner = nullptr;
+    std::array<Value, 6> references{Value::reference(0), Value::reference(0), Value::reference(0),
+                                    Value::reference(0), Value::reference(0), Value::reference(0)};
+    std::uint32_t theme_resource = 0;
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class BackDispatcherState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    // Traced in both directions without callback or host-event authority.
+    std::array<Value, 1> references{Value::reference(0)};
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Aether-owned functional carriers, not guessed Android lambda binary names.
+// These traced edges translate Binder's class-static storage; they are not
+// advertised as fields on the source Supplier object or exposed to reflection.
+class BinderWarnSupplierState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    mutable bool warn_on_blocking = false;
+    mutable std::array<Value, 2> references{Value::reference(0), Value::reference(0)}; // ThreadLocal, work-source callback.
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+class BinderWorkSourceState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::span<const Value> values() const noexcept override { return {}; }
+    std::size_t bytes() const noexcept override { return sizeof(*this); }
+};
+// Original cold local-holder representation only. No JavaBBinder peer,
+// extension endpoint or JNI global reference is created by this constructor.
+struct LocalBinderHolder final {
+    std::mutex mutex;
+    bool peer_created = false, extension_present = false, vintf_stability = false;
+};
+class BinderState : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::unique_ptr<LocalBinderHolder> holder;
+    mutable bool object_stored = false, cleanup_registered = false, descriptor_stored = false;
+    // Concrete SDK subtypes may keep additional traced fields in their own
+    // contiguous storage. Binder operations touch only this exact two-slot span.
+    virtual std::span<Value> binder_fields() const noexcept = 0;
+    std::size_t native_bytes() const noexcept { return holder ? sizeof(LocalBinderHolder) : 0; }
+    std::uintptr_t native_object() const noexcept { return reinterpret_cast<std::uintptr_t>(holder.get()); }
+    // Destruction releases native storage only; the runtime owns the single
+    // host-state byte refund after actual destruction. No runtime callback here.
+};
+class PlainBinderState final : public BinderState {
+  public:
+    mutable std::array<Value, 2> references{Value::reference(0), Value::reference(0)};
+    std::span<Value> binder_fields() const noexcept override { return references; }
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this) + native_bytes(); }
+};
+// Targeted compiled-profile observation in ADR0485: the anonymous client
+// stores its enclosing manager before invoking the Stub/Binder superclass chain.
+class AccessibilityClientState final : public BinderState {
+  public:
+    mutable std::array<Value, 3> references{Value::reference(0), Value::reference(0), Value::reference(0)};
+    std::span<Value> binder_fields() const noexcept override { return std::span<Value>(references).first(2); }
+    std::span<const Value> values() const noexcept override { return references; }
+    std::size_t bytes() const noexcept override { return sizeof(*this) + native_bytes(); }
+};
+// Exact private member-class/outer-store order attested in ADR0485. The
+// enclosing reference is retained before the source's empty Object super body.
+class AccessibilityMyCallbackState final : public dex::HostObjectState {
+  public:
+    const void *owner = nullptr;
+    std::array<Value, 1> references{Value::reference(0)};
     std::span<const Value> values() const noexcept override { return references; }
     std::size_t bytes() const noexcept override { return sizeof(*this); }
 };
 class HandlerState final : public dex::HostObjectState {
   public:
-    explicit HandlerState(ObjectId looper) : references_{Value::reference(looper)} {}
-    ObjectId looper() const noexcept { return references_[0].bits; }
-    std::span<const Value> values() const noexcept override { return references_; }
+    explicit HandlerState(ObjectId looper = 0) : references{Value::reference(looper), Value::reference(0), Value::reference(0)} {}
+    const void *owner = nullptr;
+    // Fixed traced fields: actual Looper, nullable Callback, initial null Messenger.
+    // Mutation is restricted to the nonreentrant constructor store sequence.
+    mutable std::array<Value, 3> references;
+    mutable dex::NativeMainQueueWitness queue;
+    mutable bool queue_bound = false, asynchronous = false, shared = false, initialized = false;
+    ObjectId looper() const noexcept { return references[0].bits; }
+    std::span<const Value> values() const noexcept override { return references; }
     std::size_t bytes() const noexcept override { return sizeof(HandlerState); }
-
-  private:
-    std::array<Value, 1> references_;
 };
 [[noreturn]] void bad(std::string_view code, std::string message) {
     throw dex::DexError("AETHER_ANDROID_" + std::string(code), std::move(message));
@@ -398,6 +1127,7 @@ struct ClassInfo {
     bool is_abstract = false, is_interface = false;
 };
 constexpr ClassInfo classes[]{
+    {inflate_exception_type, "Ljava/lang/RuntimeException;"},
     {drag_event_type, "Ljava/lang/Object;"},
     {drag_listener_type, "Ljava/lang/Object;", true, true},
     {clip_data_type, "Ljava/lang/Object;"},
@@ -414,6 +1144,12 @@ constexpr ClassInfo classes[]{
     {component_callbacks2_type, "Ljava/lang/Object;", true, true},
     {application_info_type, package_item_type},
     {package_item_type, "Ljava/lang/Object;"},
+    {log_type, "Ljava/lang/Object;"},
+    {package_info_type, "Ljava/lang/Object;"},
+    {component_info_type, package_item_type},
+    {service_info_type, component_info_type},
+    {"Landroid/util/AndroidException;", "Ljava/lang/Exception;"},
+    {package_missing_type, "Landroid/util/AndroidException;"},
     {intent_type, "Ljava/lang/Object;"},
     {component_type, "Ljava/lang/Object;"},
     {intent_categories_type, "Ljava/lang/Object;"},
@@ -436,14 +1172,23 @@ constexpr ClassInfo classes[]{
     {context_impl_type, "Landroid/content/Context;"},
     {activity_thread_type, "Ljava/lang/Object;"},
     {"Landroid/content/Context;", "Ljava/lang/Object;", true},
+    {broadcast_receiver_type, "Ljava/lang/Object;", true},
     {"Landroid/content/ContextWrapper;", "Landroid/content/Context;"},
     {"Landroid/view/ContextThemeWrapper;", "Landroid/content/ContextWrapper;"},
     {"Landroid/app/Activity;", "Landroid/view/ContextThemeWrapper;"},
+    {native_activity_type, "Landroid/app/Activity;"},
+    {action_bar_type, "Ljava/lang/Object;", true},
+    {window_type, "Ljava/lang/Object;", true},
+    {session_window_type, window_type},
+    {window_callback_type, "Ljava/lang/Object;", true, true},
+    {back_dispatcher_type, "Ljava/lang/Object;", true, true},
+    {native_content_type, "Landroid/view/View;"},
     {"Landroid/app/Application;", "Landroid/content/ContextWrapper;"},
     {base_bundle_type, "Ljava/lang/Object;"},
     {bundle_type, base_bundle_type},
     {"Landroid/os/Parcelable;", "Ljava/lang/Object;", true, true},
     {"Landroid/os/SystemClock;", "Ljava/lang/Object;"},
+    {build_type, "Ljava/lang/Object;"},
     {"Landroid/os/Process;", "Ljava/lang/Object;"},
     {handler_type, "Ljava/lang/Object;"},
     {looper_type, "Ljava/lang/Object;"},
@@ -452,12 +1197,40 @@ constexpr ClassInfo classes[]{
     {"Landroid/view/KeyEvent;", "Landroid/view/InputEvent;"},
     {key_callback_type, "Ljava/lang/Object;", true, true},
     {key_listener_type, "Ljava/lang/Object;", true, true},
+    {touch_listener_type, "Ljava/lang/Object;", true, true},
     {"Landroid/content/res/Resources;", "Ljava/lang/Object;"},
+    {typed_array_type, "Ljava/lang/Object;"},
+    {theme_type, "Ljava/lang/Object;"},
+    {"Landroid/content/res/AssetManager;", "Ljava/lang/Object;"},
     {configuration_type, "Ljava/lang/Object;"},
+    {display_metrics_type, "Ljava/lang/Object;"},
+    {window_configuration_type, "Ljava/lang/Object;"},
+    {view_configuration_type, "Ljava/lang/Object;"},
+    {typed_value_type, "Ljava/lang/Object;"},
     {"Landroid/content/res/Resources$NotFoundException;", "Ljava/lang/RuntimeException;"},
     {"Landroid/content/pm/PackageManager;", "Ljava/lang/Object;", true},
-    {"Laether/android/PackageManager;", "Landroid/content/pm/PackageManager;"},
+    {session_package_manager_type, "Landroid/content/pm/PackageManager;"},
+    {application_package_manager_type, "Landroid/content/pm/PackageManager;"},
     {"Landroid/view/View;", "Ljava/lang/Object;"},
+    {surface_view_type, "Landroid/view/View;"},
+    {surface_holder_type, "Ljava/lang/Object;", true, true},
+    {surface_holder_impl_type, "Ljava/lang/Object;"},
+    {surface_callback_type, "Ljava/lang/Object;", true, true},
+    {surface_type, "Ljava/lang/Object;"},
+    {rect_type, "Ljava/lang/Object;"},
+    {bitmap_type, "Ljava/lang/Object;"},
+    {bitmap_factory_type, "Ljava/lang/Object;"},
+    {drawable_type, "Ljava/lang/Object;", true},
+    {drawable_constant_type, "Ljava/lang/Object;", true},
+    {vector_drawable_type, drawable_type},
+    {color_drawable_type, drawable_type},
+    {vector_state_type, drawable_constant_type},
+    {xml_pull_type, "Ljava/lang/Object;", true, true},
+    {xml_resource_parser_type, "Ljava/lang/Object;", true, true},
+    {xml_utility_type, "Ljava/lang/Object;"},
+    {"Lorg/xmlpull/v1/XmlPullParserException;", "Ljava/lang/Exception;"},
+    {porter_duff_mode_type, "Ljava/lang/Enum;"},
+    {"Landroid/util/AttributeSet;", "Ljava/lang/Object;", true, true},
     {accessibility_node_type, "Ljava/lang/Object;"},
     {accessibility_collection_type, "Ljava/lang/Object;"},
     {accessibility_collection_builder_type, "Ljava/lang/Object;"},
@@ -466,6 +1239,11 @@ constexpr ClassInfo classes[]{
     {accessibility_record_type, "Ljava/lang/Object;"},
     {accessibility_event_type, accessibility_record_type},
     {"Landroid/view/ViewGroup;", "Landroid/view/View;", true},
+    {"Landroid/view/ViewParent;", "Ljava/lang/Object;", true, true},
+    {layout_params_type, "Ljava/lang/Object;"},
+    {margin_params_type, layout_params_type},
+    {frame_params_type, margin_params_type},
+    {linear_params_type, margin_params_type},
     {"Landroid/widget/LinearLayout;", "Landroid/view/ViewGroup;"},
     {"Landroid/widget/FrameLayout;", "Landroid/view/ViewGroup;"},
     {scroll_view_type, "Landroid/widget/FrameLayout;"},
@@ -488,6 +1266,114 @@ constexpr ClassInfo classes[]{
     {"Landroid/view/View$OnClickListener;", "Ljava/lang/Object;", true, true}};
 std::optional<dex::HostClass> class_metadata(std::string_view type) {
     if (const auto preferences = preferences_class(type)) return preferences;
+    if (const auto map = array_map_class(type)) return map;
+    // Native Aether bootstrap implementations reserve these exact names from
+    // APK collision; their provenance is not an Android-generated lambda class.
+    static constexpr std::array supplier_interfaces{std::string_view{"Ljava/util/function/Supplier;"}};
+    if (type == binder_warn_supplier_type)
+        return dex::HostClass{"Ljava/lang/Object;", supplier_interfaces, false, false, true, true, false, true};
+    static constexpr std::array work_source_interfaces{binder_work_source_interface_type};
+    if (type == binder_work_source_type)
+        return dex::HostClass{"Ljava/lang/Object;", work_source_interfaces, false, false, true, true, false, true};
+    if (type == binder_work_source_interface_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    if (type == window_binder_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true, false, true};
+    static constexpr std::array activity_info_interfaces{std::string_view{"Landroid/os/Parcelable;"}};
+    if (type == handler_callback_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    static constexpr std::array message_interfaces{std::string_view{"Landroid/os/Parcelable;"}};
+    if (type == message_type)
+        return dex::HostClass{"Ljava/lang/Object;", message_interfaces, false, false, false, true};
+    if (type == accessibility_manager_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, false, false, false, true, false, true};
+    static constexpr std::array my_callback_interfaces{handler_callback_type};
+    if (type == accessibility_my_callback_type)
+        return dex::HostClass{"Ljava/lang/Object;", my_callback_interfaces, false, false, false, true, false, true};
+    static constexpr std::array client_interface_parents{binder_interface_type};
+    if (type == accessibility_client_interface_type)
+        return dex::HostClass{"Ljava/lang/Object;", client_interface_parents, true, true, false, true};
+    static constexpr std::array client_stub_interfaces{accessibility_client_interface_type};
+    if (type == accessibility_client_stub_type)
+        return dex::HostClass{binder_type, client_stub_interfaces, true, false, false, true, false, true};
+    if (type == accessibility_client_type)
+        return dex::HostClass{accessibility_client_stub_type, {}, false, false, false, true, false, true};
+    if (type == binder_interface_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    static constexpr std::array binder_interfaces{window_binder_type};
+    if (type == binder_type)
+        return dex::HostClass{"Ljava/lang/Object;", binder_interfaces, false, false, false, true, false, true};
+    static constexpr std::array user_handle_interfaces{std::string_view{"Landroid/os/Parcelable;"}};
+    if (type == user_handle_type)
+        return dex::HostClass{"Ljava/lang/Object;", user_handle_interfaces, false, false, false, true};
+    if (type == activity_info_type)
+        return dex::HostClass{component_info_type, activity_info_interfaces, false, false, true, true};
+    if (type == component_info_type)
+        return dex::HostClass{package_item_type, {}, false, false, true, true};
+    static constexpr std::array xml_resource_interfaces{xml_pull_type, attribute_set_type, std::string_view{"Ljava/lang/AutoCloseable;"}};
+    if (type == xml_resource_parser_type)
+        return dex::HostClass{"Ljava/lang/Object;", xml_resource_interfaces, true, true, false, true};
+    static constexpr std::array xml_parser_interfaces{xml_resource_parser_type};
+    if (type == xml_parser_type)
+        return dex::HostClass{"Ljava/lang/Object;", xml_parser_interfaces, false, false, true, true};
+    static constexpr std::array typed_array_interfaces{std::string_view{"Ljava/lang/AutoCloseable;"}};
+    if (type == typed_array_type)
+        return dex::HostClass{"Ljava/lang/Object;", typed_array_interfaces, false, false, true, true};
+    static constexpr std::array autofill_controller_interfaces{autofill_client_type, std::string_view{"Landroid/util/Dumpable;"}};
+    if (type == autofill_controller_type)
+        return dex::HostClass{"Ljava/lang/Object;", autofill_controller_interfaces, false, false, false, true};
+    if (type == autofill_client_type || type == "Landroid/util/Dumpable;")
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    static constexpr std::array capture_options_interfaces{std::string_view{"Landroid/os/Parcelable;"}};
+    if (type == content_capture_options_type || type == autofill_options_type)
+        return dex::HostClass{"Ljava/lang/Object;", capture_options_interfaces, false, false, false, true};
+    if (type == view_stub_type)
+        return dex::HostClass{"Landroid/view/View;", {}, false, false, true, true};
+    if (type == stub_listener_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    if (type == layout_inflater_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, false, false, true};
+    if (type == phone_inflater_type)
+        return dex::HostClass{layout_inflater_type, {}, false, false, false, true};
+    if (type == layout_factory_type || type == layout_filter_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    static constexpr std::array factory2_interfaces{layout_factory_type};
+    if (type == layout_factory2_type)
+        return dex::HostClass{"Ljava/lang/Object;", factory2_interfaces, true, true, false, true};
+    static constexpr std::array merger_interfaces{layout_factory2_type};
+    if (type == inflater_factory_merger_type)
+        return dex::HostClass{"Ljava/lang/Object;", merger_interfaces, false, false, false, true};
+    if (type == inflater_filter_cache_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, false, false, false, true};
+    if (type == resources_impl_carrier_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, false, false, false, true};
+    static constexpr std::array view_root_interfaces{
+        std::string_view{"Landroid/view/ViewParent;"}, std::string_view{"Landroid/view/View$AttachInfo$Callbacks;"},
+        std::string_view{"Landroid/view/ThreadedRenderer$DrawCallbacks;"}, std::string_view{"Landroid/view/AttachedSurfaceControl;"}};
+    if (type == view_root_impl_type)
+        return dex::HostClass{"Ljava/lang/Object;", view_root_interfaces, false, false, false, true};
+    if (type == "Landroid/view/View$AttachInfo$Callbacks;" || type == "Landroid/view/ThreadedRenderer$DrawCallbacks;" ||
+        type == "Landroid/view/AttachedSurfaceControl;")
+        return dex::HostClass{"Ljava/lang/Object;", {}, true, true, false, true};
+    // Return-type identity only. The HostClass contract has no public/final
+    // class flags; no ViewRootImpl objects, methods or physical authority are issued.
+    static constexpr std::array view_parent_interfaces{std::string_view{"Landroid/view/ViewParent;"}};
+    if (type == "Landroid/view/ViewGroup;")
+        return dex::HostClass{"Landroid/view/View;", view_parent_interfaces, true, false, true, true};
+    static constexpr std::array surface_holder_interfaces{surface_holder_type};
+    if (type == surface_holder_impl_type)
+        return dex::HostClass{"Ljava/lang/Object;", surface_holder_interfaces, false, false, true, true};
+    static constexpr std::array back_dispatcher_interfaces{back_dispatcher_type};
+    if (type == session_back_dispatcher_type)
+        return dex::HostClass{"Ljava/lang/Object;", back_dispatcher_interfaces, false, false, true, true};
+    static constexpr std::array surface_parcelable_interfaces{std::string_view{"Landroid/os/Parcelable;"}};
+    static constexpr std::array configuration_interfaces{std::string_view{"Landroid/os/Parcelable;"}, std::string_view{"Ljava/lang/Comparable;"}};
+    if (type == configuration_type || type == window_configuration_type)
+        return dex::HostClass{"Ljava/lang/Object;", configuration_interfaces, false, false, false, true};
+    if (type == display_metrics_type)
+        return dex::HostClass{"Ljava/lang/Object;", {}, false, false, false, true};
+    if (type == surface_type || type == rect_type || type == bitmap_type || type == package_info_type)
+        return dex::HostClass{"Ljava/lang/Object;", surface_parcelable_interfaces, false, false, true, true};
     static constexpr std::array window_token_interfaces{window_binder_type};
     if (type == window_token_type)
         return dex::HostClass{"Ljava/lang/Object;", window_token_interfaces, false, false, true, true};
@@ -499,7 +1385,7 @@ std::optional<dex::HostClass> class_metadata(std::string_view type) {
                                                                        "Landroid/os/Parcelable;"};
     static constexpr std::array component_parent{component_callbacks_type};
     static constexpr std::array component2_parent{component_callbacks2_type};
-    static constexpr std::array activity_interfaces{component_callbacks2_type, key_callback_type};
+    static constexpr std::array activity_interfaces{component_callbacks2_type, key_callback_type, window_callback_type, layout_factory2_type};
     static constexpr std::array view_interfaces{key_callback_type};
     static constexpr std::array<std::string_view, 1> notification_interfaces{"Landroid/os/Parcelable;"};
     if (type == drag_event_type || type == clip_data_type || type == clip_description_type || type == drag_permissions_type)
@@ -508,6 +1394,8 @@ std::optional<dex::HostClass> class_metadata(std::string_view type) {
         "Landroid/os/Parcelable;", "Ljava/lang/Cloneable;"};
     static constexpr std::array<std::string_view, 3> component_interfaces{
         "Landroid/os/Parcelable;", "Ljava/lang/Cloneable;", "Ljava/lang/Comparable;"};
+    if (type == service_info_type)
+        return dex::HostClass{component_info_type, notification_interfaces, false, false, true, true};
     if (type == intent_type)
         return dex::HostClass{"Ljava/lang/Object;", intent_interfaces, false, false, true, true};
     if (type == component_type)
@@ -566,6 +1454,13 @@ std::optional<dex::HostClass> class_metadata(std::string_view type) {
         return dex::HostClass{"Ljava/lang/Object;", bundle_interfaces, false, false, true, true};
     if (type == accessibility_event_type)
         return dex::HostClass{accessibility_record_type, bundle_interfaces, false, false, true, true};
+    // These pinned SDK exceptions inherit Throwable.getMessage. The apparent
+    // XmlPullParserException override in libcore is inside a block comment;
+    // Resources.NotFoundException declares only its three constructors.
+    if (type == inflate_exception_type || type == "Landroid/content/res/Resources$NotFoundException;")
+        return dex::HostClass{"Ljava/lang/RuntimeException;", {}, false, false, true, true, true};
+    if (type == "Lorg/xmlpull/v1/XmlPullParserException;")
+        return dex::HostClass{"Ljava/lang/Exception;", {}, false, false, true, true, true};
     for (const auto &entry : classes)
         if (entry.name == type)
             return dex::HostClass{entry.superclass, {}, entry.is_abstract, entry.is_interface, type != file_type, true};
@@ -587,6 +1482,19 @@ std::optional<std::uint32_t> accessibility_constant(std::string_view owner, std:
     return {};
 }
 bool api_static(const ApiSupport &api) {
+    if (api.owner == binder_type && api.name == "setWarnOnBlocking" && api.signature == "(Z)V") return true;
+    if ((api.owner == binder_type && (api.name == "getCallingUid" || api.name == "getCallingPid")) ||
+        (api.owner == process_type && (api.name == "myUid" || api.name == "myPid")) ||
+        (api.owner == user_handle_type && (api.name == "myUserId" || api.name == "getUserId"))) return true;
+    if (api.owner == log_type && api.name == "d" && api.signature == "(Ljava/lang/String;Ljava/lang/String;)I") return true;
+    if (api.owner == layout_inflater_type && api.name == "from" &&
+        api.signature == "(Landroid/content/Context;)Landroid/view/LayoutInflater;") return true;
+    if (api.owner == view_configuration_type && api.name == "get" &&
+        api.signature == "(Landroid/content/Context;)Landroid/view/ViewConfiguration;") return true;
+    if (api.owner == xml_utility_type && api.name == "asAttributeSet") return true;
+    if (api.owner == porter_duff_mode_type && (api.name == "values" || api.name == "valueOf")) return true;
+    if (api.owner == bitmap_factory_type && api.name == "decodeResource") return true;
+    if (api.owner == motion_event_type && (api.name == "obtain" || api.name == "obtainNoHistory")) return true;
     if ((api.owner == accessibility_node_type || api.owner == accessibility_collection_type ||
          api.owner == accessibility_item_type) && api.name == "obtain") return true;
     if (api.owner == clip_data_type && api.name == "newPlainText") return true;
@@ -606,8 +1514,101 @@ bool api_static(const ApiSupport &api) {
            (api.owner == looper_type && (api.name == "getMainLooper" || api.name == "myLooper"));
 }
 std::optional<std::uint32_t> uri_api_flags(const ApiSupport &api) {
+    if (api.owner == binder_work_source_interface_type) return 0x401u;
+    if (api.owner == accessibility_client_interface_type) return 0x401u;
+    if (api.owner == accessibility_client_type && api.name == "<init>") return 0u; // Actual package constructor; internal-only factory.
+    if (api.owner == accessibility_my_callback_type && api.name == "<init>") return 2u; // Attested private constructor; internal-only factory.
+    if (api.owner == binder_interface_type && api.name == "asBinder") return 0x401u;
+    if (api.owner == handler_callback_type && api.name == "handleMessage") return 0x401u;
+    if (api.owner == handler_type && api.name == "getLooper") return 0x11u;
+    if (api.owner == binder_type && (api.name == "getCallingUid" || api.name == "getCallingPid")) return 0x119u;
+    if (api.owner == process_type && (api.name == "myUid" || api.name == "myPid")) return 0x19u;
+    if (api.owner == user_handle_type && (api.name == "myUserId" || api.name == "getUserId")) return 9u;
+    if (api.owner == "Landroid/content/Context;" &&
+        (api.name == "getMainLooper" || api.name == "checkCallingOrSelfPermission" || api.name == "checkPermission")) return 0x401u;
+    if (api.owner == "Landroid/content/Context;" &&
+        ((api.name == "getString" && api.signature == "(I)Ljava/lang/String;") ||
+         (api.name == "getText" && api.signature == "(I)Ljava/lang/CharSequence;"))) return 0x11u;
+    if (api.owner == "Landroid/content/Context;" &&
+        ((api.name == "createConfigurationContext" && api.signature == "(Landroid/content/res/Configuration;)Landroid/content/Context;") ||
+         (api.name == "getResources" && api.signature == "()Landroid/content/res/Resources;") ||
+         (api.name == "getAssets" && api.signature == "()Landroid/content/res/AssetManager;") ||
+         (api.name == "getPackageName" && api.signature == "()Ljava/lang/String;") ||
+         (api.name == "getPackageManager" && api.signature == "()Landroid/content/pm/PackageManager;") ||
+         ((api.name == "getDataDir" || api.name == "getFilesDir" || api.name == "getObbDir") && api.signature == "()Ljava/io/File;") ||
+         (api.name == "getObbDirs" && api.signature == "()[Ljava/io/File;") ||
+         (api.name == "getExternalFilesDir" && api.signature == "(Ljava/lang/String;)Ljava/io/File;") ||
+         (api.name == "getExternalFilesDirs" && api.signature == "(Ljava/lang/String;)[Ljava/io/File;"))) return 0x401u;
+    if (api.owner == log_type && api.name == "d" && api.signature == "(Ljava/lang/String;Ljava/lang/String;)I") return 9u;
+    if (api.owner == "Landroid/content/pm/PackageManager;" && api.name == "getServiceInfo" &&
+        api.signature == "(Landroid/content/ComponentName;I)Landroid/content/pm/ServiceInfo;") return 0x401u;
+    if (api.owner == "Landroid/content/pm/PackageManager;" && api.name == "getActivityInfo" &&
+        api.signature == "(Landroid/content/ComponentName;I)Landroid/content/pm/ActivityInfo;") return 0x401u;
+    if (api.owner == layout_factory_type && api.name == "onCreateView" &&
+        api.signature == "(Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;") return 0x401u;
+    if (api.owner == layout_factory2_type && api.name == "onCreateView" &&
+        api.signature == "(Landroid/view/View;Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;") return 0x401u;
+    if (api.owner == layout_filter_type && api.name == "onLoadClass") return 0x401u;
+    if ((api.owner == layout_inflater_type || api.owner == phone_inflater_type) && api.name == "onCreateView" &&
+        (api.signature == "(Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" ||
+         (api.owner == layout_inflater_type && api.signature == "(Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;"))) return 4u;
+    if (api.owner == theme_wrapper_type && api.name == "<init>") return 0x10001u;
+    if (api.owner == theme_wrapper_type && api.name == "onApplyThemeResource" &&
+        api.signature == "(Landroid/content/res/Resources$Theme;IZ)V") return 4u;
+    if ((api.owner == layout_inflater_type || api.owner == phone_inflater_type) && api.name == "<init>")
+        return api.owner == phone_inflater_type && api.signature == "(Landroid/content/Context;)V" ? 1u : 4u;
+    if (api.owner == layout_inflater_type) {
+        if (api.name == "from") return 9u;
+        if (api.name == "cloneInContext") return 0x401u;
+        if (api.name == "getFactory" || api.name == "getFactory2") return 0x11u;
+        if (api.name == "tryCreateView" && api.signature == "(Landroid/view/View;Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;") return 0x11u;
+        if (api.name == "createView" &&
+            (api.signature == "(Ljava/lang/String;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" ||
+             api.signature == "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;")) return 0x11u;
+    }
+    if (api.owner == window_type && api.name == "getLayoutInflater") return 0x401u;
+    if (api.owner == "Landroid/content/Context;" && api.name == "getSystemService" &&
+        api.signature == "(Ljava/lang/String;)Ljava/lang/Object;") return 0x401u;
+    if (api.owner == "Landroid/content/Context;" && api.name == "getDisplayId" && api.signature == "()I") return 0x401u;
+    if (api.name == "attachBaseContext" && api.signature == "(Landroid/content/Context;)V" &&
+        (api.owner == "Landroid/app/Activity;" || api.owner == theme_wrapper_type || api.owner == "Landroid/content/ContextWrapper;")) return 4u;
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getApplication" && api.signature == "()Landroid/app/Application;") return 0x11u;
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getAutofillClient" &&
+        api.signature == "()Landroid/view/autofill/AutofillManager$AutofillClient;") return 0x11u;
+    if (api.owner == stub_listener_type && api.name == "onInflate" &&
+        api.signature == "(Landroid/view/ViewStub;Landroid/view/View;)V") return 0x401u;
+    if (api.owner == "Landroid/content/Context;" && api.name == "isAutofillCompatibilityEnabled") return 0x11u;
+    if (api.owner == "Landroid/view/View;" && api.name == "isFocusedByDefault") return 0x11u;
+    if (api.owner == "Landroid/view/View;" && api.name == "getParent" && api.signature == "()Landroid/view/ViewParent;") return 0x11u;
+    if (api.owner == typed_value_type && api.name == "getFloat" && api.signature == "()F") return 0x11u;
+    if (api.owner == layout_params_type && api.name == "setBaseAttributes" &&
+        api.signature == "(Landroid/content/res/TypedArray;II)V") return 4u;
+    if ((api.owner == "Landroid/view/ViewGroup;" || api.owner == frame_layout_type || api.owner == "Landroid/widget/LinearLayout;") &&
+        (api.name == "checkLayoutParams" || api.name == "generateDefaultLayoutParams" || api.name == "onSetLayoutParams" ||
+         (api.name == "generateLayoutParams" && api.signature.starts_with("(Landroid/view/ViewGroup$LayoutParams;)")))) return 4u;
+    if ((api.owner == "Landroid/view/View;" || api.owner == "Landroid/view/ViewGroup;") && api.name == "resetResolvedDrawables") return 4u;
+    if (api.owner == "Landroid/view/View;" && api.name == "resolveLayoutParams" && api.signature == "()V") return 1u;
+    if (api.owner == "Landroid/view/View;" && api.name == "onFinishInflate" && api.signature == "()V") return 4u;
+    if (api.owner == xml_pull_type || api.owner == xml_resource_parser_type || api.owner == attribute_set_type) return 0x401u;
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getTitle" && api.signature == "()Ljava/lang/CharSequence;")
+        return 0x11u;
+    if (api.owner == "Landroid/content/Context;" && api.name == "getClassLoader" &&
+        api.signature == "()Ljava/lang/ClassLoader;") return 0x401u;
+    if (api.name == "getDrawable") {
+        if (api.owner == "Landroid/content/Context;" &&
+            api.signature == "(I)Landroid/graphics/drawable/Drawable;") return 0x11u;
+        if (api.owner == "Landroid/content/res/Resources;" &&
+            (api.signature == "(I)Landroid/graphics/drawable/Drawable;" ||
+             api.signature == "(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;")) return 1u;
+    }
+    if (api.owner == window_callback_type && api.signature == "()V" &&
+        (api.name == "onContentChanged" || api.name == "onAttachedToWindow" || api.name == "onDetachedFromWindow"))
+        return 0x401u;
     if(api.owner==resolver_type && (api.name=="getType" || api.name=="openInputStream"))return 0x11u;
     if(api.name=="getContentResolver")return api.owner=="Landroid/content/Context;" ? 0x401u : 1u;
+    if (api.owner == "Landroid/content/Context;" && (api.name == "getTheme" || api.name == "setTheme")) return 0x401u;
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "newTheme") return 0x11u;
+    if (api.owner == window_type && (api.name == "getContext" || api.name == "getCallback")) return 0x11u;
     if (api.owner == uri_type) {
         if (api_static(api)) return 9u;
         if (api.name == "isHierarchical" || api.name == "isRelative" || api.name == "toString" ||
@@ -619,19 +1620,35 @@ std::optional<std::uint32_t> uri_api_flags(const ApiSupport &api) {
     return {};
 }
 bool public_api(const ApiSupport &api) {
+    if (api.name == "attachBaseContext" && (api.owner == "Landroid/app/Activity;" || api.owner == theme_wrapper_type)) return false;
+    if (api.owner == layout_params_type && api.name == "setBaseAttributes") return false;
+    if ((api.owner == "Landroid/view/ViewGroup;" || api.owner == frame_layout_type || api.owner == "Landroid/widget/LinearLayout;") &&
+        (api.name == "checkLayoutParams" || api.name == "generateDefaultLayoutParams" || api.name == "onSetLayoutParams" ||
+         (api.name == "generateLayoutParams" && api.signature.starts_with("(Landroid/view/ViewGroup$LayoutParams;)")))) return false;
+    if ((api.owner == "Landroid/view/View;" || api.owner == "Landroid/view/ViewGroup;") && api.name == "resetResolvedDrawables") return false;
+    if (api.owner == "Landroid/view/View;" && api.name == "onFinishInflate") return false;
+    if ((api.owner == layout_inflater_type || api.owner == phone_inflater_type) && api.name == "onCreateView" &&
+        (api.signature == "(Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" ||
+         api.signature == "(Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;")) return false;
     if (api.name == "<init>" || api.name == "<clinit>")
         return false;
-    if (api.owner == "Landroid/content/ContextWrapper;" && api.name == "attachBaseContext")
+    if ((api.owner == "Landroid/content/ContextWrapper;" && api.name == "attachBaseContext") ||
+        (api.owner == theme_wrapper_type && api.name == "onApplyThemeResource"))
         return false;
     if (api.owner == "Landroid/app/Activity;" && api.name.starts_with("on") &&
-        api.name != "onWindowFocusChanged" && api.name != "onKeyDown" && api.name != "onKeyUp")
+        api.name != "onWindowFocusChanged" && api.name != "onKeyDown" && api.name != "onKeyUp" &&
+        api.name != "onContentChanged" && api.name != "onAttachedToWindow" && api.name != "onDetachedFromWindow" && api.name != "onCreateView")
         return false; // These Activity lifecycle callbacks are protected.
+    if (api.owner == native_activity_type && api.name.starts_with("on") &&
+        api.name != "onWindowFocusChanged" && api.name != "onConfigurationChanged" && api.name != "onLowMemory")
+        return false;
     if (api.owner == "Landroid/widget/TextView;" &&
         (api.name == "onTextChanged" || api.name == "onSelectionChanged")) return false;
     if (api.owner == "Landroid/view/View;" && api.name == "dispatchSetSelected") return false;
     return true;
 }
 std::string_view component_method_owner(std::string_view owner,std::string_view name) {
+    if (owner == accessibility_client_interface_type && name == "asBinder") return binder_interface_type;
     if ((owner == uri_type || owner == abstract_uri_type) && name == "describeContents")
         return "Landroid/os/Parcelable;";
     if (owner == editable_type && (name == "length" || name == "charAt" || name == "subSequence" || name == "toString"))
@@ -639,6 +1656,10 @@ std::string_view component_method_owner(std::string_view owner,std::string_view 
     if (owner == editable_type && name == "getChars") return "Landroid/text/GetChars;";
     if(owner==component_callbacks2_type && (name=="onConfigurationChanged" || name=="onLowMemory"))
         return component_callbacks_type;
+    return owner;
+}
+std::string_view layout_factory_method_owner(std::string_view owner, std::string_view name, std::size_t count) {
+    if (owner == layout_factory2_type && name == "onCreateView" && count == 3) return layout_factory_type;
     return owner;
 }
 std::vector<std::string> api_parameters(std::string_view signature) {
@@ -661,9 +1682,12 @@ const ApiSupport &resolve(const dex::DexImage &image, dex::Index index) {
     const auto &signature = image.prototypes.at(method.prototype).descriptor;
     auto owner = std::string_view(image.types.at(method.owner));
     for (unsigned depth = 0; depth < 256; ++depth) {
-        owner = component_method_owner(preferences_owner(owner), method.name);
+        owner = layout_factory_method_owner(component_method_owner(preferences_owner(owner), method.name),
+            method.name, image.prototypes.at(method.prototype).parameters.size());
         for (const auto &api : api_registry())
-            if (api.owner == owner && api.name == method.name && api.signature == signature) {
+            if ((api.owner == owner || (owner == xml_resource_parser_type &&
+                 (api.owner == xml_pull_type || api.owner == attribute_set_type))) &&
+                api.name == method.name && api.signature == signature) {
                 if (api.status == ApiStatus::not_started || api.status == ApiStatus::stub)
                     bad("API_UNSUPPORTED", std::string(owner) + "." + method.name + signature + ": " +
                                                std::string(api.behavior));
@@ -689,7 +1713,24 @@ struct ActivitySession::Impl {
     dex::ManagedRuntime &runtime;
     std::string package, activity_type;
     apk::ResourceTable resources;
+    ResourceFileReader resource_file_reader;
+    std::optional<PackageMetadata> package_metadata;
+    ImplicitComponentQueryPolicy component_query_policy = ImplicitComponentQueryPolicy::unknown;
+    bool component_query_policy_bound = false;
+    std::optional<AndroidProcessIdentity> process_identity;
+    // This framework profile has no incoming Binder-transaction entry point.
+    // Any future transaction integration must replace this witness while active.
+    enum class BinderIdentityContext { no_incoming_transaction, unknown };
+    BinderIdentityContext binder_identity_context = BinderIdentityContext::no_incoming_transaction;
+    AccessibilityBackendAvailability accessibility_backend_availability = AccessibilityBackendAvailability::unknown;
+    bool accessibility_backend_bound = false;
+    std::optional<apk::ManifestInteger> activity_theme;
+    std::optional<std::uint32_t> bound_target_sdk;
+    ObjectId base_theme = 0, current_activity_theme = 0;
+    std::uint32_t base_theme_resource = 0, activity_theme_resource = 0;
+    bool resource_read_active = false;
     DisplayConfiguration configuration;
+    std::optional<ViewportAdmission> launch_viewport;
     const host::TimeService *time;
     host::FileService *files;
     host::NotificationService *notifications;
@@ -699,13 +1740,66 @@ struct ActivitySession::Impl {
     bool input_cleanup_failed = false;
     bool terminal_cleanup = false;
     ObjectId files_directory = 0;
-    ObjectId application = 0, resource_object = 0, package_manager = 0, content_resolver = 0, activity = 0, content = 0;
+    ObjectId application = 0, resource_object = 0, asset_manager = 0, package_manager = 0, content_resolver = 0, activity = 0, content = 0;
+    std::uint64_t attachment_revision = 0;
     ObjectId main_looper = 0, base_context = 0, activity_thread = 0;
+    ObjectId layout_inflater_service_name = 0, inflater_constructor_cache = 0;
+    ObjectId accessibility_client_descriptor = 0; // Actual SDK class constant, retained across Activity recreation.
+    ObjectId binder_warn_supplier = 0; // One class-space root; its traced edges own the other static values.
+    ObjectId array_map_class_space = 0; // Installed/retained by the admitted map module; one class-space root.
+    ObjectId accessibility_instance_sync = 0; // Actual Manager.sInstanceSync; no Manager cache published here.
+    ObjectId inflater_theme_attributes = 0, inflater_class_attribute_name = 0;
+    std::array<ObjectId, 4> inflater_prefix_names{};
+    std::size_t inflater_constructor_count = 0;
+    std::uint64_t configuration_origin = 1;
+    std::uint64_t resource_source_origin = 1;
     ObjectId configuration_object = 0;
+    ObjectId display_metrics = 0, window_configuration = 0;
+    ObjectId view_configuration = 0;
+    ViewConfigurationMenuKey view_menu_key;
+    bool linear_compatibility_done = false, linear_remeasure_weighted_children = true;
+    bool view_compatibility_done = false, view_preserve_margin_params = false;
+    bool view_default_focus_highlight = false;
+    std::int32_t view_compatibility_pre_target = 0, view_compatibility_post_target = 0;
+    ObjectId view_styleable_ids = 0, view_styleable_ordinals = 0;
+    std::array<StyleableArrays, static_cast<std::size_t>(WidgetStyleable::view_stub) + 1> widget_styleables{};
     ObjectId notification_manager = 0;
     ObjectId clipboard_manager = 0, clipboard_name = 0, plain_text_mime = 0;
+    ObjectId build_fingerprint_string = 0;
     ObjectId input_method_manager = 0, window_token = 0, input_method_name = 0;
     std::uint64_t soft_input_revision = 0, window_generation = 1;
+    std::shared_ptr<NativeWindows> native_window_registry = std::make_shared<NativeWindows>();
+    NativeActivityObserver native_activity_observer;
+    NativeActivityPointerObserver native_pointer_observer;
+    NativeActivityKeyObserver native_key_observer;
+    NativeKeyCompletionObserver key_completion_observer;
+    std::exception_ptr key_completion_failure;
+    struct PendingNativeKey {
+        NativeActivityKeyInput input;
+        bool dispatching = false, cancel_requested = false;
+    };
+    std::array<PendingNativeKey, 256> native_keys{};
+    ObjectId native_content_view = 0;
+    bool native_queue_created = false;
+    bool finishing = false;
+    std::uint64_t finish_ordinal = 0;
+    std::optional<ActivityFinishRequest> finish_request;
+    std::optional<NativeActivityPointerInput> native_pointer;
+    std::uint64_t input_generation = 1, native_completion_queue = 0;
+    struct NativeCompletionTarget { Impl *owner; };
+    std::shared_ptr<NativeCompletionTarget> native_completion_target =
+        std::make_shared<NativeCompletionTarget>(NativeCompletionTarget{this});
+    bool native_constructed = false, native_create_attempted = false, native_created = false, native_dispatching = false;
+    std::function<NativeSurfaceAdmission(const NativeSurfaceRequest &)> native_surface_observer;
+    struct ActiveSurface {
+        ObjectId view = 0, holder = 0, surface = 0;
+        NativeSurfaceRequest request;
+        NativeSurfaceAdmission admission;
+        std::shared_ptr<NativeWindowProducer> producer;
+    };
+    std::optional<ActiveSurface> active_surface;
+    bool reconciling_surface = false, surface_creating = false, surface_dirty = true, surface_recreate = false;
+    bool assigning_content = false;
     std::array<ViewActivation, view_activation_limit> view_activations{};
     std::size_t view_activation_count = 0;
     std::uint64_t view_activation_revision = 0;
@@ -748,6 +1842,7 @@ struct ActivitySession::Impl {
     AccessibilityProviderQuery *accessibility_provider_query = nullptr;
     std::map<ObjectId, ViewBounds> unscrolled_bounds;
     std::array<ObjectId, 3> buffer_modes{};
+    std::array<ObjectId, porter_duff_mode_names.size()> porter_duff_modes{};
     std::size_t text_depth = 0;
     struct PendingCompositionRemoval;
     PendingCompositionRemoval *pending_composition = nullptr;
@@ -763,9 +1858,110 @@ struct ActivitySession::Impl {
     std::array<std::u16string,2> standard_output;
     std::size_t output_characters=0;
     FrameworkMetrics metrics;
+    struct TouchGesture {
+        struct Route { ObjectId object = 0, child = 0; bool disallow = false, accepted = false; };
+        dex::ManagedRuntime &runtime;
+        ObjectId root, owner_activity;
+        std::uint64_t generation;
+        PointerInput last;
+        bool down_time_known;
+        std::uint64_t down_time_ms;
+        float pixels_per_dp;
+        std::optional<std::uint64_t> last_known_event_time_ms;
+        std::array<Route, 256> routes{};
+        std::size_t count = 0;
+        bool accepted = false, cancel_requested = false, canceling = false;
+        bool native_fallback = false;
+        TouchGesture(dex::ManagedRuntime &vm, ObjectId root_view, ObjectId owner, std::uint64_t window,
+                     const PointerInput &input, float scale)
+            : runtime(vm), root(root_view), owner_activity(owner), generation(window), last(input),
+              down_time_known(input.time_known), down_time_ms(input.down_time_ms), pixels_per_dp(scale) {
+            if (input.time_known) last_known_event_time_ms = input.event_time_ms;
+            runtime.retain(owner_activity);
+        }
+        ~TouchGesture() {
+            for (std::size_t n = 0; n < count; ++n) runtime.release(routes[n].object);
+            runtime.release(owner_activity);
+        }
+        Route &route(ObjectId object) {
+            for (std::size_t n = 0; n < count; ++n) if (routes[n].object == object) return routes[n];
+            if (count == routes.size()) bad("INPUT_ROUTE_LIMIT", "Touch routing exceeds the 256-view profile");
+            runtime.retain(object);
+            routes[count].object = object;
+            return routes[count++];
+        }
+    };
+    std::shared_ptr<TouchGesture> touch_gesture;
+    std::size_t touch_dispatch_depth = 0;
+    bool sending_touch_cancel = false;
     struct InputData {
         std::optional<PointerInput> pointer;
         std::optional<KeyInput> key;
+        std::optional<PointerInput> global_pointer;
+        std::shared_ptr<TouchGesture> gesture;
+        ObjectId touch_receiver = 0;
+        float pixels_per_dp = 1;
+        bool native_fallback = false, persistent_touch = true, allow_view_dispatch = true;
+        bool key_pre_ime = false;
+        ObjectId key_root = 0;
+    };
+    struct NativeCompletionEntry final : dex::ManagedMainEntry {
+        std::weak_ptr<NativeCompletionTarget> target;
+        NativeActivityInputCompletion completion;
+        std::array<Value, 2> roots;
+        bool consumed = false;
+        NativeCompletionEntry(const std::shared_ptr<NativeCompletionTarget> &owner,
+                              const NativeActivityInputCompletion &value)
+            : target(owner), completion(value),
+              roots{Value::reference(value.key ? value.key->activity : value.input.activity),
+                    Value::reference(value.key ? value.key->sample.root : value.input.root)} {}
+        void run(dex::ManagedRuntime &vm) override {
+            if (std::exchange(consumed, true)) return;
+            const auto owner = target.lock();
+            const auto scope = completion.scope.lock();
+            if (!owner || !owner->owner) return; // Cleanup has already settled owned keys.
+            if (&vm != &owner->owner->runtime)
+                bad("NATIVE_INPUT_COMPLETION", "Native completion belongs to another managed runtime");
+            if (completion.key) owner->owner->native_key_completion(completion);
+            else if (scope && scope->active) owner->owner->native_pointer_completion(completion);
+        }
+        std::span<const Value> values() const noexcept override { return roots; }
+        std::size_t bytes() const noexcept override { return sizeof(*this); }
+    };
+    struct NativeHostWorkEntry final : dex::ManagedMainEntry {
+        std::weak_ptr<NativeCompletionTarget> target;
+        NativeActivityHostWork work;
+        std::array<Value, 2> roots;
+        bool consumed = false;
+        NativeHostWorkEntry(const std::shared_ptr<NativeCompletionTarget> &owner,
+                            const NativeActivityHostWork &value)
+            : target(owner), work(value),
+              roots{Value::reference(value.activity), Value::reference(value.content)} {}
+        void release_credit() noexcept {
+            const auto scope = work.scope.lock();
+            if (!scope || work.credit_slot >= scope->credits.size()) return;
+            auto &credit = scope->credits[work.credit_slot];
+            // An unsuccessful post still belongs to the Bridge's queued head.
+            if (credit.serial != work.serial || !credit.posted) return;
+            credit.serial = 0; credit.posted = false;
+            if (!scope->outstanding) std::terminate();
+            --scope->outstanding;
+        }
+        ~NativeHostWorkEntry() override { release_credit(); }
+        void run(dex::ManagedRuntime &vm) override {
+            if (std::exchange(consumed, true)) return;
+            const auto scope = work.scope.lock();
+            const bool admitted = scope && work.credit_slot < scope->credits.size() &&
+                scope->credits[work.credit_slot].serial == work.serial && scope->credits[work.credit_slot].posted;
+            release_credit();
+            const auto owner = target.lock();
+            if (!admitted || !scope->active || !owner || !owner->owner) return;
+            if (&vm != &owner->owner->runtime)
+                bad("NATIVE_ACTIVITY_WORK", "Native host work belongs to another managed runtime");
+            owner->owner->native_activity_work(work);
+        }
+        std::span<const Value> values() const noexcept override { return roots; }
+        std::size_t bytes() const noexcept override { return sizeof(*this); }
     };
     std::map<ObjectId, InputData> input_events;
     struct DragSequence {
@@ -794,6 +1990,8 @@ struct ActivitySession::Impl {
     bool suspended = false, window_focused = false;
     std::uint64_t lifecycle_revision=0;
     bool application_configuration_delivery = false;
+    bool activity_base_attach_active = false;
+    ObjectId pending_activity_base = 0; // Rooted by the enclosing attachment call until cleared.
     explicit Impl(dex::ManagedRuntime &runtime, std::string package, apk::ResourceTable resources,
                   const host::TimeService *time, host::FileService *files, DisplayConfiguration configuration,
                   host::NotificationService *notifications, host::DocumentService *documents, host::ClipboardService *clipboard)
@@ -910,12 +2108,4673 @@ struct ActivitySession::Impl {
         }
         return files_directory;
     }
+    ObjectId new_directory_file(std::u16string_view suffix, PrivateFileKind kind) {
+        constexpr std::u16string_view prefix = u"/data/user/0/";
+        if (suffix.size() > 1024 - prefix.size() || package.size() > 1024 - prefix.size() - suffix.size())
+            bad("FILE_PATH_UNSUPPORTED", "Private-directory path exceeds the existing 1024-unit bound");
+        const auto length = prefix.size() + package.size() + suffix.size();
+        const auto object = runtime.new_object(file_type);
+        ManagedRoot file_root(runtime, object);
+        const auto admitted = runtime.host_state_capacity(object);
+        // Local native strings and constructor value parameters remain live
+        // while their storage moves into the installed provider state.
+        constexpr auto wrappers = 2 * sizeof(std::u16string) + 2 * sizeof(std::string);
+        if (admitted < sizeof(PrivateFileState) + wrappers)
+            bad("FILE_METADATA_LIMIT", "Private-directory metadata exceeds managed admission");
+        const auto dynamic = admitted - sizeof(PrivateFileState) - wrappers;
+        std::u16string path;
+        std::string relative;
+        const auto admit_path = [&] {
+            if (relative.capacity() >= dynamic ||
+                path.capacity() >= (dynamic - relative.capacity() - 1) / sizeof(char16_t))
+                bad("FILE_METADATA_LIMIT", "Private-directory string capacity exceeds managed admission");
+        };
+        admit_path();
+        if (length >= (dynamic - relative.capacity() - 1) / sizeof(char16_t))
+            bad("FILE_METADATA_LIMIT", "Private-directory text exceeds managed admission");
+        path.reserve(length);
+        admit_path(); // Actual first capacity is checked before filling/copying.
+        runtime.charge_provider_work(prefix.size()); path.append(prefix);
+        for (const auto byte : package) {
+            runtime.charge_provider_work(1);
+            if (!((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                  (byte >= '0' && byte <= '9') || byte == '_' || byte == '.'))
+                bad("PACKAGE", "Package cannot identify a logical private-directory root");
+            path.push_back(static_cast<char16_t>(static_cast<unsigned char>(byte)));
+        }
+        runtime.charge_provider_work(suffix.size()); path.append(suffix);
+        auto metadata = std::make_unique<PrivateFileState>(std::move(path), std::move(relative), base_context, kind);
+        if (metadata->bytes() > admitted - wrappers)
+            bad("FILE_METADATA_LIMIT", "Private-directory retained capacity exceeds managed admission");
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    ObjectId loaded_data_directory() {
+        if (!loaded_package) bad("FILE_STATE", "Context has no actual LoadedApk data-directory owner");
+        ManagedRoot package_root(runtime, loaded_package);
+        if (const auto *existing = dynamic_cast<const LoadedApkDirectoryState *>(runtime.host_state(loaded_package))) {
+            if (existing->owner != this || !existing->references[0].bits)
+                bad("FILE_STATE", "LoadedApk data-directory custody is invalid");
+            return existing->references[0].bits;
+        }
+        if (runtime.host_state(loaded_package)) bad("FILE_STATE", "LoadedApk has incompatible provider state");
+        const auto object = new_directory_file({}, PrivateFileKind::data_root);
+        ManagedRoot file_root(runtime, object);
+        if (runtime.host_state_capacity(loaded_package) < sizeof(LoadedApkDirectoryState))
+            bad("FILE_METADATA_LIMIT", "LoadedApk data-directory cache exceeds managed admission");
+        auto metadata = std::make_unique<LoadedApkDirectoryState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(object);
+        runtime.set_host_state(loaded_package, std::move(metadata));
+        return object;
+    }
+    Value context_directory(const ApiSupport &api, std::span<const Value> args) {
+        const bool typed = api.name == "getExternalFilesDir" || api.name == "getExternalFilesDirs";
+        if (args.size() != (typed ? 2u : 1u) || args[0].kind != dex::ValueKind::reference ||
+            (typed && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("FILE_ARGUMENT", "Context directory arguments do not match their canonical descriptor");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, object), type_root(runtime, typed ? args[1].bits : 0);
+        if (api.owner == "Landroid/content/ContextWrapper;") return delegate_wrapper(api, args);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context directory getter has no concrete base body");
+        if (api.owner != context_impl_type) bad("FILE_STATE", "Directory cache requires an actual issued ContextImpl");
+        ensure_primary_context_state(object);
+        if (api.name == "getDataDir") {
+            require_private_root(); // Namespace authorization/readiness is never cached.
+            return Value::reference(loaded_data_directory());
+        }
+        if (api.name == "getFilesDir") {
+            auto file = context_impl_state(object).references[ContextImplState::files_slot].bits;
+            if (!file) {
+                const auto parent = runtime.invoke_virtual_named(object, "getDataDir", "()Ljava/io/File;");
+                if (parent.kind != dex::ValueKind::reference || !parent.bits)
+                    bad("FILE_STATE", "Context data directory has no supported actual File value");
+                ManagedRoot parent_root(runtime, parent.bits);
+                const auto *parent_metadata = dynamic_cast<const PrivateFileState *>(runtime.host_state(parent.bits));
+                if (!parent_metadata || parent_metadata->context() != base_context || parent_metadata->kind != PrivateFileKind::data_root)
+                    bad("FILE_STATE", "Files directory requires its actual same-package data-directory File");
+                file = new_directory_file(u"/files", PrivateFileKind::root_alias);
+                ManagedRoot file_root(runtime, file);
+                update_context_impl(object, [file](ContextImplState &next) {
+                    next.references[ContextImplState::files_slot] = Value::reference(file);
+                }); // Preserve this cache if the later broker check refuses access.
+            }
+            require_private_root();
+            return Value::reference(file);
+        }
+        if (api.name == "getExternalFilesDir" || api.name == "getObbDir") {
+            const auto plural = api.name == "getObbDir" ? "getObbDirs" : "getExternalFilesDirs";
+            const auto signature = api.name == "getObbDir" ? "()[Ljava/io/File;" : "(Ljava/lang/String;)[Ljava/io/File;";
+            const auto directories = runtime.invoke_virtual_named(object, plural, signature, args.subspan(1));
+            if (directories.kind != dex::ValueKind::reference)
+                bad("FILE_STATE", "External directory provider returned a nonreference array");
+            ManagedRoot array_root(runtime, directories.bits);
+            if (!directories.bits) return Value::reference(0);
+            if (!runtime.assignable(directories.bits, "[Ljava/io/File;"))
+                bad("FILE_STATE", "External directory provider did not return File[]");
+            runtime.charge_provider_work(1);
+            return runtime.array_length(directories.bits) ? runtime.array_get(directories.bits, 0) : Value::reference(0);
+        }
+        if (api.name == "getExternalFilesDirs" || api.name == "getObbDirs") {
+            // SDK evaluates this virtual package-name query before constructing
+            // paths. This virtual platform provisions no external volume.
+            const auto package_value = runtime.invoke_virtual_named(object, "getPackageName", "()Ljava/lang/String;");
+            if (package_value.kind != dex::ValueKind::reference)
+                bad("FILE_STATE", "Context package-name query returned a nonreference value");
+            ManagedRoot package_root(runtime, package_value.bits);
+            (void)runtime.string(package_value.bits);
+            if (typed && args[1].bits) (void)runtime.string(args[1].bits);
+            return Value::reference(runtime.new_array("[Ljava/io/File;", 0));
+        }
+        bad("FILE_UNSUPPORTED", "Context directory getter is outside its implemented profile");
+    }
+    AndroidProcessIdentity required_process_identity() const {
+        if (!process_identity)
+            bad("PROCESS_IDENTITY_UNBOUND", "Java process identity requires its initial trusted virtual Android binding");
+        return *process_identity;
+    }
+    std::uint32_t own_android_pid() const {
+        (void)required_process_identity();
+        const auto pid = host::current_process_id(); // Same producer as the native getpid profile.
+        if (!pid || pid > static_cast<std::uint32_t>(INT32_MAX))
+            bad("PROCESS_IDENTITY_PID_UNSUPPORTED", "Current process ID cannot be represented by the supported Android PID profile");
+        return pid;
+    }
+    Value invoke_sdk_identity_static(ActivitySession &host, std::string_view owner, std::string_view name,
+            std::string_view signature, std::span<const Value> args = {}) {
+        // Trusted source-fixed SDK calls, not synthetic DEX method references.
+        // The regular provider entry preserves each actual body's validation,
+        // metrics and the existing work owner even when the APK has no ref to it.
+        const ApiSupport api{owner, name, signature, ApiStatus::partial, "Actual SDK process/user static body"};
+        return host.invoke_api(runtime, api, args);
+    }
+    Value process_identity_api(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        runtime.charge_provider_work(1);
+        if (api.owner == user_handle_type && api.name == "getUserId") {
+            if (args.size() != 1 || args[0].kind != dex::ValueKind::word)
+                bad("PROCESS_IDENTITY_ARGUMENT", "UserHandle.getUserId requires its signed UID argument");
+            const auto uid = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[0].bits));
+            return Value::word(std::bit_cast<std::uint32_t>(uid / 100000)); // Java signed division truncates toward zero.
+        }
+        if (!args.empty()) bad("PROCESS_IDENTITY_ARGUMENT", "Process identity query has unexpected arguments");
+        if (api.owner == user_handle_type && api.name == "myUserId") {
+            const auto uid = invoke_sdk_identity_static(host, process_type, "myUid", "()I");
+            const std::array call{uid};
+            return invoke_sdk_identity_static(host, user_handle_type, "getUserId", "(I)I", call);
+        }
+        const auto identity = required_process_identity();
+        if (api.owner == binder_type && binder_identity_context != BinderIdentityContext::no_incoming_transaction)
+            bad("BINDER_CALLING_IDENTITY_UNSUPPORTED", "Incoming Binder transaction identity is not modeled by this profile");
+        if (api.name == "myUid" || api.name == "getCallingUid") return Value::word(identity.uid);
+        if (api.name == "myPid" || api.name == "getCallingPid") return Value::word(own_android_pid());
+        bad("PROCESS_IDENTITY_UNSUPPORTED", "Process identity operation is not implemented");
+    }
+    Value context_identity_prerequisite(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_ARGUMENT", "Context prerequisite requires its actual receiver");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver);
+        if (api.owner == "Landroid/content/ContextWrapper;") return delegate_wrapper(api, args);
+        if (api.owner == "Landroid/content/Context;") {
+            if (api.name == "getUserId") return invoke_sdk_identity_static(host, user_handle_type, "myUserId", "()I");
+            bad("CONTEXT_ABSTRACT", "This Context prerequisite has no executable abstract base body");
+        }
+        if (api.owner != context_impl_type) bad("CONTEXT_ARGUMENT", "Context prerequisite has an unsupported SDK declaration");
+        runtime.charge_provider_work(1);
+        if (api.name == "getMainLooper") {
+            ensure_primary_context_state(receiver);
+            return Value::reference(main_loop()); // Shared mMainThread/Looper owner.
+        }
+        if (api.name == "getUserId") {
+            (void)required_process_identity();
+            ensure_primary_context_state(receiver);
+            const auto user = context_impl_state(receiver).user_id;
+            if (!user) bad("CONTEXT_USER_UNSUPPORTED", "Context user lacks authentic initial/container provenance");
+            return Value::word(*user);
+        }
+        if (args.size() < 2 || (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONTEXT_PERMISSION_ARGUMENT", "Permission check requires its nullable permission String");
+        ManagedRoot permission_root(runtime, args[1].bits);
+        if (!args[1].bits) runtime.raise("Ljava/lang/IllegalArgumentException;", u"permission is null");
+        ensure_primary_context_state(receiver);
+        if (api.name == "checkCallingOrSelfPermission") {
+            const auto pid = invoke_sdk_identity_static(host, binder_type, "getCallingPid", "()I");
+            const auto uid = invoke_sdk_identity_static(host, binder_type, "getCallingUid", "()I");
+            const std::array call{args[1], pid, uid};
+            return runtime.invoke_virtual_named(receiver, "checkPermission", "(Ljava/lang/String;II)I", call);
+        }
+        if (api.name != "checkPermission" || args.size() != 4 || args[2].kind != dex::ValueKind::word || args[3].kind != dex::ValueKind::word)
+            bad("CONTEXT_PERMISSION_ARGUMENT", "Permission check arguments disagree with the supported SDK descriptor");
+        const auto identity = required_process_identity();
+        const auto pid = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[2].bits));
+        const auto uid = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[3].bits));
+        const auto &metadata = context_impl_state(receiver);
+        if (!metadata.own_permission_parameters_known || metadata.device_id != 0 ||
+            pid != static_cast<std::int32_t>(own_android_pid()) || uid != static_cast<std::int32_t>(identity.uid))
+            bad("CONTEXT_PERMISSION_PROFILE_UNSUPPORTED", "Permission checks require the known own-process/default-device context profile");
+        // Only the existing consent-backed policy is available. This is not an
+        // Android PermissionManager Binder-service implementation or a new grant.
+        const auto permission = runtime.string(args[1].bits);
+        constexpr std::u16string_view notification = u"android.permission.POST_NOTIFICATIONS";
+        bool same = permission.size() == notification.size();
+        for (std::size_t offset = 0; same && offset < permission.size(); ++offset) {
+            runtime.charge_provider_work(1);
+            same = permission[offset] == notification[offset];
+        }
+        if (same && notification_permission()) return Value::word(0);
+        ++metrics.denied_permissions;
+        return Value::word(UINT32_MAX);
+    }
+    const WindowState &window_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;", u"Window is null");
+        const auto *metadata = dynamic_cast<const WindowState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != session_window_type)
+            bad("WINDOW_STATE", "Window is not an actual policy object issued by this session");
+        return *metadata;
+    }
+    const ContextImplState &context_impl_state(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const ContextImplState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != context_impl_type)
+            bad("CONTEXT_IMPL_STATE", "ContextImpl is not an actual context issued by this session");
+        return *metadata;
+    }
+    void ensure_primary_context_state(ObjectId object) {
+        if (object == base_context && !runtime.host_state(object)) {
+            if (runtime.host_state_capacity(object) < sizeof(ContextImplState))
+                bad("CONTEXT_IMPL_LIMIT", "Context field storage exceeds existing managed admission");
+            auto fresh = std::make_unique<ContextImplState>();
+            fresh->owner = this; fresh->lineage = object;
+            if (process_identity) fresh->user_id = process_identity->user_id;
+            fresh->own_permission_parameters_known = true;
+            fresh->references[ContextImplState::resources_slot] = Value::reference(resource_object);
+            fresh->references[ContextImplState::outer_slot] = Value::reference(application_published ? application : base_context);
+            fresh->references[ContextImplState::theme_slot] = Value::reference(base_theme);
+            fresh->theme_resource = base_theme_resource;
+            runtime.set_host_state(object, std::move(fresh));
+        }
+        (void)context_impl_state(object);
+    }
+    ObjectId new_activity_base_context(ObjectId receiver) {
+        ManagedRoot activity_root(runtime, receiver);
+        const auto object = runtime.new_object(context_impl_type);
+        ManagedRoot context_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(ContextImplState))
+            bad("CONTEXT_IMPL_LIMIT", "Activity base Context storage exceeds existing managed admission");
+        auto metadata = std::make_unique<ContextImplState>();
+        metadata->owner = this; metadata->lineage = object;
+        if (process_identity) metadata->user_id = process_identity->user_id;
+        metadata->own_permission_parameters_known = true;
+        metadata->references[ContextImplState::resources_slot] = Value::reference(resource_object);
+        metadata->references[ContextImplState::outer_slot] = Value::reference(receiver);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    Value activity_base_context(ObjectId receiver) const {
+        (void)activity_window(receiver); // Authenticate the actual Activity state, including pre-Window null.
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!metadata) bad("ACTIVITY_CONTEXT", "Activity has no actual base-context storage");
+        return metadata->base_attached ? metadata->references[ActivityIntentState::base_slot] : Value::reference(0);
+    }
+    Value wrapper_base_context(ObjectId receiver) const {
+        if (const auto *wrapper = receiver ? dynamic_cast<const ContextWrapperState *>(runtime.host_state(receiver)) : nullptr) {
+            if (wrapper->owner != this) bad("CONTEXT_WRAPPER_STATE", "ContextWrapper belongs to another session");
+            return wrapper->references[0];
+        }
+        if (receiver == application && application)
+            return Value::reference(application_attached ? base_context : 0);
+        const auto *metadata = receiver ? dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver)) : nullptr;
+        if (metadata && metadata->owner == this) return activity_base_context(receiver);
+        bad("CONTEXT_WRAPPER_UNSUPPORTED", "ContextWrapper has no implemented session base storage");
+    }
+    bool manifest_name_equals(std::string_view utf8, std::u16string_view utf16) {
+        std::size_t at = 0;
+        for (std::size_t index = 0; index < utf16.size(); ++index) {
+            runtime.charge_provider_work(1);
+            std::uint32_t point = utf16[index];
+            if (point >= 0xd800u && point <= 0xdbffu) {
+                if (++index == utf16.size()) return false;
+                runtime.charge_provider_work(1);
+                const auto low = static_cast<std::uint32_t>(utf16[index]);
+                if (low < 0xdc00u || low > 0xdfffu) return false;
+                point = 0x10000u + ((point - 0xd800u) << 10) + low - 0xdc00u;
+            } else if (point >= 0xdc00u && point <= 0xdfffu) return false;
+            std::array<std::uint8_t, 4> encoded{};
+            std::size_t count = 0;
+            if (point < 0x80u) { encoded[0] = static_cast<std::uint8_t>(point); count = 1; }
+            else if (point < 0x800u) {
+                encoded[0] = static_cast<std::uint8_t>(0xc0u | (point >> 6));
+                encoded[1] = static_cast<std::uint8_t>(0x80u | (point & 0x3fu)); count = 2;
+            } else if (point < 0x10000u) {
+                encoded[0] = static_cast<std::uint8_t>(0xe0u | (point >> 12));
+                encoded[1] = static_cast<std::uint8_t>(0x80u | ((point >> 6) & 0x3fu));
+                encoded[2] = static_cast<std::uint8_t>(0x80u | (point & 0x3fu)); count = 3;
+            } else {
+                encoded[0] = static_cast<std::uint8_t>(0xf0u | (point >> 18));
+                encoded[1] = static_cast<std::uint8_t>(0x80u | ((point >> 12) & 0x3fu));
+                encoded[2] = static_cast<std::uint8_t>(0x80u | ((point >> 6) & 0x3fu));
+                encoded[3] = static_cast<std::uint8_t>(0x80u | (point & 0x3fu)); count = 4;
+            }
+            if (count > utf8.size() - at) return false;
+            for (std::size_t byte = 0; byte < count; ++byte) {
+                runtime.charge_provider_work(1);
+                if (static_cast<std::uint8_t>(utf8[at++]) != encoded[byte]) return false;
+            }
+        }
+        runtime.charge_provider_work(1);
+        return at == utf8.size();
+    }
+    const ActivityInfoState &activity_info_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const ActivityInfoState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != activity_info_type)
+            bad("ACTIVITY_INFO_STATE", "ActivityInfo has no authentic package-query snapshot");
+        return *metadata;
+    }
+    template <class Update> void update_activity_info(ObjectId object, Update update) {
+        ManagedRoot object_root(runtime, object);
+        (void)activity_info_state(object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ActivityInfoState)); // Old fields remain charged and rooted across this possible collection.
+        auto next = std::make_unique<ActivityInfoState>(activity_info_state(object));
+        update(*next);
+        runtime.charge_provider_work(1); // Actual single traced-child validation in reserved publication.
+        storage.publish(object, std::move(next));
+    }
+    template <class Emit> void visit_metadata_utf8(std::string_view text, Emit emit) {
+        for (std::size_t offset = 0; offset < text.size();) {
+            runtime.charge_provider_work(1);
+            const auto first = static_cast<std::uint8_t>(text[offset++]);
+            std::uint32_t point = first, minimum = 0;
+            unsigned following = 0;
+            if (first < 0x80) {}
+            else if (first >= 0xc2 && first <= 0xdf) { point &= 0x1fu; minimum = 0x80; following = 1; }
+            else if (first >= 0xe0 && first <= 0xef) { point &= 0x0fu; minimum = 0x800; following = 2; }
+            else if (first >= 0xf0 && first <= 0xf4) { point &= 7u; minimum = 0x10000; following = 3; }
+            else bad("ACTIVITY_METADATA_TEXT", "Manifest metadata has invalid UTF8 text");
+            if (following > text.size() - offset)
+                bad("ACTIVITY_METADATA_TEXT", "Manifest metadata UTF8 sequence is truncated");
+            for (unsigned index = 0; index < following; ++index) {
+                runtime.charge_provider_work(1);
+                const auto next = static_cast<std::uint8_t>(text[offset++]);
+                if ((next & 0xc0u) != 0x80u) bad("ACTIVITY_METADATA_TEXT", "Manifest metadata UTF8 continuation is invalid");
+                point = (point << 6) | (next & 0x3fu);
+            }
+            if (point < minimum || point > 0x10ffffu || (point >= 0xd800u && point <= 0xdfffu))
+                bad("ACTIVITY_METADATA_TEXT", "Manifest metadata UTF8 scalar is invalid");
+            emit(point);
+        }
+    }
+    void decode_metadata_text(std::string_view text, std::u16string &output, ProviderStorageReservation &storage) {
+        if (!output.empty()) bad("ACTIVITY_METADATA_STATE", "Metadata decoding requires fresh text storage");
+        const auto initial_capacity = output.capacity();
+        std::size_t units = 0;
+        visit_metadata_utf8(text, [&](std::uint32_t point) {
+            const std::size_t count = point <= 0xffffu ? 1u : 2u;
+            if (count > SIZE_MAX - units) bad("ACTIVITY_METADATA_LIMIT", "Manifest metadata text length overflows");
+            units += count;
+        });
+        if (units > SIZE_MAX - 16) bad("ACTIVITY_METADATA_LIMIT", "Manifest metadata string capacity overflows");
+        // Fresh MSVC basic_string capacity is bounded by this allocation mask;
+        // reserve the ceiling first and only refund after observing actual capacity.
+        const auto ceiling = units > initial_capacity ? units | std::size_t{15} : initial_capacity;
+        const auto extra = units > initial_capacity ? ceiling + 1 : 0;
+        const auto previous_bytes = storage.bytes();
+        if (extra > (SIZE_MAX - previous_bytes) / sizeof(char16_t))
+            bad("ACTIVITY_METADATA_LIMIT", "Manifest metadata storage size overflows");
+        storage.resize(previous_bytes + extra * sizeof(char16_t));
+        output.reserve(units);
+        if (output.capacity() > ceiling)
+            bad("ACTIVITY_METADATA_LIMIT", "Metadata allocator exceeded its preadmitted string ceiling");
+        const auto actual = output.capacity() > initial_capacity ? (output.capacity() + 1) * sizeof(char16_t) : 0;
+        storage.resize(previous_bytes + actual); // Noncollecting refund; no allocation follows an uncharged excess.
+        visit_metadata_utf8(text, [&](std::uint32_t point) {
+            if (point <= 0xffffu) {
+                runtime.charge_provider_work(1);
+                output.push_back(static_cast<char16_t>(point));
+            } else {
+                runtime.charge_provider_work(2);
+                point -= 0x10000u;
+                output.push_back(static_cast<char16_t>(0xd800u + (point >> 10)));
+                output.push_back(static_cast<char16_t>(0xdc00u + (point & 0x3ffu)));
+            }
+        });
+    }
+    ObjectId metadata_string(std::string_view text) {
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ProviderStorageReservation) + sizeof(std::u16string));
+        std::u16string decoded;
+        decode_metadata_text(text, decoded, storage);
+        runtime.charge_provider_work(decoded.size());
+        return runtime.new_host_string(decoded, 0); // All native input is already reserved until decoded is destroyed.
+    }
+    struct MetadataValue {
+        BundleValueKind kind;
+        Value value;
+        const std::string *text = nullptr;
+    };
+    std::optional<MetadataValue> metadata_value(const apk::ManifestMetaDataEntry &entry) {
+        runtime.charge_provider_work(1);
+        if (entry.name.type != 3)
+            bad("ACTIVITY_METADATA_UNSUPPORTED", "Metadata name requires authentic nonconfiguration string resolution");
+        if (entry.resource.type == 1 && entry.resource.reference)
+            bad("ACTIVITY_METADATA_UNSUPPORTED", "Metadata resource IDs require authentic immutable alias resolution");
+        const auto resource_type = entry.resource.type;
+        if (resource_type != apk::manifest_absent_type && resource_type != 0 && resource_type != 1 &&
+            resource_type != 3 && resource_type != 4 && resource_type != 5 && resource_type != 6 &&
+            (resource_type < 0x10 || resource_type > 0x1f))
+            bad("ACTIVITY_METADATA_UNSUPPORTED", "Metadata resource precedence requires unresolved source semantics");
+        const auto &value = entry.value;
+        if (value.type == 3) return MetadataValue{BundleValueKind::string, Value::reference(0), &value.literal};
+        if (value.type == 0x12) return MetadataValue{BundleValueKind::boolean, Value::word(value.reference != 0)};
+        if (value.type >= 0x10 && value.type <= 0x1f)
+            return MetadataValue{BundleValueKind::integer, Value::word(value.reference)};
+        if (value.type == 4) return MetadataValue{BundleValueKind::floating, Value::word(value.reference)};
+        if (value.type == 2 || value.type == 5 || value.type == 6)
+            return {}; // SDK non-rigid parser skips this known unsupported Property, preserving earlier duplicates.
+        bad("ACTIVITY_METADATA_UNSUPPORTED", "Metadata value requires unresolved references or unsupported parse semantics");
+    }
+    ObjectId activity_metadata_snapshot(std::size_t activity_index) {
+        const auto &rows = package_metadata->activity_meta_data[activity_index];
+        std::size_t accepted = 0, strings = 0;
+        for (const auto &entry : rows) if (const auto selected = metadata_value(entry)) {
+            ++accepted;
+            if (selected->text) ++strings;
+        }
+        if (!accepted) return 0; // Actual PackageInfoUtils coerces empty metadata to null.
+        if (strings > static_cast<std::size_t>(INT32_MAX))
+            bad("ACTIVITY_METADATA_LIMIT", "Managed metadata string-root count exceeds its representation");
+        runtime.charge_provider_work(strings);
+        const auto roots = strings ? runtime.new_array("[Ljava/lang/Object;", static_cast<std::int32_t>(strings)) : ObjectId{0};
+        ManagedRoot roots_root(runtime, roots);
+        ProviderStorageReservation storage(runtime);
+        std::vector<std::u16string> keys;
+        std::vector<BundleSnapshotEntry> entries;
+        constexpr auto fixed = sizeof(ProviderStorageReservation) + sizeof(keys) + sizeof(entries);
+        if (accepted > (SIZE_MAX - fixed) / sizeof(std::u16string))
+            bad("ACTIVITY_METADATA_LIMIT", "Metadata key vector size overflows");
+        storage.resize(fixed + accepted * sizeof(std::u16string));
+        keys.reserve(accepted);
+        if (keys.capacity() > accepted)
+            bad("ACTIVITY_METADATA_LIMIT", "Metadata key vector exceeded its preadmitted capacity");
+        const auto key_bytes = keys.capacity() * sizeof(std::u16string);
+        if (accepted > (SIZE_MAX - fixed - key_bytes) / sizeof(BundleSnapshotEntry))
+            bad("ACTIVITY_METADATA_LIMIT", "Metadata entry vector size overflows");
+        storage.resize(fixed + key_bytes + accepted * sizeof(BundleSnapshotEntry));
+        entries.reserve(accepted);
+        if (entries.capacity() > accepted)
+            bad("ACTIVITY_METADATA_LIMIT", "Metadata entry vector exceeded its preadmitted capacity");
+        std::size_t string_index = 0;
+        for (const auto &entry : rows) {
+            const auto selected = metadata_value(entry);
+            if (!selected) continue;
+            runtime.charge_provider_work(1);
+            keys.emplace_back(); // Capacity was admitted before either native vector allocation.
+            decode_metadata_text(entry.name.literal, keys.back(), storage);
+            auto value = selected->value;
+            if (selected->text) {
+                const auto object = metadata_string(*selected->text);
+                ManagedRoot value_root(runtime, object);
+                runtime.charge_provider_work(1);
+                runtime.array_set(roots, static_cast<std::int32_t>(string_index++), Value::reference(object));
+                value = Value::reference(object);
+            }
+            runtime.charge_provider_work(1);
+            entries.push_back({keys.back(), false, selected->kind, value});
+        }
+        return new_bundle_snapshot(runtime, entries, storage.bytes());
+    }
+    void authenticate_package_manager(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (object == package_manager) return; // Existing session backend identity.
+        const auto *metadata = dynamic_cast<const ApplicationPackageManagerState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != application_package_manager_type)
+            bad("PACKAGE_MANAGER", "PackageManager has no authentic issued Context owner");
+        (void)context_impl_state(metadata->references[0].bits);
+    }
+    std::uint32_t activity_config_value(const apk::ManifestInteger &value) {
+        if (value.type == apk::manifest_absent_type || value.type == 0 || (value.type == 1 && !value.data)) return 0;
+        if (value.type >= 0x10 && value.type <= 0x1f) return value.data;
+        bad("ACTIVITY_INFO_UNSUPPORTED", "Activity configuration flags require authentic immutable manifest resolution");
+    }
+    bool activity_manifest_enabled(const apk::ManifestBoolean &value) {
+        if (value.type == apk::manifest_absent_type || value.type == 0 || (value.type == 1 && !value.data)) return true;
+        if (value.type >= 0x10 && value.type <= 0x1f) return value.data != 0;
+        bad("ACTIVITY_INFO_UNSUPPORTED", "Activity enabled filtering requires authentic immutable manifest resolution");
+    }
+    Value activity_info(std::span<const Value> args) {
+        if (args.size() != 3 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+            args[2].kind != dex::ValueKind::word)
+            bad("ACTIVITY_INFO_ARGUMENT", "ActivityInfo query requires its manager, ComponentName and int flags");
+        ManagedRoot manager_root(runtime, args[0].bits), component_root(runtime, args[1].bits);
+        authenticate_package_manager(args[0].bits);
+        if (!args[1].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        constexpr std::uint32_t metadata_flag = 0x80, disabled_flag = 0x200, until_used_flag = 0x8000;
+        constexpr std::uint32_t boot_both = 0xc0000, boot_auto = 0x10000000;
+        const auto flags = static_cast<std::uint32_t>(args[2].bits);
+        if (flags & ~(metadata_flag | disabled_flag | until_used_flag | boot_both | boot_auto))
+            bad("ACTIVITY_INFO_UNSUPPORTED", "ActivityInfo query flags require an unimplemented package query profile");
+        const std::array component_args{args[1]};
+        const auto query_package = invoke_component(runtime, "getPackageName", "()Ljava/lang/String;", component_args);
+        ManagedRoot package_root(runtime, query_package.bits);
+        const auto query_name = invoke_component(runtime, "getClassName", "()Ljava/lang/String;", component_args);
+        ManagedRoot name_root(runtime, query_name.bits);
+        if (!manifest_name_equals(package, runtime.string(query_package.bits)))
+            runtime.raise(package_missing_type, u"Component is outside this session's visible package namespace");
+        if (!package_metadata || !package_metadata->activity_meta_data_bound ||
+            package_metadata->activity_meta_data.size() != package_metadata->activities.size() ||
+            package_metadata->activity_config_changes.size() != package_metadata->activities.size() ||
+            package_metadata->activity_recreate_on_config_changes.size() != package_metadata->activities.size())
+            bad("ACTIVITY_INFO_UNSUPPORTED", "Activity declarations lack complete aligned held-package source binding");
+        std::optional<std::size_t> found;
+        const auto name = runtime.string(query_name.bits);
+        for (std::size_t index = 0; index < package_metadata->activities.size(); ++index) {
+            runtime.charge_provider_work(1);
+            if (!manifest_name_equals(package_metadata->activities[index].name, name)) continue;
+            if (found) bad("ACTIVITY_INFO_UNSUPPORTED", "Duplicate component declarations require authentic package resolver precedence");
+            found = index;
+        }
+        if (!found) runtime.raise(package_missing_type, u"Activity component is not declared in the held package");
+        const auto index = *found;
+        if (!package_metadata->activities[index].target.empty())
+            bad("ACTIVITY_INFO_UNSUPPORTED", "Activity alias queries require authentic target inheritance");
+        auto boot_match = flags & boot_both;
+        if (!boot_match) {
+            if (component_query_policy != ImplicitComponentQueryPolicy::interactive_session_both_classes)
+                bad("ACTIVITY_INFO_USER_POLICY_UNSUPPORTED", "Implicit component matching has no bound software-session policy");
+            boot_match = boot_both; // Backend normalization only; original guest flags remain untouched.
+        }
+        if (boot_match != boot_both)
+            bad("ACTIVITY_INFO_UNSUPPORTED", "Single-category direct-boot matching requires actual component awareness metadata");
+        if (!(flags & disabled_flag)) {
+            if (!package_metadata->application_enabled_bound)
+                bad("ACTIVITY_INFO_UNSUPPORTED", "Application enabled state lacks actual manifest source binding");
+            if (!activity_manifest_enabled(package_metadata->application_enabled) ||
+                !activity_manifest_enabled(package_metadata->activities[index].enabled))
+                runtime.raise(package_missing_type, u"Activity component is disabled for this package query");
+        }
+        const auto config = activity_config_value(package_metadata->activity_config_changes[index]);
+        const auto recreate = activity_config_value(package_metadata->activity_recreate_on_config_changes[index]);
+        const auto configuration_changes = config | ((~recreate) & 3u); // SDK35 CONFIG_MCC | CONFIG_MNC parser rule.
+        const auto object = runtime.new_object(activity_info_type);
+        ManagedRoot info_root(runtime, object);
+        const auto metadata_bundle = flags & metadata_flag ? activity_metadata_snapshot(index) : ObjectId{0};
+        ManagedRoot metadata_root(runtime, metadata_bundle);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ActivityInfoState)); // Both target and new Bundle are already rooted.
+        auto metadata = std::make_unique<ActivityInfoState>();
+        metadata->owner = this; metadata->config_changes = configuration_changes;
+        metadata->references[0] = Value::reference(metadata_bundle);
+        runtime.charge_provider_work(1); // Actual single traced-child validation in reserved publication.
+        storage.publish(object, std::move(metadata));
+        return Value::reference(object);
+    }
+    Value context_package_manager(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("PACKAGE_MANAGER_ARGUMENT", "getPackageManager requires its actual Context receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, object);
+        if (api.owner == "Landroid/content/ContextWrapper;") return delegate_wrapper(api, args);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context.getPackageManager has no concrete base body");
+        if (api.owner != context_impl_type)
+            bad("PACKAGE_MANAGER_ARGUMENT", "PackageManager cache requires an issued ContextImpl");
+        ensure_primary_context_state(object);
+        const auto existing = context_impl_state(object).references[ContextImplState::package_manager_slot].bits;
+        if (existing) { authenticate_package_manager(existing); return Value::reference(existing); }
+        if (!package_manager) return Value::reference(0);
+        const auto manager = runtime.new_object(application_package_manager_type);
+        ManagedRoot manager_root(runtime, manager);
+        if (runtime.host_state_capacity(manager) < sizeof(ApplicationPackageManagerState))
+            bad("PACKAGE_MANAGER_LIMIT", "PackageManager Context ownership exceeds managed admission");
+        auto metadata = std::make_unique<ApplicationPackageManagerState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(object);
+        runtime.set_host_state(manager, std::move(metadata));
+        update_context_impl(object, [manager](ContextImplState &next) {
+            next.references[ContextImplState::package_manager_slot] = Value::reference(manager);
+        });
+        return Value::reference(manager);
+    }
+    Value service_info(std::span<const Value> args) {
+        if (args.size() != 3 || args[0].kind != dex::ValueKind::reference ||
+            args[1].kind != dex::ValueKind::reference || args[2].kind != dex::ValueKind::word)
+            bad("SERVICE_INFO_ARGUMENT", "ServiceInfo query requires its manager, ComponentName and int flags");
+        authenticate_package_manager(args[0].bits);
+        ManagedRoot manager_root(runtime, args[0].bits), component_root(runtime, args[1].bits);
+        if (static_cast<std::uint32_t>(args[2].bits) & ~0x280u)
+            bad("SERVICE_INFO_UNSUPPORTED", "Service query supports only metadata and disabled-component matching flags");
+        const std::array component_args{args[1]};
+        // ComponentName is the actual final SDK value class. Read its stored
+        // fields through its canonical bodies, without invented guest callbacks.
+        const auto component_package_name = invoke_component(runtime, "getPackageName", "()Ljava/lang/String;", component_args);
+        const auto class_name = invoke_component(runtime, "getClassName", "()Ljava/lang/String;", component_args);
+        ManagedRoot package_root(runtime, component_package_name.bits), class_root(runtime, class_name.bits);
+        if (!manifest_name_equals(package, runtime.string(component_package_name.bits)))
+            runtime.raise(package_missing_type, u"Component is outside this session's visible package namespace");
+        if (!package_metadata || !package_metadata->service_inventory_bound)
+            bad("SERVICE_INFO_UNSUPPORTED", "Service declarations have no complete held-package source binding");
+        const auto query = runtime.string(class_name.bits);
+        for (const auto &declared : package_metadata->declared_services) {
+            runtime.charge_provider_work(1);
+            if (manifest_name_equals(declared, query))
+                bad("SERVICE_INFO_UNSUPPORTED", "Declared ServiceInfo records are not implemented");
+        }
+        runtime.raise(package_missing_type, u"Service is not declared in the held package");
+    }
+    const ContextWrapperState &wrapper_state(ObjectId object, bool require_theme_wrapper = false) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const ContextWrapperState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this ||
+            (require_theme_wrapper && !metadata->platform_theme_wrapper_constructed))
+            bad("CONTEXT_WRAPPER_STATE", "Context wrapper has no authenticated constructor storage");
+        return *metadata;
+    }
+    bool generic_theme_wrapper(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const ContextWrapperState *>(runtime.find_host_state(object));
+        return metadata && metadata->owner == this && metadata->platform_theme_wrapper_constructed;
+    }
+    template <class Update> void update_wrapper(ObjectId object, Update update) {
+        ManagedRoot object_root(runtime, object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ContextWrapperState));
+        auto next = std::make_unique<ContextWrapperState>(wrapper_state(object));
+        update(*next);
+        runtime.charge_provider_work(next->references.size());
+        storage.publish(object, std::move(next));
+    }
+    Value context_theme_wrapper_constructor(const ApiSupport &api, std::span<const Value> args) {
+        const bool empty = api.signature == "()V";
+        const bool by_theme = api.signature == "(Landroid/content/Context;Landroid/content/res/Resources$Theme;)V";
+        if ((!empty && !by_theme && api.signature != "(Landroid/content/Context;I)V") || args.size() != (empty ? 1u : 3u))
+            bad("THEME_WRAPPER_ARGUMENT", "Theme wrapper constructor requires its actual declared overload");
+        if (args[0].kind != dex::ValueKind::reference ||
+            (!empty && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+            (by_theme && args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)) ||
+            (!empty && !by_theme && args[2].kind != dex::ValueKind::word))
+            bad("THEME_WRAPPER_ARGUMENT", "Theme wrapper constructor fields have incompatible value kinds");
+        const auto receiver = args[0].bits;
+        const auto base = empty ? ObjectId{0} : args[1].bits;
+        const auto theme = by_theme ? args[2].bits : ObjectId{0};
+        ManagedRoot receiver_root(runtime, receiver), base_root(runtime, base), theme_root(runtime, theme);
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(receiver, theme_wrapper_type)) bad("THEME_WRAPPER_ARGUMENT", "Constructor receiver is not a ContextThemeWrapper");
+        if (base && !runtime.assignable(base, "Landroid/content/Context;")) runtime.raise("Ljava/lang/ClassCastException;");
+        if (theme && !runtime.assignable(theme, theme_type)) runtime.raise("Ljava/lang/ClassCastException;");
+        if (runtime.host_state(receiver)) bad("CONTEXT_WRAPPER_STATE", "Context wrapper constructor called twice");
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ContextWrapperState));
+        auto metadata = std::make_unique<ContextWrapperState>();
+        metadata->owner = this;
+        metadata->platform_theme_wrapper_constructed = true;
+        metadata->references[ContextWrapperState::base_slot] = Value::reference(base);
+        metadata->references[ContextWrapperState::theme_slot] = Value::reference(theme);
+        metadata->theme_resource = empty || by_theme ? 0u : static_cast<std::uint32_t>(args[2].bits);
+        runtime.charge_provider_work(metadata->references.size());
+        storage.publish(receiver, std::move(metadata));
+        return Value::nothing();
+    }
+    Value theme_wrapper_resources(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto existing = wrapper_state(object, true).references[ContextWrapperState::resources_slot];
+        if (existing.bits) return existing;
+        const auto override_configuration = wrapper_state(object, true).references[ContextWrapperState::override_slot].bits;
+        ManagedRoot override_root(runtime, override_configuration);
+        Value resource;
+        if (!override_configuration) {
+            const ApiSupport base_api{"Landroid/content/ContextWrapper;", "getResources", "()Landroid/content/res/Resources;",
+                ApiStatus::partial, "Actual ContextWrapper super delegation"};
+            const std::array query{Value::reference(object)};
+            resource = delegate_wrapper(base_api, query);
+        } else {
+            const std::array query{Value::reference(override_configuration)};
+            const auto configured = runtime.invoke_virtual_named(object, "createConfigurationContext",
+                "(Landroid/content/res/Configuration;)Landroid/content/Context;", query);
+            if (configured.kind != dex::ValueKind::reference && !(configured.kind == dex::ValueKind::word && !configured.bits))
+                bad("THEME_WRAPPER_RESOURCES", "Configuration override returned a nonreference Context");
+            ManagedRoot configured_root(runtime, configured.bits);
+            resource = runtime.invoke_virtual_named(configured.bits, "getResources", "()Landroid/content/res/Resources;");
+        }
+        if (resource.kind != dex::ValueKind::reference && !(resource.kind == dex::ValueKind::word && !resource.bits))
+            bad("THEME_WRAPPER_RESOURCES", "Context returned nonreference Resources");
+        ManagedRoot resource_root(runtime, resource.bits);
+        if (resource.bits && !runtime.assignable(resource.bits, "Landroid/content/res/Resources;")) runtime.raise("Ljava/lang/ClassCastException;");
+        if (wrapper_state(object, true).references[ContextWrapperState::resources_slot].bits != resource.bits)
+            update_wrapper(object, [resource](ContextWrapperState &next) {
+                next.references[ContextWrapperState::resources_slot] = Value::reference(resource.bits);
+            });
+        return Value::reference(resource.bits);
+    }
+    Value theme_wrapper_service(ObjectId object, bool layout, std::span<const Value> args) {
+        ManagedRoot object_root(runtime, object);
+        const auto existing = wrapper_state(object, true).references[ContextWrapperState::inflater_slot];
+        if (layout && existing.bits) return existing;
+        const auto base = runtime.invoke_virtual_named(object, "getBaseContext", "()Landroid/content/Context;");
+        if (base.kind != dex::ValueKind::reference && !(base.kind == dex::ValueKind::word && !base.bits))
+            bad("THEME_WRAPPER_SERVICE", "getBaseContext returned a nonreference Context");
+        ManagedRoot base_root(runtime, base.bits);
+        if (!layout) return runtime.invoke_virtual_named(base.bits, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", args.subspan(1));
+        const auto original = inflater_from(base.bits);
+        ManagedRoot original_root(runtime, original.bits);
+        const std::array clone_query{Value::reference(object)};
+        const auto clone = runtime.invoke_virtual_named(original.bits, "cloneInContext", "(Landroid/content/Context;)Landroid/view/LayoutInflater;", clone_query);
+        if (clone.kind != dex::ValueKind::reference && !(clone.kind == dex::ValueKind::word && !clone.bits))
+            bad("THEME_WRAPPER_SERVICE", "Inflater clone returned a nonreference value");
+        ManagedRoot clone_root(runtime, clone.bits);
+        if (clone.bits && !runtime.assignable(clone.bits, layout_inflater_type)) runtime.raise("Ljava/lang/ClassCastException;");
+        if (wrapper_state(object, true).references[ContextWrapperState::inflater_slot].bits != clone.bits)
+            update_wrapper(object, [clone](ContextWrapperState &next) {
+                next.references[ContextWrapperState::inflater_slot] = Value::reference(clone.bits);
+            });
+        return Value::reference(clone.bits);
+    }
+    void initialize_theme_wrapper(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const bool first = !wrapper_state(object, true).references[ContextWrapperState::theme_slot].bits;
+        if (first) {
+            const auto resource = runtime.invoke_virtual_named(object, "getResources", "()Landroid/content/res/Resources;");
+            if (resource.kind != dex::ValueKind::reference && !(resource.kind == dex::ValueKind::word && !resource.bits))
+                bad("THEME_WRAPPER_THEME", "getResources returned a nonreference value");
+            ManagedRoot resource_root(runtime, resource.bits);
+            // Resources.newTheme is final. The new Theme's owner is this exact
+            // Resources wrapper; publish before either original base hook.
+            const auto fresh = new_theme(resource.bits);
+            ManagedRoot fresh_root(runtime, fresh);
+            update_wrapper(object, [fresh](ContextWrapperState &next) {
+                next.references[ContextWrapperState::theme_slot] = Value::reference(fresh);
+            });
+            const auto base = runtime.invoke_virtual_named(object, "getBaseContext", "()Landroid/content/Context;");
+            if (base.kind != dex::ValueKind::reference && !(base.kind == dex::ValueKind::word && !base.bits))
+                bad("THEME_WRAPPER_THEME", "getBaseContext returned a nonreference value");
+            ManagedRoot base_root(runtime, base.bits);
+            const auto inherited = runtime.invoke_virtual_named(base.bits, "getTheme", "()Landroid/content/res/Resources$Theme;");
+            if (inherited.kind != dex::ValueKind::reference && !(inherited.kind == dex::ValueKind::word && !inherited.bits))
+                bad("THEME_WRAPPER_THEME", "Base Context returned a nonreference Theme");
+            ManagedRoot inherited_root(runtime, inherited.bits);
+            if (inherited.bits) {
+                const auto target = wrapper_state(object, true).references[ContextWrapperState::theme_slot].bits;
+                ManagedRoot target_root(runtime, target);
+                theme_set_to(target, inherited.bits);
+            }
+        }
+        const auto target = wrapper_state(object, true).references[ContextWrapperState::theme_slot].bits;
+        ManagedRoot target_root(runtime, target);
+        const auto style = wrapper_state(object, true).theme_resource;
+        if (const auto method = metered_view_override(object, "onApplyThemeResource", "(Landroid/content/res/Resources$Theme;IZ)V")) {
+            const std::array query{Value::reference(object), Value::reference(target), Value::word(style), Value::word(first)};
+            (void)runtime.invoke_virtual(*method, query);
+        } else theme_apply(target, style, true);
+    }
+    Value theme_wrapper_theme(const ApiSupport &api, std::span<const Value> args) {
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object);
+        (void)wrapper_state(object, true);
+        if (api.name == "setTheme" && api.signature == "(Landroid/content/res/Resources$Theme;)V") {
+            if (args.size() != 2 || (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+                bad("THEME_WRAPPER_ARGUMENT", "Theme setter requires its nullable original Theme");
+            ManagedRoot theme_root(runtime, args[1].bits);
+            if (args[1].bits && !runtime.assignable(args[1].bits, theme_type)) runtime.raise("Ljava/lang/ClassCastException;");
+            const auto value = args[1].bits;
+            if (wrapper_state(object, true).references[ContextWrapperState::theme_slot].bits == value) return Value::nothing();
+            update_wrapper(object, [value](ContextWrapperState &next) { next.references[ContextWrapperState::theme_slot] = Value::reference(value); });
+            return Value::nothing();
+        }
+        if (api.name == "setTheme") {
+            if (api.signature != "(I)V" || args.size() != 2 || args[1].kind != dex::ValueKind::word)
+                bad("THEME_WRAPPER_ARGUMENT", "Theme resource setter requires its original integer ID");
+            const auto value = static_cast<std::uint32_t>(args[1].bits);
+            if (wrapper_state(object, true).theme_resource != value) {
+                update_wrapper(object, [value](ContextWrapperState &next) { next.theme_resource = value; });
+                initialize_theme_wrapper(object);
+            }
+            return Value::nothing();
+        }
+        if (api.name != "getTheme" || args.size() != 1) bad("THEME_WRAPPER_ARGUMENT", "Theme wrapper query has an invalid descriptor");
+        if (!wrapper_state(object, true).references[ContextWrapperState::theme_slot].bits) {
+            // Capture selectDefaultTheme's first argument before the original
+            // getApplicationInfo callback can mutate this wrapper's fields.
+            const auto prior = wrapper_state(object, true).theme_resource;
+            const auto sdk = theme_target_sdk(object);
+            const auto selected = select_default_theme(prior, sdk);
+            update_wrapper(object, [selected](ContextWrapperState &next) { next.theme_resource = selected; });
+            initialize_theme_wrapper(object);
+        }
+        return wrapper_state(object, true).references[ContextWrapperState::theme_slot];
+    }
+    Value theme_wrapper_configuration(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_WRAPPER_ARGUMENT", "Override configuration requires its actual wrapper receiver");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object);
+        (void)wrapper_state(object, true);
+        if (api.name == "getOverrideConfiguration" && args.size() == 1)
+            return wrapper_state(object, true).references[ContextWrapperState::override_slot];
+        if (api.name != "applyOverrideConfiguration" || args.size() != 2 ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("THEME_WRAPPER_ARGUMENT", "Override setter requires its original nullable Configuration argument");
+        ManagedRoot original_root(runtime, args[1].bits);
+        if (wrapper_state(object, true).references[ContextWrapperState::resources_slot].bits)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"getResources() or getAssets() has already been called");
+        if (wrapper_state(object, true).references[ContextWrapperState::override_slot].bits)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"Override configuration has already been set");
+        const auto copied = runtime.new_object(configuration_type);
+        ManagedRoot copied_root(runtime, copied);
+        const std::array copy_query{Value::reference(copied), args[1]};
+        const ApiSupport copy_api{configuration_type, "<init>", "(Landroid/content/res/Configuration;)V",
+            ApiStatus::partial, "Actual Configuration copy constructor"};
+        (void)configuration_api(copy_api, copy_query);
+        update_wrapper(object, [copied](ContextWrapperState &next) {
+            next.references[ContextWrapperState::override_slot] = Value::reference(copied);
+        });
+        return Value::nothing();
+    }
+    Value context_wrapper_constructor(std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONTEXT_WRAPPER_ARGUMENT", "ContextWrapper constructor requires its receiver and nullable base Context");
+        const auto receiver = args[0].bits, base = args[1].bits;
+        ManagedRoot wrapper_root(runtime, receiver), base_root(runtime, base);
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(receiver, "Landroid/content/ContextWrapper;"))
+            bad("CONTEXT_WRAPPER_ARGUMENT", "ContextWrapper constructor receiver has the wrong type");
+        if (base && !runtime.assignable(base, "Landroid/content/Context;"))
+            bad("CONTEXT_WRAPPER_ARGUMENT", "ContextWrapper base has the wrong type");
+        if (runtime.host_state(receiver)) bad("CONTEXT_WRAPPER_STATE", "ContextWrapper constructor called twice");
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ContextWrapperState));
+        auto metadata = std::make_unique<ContextWrapperState>();
+        metadata->owner = this; metadata->references[ContextWrapperState::base_slot] = Value::reference(base);
+        runtime.charge_provider_work(metadata->references.size());
+        storage.publish(receiver, std::move(metadata));
+        return Value::nothing();
+    }
+    Value attach_wrapper_base(std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONTEXT_WRAPPER_ARGUMENT", "Base attachment requires its receiver and nullable base Context");
+        const auto receiver = args[0].bits, base = args[1].bits;
+        ManagedRoot wrapper_root(runtime, receiver), base_root(runtime, base);
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *previous = dynamic_cast<const ContextWrapperState *>(runtime.host_state(receiver));
+        if (!previous || previous->owner != this) bad("CONTEXT_WRAPPER_STATE", "Wrapper has no authenticated base field");
+        if (previous->references[0].bits)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"Base context already set");
+        if (base && !runtime.assignable(base, "Landroid/content/Context;"))
+            bad("CONTEXT_WRAPPER_ARGUMENT", "ContextWrapper base has the wrong type");
+        if (!base) return Value::nothing(); // Storing null into the known null mBase has no SDK side effects.
+        update_wrapper(receiver, [base](ContextWrapperState &next) {
+            next.references[ContextWrapperState::base_slot] = Value::reference(base);
+        });
+        return Value::nothing();
+    }
+    Value delegate_wrapper(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_WRAPPER_ARGUMENT", "ContextWrapper method requires its actual receiver");
+        ManagedRoot wrapper_root(runtime, args[0].bits);
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto base = wrapper_base_context(args[0].bits);
+        ManagedRoot base_root(runtime, base.bits);
+        return runtime.invoke_virtual_named(base.bits, api.name, api.signature, args.subspan(1));
+    }
+    template <class Update> void update_context_impl(ObjectId object, Update update) {
+        ManagedRoot context_root(runtime, object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ContextImplState));
+        const auto &previous = context_impl_state(object);
+        auto next = std::make_unique<ContextImplState>(previous);
+        update(*next); // Private fixed-field update only; every new reference is independently rooted.
+        storage.publish(object, std::move(next));
+    }
+    Value activity_autofill_client(ObjectId receiver) {
+        ManagedRoot activity_root(runtime, receiver);
+        (void)activity_window(receiver);
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        const auto existing = metadata->references[ActivityIntentState::autofill_slot].bits;
+        if (existing) {
+            const auto *controller = dynamic_cast<const AutofillControllerState *>(runtime.host_state(existing));
+            if (!controller || controller->owner != this || controller->references[0].bits != receiver)
+                bad("AUTOFILL_CLIENT_STATE", "Activity controller does not belong to its actual Activity");
+            return Value::reference(existing);
+        }
+        const auto object = runtime.new_object(autofill_controller_type);
+        ManagedRoot controller_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(AutofillControllerState))
+            bad("AUTOFILL_CLIENT_LIMIT", "Autofill client storage exceeds existing managed admission");
+        auto controller = std::make_unique<AutofillControllerState>();
+        controller->owner = this; controller->references[0] = Value::reference(receiver);
+        runtime.set_host_state(object, std::move(controller));
+        const auto admitted = runtime.host_state_capacity(receiver);
+        metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!metadata || metadata->owner != this || admitted < metadata->bytes() || sizeof(ActivityIntentState) > admitted - metadata->bytes())
+            bad("AUTOFILL_CLIENT_LIMIT", "Activity controller reference exceeds simultaneous managed admission");
+        auto next = std::make_unique<ActivityIntentState>(*metadata);
+        next->references[ActivityIntentState::autofill_slot] = Value::reference(object);
+        runtime.set_host_state(receiver, std::move(next));
+        return Value::reference(object);
+    }
+    Value context_autofill_options(const ApiSupport &api, std::span<const Value> args) {
+        const bool setting = api.name == "setAutofillOptions";
+        if (args.size() != (setting ? 2u : 1u) || args[0].kind != dex::ValueKind::reference ||
+            (setting && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("AUTOFILL_OPTIONS_ARGUMENT", "Autofill options arguments disagree with their SDK descriptor");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver), options_root(runtime, setting ? args[1].bits : 0);
+        if (api.name == "isAutofillCompatibilityEnabled") {
+            const auto options = runtime.invoke_virtual_named(receiver, "getAutofillOptions", "()Landroid/content/AutofillOptions;");
+            if (options.kind != dex::ValueKind::reference)
+                bad("AUTOFILL_OPTIONS_ARGUMENT", "Autofill options callback returned a nonreference");
+            ManagedRoot result_root(runtime, options.bits);
+            if (!options.bits) return Value::word(0);
+            bad("AUTOFILL_OPTIONS_UNSUPPORTED", "Non-null AutofillOptions requires its actual compatibility-mode field storage");
+        }
+        if (setting && args[1].bits && !runtime.assignable(args[1].bits, autofill_options_type))
+            bad("AUTOFILL_OPTIONS_ARGUMENT", "Autofill options have the wrong runtime type");
+        if (api.owner == "Landroid/content/Context;") return setting ? Value::nothing() : Value::reference(0);
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            if (!base.bits) return setting ? Value::nothing() : Value::reference(0);
+            return runtime.invoke_virtual_named(base.bits, api.name, api.signature, args.subspan(1));
+        }
+        if (api.owner != context_impl_type) bad("AUTOFILL_OPTIONS_ARGUMENT", "Autofill options require their canonical SDK owner");
+        ensure_primary_context_state(receiver);
+        if (setting) {
+            const auto options = args[1].bits;
+            runtime.charge_provider_work(1 + context_impl_state(receiver).references.size());
+            update_context_impl(receiver, [options](ContextImplState &next) {
+                next.references[ContextImplState::autofill_options_slot] = Value::reference(options);
+            });
+            return Value::nothing();
+        }
+        return context_impl_state(receiver).references[ContextImplState::autofill_options_slot];
+    }
+    Value context_capture_options(const ApiSupport &api, std::span<const Value> args) {
+        const bool setting = api.name == "setContentCaptureOptions";
+        if (args.size() != (setting ? 2u : 1u) || args[0].kind != dex::ValueKind::reference ||
+            (setting && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONTENT_CAPTURE_ARGUMENT", "Content capture options arguments do not match the SDK descriptor");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver), options_root(runtime, setting ? args[1].bits : 0);
+        if (setting && args[1].bits && !runtime.assignable(args[1].bits, content_capture_options_type))
+            bad("CONTENT_CAPTURE_ARGUMENT", "Content capture options have the wrong runtime type");
+        if (api.owner == "Landroid/content/Context;")
+            return setting ? Value::nothing() : Value::reference(0); // Actual concrete SDK defaults.
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            if (!base.bits) return setting ? Value::nothing() : Value::reference(0);
+            return runtime.invoke_virtual_named(base.bits, api.name, api.signature, args.subspan(1));
+        }
+        if (api.owner != context_impl_type)
+            bad("CONTENT_CAPTURE_ARGUMENT", "Content capture options require their canonical SDK owner");
+        ensure_primary_context_state(receiver);
+        if (setting) {
+            const auto value = args[1].bits;
+            update_context_impl(receiver, [value](ContextImplState &next) { next.references[ContextImplState::capture_slot] = Value::reference(value); });
+            return Value::nothing();
+        }
+        return context_impl_state(receiver).references[ContextImplState::capture_slot];
+    }
+    Value context_autofill_client(const ApiSupport &api, std::span<const Value> args) {
+        const bool setting = api.name == "setAutofillClient";
+        if (args.size() != (setting ? 2u : 1u) || args[0].kind != dex::ValueKind::reference ||
+            (setting && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("AUTOFILL_CLIENT_ARGUMENT", "Context autofill client arguments do not match their descriptor");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver), client_root(runtime, setting ? args[1].bits : 0);
+        if (api.owner == "Landroid/content/ContextWrapper;")
+            return delegate_wrapper(api, args);
+        if (api.owner == "Landroid/content/Context;")
+            return setting ? Value::nothing() : Value::reference(0); // Actual SDK defaults.
+        if (api.owner != context_impl_type)
+            bad("AUTOFILL_CLIENT_UNSUPPORTED", "Autofill client storage requires its actual Context implementation");
+        ensure_primary_context_state(receiver);
+        if (setting) {
+            if (args[1].bits && !runtime.assignable(args[1].bits, autofill_client_type))
+                bad("AUTOFILL_CLIENT_ARGUMENT", "Autofill client has the wrong runtime type");
+            const auto value = args[1].bits;
+            update_context_impl(receiver, [value](ContextImplState &next) { next.references[ContextImplState::autofill_slot] = Value::reference(value); });
+            return Value::nothing();
+        }
+        return context_impl_state(receiver).references[ContextImplState::autofill_slot];
+    }
+    void require_activity_context_lineage(ObjectId entry, ObjectId anchor) {
+        ManagedRoot entry_root(runtime, entry), anchor_root(runtime, anchor);
+        const auto &receipt = context_impl_state(anchor);
+        if (receipt.lineage != anchor)
+            bad("ACTIVITY_CONTEXT", "Activity base has no actual creation-anchor receipt");
+        struct Reader { Impl *session; ObjectId anchor; } reader{this, anchor};
+        require_context_lineage(entry, anchor, {&reader,
+            [](void *opaque, ObjectId object) -> std::optional<ObjectId> {
+                const auto &access = *static_cast<Reader *>(opaque);
+                const auto *metadata = access.session->runtime.find_host_state(object);
+                if (const auto *wrapper = dynamic_cast<const ContextWrapperState *>(metadata);
+                    wrapper && wrapper->owner == access.session)
+                    return wrapper->references[0].bits;
+                if (const auto *context_state = dynamic_cast<const ContextImplState *>(metadata);
+                    context_state && context_state->owner == access.session && context_state->lineage == access.anchor &&
+                    access.session->runtime.object_type(object) == context_impl_type)
+                    return access.anchor;
+                return {};
+            },
+            [](void *opaque, std::uint64_t work) {
+                static_cast<Reader *>(opaque)->session->runtime.charge_provider_work(work);
+            }});
+    }
+    Value attach_activity_base(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::reference)
+            bad("ACTIVITY_CONTEXT_ARGUMENT", "Activity base attachment requires the actual receiver and supplied Context");
+        const auto receiver = args[0].bits, supplied = args[1].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver), context_root(runtime, supplied);
+        (void)activity_window(receiver);
+        const auto *previous = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!previous) bad("ACTIVITY_CONTEXT", "Activity has no authentic attachment state");
+        if (previous->base_attached)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"Base Context is already attached");
+        if (!activity_base_attach_active || receiver != activity || !supplied || !pending_activity_base)
+            bad("ACTIVITY_CONTEXT_UNSUPPORTED", "Activity base attachment requires its actual active supplied-context phase");
+        require_activity_context_lineage(supplied, pending_activity_base);
+        const auto admitted = runtime.host_state_capacity(receiver);
+        previous = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!previous || admitted < previous->bytes() || sizeof(ActivityIntentState) > admitted - previous->bytes())
+            bad("ACTIVITY_CONTEXT_LIMIT", "Activity base replacement exceeds simultaneous managed admission");
+        auto next = std::make_unique<ActivityIntentState>(*previous);
+        next->references[ActivityIntentState::base_slot] = Value::reference(supplied);
+        next->base_attached = true;
+        runtime.set_host_state(receiver, std::move(next));
+        if (api.owner == "Landroid/app/Activity;") {
+            const auto client = activity_autofill_client(receiver); // Actual final SDK getter's lazy controller.
+            ManagedRoot client_root(runtime, client.bits);
+            const std::array client_args{client};
+            (void)runtime.invoke_virtual_named(supplied, "setAutofillClient", "(Landroid/view/autofill/AutofillManager$AutofillClient;)V", client_args);
+            const auto options = runtime.invoke_virtual_named(receiver, "getContentCaptureOptions", "()Landroid/content/ContentCaptureOptions;");
+            ManagedRoot options_root(runtime, options.bits);
+            const std::array options_args{options};
+            (void)runtime.invoke_virtual_named(supplied, "setContentCaptureOptions", "(Landroid/content/ContentCaptureOptions;)V", options_args);
+        }
+        return Value::nothing();
+    }
+    void attach_activity_context(ObjectId receiver) {
+        ManagedRoot receiver_root(runtime, receiver);
+        const auto supplied = new_activity_base_context(receiver);
+        ManagedRoot context_root(runtime, supplied);
+        activity_base_attach_active = true; pending_activity_base = supplied;
+        struct EndAttach {
+            Impl &session;
+            ~EndAttach() { session.activity_base_attach_active = false; session.pending_activity_base = 0; }
+        } end{*this};
+        const std::array args{Value::reference(receiver), Value::reference(supplied)};
+        if (const auto method = metered_view_override(receiver, "attachBaseContext", "(Landroid/content/Context;)V"))
+            (void)runtime.invoke_virtual(*method, args);
+        else {
+            const ApiSupport base_api{"Landroid/app/Activity;", "attachBaseContext", "(Landroid/content/Context;)V",
+                ApiStatus::partial, "Actual Activity base attachment"};
+            (void)attach_activity_base(base_api, args);
+        }
+        const auto base = activity_base_context(receiver);
+        ManagedRoot base_root(runtime, base.bits);
+        require_activity_context_lineage(base.bits, supplied);
+    }
+    const InflaterState &inflater_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const InflaterState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("INFLATER_STATE", "LayoutInflater has no initialized session state");
+        return *metadata;
+    }
+    template <class Update> void update_inflater(ObjectId object, Update update) {
+        ManagedRoot inflater_root(runtime, object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(InflaterState));
+        auto next = std::make_unique<InflaterState>(inflater_state(object));
+        update(*next);
+        runtime.charge_provider_work(next->references.size());
+        storage.publish(object, std::move(next));
+    }
+    void inflater_set_filter(ObjectId object, ObjectId filter) {
+        ManagedRoot inflater_root(runtime, object), filter_root(runtime, filter);
+        if (filter && !runtime.assignable(filter, layout_filter_type))
+            bad("INFLATER_FILTER", "Inflater filter does not implement its SDK interface");
+        update_inflater(object, [filter](InflaterState &next) {
+            next.references[InflaterState::filter_slot] = Value::reference(filter);
+        }); // The SDK filter store precedes allocation, including allocation failure.
+        if (filter) {
+            const auto cache = runtime.new_object(inflater_filter_cache_type);
+            ManagedRoot cache_root(runtime, cache);
+            if (runtime.host_state_capacity(cache) < sizeof(InflaterFilterCacheState))
+                bad("INFLATER_LIMIT", "Inflater filter map exceeds existing managed admission");
+            auto metadata = std::make_unique<InflaterFilterCacheState>();
+            metadata->owner = this;
+            runtime.set_host_state(cache, std::move(metadata));
+            update_inflater(object, [cache](InflaterState &next) {
+                next.references[InflaterState::filter_cache_slot] = Value::reference(cache);
+            });
+        } // Null leaves the old, unused SDK map intact.
+    }
+    void initialize_inflater(ObjectId object, ObjectId context_object, ObjectId original = 0) {
+        ManagedRoot inflater_root(runtime, object), context_root(runtime, context_object), original_root(runtime, original);
+        if (runtime.host_state(object)) bad("INFLATER_STATE", "LayoutInflater constructor called twice");
+        if (context_object && !runtime.assignable(context_object, "Landroid/content/Context;"))
+            bad("INFLATER_CONTEXT", "Inflater constructor requires a Context");
+        const auto constructor_args = runtime.new_array("[Ljava/lang/Object;", 2);
+        ManagedRoot constructor_args_root(runtime, constructor_args);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(InflaterState));
+        auto metadata = std::make_unique<InflaterState>();
+        metadata->owner = this;
+        metadata->references[InflaterState::context_slot] = Value::reference(context_object);
+        metadata->references[InflaterState::constructor_args_slot] = Value::reference(constructor_args);
+        ObjectId filter = 0;
+        if (original) {
+            const auto &prior = inflater_state(original);
+            metadata->references[InflaterState::factory_slot] = prior.references[InflaterState::factory_slot];
+            metadata->references[InflaterState::factory2_slot] = prior.references[InflaterState::factory2_slot];
+            metadata->references[InflaterState::private_slot] = prior.references[InflaterState::private_slot];
+            filter = prior.references[InflaterState::filter_slot].bits;
+        }
+        ManagedRoot filter_root(runtime, filter);
+        runtime.charge_provider_work(metadata->references.size());
+        storage.publish(object, std::move(metadata));
+        if (original) {
+            if (const auto method = metered_view_override(object, "setFilter", "(Landroid/view/LayoutInflater$Filter;)V")) {
+                const std::array callback_args{Value::reference(object), Value::reference(filter)};
+                (void)runtime.invoke_virtual(*method, callback_args);
+            } else inflater_set_filter(object, filter);
+        }
+    }
+    ObjectId new_phone_inflater(ObjectId context_object, ObjectId original = 0) {
+        ManagedRoot context_root(runtime, context_object), original_root(runtime, original);
+        if (runtime.class_definition(phone_inflater_type))
+            bad("INFLATER_TYPE", "Package class collides with the issued PhoneLayoutInflater policy");
+        const auto object = runtime.new_object(phone_inflater_type);
+        ManagedRoot inflater_root(runtime, object);
+        initialize_inflater(object, context_object, original);
+        return object;
+    }
+    ObjectId inflater_literal(ObjectId &cached, std::u16string_view text) {
+        if (!cached) {
+            runtime.charge_provider_work(text.size() + 1);
+            const auto value = runtime.new_string(text);
+            ManagedRoot value_root(runtime, value);
+            const auto literal = runtime.invoke_virtual_named(value, "intern", "()Ljava/lang/String;");
+            ManagedRoot literal_root(runtime, literal.bits);
+            cached = own(literal.bits);
+        }
+        return cached;
+    }
+    ObjectId inflater_prefix_literal(std::size_t index) {
+        static constexpr std::array<std::u16string_view, 4> prefixes{
+            u"android.widget.", u"android.webkit.", u"android.app.", u"android.view."};
+        if (index >= prefixes.size()) bad("INFLATER_STATE", "Invalid original inflater prefix ordinal");
+        return inflater_literal(inflater_prefix_names[index], prefixes[index]);
+    }
+    ObjectId inflater_theme_attribute_array() {
+        if (!inflater_theme_attributes) {
+            ProviderWorkCharge provider_charge{runtime};
+            const SdkResourceWork charge(std::ref(provider_charge));
+            const auto theme = embedded_sdk_resources().identifier("attr", "theme", charge);
+            if (!theme) bad("INFLATER_THEME_STATE", "SDK theme attribute has no authentic catalog identity");
+            runtime.charge_provider_work(2); // Actual allocation and one zero-initialized cell.
+            const auto array = runtime.new_array("[I", 1);
+            ManagedRoot array_root(runtime, array);
+            runtime.charge_provider_work(1);
+            runtime.array_set(array, 0, Value::word(theme));
+            inflater_theme_attributes = own(array);
+        }
+        // The SDK final int[] is mutable through original Context callbacks;
+        // preserve its identity and contents instead of rebuilding it per tag.
+        return inflater_theme_attributes;
+    }
+    ObjectId inflater_service_literal() {
+        if (!layout_inflater_service_name) {
+            const auto text = runtime.new_string(u"layout_inflater");
+            ManagedRoot text_root(runtime, text);
+            // The SDK passes Context.LAYOUT_INFLATER_SERVICE, a compile-time
+            // interned String. Preserve identity against original const-string.
+            const auto literal = runtime.invoke_virtual_named(text, "intern", "()Ljava/lang/String;");
+            ManagedRoot literal_root(runtime, literal.bits);
+            layout_inflater_service_name = own(literal.bits);
+        }
+        return layout_inflater_service_name;
+    }
+    std::optional<std::size_t> inflater_constructor_slot(ObjectId name) {
+        if (!inflater_constructor_cache) return {};
+        const auto entries = runtime.array_get(inflater_constructor_cache, 0).bits;
+        for (std::size_t index = 0; index < inflater_constructor_count; ++index) {
+            runtime.charge_provider_work(1);
+            const auto key = runtime.array_get(entries, static_cast<std::int32_t>(index * 2)).bits;
+            const auto left = runtime.string(key), right = runtime.string(name);
+            runtime.charge_provider_work(1);
+            if (left.size() != right.size()) continue;
+            bool equal = true;
+            for (std::size_t unit = 0; unit < left.size(); ++unit) {
+                runtime.charge_provider_work(1);
+                if (left[unit] != right[unit]) { equal = false; break; }
+            }
+            if (equal) return index;
+        }
+        return {};
+    }
+    ObjectId inflater_cached_constructor(ObjectId name) {
+        const auto slot = inflater_constructor_slot(name);
+        if (!slot) return 0;
+        const auto entries = runtime.array_get(inflater_constructor_cache, 0).bits;
+        return runtime.array_get(entries, static_cast<std::int32_t>(*slot * 2 + 1)).bits;
+    }
+    void inflater_cache_constructor(ObjectId name, ObjectId entry) {
+        ManagedRoot name_root(runtime, name), entry_root(runtime, entry);
+        if (!inflater_constructor_cache) {
+            const auto holder = runtime.new_array("[Ljava/lang/Object;", 1);
+            ManagedRoot holder_root(runtime, holder);
+            inflater_constructor_cache = own(holder);
+        }
+        const auto previous = runtime.array_get(inflater_constructor_cache, 0).bits;
+        ManagedRoot previous_root(runtime, previous);
+        // A getClassLoader callback can reenter inflation and publish this key.
+        // HashMap.put replaces its value while retaining the original key.
+        if (const auto slot = inflater_constructor_slot(name)) {
+            runtime.charge_provider_work(1);
+            runtime.array_set(previous, static_cast<std::int32_t>(*slot * 2 + 1), Value::reference(entry));
+            return;
+        }
+        const auto count = previous ? runtime.array_length(previous) : 0;
+        const auto needed = inflater_constructor_count + 1;
+        if (needed > static_cast<std::size_t>(INT32_MAX) / 2)
+            bad("INFLATER_CACHE_LIMIT", "Constructor cache exceeds the managed array index domain");
+        ObjectId entries = previous;
+        if (needed > count / 2) {
+            const auto capacity = std::max(needed, std::min(static_cast<std::size_t>(INT32_MAX) / 2,
+                count ? count / 2 * 2 : std::size_t{1}));
+            entries = runtime.new_array("[Ljava/lang/Object;", static_cast<std::int32_t>(capacity * 2));
+            ManagedRoot entries_root(runtime, entries);
+            for (std::size_t index = 0; index < inflater_constructor_count * 2; ++index) {
+                runtime.charge_provider_work(1);
+                runtime.array_set(entries, static_cast<std::int32_t>(index), runtime.array_get(previous, static_cast<std::int32_t>(index)));
+            }
+            runtime.array_set(inflater_constructor_cache, 0, Value::reference(entries));
+        }
+        const auto offset = static_cast<std::int32_t>(inflater_constructor_count * 2);
+        runtime.charge_provider_work(2);
+        runtime.array_set(entries, offset, Value::reference(name));
+        runtime.array_set(entries, offset + 1, Value::reference(entry));
+        ++inflater_constructor_count;
+    }
+    bool inflater_name_equals(ObjectId name, std::u16string_view expected) {
+        const auto actual = runtime.string(name);
+        runtime.charge_provider_work(1);
+        if (actual.size() != expected.size()) return false;
+        for (std::size_t index = 0; index < actual.size(); ++index) {
+            runtime.charge_provider_work(1);
+            if (actual[index] != expected[index]) return false;
+        }
+        return true;
+    }
+    Value inflater_try_create_view(ObjectId object, std::span<const Value> args) {
+        if (args.size() != 5) bad("INFLATER_ARGUMENT", "tryCreateView requires parent, name, Context and AttributeSet");
+        for (const auto value : args)
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("INFLATER_ARGUMENT", "Inflater factory arguments must be nullable references");
+        ManagedRoot inflater_root(runtime, object), parent_root(runtime, args[1].bits), name_root(runtime, args[2].bits),
+            context_root(runtime, args[3].bits), attrs_root(runtime, args[4].bits);
+        // The SDK evaluates name.equals before touching either factory field.
+        if (inflater_name_equals(args[2].bits, u"blink"))
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"BlinkLayout animation is not implemented");
+        const InflaterFactoryAccess access{this, [](void *owner, ObjectId inflater, InflaterFactorySlot slot) -> ObjectId {
+            auto &session = *static_cast<Impl *>(owner);
+            const auto &metadata = session.inflater_state(inflater);
+            const auto index = slot == InflaterFactorySlot::factory ? InflaterState::factory_slot
+                : slot == InflaterFactorySlot::factory2 ? InflaterState::factory2_slot : InflaterState::private_slot;
+            return metadata.references[index].bits;
+        }};
+        return Value::reference(invoke_inflater_factories(runtime, object, args[1].bits, args[2].bits,
+            args[3].bits, args[4].bits, access));
+    }
+    ObjectId inflater_concat(ObjectId left, ObjectId right) {
+        ManagedRoot left_root(runtime, left), right_root(runtime, right);
+        const std::array arguments{Value::reference(right)};
+        const auto result = runtime.invoke_virtual_named(left, "concat", "(Ljava/lang/String;)Ljava/lang/String;", arguments);
+        return result.bits;
+    }
+    ObjectId inflater_loader(ObjectId object) {
+        const auto constructor_context = inflater_state(object).references[InflaterState::context_slot].bits;
+        ManagedRoot context_root(runtime, constructor_context);
+        const auto loader = runtime.invoke_virtual_named(constructor_context, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        if (loader.kind != dex::ValueKind::reference && !(loader.kind == dex::ValueKind::word && !loader.bits))
+            bad("INFLATER_LOADER", "Inflater Context returned a nonreference class loader");
+        return loader.bits;
+    }
+    bool inflater_sdk_constructor(std::string_view descriptor) const {
+        return descriptor == "Landroid/view/View;" || descriptor == frame_layout_type ||
+            descriptor == "Landroid/widget/LinearLayout;" || descriptor == surface_view_type || descriptor == view_stub_type;
+    }
+    ObjectId inflater_class_name(ObjectId loaded_class) {
+        const auto descriptor = runtime.represented_class(loaded_class);
+        const auto binary = metadata_string(descriptor.substr(1, descriptor.size() - 2));
+        ManagedRoot binary_root(runtime, binary);
+        const auto slash = runtime.new_string(u"/");
+        ManagedRoot slash_root(runtime, slash);
+        const auto dot = runtime.new_string(u".");
+        ManagedRoot dot_root(runtime, dot);
+        const std::array query{Value::reference(slash), Value::reference(dot)};
+        return runtime.invoke_virtual_named(binary, "replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;", query).bits;
+    }
+    [[noreturn]] void inflater_construction_error(ObjectId constructor_context, ObjectId attrs,
+        ObjectId class_name, ObjectId cause, bool cast_error, bool represented_name, bool null_name_as_null = false) {
+        ManagedRoot context_root(runtime, constructor_context), attrs_root(runtime, attrs),
+            name_root(runtime, class_name), cause_root(runtime, cause);
+        const auto exception_object = runtime.new_object(inflate_exception_type);
+        ManagedRoot exception_root(runtime, exception_object);
+        std::uint32_t source = 0;
+        if (attrs) {
+            const auto *parser = dynamic_cast<const XmlParserState *>(runtime.find_host_state(attrs));
+            if (parser && parser->owner == this && runtime.object_type(attrs) == xml_parser_type && !parser->closed())
+                source = parser->cursor().source().resource_id;
+        }
+        const auto position = runtime.invoke_virtual_named(attrs, "getPositionDescription", "()Ljava/lang/String;");
+        ManagedRoot position_root(runtime, position.bits);
+        const auto empty_position = position.bits ? 0 : runtime.new_string(u"null");
+        ManagedRoot empty_position_root(runtime, empty_position);
+        ObjectId description = position.bits ? position.bits : empty_position;
+        ManagedRoot description_root(runtime, description);
+        if (source) {
+            // This original diagnostic callback is observable too. Until the
+            // base resource-name provider is implemented it fails precisely;
+            // an original owned Resources override can supply the real name.
+            const auto resources_result = runtime.invoke_virtual_named(constructor_context, "getResources", "()Landroid/content/res/Resources;");
+            ManagedRoot resources_root(runtime, resources_result.bits);
+            const std::array resource_query{Value::word(source)};
+            const auto resource_name = runtime.invoke_virtual_named(resources_result.bits, "getResourceName", "(I)Ljava/lang/String;", resource_query);
+            ManagedRoot resource_name_root(runtime, resource_name.bits);
+            const auto separator = runtime.new_string(u" in ");
+            ManagedRoot separator_root(runtime, separator);
+            const auto prefix = inflater_concat(description, separator);
+            ManagedRoot prefix_root(runtime, prefix);
+            const auto actual_name = resource_name.bits ? resource_name.bits : runtime.new_string(u"null");
+            ManagedRoot actual_name_root(runtime, actual_name);
+            description = inflater_concat(prefix, actual_name);
+            description_root.reset(description);
+        }
+        const auto suffix = runtime.new_string(cast_error ? u": Class is not a View " : u": Error inflating class ");
+        ManagedRoot suffix_root(runtime, suffix);
+        const auto prefix = inflater_concat(description, suffix);
+        ManagedRoot prefix_root(runtime, prefix);
+        const auto actual_class_name = class_name && represented_name ? inflater_class_name(class_name) : class_name;
+        ManagedRoot actual_class_name_root(runtime, actual_class_name);
+        const auto unknown = actual_class_name ? 0 : runtime.new_string(null_name_as_null ? u"null" : u"<unknown>");
+        ManagedRoot unknown_root(runtime, unknown);
+        const auto message = inflater_concat(prefix, actual_class_name ? actual_class_name : unknown);
+        ManagedRoot message_root(runtime, message);
+        runtime.raise_existing_with_message_and_cause(exception_object, message, cause);
+    }
+    Value inflater_create_view(ActivitySession &host, std::span<const Value> args) {
+        const bool explicit_context = args.size() == 5;
+        if (!explicit_context && args.size() != 4)
+            bad("INFLATER_ARGUMENT", "createView requires its actual Context/name/prefix/AttributeSet overload");
+        for (const auto value : args)
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("INFLATER_ARGUMENT", "createView arguments must be nullable references");
+        const auto object = args[0].bits;
+        ManagedRoot inflater_root(runtime, object);
+        const auto constructor_arguments = inflater_state(object).references[InflaterState::constructor_args_slot].bits;
+        ManagedRoot arguments_root(runtime, constructor_arguments);
+        const auto selected_context = explicit_context ? args[1].bits : runtime.array_get(constructor_arguments, 0).bits;
+        const auto constructor_context = explicit_context || selected_context ? selected_context
+            : inflater_state(object).references[InflaterState::context_slot].bits;
+        const auto name = args[explicit_context ? 2 : 1].bits;
+        const auto prefix = args[explicit_context ? 3 : 2].bits;
+        const auto attrs = args[explicit_context ? 4 : 3].bits;
+        ManagedRoot context_root(runtime, constructor_context), name_root(runtime, name),
+            prefix_root(runtime, prefix), attrs_root(runtime, attrs);
+        if (!constructor_context || !name) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(constructor_context, "Landroid/content/Context;")) runtime.raise("Ljava/lang/ClassCastException;");
+        (void)runtime.string(name);
+        if (prefix) (void)runtime.string(prefix);
+        auto entry = inflater_cached_constructor(name);
+        ManagedRoot entry_root(runtime, entry);
+        ObjectId loaded_class = entry ? runtime.array_get(entry, 0).bits : 0;
+        ManagedRoot class_root(runtime, loaded_class);
+        // SDK's local clazz is populated only on an actual cache-miss load;
+        // the cached constructor's declaring class is separate authentication.
+        ObjectId diagnostic_class = 0;
+        ManagedRoot diagnostic_class_root(runtime, 0);
+        ObjectId loader = 0;
+        ManagedRoot loader_root(runtime, 0);
+        if (entry && runtime.class_definition(runtime.represented_class(loaded_class))) {
+            // SDK verification of a cached non-bootstrap constructor occurs
+            // before its try/catch. Preserve that callback's exception boundary.
+            loader = inflater_loader(object);
+            loader_root.reset(loader);
+            if (loader != runtime.class_loader())
+                bad("INFLATER_LOADER_UNSUPPORTED", "Cached owned XML class requires its authentic held class loader");
+        }
+        ObjectId full_name = name;
+        ManagedRoot full_name_root(runtime, full_name);
+        try {
+            if (!entry) {
+                if (prefix) {
+                    full_name = inflater_concat(prefix, name);
+                    full_name_root.reset(full_name);
+                }
+                loader = inflater_loader(object);
+                loader_root.reset(loader);
+                if (!loader)
+                    bad("INFLATER_LOADER_UNSUPPORTED", "Bootstrap-only XML class lookup requires an implemented Class.forName null-loader path");
+                const std::array query{Value::reference(full_name)};
+                const auto selected_class = runtime.invoke_virtual_named(loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", query);
+                loaded_class = selected_class.bits;
+                class_root.reset(loaded_class);
+                const auto descriptor = runtime.represented_class(loaded_class);
+                if (!runtime.class_assignable(descriptor, "Landroid/view/View;")) runtime.raise("Ljava/lang/ClassCastException;");
+                diagnostic_class = loaded_class;
+                diagnostic_class_root.reset(diagnostic_class);
+                if (inflater_state(object).references[InflaterState::filter_slot].bits)
+                    bad("INFLATER_FILTER_UNSUPPORTED", "XML class filters require their actual class/decision-cache callback flow");
+                const auto constructor = runtime.class_definition(descriptor)
+                    ? lookup_owned_xml_constructor(runtime, descriptor, loader) : ObjectId{0};
+                ManagedRoot constructor_root(runtime, constructor);
+                if (!constructor && !inflater_sdk_constructor(descriptor))
+                    bad("INFLATER_CLASS_UNSUPPORTED", "This platform XML constructor has no implemented original SDK body");
+                entry = runtime.new_array("[Ljava/lang/Object;", 2);
+                entry_root.reset(entry);
+                runtime.charge_provider_work(2);
+                runtime.array_set(entry, 0, Value::reference(loaded_class));
+                runtime.array_set(entry, 1, Value::reference(constructor));
+                inflater_cache_constructor(name, entry); // Real publication precedes target initialization/body.
+            } else if (inflater_state(object).references[InflaterState::filter_slot].bits) {
+                bad("INFLATER_FILTER_UNSUPPORTED", "Cached XML class filters require their actual decision-cache callback flow");
+            }
+            const auto last_context = runtime.array_get(constructor_arguments, 0).bits;
+            ManagedRoot last_context_root(runtime, last_context);
+            runtime.charge_provider_work(2);
+            runtime.array_set(constructor_arguments, 0, Value::reference(constructor_context));
+            runtime.array_set(constructor_arguments, 1, Value::reference(attrs));
+            try {
+                const auto constructor = runtime.array_get(entry, 1).bits;
+                ManagedRoot constructor_root(runtime, constructor);
+                ObjectId view_object = 0;
+                ManagedRoot view_root(runtime, 0);
+                if (constructor) {
+                    view_object = invoke_owned_xml_constructor(runtime, constructor, constructor_arguments);
+                    view_root.reset(view_object);
+                } else {
+                    const auto descriptor = runtime.represented_class(loaded_class);
+                    view_object = runtime.new_object(descriptor);
+                    view_root.reset(view_object);
+                    const auto actual_context = runtime.array_get(constructor_arguments, 0);
+                    const auto actual_attrs = runtime.array_get(constructor_arguments, 1);
+                    const std::array constructor_call{Value::reference(view_object), actual_context, actual_attrs};
+                    try {
+                        const ApiSupport constructor_api{descriptor, "<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+                            ApiStatus::partial, "Actual admitted SDK XML constructor"};
+                        (void)host.invoke_api(runtime, constructor_api, constructor_call);
+                    } catch (const dex::JavaException &error) {
+                        ManagedRoot error_root(runtime, error.object);
+                        runtime.raise_with_cause("Ljava/lang/reflect/InvocationTargetException;", {}, error.object);
+                    }
+                }
+                if (runtime.assignable(view_object, view_stub_type)) {
+                    const auto actual_context = runtime.array_get(constructor_arguments, 0);
+                    ManagedRoot actual_context_root(runtime, actual_context.bits);
+                    const std::array clone_query{actual_context};
+                    const auto clone = runtime.invoke_virtual_named(object, "cloneInContext", "(Landroid/content/Context;)Landroid/view/LayoutInflater;", clone_query);
+                    ManagedRoot clone_root(runtime, clone.bits);
+                    const std::array setter_query{clone};
+                    (void)runtime.invoke_virtual_named(view_object, "setLayoutInflater", "(Landroid/view/LayoutInflater;)V", setter_query);
+                }
+                runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+                return Value::reference(view_object);
+            } catch (...) {
+                runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+                throw;
+            }
+        } catch (const dex::JavaException &error) {
+            ManagedRoot error_root(runtime, error.object);
+            const auto type = runtime.object_type(error.object);
+            if (runtime.class_assignable(type, "Ljava/lang/ClassNotFoundException;") ||
+                !runtime.class_assignable(type, "Ljava/lang/Exception;")) throw;
+            const bool cast_error = runtime.class_assignable(type, "Ljava/lang/ClassCastException;");
+            // Fully qualified diagnostic class names are original managed
+            // String values. Context/AttributeSet diagnostic hooks run below.
+            const bool requested_name = cast_error || runtime.class_assignable(type, "Ljava/lang/NoSuchMethodException;");
+            inflater_construction_error(constructor_context, attrs, requested_name ? full_name : diagnostic_class,
+                error.object, cast_error, !requested_name);
+        }
+    }
+    Value dispatch_inflater_on_create_view(ActivitySession &host, ObjectId object,
+        std::string_view signature, std::span<const Value> args) {
+        if (args.size() < 2 || args.size() > 4)
+            bad("INFLATER_ARGUMENT", "Inflater creation hook has an invalid argument count");
+        for (const auto value : args)
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("INFLATER_ARGUMENT", "Inflater hook arguments must be nullable references");
+        ManagedRoot object_root(runtime, object), arg0_root(runtime, args[0].bits), arg1_root(runtime, args[1].bits),
+            arg2_root(runtime, args.size() >= 3 ? args[2].bits : 0), arg3_root(runtime, args.size() == 4 ? args[3].bits : 0);
+        const std::array full{Value::reference(object), args[0], args[1],
+            args.size() >= 3 ? args[2] : Value::reference(0), args.size() == 4 ? args[3] : Value::reference(0)};
+        const auto call = std::span<const Value>(full).first(args.size() + 1);
+        if (const auto method = metered_view_override(object, "onCreateView", signature))
+            return runtime.invoke_virtual(*method, call);
+        const auto owner = args.size() == 2 && runtime.assignable(object, phone_inflater_type)
+            ? phone_inflater_type : layout_inflater_type;
+        const ApiSupport base_api{owner, "onCreateView", signature, ApiStatus::partial, "Original SDK inflater hook"};
+        return inflater_on_create_view(host, base_api, call);
+    }
+    Value inflater_on_create_view(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() < 3 || args.size() > 5 || args[0].kind != dex::ValueKind::reference)
+            bad("INFLATER_ARGUMENT", "Inflater creation hook requires its actual receiver and reference arguments");
+        for (const auto value : args)
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("INFLATER_ARGUMENT", "Inflater creation hook requires nullable reference arguments");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object);
+        (void)inflater_state(object);
+        if (api.owner == layout_inflater_type && api.signature == "(Landroid/content/Context;Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" && args.size() == 5) {
+            const std::array query{args[2], args[3], args[4]};
+            return dispatch_inflater_on_create_view(host, object,
+                "(Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;", query);
+        }
+        if (api.owner == layout_inflater_type && api.signature == "(Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" && args.size() == 4) {
+            const std::array query{args[2], args[3]};
+            return dispatch_inflater_on_create_view(host, object,
+                "(Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;", query);
+        }
+        if (api.signature != "(Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;" || args.size() != 3 ||
+            (api.owner != layout_inflater_type && api.owner != phone_inflater_type))
+            bad("INFLATER_ARGUMENT", "Inflater creation hook does not match its actual SDK declaration");
+        ManagedRoot name_root(runtime, args[1].bits), attrs_root(runtime, args[2].bits);
+        if (api.owner == phone_inflater_type) {
+            for (std::size_t index = 0; index < 3; ++index) {
+                runtime.charge_provider_work(1);
+                const auto prefix = inflater_prefix_literal(index);
+                ManagedRoot prefix_root(runtime, prefix);
+                const std::array query{Value::reference(object), args[1], Value::reference(prefix), args[2]};
+                try {
+                    const auto result = inflater_create_view(host, query);
+                    if (result.bits) return result;
+                } catch (const dex::JavaException &error) {
+                    ManagedRoot error_root(runtime, error.object);
+                    if (!runtime.class_assignable(runtime.object_type(error.object), "Ljava/lang/ClassNotFoundException;")) throw;
+                    // Only an actual lookup miss advances the original prefix
+                    // search. Unsupported platform metadata is never absence.
+                }
+            }
+        }
+        const auto prefix = inflater_prefix_literal(3);
+        ManagedRoot prefix_root(runtime, prefix);
+        const std::array query{Value::reference(object), args[1], Value::reference(prefix), args[2]};
+        return inflater_create_view(host, query);
+    }
+    ObjectId inflater_create_view_from_tag(ActivitySession &host, ObjectId object, ObjectId parent,
+        ObjectId name, ObjectId constructor_context, ObjectId attrs, bool ignore_theme_attribute = false) {
+        ManagedRoot inflater_root(runtime, object), parent_root(runtime, parent), name_root(runtime, name),
+            context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        (void)inflater_state(object);
+        if (inflater_name_equals(name, u"view")) {
+            const auto class_name = inflater_literal(inflater_class_attribute_name, u"class");
+            ManagedRoot class_name_root(runtime, class_name);
+            const std::array query{Value::reference(0), Value::reference(class_name)};
+            const auto selected = runtime.invoke_virtual_named(attrs, "getAttributeValue", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", query);
+            if (selected.kind != dex::ValueKind::reference && !(selected.kind == dex::ValueKind::word && !selected.bits))
+                bad("INFLATER_ARGUMENT", "The view class attribute returned a nonreference name");
+            name = selected.bits;
+            name_root.reset(name);
+        }
+        if (!ignore_theme_attribute) {
+            const auto theme_attributes = inflater_theme_attribute_array();
+            ManagedRoot theme_attributes_root(runtime, theme_attributes);
+            const std::array query{Value::reference(attrs), Value::reference(theme_attributes)};
+            const auto values = runtime.invoke_virtual_named(constructor_context, "obtainStyledAttributes",
+                "(Landroid/util/AttributeSet;[I)Landroid/content/res/TypedArray;", query);
+            if (values.kind != dex::ValueKind::reference && !(values.kind == dex::ValueKind::word && !values.bits))
+                bad("INFLATER_THEME_STATE", "Tag Context returned a nonreference TypedArray");
+            ManagedRoot values_root(runtime, values.bits);
+            const std::array resource_query{Value::word(0), Value::word(0)};
+            const auto theme = runtime.invoke_virtual_named(values.bits, "getResourceId", "(II)I", resource_query);
+            if (theme.kind != dex::ValueKind::word) bad("INFLATER_THEME_STATE", "Theme resource getter returned a noninteger value");
+            if (theme.bits) {
+                if (runtime.class_definition(theme_wrapper_type))
+                    bad("THEME_WRAPPER_TYPE", "Package class collides with the issued platform ContextThemeWrapper");
+                const auto wrapper = runtime.new_object(theme_wrapper_type);
+                ManagedRoot wrapper_root(runtime, wrapper);
+                const std::array constructor_query{Value::reference(wrapper), Value::reference(constructor_context), theme};
+                const ApiSupport constructor_api{theme_wrapper_type, "<init>", "(Landroid/content/Context;I)V",
+                    ApiStatus::partial, "Actual per-tag platform theme wrapper"};
+                (void)context_theme_wrapper_constructor(constructor_api, constructor_query);
+                constructor_context = wrapper;
+                context_root.reset(constructor_context);
+            }
+            // This is the SDK's ordinary trailing recycle, not a finally: a
+            // failed theme-wrapper constructor does not execute the recycle.
+            (void)runtime.invoke_virtual_named(values.bits, "recycle", "()V");
+        }
+        try {
+            const std::array factory_query{Value::reference(object), Value::reference(parent), Value::reference(name),
+                Value::reference(constructor_context), Value::reference(attrs)};
+            const auto factory_view = inflater_try_create_view(object, factory_query);
+            if (factory_view.bits) return factory_view.bits;
+            const auto constructor_arguments = inflater_state(object).references[InflaterState::constructor_args_slot].bits;
+            ManagedRoot arguments_root(runtime, constructor_arguments);
+            const auto last_context = runtime.array_get(constructor_arguments, 0).bits;
+            ManagedRoot last_context_root(runtime, last_context);
+            runtime.charge_provider_work(1);
+            runtime.array_set(constructor_arguments, 0, Value::reference(constructor_context));
+            try {
+                bool qualified = false;
+                const auto text = runtime.string(name);
+                for (const auto unit : text) {
+                    runtime.charge_provider_work(1);
+                    if (unit == u'.') { qualified = true; break; }
+                }
+                Value result;
+                if (qualified) {
+                    const std::array query{Value::reference(object), Value::reference(constructor_context), Value::reference(name),
+                        Value::reference(0), Value::reference(attrs)};
+                    result = inflater_create_view(host, query);
+                } else {
+                    const std::array query{Value::reference(constructor_context), Value::reference(parent), Value::reference(name), Value::reference(attrs)};
+                    result = dispatch_inflater_on_create_view(host, object,
+                        "(Landroid/content/Context;Landroid/view/View;Ljava/lang/String;Landroid/util/AttributeSet;)Landroid/view/View;", query);
+                }
+                if (result.kind != dex::ValueKind::reference && !(result.kind == dex::ValueKind::word && !result.bits))
+                    bad("INFLATER_RESULT", "Inflater hook returned a nonreference View");
+                ManagedRoot result_root(runtime, result.bits);
+                if (result.bits && !runtime.assignable(result.bits, "Landroid/view/View;")) runtime.raise("Ljava/lang/ClassCastException;");
+                runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+                return result.bits;
+            } catch (...) {
+                runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+                throw;
+            }
+        } catch (const dex::JavaException &error) {
+            ManagedRoot error_root(runtime, error.object);
+            const auto type = runtime.object_type(error.object);
+            if (runtime.class_assignable(type, inflate_exception_type) || !runtime.class_assignable(type, "Ljava/lang/Exception;")) throw;
+            inflater_construction_error(constructor_context, attrs, name, error.object, false, false, true);
+        }
+    }
+    struct InflaterTraversalStack {
+        dex::ManagedRuntime &runtime;
+        ManagedRoot references, states;
+        std::size_t size = 0, capacity = 0;
+        explicit InflaterTraversalStack(dex::ManagedRuntime &owner)
+            : runtime(owner), references(owner, 0), states(owner, 0) {}
+        void reserve(std::size_t needed) {
+            if (needed <= capacity) return;
+            const auto maximum = static_cast<std::size_t>(INT32_MAX) / 4;
+            if (needed > maximum) bad("INFLATER_STACK_LIMIT", "Traversal stack exceeds the managed array index domain");
+            const auto next = std::max(needed, std::min(maximum, capacity ? capacity * 2 : std::size_t{1}));
+            const auto length = static_cast<std::int32_t>(next * 4);
+            runtime.charge_provider_work(next * 4 + 1);
+            const auto next_references = runtime.new_array("[Ljava/lang/Object;", length);
+            ManagedRoot next_references_root(runtime, next_references);
+            runtime.charge_provider_work(next * 4 + 1);
+            const auto next_states = runtime.new_array("[I", length);
+            ManagedRoot next_states_root(runtime, next_states);
+            for (std::size_t index = 0; index < size * 4; ++index) {
+                runtime.charge_provider_work(4);
+                const auto at = static_cast<std::int32_t>(index);
+                runtime.array_set(next_references, at, runtime.array_get(references.object, at));
+                runtime.array_set(next_states, at, runtime.array_get(states.object, at));
+            }
+            references.reset(next_references); states.reset(next_states); capacity = next;
+        }
+        ObjectId reference(std::size_t frame, std::size_t slot) {
+            runtime.charge_provider_work(1);
+            return runtime.array_get(references.object, static_cast<std::int32_t>(frame * 4 + slot)).bits;
+        }
+        void reference(std::size_t frame, std::size_t slot, ObjectId value) {
+            runtime.charge_provider_work(1);
+            runtime.array_set(references.object, static_cast<std::int32_t>(frame * 4 + slot), Value::reference(value));
+        }
+        std::int32_t number(std::size_t frame, std::size_t slot) {
+            runtime.charge_provider_work(1);
+            return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(runtime.array_get(states.object,
+                static_cast<std::int32_t>(frame * 4 + slot)).bits));
+        }
+        void number(std::size_t frame, std::size_t slot, std::int32_t value) {
+            runtime.charge_provider_work(1);
+            runtime.array_set(states.object, static_cast<std::int32_t>(frame * 4 + slot), Value::word(std::bit_cast<std::uint32_t>(value)));
+        }
+        void push(ObjectId parent, ObjectId constructor_context, std::int32_t depth, bool finish) {
+            ManagedRoot parent_root(runtime, parent), context_root(runtime, constructor_context);
+            reserve(size + 1);
+            reference(size, 0, parent); reference(size, 1, constructor_context); reference(size, 2, 0); reference(size, 3, 0);
+            number(size, 0, depth); number(size, 1, 0); number(size, 2, finish ? 1 : 0); number(size, 3, 0);
+            ++size;
+        }
+        void pop() {
+            if (!size) bad("INFLATER_STATE", "Traversal stack underflow");
+            --size;
+            for (std::size_t slot = 0; slot < 4; ++slot) reference(size, slot, 0);
+        }
+    };
+    std::int32_t inflater_parser_integer(ObjectId parser, std::string_view name) {
+        const auto result = runtime.invoke_virtual_named(parser, name, "()I");
+        if (result.kind != dex::ValueKind::word) bad("INFLATER_PARSER_RESULT", "Parser returned a noninteger cursor value");
+        return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(result.bits));
+    }
+    void inflater_consume_children(ObjectId parser) {
+        ManagedRoot parser_root(runtime, parser);
+        const auto depth = inflater_parser_integer(parser, "getDepth");
+        for (;;) {
+            const auto type = inflater_parser_integer(parser, "next");
+            if (type == 3 && inflater_parser_integer(parser, "getDepth") <= depth) break;
+            if (type == 1) break;
+        }
+    }
+    void inflater_inflate_children(ActivitySession &host, ObjectId object, ObjectId parser,
+        ObjectId parent, ObjectId constructor_context, ObjectId attrs, bool finish) {
+        ManagedRoot inflater_root(runtime, object), parser_root(runtime, parser), parent_root(runtime, parent),
+            context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        InflaterTraversalStack stack(runtime);
+        stack.push(parent, constructor_context, inflater_parser_integer(parser, "getDepth"), finish);
+        while (stack.size) {
+            const auto frame = stack.size - 1;
+            const auto current_parent = stack.reference(frame, 0);
+            ManagedRoot current_parent_root(runtime, current_parent);
+            if (stack.number(frame, 1)) {
+                const auto child = stack.reference(frame, 2), params = stack.reference(frame, 3);
+                ManagedRoot child_root(runtime, child), params_root(runtime, params);
+                const std::array query{Value::reference(child), Value::reference(params)};
+                (void)runtime.invoke_virtual_named(current_parent, "addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", query);
+                stack.reference(frame, 2, 0); stack.reference(frame, 3, 0); stack.number(frame, 1, 0);
+                continue;
+            }
+            const auto type = inflater_parser_integer(parser, "next");
+            const bool closing = type == 3 && inflater_parser_integer(parser, "getDepth") <= stack.number(frame, 0);
+            if (closing || type == 1) {
+                if (stack.number(frame, 3)) (void)runtime.invoke_virtual_named(current_parent, "restoreDefaultFocus", "()Z");
+                if (stack.number(frame, 2)) dispatch_finish_inflate(current_parent);
+                stack.pop();
+                continue;
+            }
+            if (type != 2) continue;
+            const auto name = runtime.invoke_virtual_named(parser, "getName", "()Ljava/lang/String;");
+            if (name.kind != dex::ValueKind::reference && !(name.kind == dex::ValueKind::word && !name.bits))
+                bad("INFLATER_PARSER_RESULT", "Parser returned a nonreference tag name");
+            ManagedRoot name_root(runtime, name.bits);
+            if (name.bits && inflater_name_equals(name.bits, u"requestFocus")) {
+                stack.number(frame, 3, 1);
+                inflater_consume_children(parser);
+                continue;
+            }
+            if (name.bits && inflater_name_equals(name.bits, u"tag"))
+                bad("INFLATER_TAG_UNSUPPORTED", "View tag inflation requires its actual TypedArray text and keyed tag consumers");
+            if (name.bits && inflater_name_equals(name.bits, u"include")) {
+                if (inflater_parser_integer(parser, "getDepth") == 0)
+                    runtime.raise(inflate_exception_type, u"<include /> cannot be the root element");
+                if (!runtime.assignable(current_parent, "Landroid/view/ViewGroup;"))
+                    runtime.raise(inflate_exception_type, u"<include /> can only be used inside of a ViewGroup");
+                bad("INFLATER_INCLUDE_UNSUPPORTED", "Include inflation requires actual theme/reference/override LayoutParams consumers");
+            }
+            if (name.bits && inflater_name_equals(name.bits, u"merge"))
+                runtime.raise(inflate_exception_type, u"<merge /> must be the root element");
+            const auto current_context = stack.reference(frame, 1);
+            ManagedRoot current_context_root(runtime, current_context);
+            const auto child = inflater_create_view_from_tag(host, object, current_parent, name.bits, current_context, attrs);
+            ManagedRoot child_root(runtime, child);
+            if (!runtime.assignable(current_parent, "Landroid/view/ViewGroup;")) runtime.raise("Ljava/lang/ClassCastException;");
+            const std::array params_query{Value::reference(attrs)};
+            const auto params = runtime.invoke_virtual_named(current_parent, "generateLayoutParams",
+                "(Landroid/util/AttributeSet;)Landroid/view/ViewGroup$LayoutParams;", params_query);
+            if (params.kind != dex::ValueKind::reference && !(params.kind == dex::ValueKind::word && !params.bits))
+                bad("INFLATER_LAYOUT_PARAMS", "ViewGroup returned nonreference LayoutParams");
+            ManagedRoot params_root(runtime, params.bits);
+            stack.reference(frame, 2, child); stack.reference(frame, 3, params.bits); stack.number(frame, 1, 1);
+            const auto child_context = runtime.invoke_virtual_named(child, "getContext", "()Landroid/content/Context;");
+            if (child_context.kind != dex::ValueKind::reference && !(child_context.kind == dex::ValueKind::word && !child_context.bits))
+                bad("INFLATER_CONTEXT", "Inflated child returned a nonreference Context");
+            ManagedRoot child_context_root(runtime, child_context.bits);
+            stack.push(child, child_context.bits, inflater_parser_integer(parser, "getDepth"), true);
+        }
+    }
+    ObjectId inflater_new_text(std::u16string_view value) {
+        runtime.charge_provider_work(value.size() + 1);
+        return runtime.new_string(value);
+    }
+    ObjectId inflater_nullable_text(ObjectId value) {
+        return value ? value : inflater_new_text(u"null");
+    }
+    ObjectId inflater_parser_description(ObjectId constructor_context, ObjectId attrs) {
+        ManagedRoot context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        std::uint32_t source = 0;
+        if (attrs) {
+            const auto *parser = dynamic_cast<const XmlParserState *>(runtime.find_host_state(attrs));
+            if (parser && parser->owner == this && runtime.object_type(attrs) == xml_parser_type && !parser->closed())
+                source = parser->cursor().source().resource_id;
+        }
+        const auto position = runtime.invoke_virtual_named(attrs, "getPositionDescription", "()Ljava/lang/String;");
+        if (position.kind != dex::ValueKind::reference && !(position.kind == dex::ValueKind::word && !position.bits))
+            bad("INFLATER_PARSER_RESULT", "AttributeSet returned a nonreference position description");
+        ManagedRoot position_root(runtime, position.bits);
+        if (!source) return position.bits;
+        const auto resources_result = runtime.invoke_virtual_named(constructor_context, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot resources_root(runtime, resources_result.bits);
+        const std::array query{Value::word(source)};
+        const auto name = runtime.invoke_virtual_named(resources_result.bits, "getResourceName", "(I)Ljava/lang/String;", query);
+        ManagedRoot name_root(runtime, name.bits);
+        const auto left = inflater_nullable_text(position.bits);
+        ManagedRoot left_root(runtime, left);
+        const auto separator = inflater_new_text(u" in ");
+        ManagedRoot separator_root(runtime, separator);
+        const auto prefix = inflater_concat(left, separator);
+        ManagedRoot prefix_root(runtime, prefix);
+        const auto right = inflater_nullable_text(name.bits);
+        ManagedRoot right_root(runtime, right);
+        return inflater_concat(prefix, right);
+    }
+    [[noreturn]] void inflater_parser_failure(ObjectId constructor_context, ObjectId attrs, ObjectId cause) {
+        ManagedRoot context_root(runtime, constructor_context), attrs_root(runtime, attrs), cause_root(runtime, cause);
+        const bool xml_error = runtime.class_assignable(runtime.object_type(cause), "Lorg/xmlpull/v1/XmlPullParserException;");
+        const auto exception_object = runtime.new_object(inflate_exception_type);
+        ManagedRoot exception_root(runtime, exception_object);
+        if (xml_error) {
+            const auto message = runtime.invoke_virtual_named(cause, "getMessage", "()Ljava/lang/String;");
+            if (message.kind != dex::ValueKind::reference && !(message.kind == dex::ValueKind::word && !message.bits))
+                bad("INFLATER_EXCEPTION_RESULT", "Throwable returned a nonreference diagnostic message");
+            ManagedRoot message_root(runtime, message.bits);
+            runtime.raise_existing_with_message_and_cause(exception_object, message.bits, cause);
+        }
+        const auto description = inflater_parser_description(constructor_context, attrs);
+        ManagedRoot description_root(runtime, description);
+        const auto left = inflater_nullable_text(description);
+        ManagedRoot left_root(runtime, left);
+        const auto separator = inflater_new_text(u": ");
+        ManagedRoot separator_root(runtime, separator);
+        const auto prefix = inflater_concat(left, separator);
+        ManagedRoot prefix_root(runtime, prefix);
+        const auto message = runtime.invoke_virtual_named(cause, "getMessage", "()Ljava/lang/String;");
+        if (message.kind != dex::ValueKind::reference && !(message.kind == dex::ValueKind::word && !message.bits))
+            bad("INFLATER_EXCEPTION_RESULT", "Throwable returned a nonreference diagnostic message");
+        ManagedRoot message_root(runtime, message.bits);
+        const auto right = inflater_nullable_text(message.bits);
+        ManagedRoot right_root(runtime, right);
+        const auto full = inflater_concat(prefix, right);
+        ManagedRoot full_root(runtime, full);
+        runtime.raise_existing_with_message_and_cause(exception_object, full, cause);
+    }
+    void inflater_notify_renderer(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto first = runtime.invoke_virtual_named(object, "getViewRootImpl", "()Landroid/view/ViewRootImpl;");
+        if (first.kind != dex::ValueKind::reference && !(first.kind == dex::ValueKind::word && !first.bits))
+            bad("INFLATER_VIEW_ROOT", "View returned a nonreference ViewRootImpl");
+        ManagedRoot first_root(runtime, first.bits);
+        if (first.bits) {
+            const auto second = runtime.invoke_virtual_named(object, "getViewRootImpl", "()Landroid/view/ViewRootImpl;");
+            if (second.kind != dex::ValueKind::reference && !(second.kind == dex::ValueKind::word && !second.bits))
+                bad("INFLATER_VIEW_ROOT", "View returned a nonreference ViewRootImpl");
+            ManagedRoot second_root(runtime, second.bits);
+            // No physical ViewRoot is issued by this profile. Preserve the two
+            // original getter calls and fail at its actual missing consumer.
+            (void)runtime.invoke_virtual_named(second.bits, "notifyRendererOfExpensiveFrame", "()V");
+        }
+    }
+    Value dispatch_inflater_inflate(ActivitySession &host, ObjectId object, std::string_view signature,
+        std::span<const Value> args) {
+        if (args.size() != 3) bad("INFLATER_ARGUMENT", "Inflater overload dispatch requires three actual arguments");
+        ManagedRoot object_root(runtime, object), parser_root(runtime, args[0].kind == dex::ValueKind::reference ? args[0].bits : 0),
+            parent_root(runtime, args[1].bits);
+        if (const auto method = metered_view_override(object, "inflate", signature)) {
+            const std::array query{Value::reference(object), args[0], args[1], args[2]};
+            return runtime.invoke_virtual(*method, query);
+        }
+        const ApiSupport base_api{layout_inflater_type, "inflate", signature, ApiStatus::partial, "Actual public inflater overload"};
+        const std::array query{Value::reference(object), args[0], args[1], args[2]};
+        return inflater_inflate(host, base_api, query);
+    }
+    void inflater_release_failed_parser(ObjectId parser) noexcept {
+        try {
+            const auto *metadata = dynamic_cast<const XmlParserState *>(runtime.find_host_state(parser));
+            if (metadata && metadata->owner == this) runtime.set_host_state(parser, {});
+        } catch (...) { /* Only release custody; never replace the hard failure. */ }
+    }
+    void inflater_close_created_parser(ObjectId parser) {
+        try { (void)runtime.invoke_virtual_named(parser, "close", "()V"); }
+        catch (const dex::JavaException &) { throw; }
+        catch (...) { inflater_release_failed_parser(parser); throw; }
+    }
+    Value inflater_inflate(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        const bool resource_id = api.signature.starts_with("(I");
+        if ((args.size() != 3 && args.size() != 4) || args[0].kind != dex::ValueKind::reference ||
+            (args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)) ||
+            (resource_id ? args[1].kind != dex::ValueKind::word :
+                args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+            (args.size() == 4 && args[3].kind != dex::ValueKind::word))
+            bad("INFLATER_ARGUMENT", "inflate requires its declared resource/parser, ViewGroup and boolean overload");
+        const auto object = args[0].bits, parent = args[2].bits;
+        ManagedRoot object_root(runtime, object), parent_root(runtime, parent), input_root(runtime, resource_id ? 0 : args[1].bits);
+        (void)inflater_state(object);
+        const auto signature = resource_id
+            ? "(ILandroid/view/ViewGroup;Z)Landroid/view/View;"
+            : "(Lorg/xmlpull/v1/XmlPullParser;Landroid/view/ViewGroup;Z)Landroid/view/View;";
+        if (args.size() == 3) {
+            const std::array query{args[1], args[2], Value::word(parent != 0)};
+            return dispatch_inflater_inflate(host, object, signature, query);
+        }
+        if (resource_id) {
+            const auto supplied_context = runtime.invoke_virtual_named(object, "getContext", "()Landroid/content/Context;");
+            if (supplied_context.kind != dex::ValueKind::reference && !(supplied_context.kind == dex::ValueKind::word && !supplied_context.bits))
+                bad("INFLATER_CONTEXT", "Inflater returned a nonreference Context");
+            ManagedRoot context_root(runtime, supplied_context.bits);
+            const auto resource = runtime.invoke_virtual_named(supplied_context.bits, "getResources", "()Landroid/content/res/Resources;");
+            if (resource.kind != dex::ValueKind::reference && !(resource.kind == dex::ValueKind::word && !resource.bits))
+                bad("INFLATER_CONTEXT", "Inflater Context returned nonreference Resources");
+            ManagedRoot resource_root(runtime, resource.bits);
+            const std::array resource_query{args[1]};
+            const auto parser_result = runtime.invoke_virtual_named(resource.bits, "getLayout", "(I)Landroid/content/res/XmlResourceParser;", resource_query);
+            if (parser_result.kind != dex::ValueKind::reference && !(parser_result.kind == dex::ValueKind::word && !parser_result.bits))
+                bad("INFLATER_PARSER_RESULT", "Resources returned a nonreference layout parser");
+            const auto parser = parser_result.bits;
+            ManagedRoot parser_root(runtime, parser);
+            const std::array query{Value::reference(parser), args[2], args[3]};
+            Value result;
+            try {
+                result = dispatch_inflater_inflate(host, object,
+                    "(Lorg/xmlpull/v1/XmlPullParser;Landroid/view/ViewGroup;Z)Landroid/view/View;", query);
+                if (result.kind != dex::ValueKind::reference && !(result.kind == dex::ValueKind::word && !result.bits))
+                    bad("INFLATER_RESULT", "Inflater returned a nonreference View");
+            } catch (const dex::JavaException &error) {
+                ManagedRoot error_root(runtime, error.object);
+                inflater_close_created_parser(parser);
+                throw;
+            } catch (...) {
+                inflater_release_failed_parser(parser);
+                throw;
+            }
+            ManagedRoot result_root(runtime, result.bits);
+            inflater_close_created_parser(parser);
+            return result;
+        }
+        const auto parser = args[1].bits;
+        ManagedRoot parser_root(runtime, parser);
+        const auto constructor_context = inflater_state(object).references[InflaterState::context_slot].bits;
+        ManagedRoot context_root(runtime, constructor_context);
+        const ApiSupport attributes_api{xml_utility_type, "asAttributeSet",
+            "(Lorg/xmlpull/v1/XmlPullParser;)Landroid/util/AttributeSet;", ApiStatus::partial, "Actual parser attribute-set identity"};
+        const std::array attributes_query{Value::reference(parser)};
+        const auto attributes = host.invoke_api(runtime, attributes_api, attributes_query);
+        if (attributes.kind != dex::ValueKind::reference && !(attributes.kind == dex::ValueKind::word && !attributes.bits))
+            bad("INFLATER_PARSER_RESULT", "Xml.asAttributeSet returned a nonreference AttributeSet");
+        ManagedRoot attrs_root(runtime, attributes.bits);
+        const auto constructor_arguments = inflater_state(object).references[InflaterState::constructor_args_slot].bits;
+        ManagedRoot arguments_root(runtime, constructor_arguments);
+        const auto last_context = runtime.array_get(constructor_arguments, 0).bits;
+        ManagedRoot last_context_root(runtime, last_context);
+        if (last_context && !runtime.assignable(last_context, "Landroid/content/Context;")) runtime.raise("Ljava/lang/ClassCastException;");
+        runtime.charge_provider_work(1);
+        runtime.array_set(constructor_arguments, 0, Value::reference(constructor_context));
+        // This SDK root notification precedes the try/finally; if its original
+        // getter throws, the partial constructor-argument store is retained.
+        if (parent) inflater_notify_renderer(parent);
+        try {
+            try {
+                std::int32_t type;
+                do { type = inflater_parser_integer(parser, "next"); } while (type != 2 && type != 1);
+                if (type != 2) {
+                    const auto exception_object = runtime.new_object(inflate_exception_type);
+                    ManagedRoot exception_root(runtime, exception_object);
+                    const auto position = runtime.invoke_virtual_named(parser, "getPositionDescription", "()Ljava/lang/String;");
+                    if (position.kind != dex::ValueKind::reference && !(position.kind == dex::ValueKind::word && !position.bits))
+                        bad("INFLATER_PARSER_RESULT", "Parser returned a nonreference position description");
+                    ManagedRoot position_root(runtime, position.bits);
+                    const auto left = inflater_nullable_text(position.bits);
+                    ManagedRoot left_root(runtime, left);
+                    const auto suffix = inflater_new_text(u": No start tag found!");
+                    ManagedRoot suffix_root(runtime, suffix);
+                    const auto message = inflater_concat(left, suffix);
+                    ManagedRoot message_root(runtime, message);
+                    runtime.raise_existing_with_message_and_cause(exception_object, message, 0);
+                }
+                const auto name = runtime.invoke_virtual_named(parser, "getName", "()Ljava/lang/String;");
+                if (name.kind != dex::ValueKind::reference && !(name.kind == dex::ValueKind::word && !name.bits))
+                    bad("INFLATER_PARSER_RESULT", "Parser returned a nonreference root tag name");
+                ManagedRoot name_root(runtime, name.bits);
+                ObjectId result = parent;
+                ManagedRoot result_root(runtime, result);
+                const bool attach_to_root = args[3].bits != 0;
+                if (name.bits && inflater_name_equals(name.bits, u"merge")) {
+                    if (!parent || !attach_to_root)
+                        runtime.raise(inflate_exception_type, u"<merge /> can be used only with a valid ViewGroup root and attachToRoot=true");
+                    inflater_inflate_children(host, object, parser, parent, constructor_context, attributes.bits, false);
+                } else {
+                    const auto temporary = inflater_create_view_from_tag(host, object, parent, name.bits, constructor_context, attributes.bits);
+                    ManagedRoot temporary_root(runtime, temporary);
+                    if (!parent && temporary) inflater_notify_renderer(temporary);
+                    ObjectId params = 0;
+                    ManagedRoot params_root(runtime, 0);
+                    if (parent) {
+                        const std::array params_query{Value::reference(attributes.bits)};
+                        const auto selected_params = runtime.invoke_virtual_named(parent, "generateLayoutParams",
+                            "(Landroid/util/AttributeSet;)Landroid/view/ViewGroup$LayoutParams;", params_query);
+                        if (selected_params.kind != dex::ValueKind::reference && !(selected_params.kind == dex::ValueKind::word && !selected_params.bits))
+                            bad("INFLATER_LAYOUT_PARAMS", "Root ViewGroup returned nonreference LayoutParams");
+                        params = selected_params.bits; params_root.reset(params);
+                        if (!attach_to_root) dispatch_set_layout_params(temporary, params);
+                    }
+                    const auto temporary_context = runtime.invoke_virtual_named(temporary, "getContext", "()Landroid/content/Context;");
+                    if (temporary_context.kind != dex::ValueKind::reference && !(temporary_context.kind == dex::ValueKind::word && !temporary_context.bits))
+                        bad("INFLATER_CONTEXT", "Inflated root returned a nonreference Context");
+                    ManagedRoot temporary_context_root(runtime, temporary_context.bits);
+                    inflater_inflate_children(host, object, parser, temporary, temporary_context.bits, attributes.bits, true);
+                    if (parent && attach_to_root) {
+                        const std::array add_query{Value::reference(temporary), Value::reference(params)};
+                        (void)runtime.invoke_virtual_named(parent, "addView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", add_query);
+                    }
+                    if (!parent || !attach_to_root) { result = temporary; result_root.reset(result); }
+                }
+                runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+                runtime.restore_host_array_reference(constructor_arguments, 1, 0);
+                return Value::reference(result);
+            } catch (const dex::JavaException &error) {
+                ManagedRoot error_root(runtime, error.object);
+                if (!runtime.class_assignable(runtime.object_type(error.object), "Ljava/lang/Exception;")) throw;
+                inflater_parser_failure(constructor_context, attributes.bits, error.object);
+            }
+        } catch (...) {
+            runtime.restore_host_array_reference(constructor_arguments, 0, last_context);
+            runtime.restore_host_array_reference(constructor_arguments, 1, 0);
+            throw;
+        }
+    }
+    Value generate_xml_layout_params(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("LAYOUT_PARAMS_ARGUMENT", "XML parameter generation requires its ViewGroup and nullable AttributeSet");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object), attrs_root(runtime, args[1].bits);
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)view(object);
+        const auto params_type = api.owner == frame_layout_type ? frame_params_type
+            : api.owner == "Landroid/widget/LinearLayout;" ? linear_params_type : layout_params_type;
+        if (api.owner != frame_layout_type && api.owner != "Landroid/widget/LinearLayout;" && api.owner != "Landroid/view/ViewGroup;")
+            bad("LAYOUT_PARAMS_UNSUPPORTED", "XML parameter factory has no implemented actual SDK owner");
+        const auto params = runtime.new_object(params_type);
+        ManagedRoot params_root(runtime, params);
+        const auto constructor_context = runtime.invoke_virtual_named(object, "getContext", "()Landroid/content/Context;");
+        if (constructor_context.kind != dex::ValueKind::reference && !(constructor_context.kind == dex::ValueKind::word && !constructor_context.bits))
+            bad("LAYOUT_PARAMS_ARGUMENT", "ViewGroup returned a nonreference Context");
+        ManagedRoot context_root(runtime, constructor_context.bits);
+        const std::array constructor_args{Value::reference(params), constructor_context, args[1]};
+        const ApiSupport constructor_api{params_type, "<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
+            ApiStatus::partial, "Original LayoutParams XML constructor"};
+        (void)layout_params_xml_constructor(constructor_api, constructor_args);
+        return Value::reference(params);
+    }
+    void dispatch_finish_inflate(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "onFinishInflate", "()V")) {
+            const std::array query{Value::reference(object)};
+            (void)runtime.invoke_virtual(*method, query);
+        } else {
+            (void)view(object);
+            // SDK View's protected base callback has an empty body. ViewGroup
+            // does not override it; traversal supplies the postorder sequence.
+        }
+    }
+    Value inflater_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.name == "from") {
+            if (args.size() != 1) bad("INFLATER_ARGUMENT", "LayoutInflater.from requires a Context");
+            const auto context_object = args[0].bits;
+            ManagedRoot context_root(runtime, context_object);
+            const auto name = inflater_service_literal();
+            ManagedRoot name_root(runtime, name);
+            const std::array query{Value::reference(name)};
+            const auto result = runtime.invoke_virtual_named(context_object, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", query);
+            ManagedRoot result_root(runtime, result.bits);
+            if (result.bits && !runtime.assignable(result.bits, layout_inflater_type))
+                runtime.raise("Ljava/lang/ClassCastException;");
+            if (!result.bits) runtime.raise("Ljava/lang/AssertionError;", u"LayoutInflater not found.");
+            return result;
+        }
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("INFLATER_ARGUMENT", "Inflater operation requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot inflater_root(runtime, object);
+        if (api.name == "<init>") {
+            if (args.size() != 2 && args.size() != 3) bad("INFLATER_ARGUMENT", "Inflater constructor has an invalid descriptor");
+            if (args.size() == 3 && !args[1].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            initialize_inflater(object, args.back().bits, args.size() == 3 ? args[1].bits : 0);
+            return Value::nothing();
+        }
+        (void)inflater_state(object);
+        if (api.name == "tryCreateView") return inflater_try_create_view(object, args);
+        if (api.name == "cloneInContext") {
+            if (api.owner == layout_inflater_type)
+                bad("INFLATER_ABSTRACT", "LayoutInflater.cloneInContext has no concrete base body");
+            if (args.size() != 2) bad("INFLATER_ARGUMENT", "Inflater clone requires its new Context");
+            return Value::reference(new_phone_inflater(args[1].bits, object));
+        }
+        if (api.name == "getContext") return inflater_state(object).references[InflaterState::context_slot];
+        if (api.name == "getFactory") return inflater_state(object).references[InflaterState::factory_slot];
+        if (api.name == "getFactory2") return inflater_state(object).references[InflaterState::factory2_slot];
+        if (api.name == "getFilter") return inflater_state(object).references[InflaterState::filter_slot];
+        if (api.name == "setFilter") {
+            if (args.size() != 2) bad("INFLATER_ARGUMENT", "setFilter requires a nullable Filter");
+            inflater_set_filter(object, args[1].bits);
+            return Value::nothing();
+        }
+        const bool private_factory = api.name == "setPrivateFactory";
+        const bool factory2 = api.name == "setFactory2";
+        if (!private_factory && !factory2 && api.name != "setFactory")
+            bad("INFLATER_API", "Inflater operation has no implemented body");
+        if (args.size() != 2) bad("INFLATER_ARGUMENT", "Inflater factory setter requires its factory");
+        const auto factory = args[1].bits;
+        ManagedRoot factory_root(runtime, factory);
+        if (!private_factory) {
+            if (inflater_state(object).factory_set)
+                runtime.raise("Ljava/lang/IllegalStateException;", u"A factory has already been set on this LayoutInflater");
+            if (!factory) runtime.raise("Ljava/lang/NullPointerException;", u"Given factory can not be null");
+        }
+        if (factory && !runtime.assignable(factory, private_factory || factory2 ? layout_factory2_type : layout_factory_type))
+            bad("INFLATER_FACTORY", "Factory does not implement its canonical SDK contract");
+        if (!private_factory) update_inflater(object, [](InflaterState &next) { next.factory_set = true; });
+        const auto old = inflater_state(object).references[private_factory ? InflaterState::private_slot : InflaterState::factory_slot].bits;
+        ManagedRoot old_root(runtime, old);
+        const auto old2 = private_factory ? old : inflater_state(object).references[InflaterState::factory2_slot].bits;
+        ManagedRoot old2_root(runtime, old2);
+        const auto selected = old ? new_inflater_factory_merger(runtime, factory, private_factory || factory2 ? factory : 0, old, old2) : factory;
+        ManagedRoot selected_root(runtime, selected);
+        update_inflater(object, [=](InflaterState &next) {
+            if (private_factory) next.references[InflaterState::private_slot] = Value::reference(selected);
+            else {
+                next.references[InflaterState::factory_slot] = Value::reference(selected);
+                if (factory2) next.references[InflaterState::factory2_slot] = Value::reference(selected);
+            }
+        });
+        return Value::nothing();
+    }
+    Value inflater_from(ObjectId context_object) {
+        const ApiSupport api{layout_inflater_type, "from", "(Landroid/content/Context;)Landroid/view/LayoutInflater;", ApiStatus::partial, "Actual service lookup"};
+        const std::array args{Value::reference(context_object)};
+        return inflater_api(api, args);
+    }
+    Value context_service(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_SERVICE_ARGUMENT", "System service requires its Context receiver and String name");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver), name_root(runtime, args[1].bits);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context.getSystemService has no concrete base body");
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            return runtime.invoke_virtual_named(base.bits, api.name, api.signature, args.subspan(1));
+        }
+        const bool layout = args[1].bits && runtime.string(args[1].bits) == u"layout_inflater";
+        if (api.owner == theme_wrapper_type) {
+            if (generic_theme_wrapper(receiver)) return theme_wrapper_service(receiver, layout, args);
+            (void)activity_window(receiver);
+            const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+            const auto existing = metadata->references[ActivityIntentState::inflater_slot].bits;
+            if (layout && existing) return Value::reference(existing);
+            const auto base = runtime.invoke_virtual_named(receiver, "getBaseContext", "()Landroid/content/Context;");
+            ManagedRoot base_root(runtime, base.bits);
+            if (!layout) return runtime.invoke_virtual_named(base.bits, api.name, api.signature, args.subspan(1));
+            const auto original = inflater_from(base.bits);
+            ManagedRoot original_root(runtime, original.bits);
+            const std::array clone_args{Value::reference(receiver)};
+            const auto clone = runtime.invoke_virtual_named(original.bits, "cloneInContext", "(Landroid/content/Context;)Landroid/view/LayoutInflater;", clone_args);
+            ManagedRoot clone_root(runtime, clone.bits);
+            if (clone.bits && !runtime.assignable(clone.bits, layout_inflater_type)) runtime.raise("Ljava/lang/ClassCastException;");
+            const auto admitted = runtime.host_state_capacity(receiver);
+            metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+            if (!metadata || metadata->owner != this || admitted < metadata->bytes() || sizeof(ActivityIntentState) > admitted - metadata->bytes())
+                bad("INFLATER_LIMIT", "Activity inflater reference exceeds simultaneous managed admission");
+            auto next = std::make_unique<ActivityIntentState>(*metadata);
+            next->references[ActivityIntentState::inflater_slot] = Value::reference(clone.bits);
+            runtime.set_host_state(receiver, std::move(next));
+            return clone;
+        }
+        if (api.owner != context_impl_type) bad("CONTEXT_SERVICE", "System service has an unimplemented Context owner");
+        ensure_primary_context_state(receiver);
+        if (layout) {
+            const auto existing = context_impl_state(receiver).references[ContextImplState::inflater_slot].bits;
+            if (existing) return Value::reference(existing);
+            const auto outer = context_impl_state(receiver).references[ContextImplState::outer_slot].bits;
+            ManagedRoot outer_root(runtime, outer);
+            const auto inflater = new_phone_inflater(outer);
+            ManagedRoot inflater_root(runtime, inflater);
+            update_context_impl(receiver, [inflater](ContextImplState &next) { next.references[ContextImplState::inflater_slot] = Value::reference(inflater); });
+            return Value::reference(inflater);
+        }
+        // Other implemented services retain their actual session-owned identities.
+        if (args[1].bits) {
+            const auto name = runtime.string(args[1].bits);
+            if (name == u"clipboard") return Value::reference(clipboard_service());
+            if (name == u"notification") return Value::reference(notification_service());
+            if (name == u"input_method") return Value::reference(input_method_service());
+        }
+        ++metrics.unsupported_services;
+        runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Android system service is outside the implemented session profile");
+    }
+    Value activity_factory(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 4 && args.size() != 5) bad("INFLATER_ARGUMENT", "Activity factory arguments do not match the SDK overload");
+        const auto receiver = args[0].bits;
+        ManagedRoot activity_root(runtime, receiver);
+        (void)activity_window(receiver);
+        if (args.size() == 4) return Value::reference(0); // Actual SDK base body.
+        if (args[2].bits && runtime.string(args[2].bits) == u"fragment")
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Framework fragment inflation is not implemented");
+        return runtime.invoke_virtual_named(receiver, api.name,
+            "(Ljava/lang/String;Landroid/content/Context;Landroid/util/AttributeSet;)Landroid/view/View;", args.subspan(2));
+    }
+    ObjectId attach_window(ObjectId receiver) {
+        if (!receiver || receiver != activity || activity_attached)
+            bad("WINDOW_ATTACH", "Window creation requires the actual Activity's initial attach");
+        if (runtime.class_definition(session_window_type))
+            bad("WINDOW_TYPE", "Package classes collide with the actual Window policy implementation");
+        const auto object = runtime.new_object(session_window_type);
+        ManagedRoot root(runtime, object), context_root(runtime, receiver);
+        const auto inflater = inflater_from(receiver);
+        ManagedRoot inflater_root(runtime, inflater.bits);
+        if (runtime.host_state_capacity(object) < sizeof(WindowState))
+            bad("WINDOW_LIMIT", "Window fields exceed existing managed admission");
+        auto metadata = std::make_unique<WindowState>();
+        metadata->owner = this;
+        metadata->references[WindowState::context_slot] = Value::reference(receiver);
+        metadata->references[WindowState::callback_slot] = Value::reference(receiver);
+        metadata->references[WindowState::inflater_slot] = inflater;
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    Value window_back_dispatcher(ObjectId window) {
+        ManagedRoot window_root(runtime, window);
+        const auto existing = window_state(window).references[WindowState::back_dispatcher_slot].bits;
+        if (existing) {
+            const auto *existing_dispatcher_metadata = dynamic_cast<const BackDispatcherState *>(runtime.host_state(existing));
+            if (!existing_dispatcher_metadata || existing_dispatcher_metadata->owner != this ||
+                existing_dispatcher_metadata->references[0].bits != window ||
+                runtime.object_type(existing) != session_back_dispatcher_type)
+                bad("BACK_DISPATCHER_STATE", "Window dispatcher does not belong to its actual issued Window");
+            return Value::reference(existing);
+        }
+        if (runtime.class_definition(session_back_dispatcher_type))
+            bad("BACK_DISPATCHER_TYPE", "Package class collides with the issued Window dispatcher policy");
+        const auto dispatcher = runtime.new_object(session_back_dispatcher_type);
+        ManagedRoot dispatcher_root(runtime, dispatcher);
+        if (runtime.host_state_capacity(dispatcher) < sizeof(BackDispatcherState))
+            bad("BACK_DISPATCHER_LIMIT", "Window dispatcher storage exceeds the existing managed admission");
+        auto dispatcher_metadata = std::make_unique<BackDispatcherState>();
+        dispatcher_metadata->owner = this; dispatcher_metadata->references[0] = Value::reference(window);
+        runtime.set_host_state(dispatcher, std::move(dispatcher_metadata));
+        // Admit simultaneous old/new storage before copying. No guest callbacks
+        // run here; set_host_state revalidates final live-byte accounting.
+        const auto old_bytes = window_state(window).bytes();
+        const auto admitted = runtime.host_state_capacity(window);
+        if (old_bytes > admitted || sizeof(WindowState) > admitted - old_bytes)
+            bad("BACK_DISPATCHER_LIMIT", "Window dispatcher custody exceeds the existing managed admission");
+        auto next = std::make_unique<WindowState>(window_state(window));
+        next->references[WindowState::back_dispatcher_slot] = Value::reference(dispatcher);
+        runtime.set_host_state(window, std::move(next));
+        return Value::reference(dispatcher);
+    }
+    Value window_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.name == "getLayoutInflater") {
+            if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+                bad("WINDOW_ARGUMENT", "Window inflater getter requires its actual receiver");
+            if (api.owner == window_type)
+                bad("WINDOW_ABSTRACT", "Window.getLayoutInflater has no concrete base body");
+            return window_state(args[0].bits).references[WindowState::inflater_slot];
+        }
+        const bool setting = api.name == "setCallback" || api.name == "setTheme";
+        if (args.size() != (setting ? 2u : 1u) || args[0].kind != dex::ValueKind::reference)
+            bad("WINDOW_ARGUMENT", "Window operation has invalid arguments");
+        const auto object = args[0].bits;
+        ManagedRoot root(runtime, object);
+        (void)window_state(object);
+        if (api.name == "getContext") return window_state(object).references[0];
+        if (api.name == "getCallback") return window_state(object).references[1];
+        if (api.name == "getOnBackInvokedDispatcher") {
+            if (api.owner == window_type)
+                runtime.raise("Ljava/lang/RuntimeException;", u"Window must override getOnBackInvokedDispatcher");
+            if (api.owner != session_window_type)
+                bad("WINDOW_STATE", "Back dispatcher requires the actual issued Window policy");
+            return window_back_dispatcher(object);
+        }
+        if (api.name == "setCallback") {
+            if (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits))
+                bad("WINDOW_ARGUMENT", "Window Callback must be a nullable reference");
+            const auto callback_object = args[1].bits;
+            ManagedRoot callback_root(runtime, callback_object);
+            if (callback_object && !runtime.assignable(callback_object, window_callback_type))
+                runtime.raise("Ljava/lang/IllegalArgumentException;", u"Callback does not implement Window.Callback");
+            // Reacquire the issued object after type resolution; no borrowed
+            // state or callback reference crosses a loader/GC boundary.
+            auto next = std::make_unique<WindowState>(window_state(object));
+            next->references[1] = Value::reference(callback_object);
+            runtime.set_host_state(object, std::move(next));
+            return Value::nothing();
+        }
+        if (api.name == "setTheme") {
+            if (args[1].kind != dex::ValueKind::word)
+                bad("WINDOW_ARGUMENT", "Window theme ID must be an integer");
+            if (api.owner == window_type) return Value::nothing(); // The real SDK Window base body is empty.
+            if (api.owner != session_window_type)
+                bad("WINDOW_STATE", "Window theme implementation is not the actual issued policy");
+            auto next = std::make_unique<WindowState>(window_state(object));
+            next->theme_resource = static_cast<std::uint32_t>(args[1].bits);
+            runtime.set_host_state(object, std::move(next));
+            return Value::nothing();
+        }
+        bad("WINDOW_UNSUPPORTED", "Window operation requires an implemented decor or event consumer");
+    }
+    Value activity_window(ObjectId receiver) const {
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;", u"Activity is null");
+        if (!runtime.assignable(receiver, "Landroid/app/Activity;"))
+            bad("WINDOW_ACTIVITY", "Window getter requires an Activity receiver");
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!metadata || metadata->owner != this) bad("WINDOW_ACTIVITY", "Activity has no authenticated session-owned instance storage");
+        return metadata->references[1]; // Null before attach; retained old instances keep their actual Window.
+    }
+    Value activity_back_dispatcher(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("WINDOW_ARGUMENT", "Activity.getOnBackInvokedDispatcher requires its actual receiver");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver);
+        // The SDK reads the actual stored Window, not an overridden getWindow.
+        const auto window = activity_window(receiver);
+        ManagedRoot window_root(runtime, window.bits);
+        if (!window.bits)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"OnBackInvokedDispatcher are not available on non-visual activities");
+        return runtime.invoke_virtual_named(window.bits, "getOnBackInvokedDispatcher",
+                                            "()Landroid/window/OnBackInvokedDispatcher;");
+    }
+    Value activity_window_base_hook(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("WINDOW_CALLBACK_ARGUMENT", "Activity window hook requires one Activity receiver");
+        const auto receiver = args[0].bits;
+        ManagedRoot receiver_root(runtime, receiver);
+        (void)activity_window(receiver);
+        return Value::nothing(); // Genuine empty SDK body; no attachment event is invented.
+    }
+    Value activity_set_theme(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+            bad("THEME_ARGUMENT", "Activity.setTheme requires its receiver and integer resource ID");
+        const auto receiver = args[0].bits;
+        ManagedRoot root(runtime, receiver);
+        auto superclass_api = api;
+        superclass_api.owner = theme_wrapper_type;
+        (void)context_theme_api(superclass_api, args); // Real caller hooks complete before Window.setTheme.
+        const auto window = activity_window(receiver);
+        ManagedRoot window_root(runtime, window.bits);
+        const std::array theme_args{args[1]};
+        (void)runtime.invoke_virtual_named(window.bits, "setTheme", "(I)V", theme_args);
+        return Value::nothing();
+    }
+    ObjectId compatible_resource_impl(ObjectId resource) const {
+        if (!resource) runtime.raise("Ljava/lang/NullPointerException;");
+        if (resource == resource_object) return 0; // Preserve the existing unbound-root profile.
+        const auto *metadata = dynamic_cast<const ResourcesObjectState *>(runtime.host_state(resource));
+        if (!metadata || metadata->owner != this || runtime.object_type(resource) != "Landroid/content/res/Resources;")
+            bad("RESOURCES_STATE", "Resources has no actual session-owned implementation");
+        const auto impl = metadata->references[0].bits;
+        if (!resources_impl_state(impl).table_compatible)
+            bad("CONFIGURED_RESOURCES_UNSUPPORTED", "Configuration has no supported native selected-resource source");
+        return impl;
+    }
+    ObjectId asset_source_owner(ObjectId manager) const {
+        if (!manager) runtime.raise("Ljava/lang/NullPointerException;");
+        if (manager == asset_manager) return manager;
+        const auto *metadata = dynamic_cast<const AssetManagerObjectState *>(runtime.host_state(manager));
+        if (!metadata || metadata->owner != this || metadata->references[0].bits != asset_manager ||
+            runtime.object_type(manager) != "Landroid/content/res/AssetManager;")
+            bad("ASSET_SOURCES", "AssetManager does not share this session's actual immutable source instances");
+        return metadata->references[0].bits;
+    }
+    ObjectId resource_assets(ObjectId resource) const {
+        const auto impl = compatible_resource_impl(resource);
+        if (!impl) return asset_manager;
+        const auto manager = resources_impl_state(impl).references[ResourcesImplState::assets_slot].bits;
+        (void)asset_source_owner(manager);
+        return manager;
+    }
+    const ThemeState &theme_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;", u"Theme is null");
+        const auto *metadata = dynamic_cast<const ThemeState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("THEME_STATE", "Theme is not owned by this session's actual Resources");
+        (void)compatible_resource_impl(metadata->references[0].bits);
+        return *metadata;
+    }
+    ObjectId new_theme(ObjectId resource) {
+        ManagedRoot resource_root(runtime, resource);
+        (void)compatible_resource_impl(resource);
+        const auto object = runtime.new_object(theme_type);
+        ManagedRoot root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(ThemeState))
+            bad("THEME_LIMIT", "Theme fields exceed existing managed admission");
+        auto metadata = std::make_unique<ThemeState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(resource);
+        runtime.set_host_state(object, std::move(metadata));
+        return object; // Resources.newTheme is genuinely empty until applyStyle/setTo.
+    }
+    void theme_apply(ObjectId object, std::uint32_t style, bool force) {
+        ManagedRoot root(runtime, object);
+        (void)theme_state(object);
+        if (!style) return; // Native ApplyStyle(0) cannot select a resource bag.
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &source = theme_state(object);
+        const auto old_bytes = source.bytes();
+        const auto capacity = admitted > old_bytes ? admitted - old_bytes : 0;
+        if (capacity < sizeof(ThemeState) || source.layers.size() >=
+            (capacity - sizeof(ThemeState)) / sizeof(ThemeStyleLayer))
+            bad("THEME_LIMIT", "Theme layers exceed the available managed heap");
+        auto next = std::make_unique<ThemeState>();
+        next->owner = this; next->references = source.references;
+        next->layers.reserve(source.layers.size() + 1);
+        if (next->bytes() > capacity) bad("THEME_LIMIT", "Theme layer capacity exceeds the available managed heap");
+        runtime.charge_provider_work(source.layers.size());
+        next->layers.insert(next->layers.end(), source.layers.begin(), source.layers.end());
+        runtime.charge_provider_work(1);
+        next->layers.push_back({style, force});
+        runtime.set_host_state(object, std::move(next));
+    }
+    void theme_set_to(ObjectId destination, ObjectId source_object) {
+        ManagedRoot target_root(runtime, destination), source_root(runtime, source_object);
+        (void)theme_state(destination); (void)theme_state(source_object);
+        if (destination == source_object) return;
+        const auto destination_resource = theme_state(destination).references[0].bits;
+        const auto source_resource = theme_state(source_object).references[0].bits;
+        if (asset_source_owner(resource_assets(destination_resource)) != asset_source_owner(resource_assets(source_resource)))
+            bad("THEME_COPY_UNSUPPORTED", "Cross-manager theme copy requires actual shared APK instances and assigned source identities");
+        const auto admitted = runtime.host_state_capacity(destination);
+        const auto old_bytes = theme_state(destination).bytes();
+        const auto capacity = admitted > old_bytes ? admitted - old_bytes : 0;
+        const auto &source = theme_state(source_object);
+        if (capacity < sizeof(ThemeState) || source.layers.size() >
+            (capacity - sizeof(ThemeState)) / sizeof(ThemeStyleLayer))
+            bad("THEME_LIMIT", "Theme copy exceeds the available managed heap");
+        auto next = std::make_unique<ThemeState>();
+        next->owner = this; next->references = theme_state(destination).references;
+        next->layers.reserve(source.layers.size());
+        if (next->bytes() > capacity) bad("THEME_LIMIT", "Theme copy capacity exceeds the available managed heap");
+        runtime.charge_provider_work(source.layers.size());
+        next->layers.insert(next->layers.end(), source.layers.begin(), source.layers.end());
+        runtime.set_host_state(destination, std::move(next));
+    }
+    const ViewportAdmission &current_display() const {
+        if (!launch_viewport || launch_viewport->configuration != configuration)
+            bad("DISPLAY_METRICS_UNSUPPORTED", "Current display lacks an unchanged authenticated viewport receipt");
+        return *launch_viewport;
+    }
+    const ConfigurationState &configuration_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const ConfigurationState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("CONFIGURATION_STATE", "Configuration has no authenticated value snapshot");
+        return *metadata;
+    }
+    template <class Update> void update_configuration(ObjectId object, Update update) {
+        ManagedRoot object_root(runtime, object);
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &previous = configuration_state(object);
+        if (admitted < previous.bytes() || sizeof(ConfigurationState) > admitted - previous.bytes())
+            bad("CONFIGURATION_LIMIT", "Configuration replacement exceeds simultaneous managed admission");
+        auto next = std::make_unique<ConfigurationState>(previous);
+        update(*next);
+        runtime.set_host_state(object, std::move(next));
+    }
+    const WindowConfigurationState &data_window_configuration(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const WindowConfigurationState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("WINDOW_CONFIGURATION_STATE", "WindowConfiguration has no authenticated value state");
+        return *metadata;
+    }
+    ObjectId new_data_window_configuration(ObjectId original, std::uint64_t origin) {
+        ManagedRoot original_root(runtime, original);
+        const auto object = runtime.new_object(window_configuration_type);
+        ManagedRoot object_root(runtime, object);
+        const auto bounds = runtime.new_object(rect_type);
+        ManagedRoot bounds_root(runtime, bounds);
+        if (runtime.host_state_capacity(bounds) < sizeof(SurfaceRectState))
+            bad("WINDOW_CONFIGURATION_LIMIT", "Window bounds exceed existing managed admission");
+        runtime.charge_provider_work(4);
+        auto rectangle = std::make_unique<SurfaceRectState>();
+        if (original) {
+            const auto &prior = surface_rect(data_window_configuration(original).references[0].bits);
+            rectangle->left = prior.left; rectangle->top = prior.top;
+            rectangle->right = prior.right; rectangle->bottom = prior.bottom;
+        }
+        runtime.set_host_state(bounds, std::move(rectangle));
+        if (runtime.host_state_capacity(object) < sizeof(WindowConfigurationState))
+            bad("WINDOW_CONFIGURATION_LIMIT", "Window fields exceed existing managed admission");
+        auto metadata = std::make_unique<WindowConfigurationState>();
+        metadata->owner = this; metadata->remainder_origin = original ? data_window_configuration(original).remainder_origin : origin;
+        metadata->references[0] = Value::reference(bounds);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    ObjectId configuration_window(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto existing = configuration_state(object).references[0].bits;
+        if (existing) return existing;
+        if (object == configuration_object) return window_configuration_object();
+        if (configuration_state(object).remainder_origin)
+            bad("CONFIGURATION_UNSUPPORTED", "Configuration source has no authentic WindowConfiguration snapshot");
+        const auto window = new_data_window_configuration(0, 0);
+        ManagedRoot window_root(runtime, window);
+        update_configuration(object, [window](ConfigurationState &next) { next.references[0] = Value::reference(window); });
+        return window;
+    }
+    void copy_data_window_configuration(ObjectId object, ObjectId original) {
+        ManagedRoot object_root(runtime, object), original_root(runtime, original);
+        const auto source_origin = data_window_configuration(original).remainder_origin;
+        const auto intermediate_origin = next_configuration_origin();
+        {
+            const auto admitted = runtime.host_state_capacity(object);
+            const auto &previous = data_window_configuration(object);
+            if (admitted < previous.bytes() || sizeof(WindowConfigurationState) > admitted - previous.bytes())
+                bad("WINDOW_CONFIGURATION_LIMIT", "Window copy preparation exceeds simultaneous managed admission");
+            auto next = std::make_unique<WindowConfigurationState>(previous);
+            next->remainder_origin = intermediate_origin;
+            runtime.set_host_state(object, std::move(next));
+        }
+        const auto bounds = data_window_configuration(object).references[0].bits;
+        ManagedRoot bounds_root(runtime, bounds);
+        const auto rectangle_admitted = runtime.host_state_capacity(bounds);
+        const auto &prior_bounds = surface_rect(bounds);
+        if (rectangle_admitted < prior_bounds.bytes() || sizeof(SurfaceRectState) > rectangle_admitted - prior_bounds.bytes())
+            bad("WINDOW_CONFIGURATION_LIMIT", "Window bounds copy exceeds simultaneous managed admission");
+        const auto &source_bounds = surface_rect(data_window_configuration(original).references[0].bits);
+        runtime.charge_provider_work(4);
+        auto rectangle = std::make_unique<SurfaceRectState>(source_bounds);
+        runtime.set_host_state(bounds, std::move(rectangle));
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &previous = data_window_configuration(object);
+        if (admitted < previous.bytes() || sizeof(WindowConfigurationState) > admitted - previous.bytes())
+            bad("WINDOW_CONFIGURATION_LIMIT", "Window fields copy exceeds simultaneous managed admission");
+        auto next = std::make_unique<WindowConfigurationState>(previous);
+        next->remainder_origin = source_origin;
+        runtime.set_host_state(object, std::move(next));
+    }
+    std::uint32_t configuration_diff(ObjectId object, ObjectId delta) {
+        const auto own_window = configuration_window(object);
+        ManagedRoot own_window_root(runtime, own_window);
+        const auto delta_window = configuration_window(delta);
+        ManagedRoot delta_window_root(runtime, delta_window);
+        const auto &a = configuration_state(object), &b = configuration_state(delta);
+        constexpr std::array<std::uint32_t, configuration_field_count> masks{
+            0x40000000u, 1u, 2u, 8u, 0x10u, 0x20u, 0x20u, 0x40u, 0x20u,
+            0x80u, 0x100u, 0x4000u, 0x200u, 0x400u, 0x400u, 0x800u, 0x1000u};
+        std::uint32_t changed = 0;
+        for (std::size_t index = 0; index < configuration_field_count; ++index) {
+            runtime.charge_provider_work(1);
+            if (b.known[index] != UINT32_MAX) {
+                if (a.known[index] == b.known[index] && a.remainder_origin == b.remainder_origin &&
+                    !((a.numbers[index] ^ b.numbers[index]) & a.known[index])) continue;
+                bad("CONFIGURATION_UNSUPPORTED", "Configuration diff requires an authenticated defined-value decision");
+            }
+            const auto bits = b.numbers[index];
+            if (index == static_cast<std::size_t>(ConfigurationField::font_scale)) {
+                const auto value = std::bit_cast<float>(bits);
+                if (!(value > 0)) continue;
+                if (a.known[index] != UINT32_MAX) bad("CONFIGURATION_UNSUPPORTED", "Font-scale diff lacks actual source values");
+                if (std::bit_cast<float>(a.numbers[index]) != value) changed |= masks[index];
+                continue;
+            }
+            if (!bits) continue; // Public diff ignores undefined delta fields.
+            if (a.known[index] != UINT32_MAX)
+                bad("CONFIGURATION_UNSUPPORTED", "Configuration diff lacks actual source values");
+            if (index == static_cast<std::size_t>(ConfigurationField::screen_layout)) {
+                if ((bits & 0xc0u) && (bits & 0xc0u) != (a.numbers[index] & 0xc0u)) changed |= 0x2000u;
+                if ((bits & ~0xc0u) && (bits & ~0xc0u) != (a.numbers[index] & ~0xc0u)) changed |= masks[index];
+            } else if (index == static_cast<std::size_t>(ConfigurationField::color_mode)) {
+                if (((bits & 3u) && (bits & 3u) != (a.numbers[index] & 3u)) ||
+                    ((bits & 0xcu) && (bits & 0xcu) != (a.numbers[index] & 0xcu))) changed |= masks[index];
+            } else if (a.numbers[index] != bits) changed |= masks[index];
+        }
+        if (b.remainder_origin && a.remainder_origin != b.remainder_origin)
+            bad("CONFIGURATION_UNSUPPORTED", "Configuration diff lacks immutable remainder provenance");
+        const auto &aw = data_window_configuration(own_window), &bw = data_window_configuration(delta_window);
+        const auto &ar = surface_rect(aw.references[0].bits), &br = surface_rect(bw.references[0].bits);
+        runtime.charge_provider_work(4);
+        const bool window_changed = ar.left != br.left || ar.top != br.top || ar.right != br.right || ar.bottom != br.bottom;
+        if (window_changed) changed |= 0x20000000u; // diff compares maxBounds even when the delta Rect is empty.
+        // Hidden mBounds is also compared unconditionally. A known maxBounds
+        // difference proves the coarse Window bit; otherwise common origin is
+        // required even for the undefined-default delta domain.
+        if (!window_changed && aw.remainder_origin != bw.remainder_origin)
+            bad("CONFIGURATION_UNSUPPORTED", "Window diff lacks immutable remainder provenance");
+        return changed;
+    }
+    std::uint64_t next_configuration_origin() {
+        if (configuration_origin >= UINT64_MAX - 1)
+            bad("CONFIGURATION_LIMIT", "Configuration provenance generation is exhausted");
+        return ++configuration_origin; // UINT64_MAX is the Java field-initialization domain.
+    }
+    void reset_data_window_configuration(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto intermediate_origin = next_configuration_origin();
+        {
+            const auto admitted = runtime.host_state_capacity(object);
+            const auto &previous = data_window_configuration(object);
+            if (admitted < previous.bytes() || sizeof(WindowConfigurationState) > admitted - previous.bytes())
+                bad("WINDOW_CONFIGURATION_LIMIT", "Window reset preparation exceeds simultaneous managed admission");
+            auto next = std::make_unique<WindowConfigurationState>(previous);
+            next->remainder_origin = intermediate_origin;
+            runtime.set_host_state(object, std::move(next));
+        }
+        const auto bounds = data_window_configuration(object).references[0].bits;
+        ManagedRoot bounds_root(runtime, bounds);
+        const auto admitted_bounds = runtime.host_state_capacity(bounds);
+        const auto &old_bounds = surface_rect(bounds);
+        if (admitted_bounds < old_bounds.bytes() || sizeof(SurfaceRectState) > admitted_bounds - old_bounds.bytes())
+            bad("WINDOW_CONFIGURATION_LIMIT", "Bounds reset exceeds simultaneous managed admission");
+        runtime.charge_provider_work(4);
+        runtime.set_host_state(bounds, std::make_unique<SurfaceRectState>());
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &previous = data_window_configuration(object);
+        if (admitted < previous.bytes() || sizeof(WindowConfigurationState) > admitted - previous.bytes())
+            bad("WINDOW_CONFIGURATION_LIMIT", "Window reset exceeds simultaneous managed admission");
+        auto next = std::make_unique<WindowConfigurationState>(previous);
+        next->remainder_origin = 0;
+        runtime.set_host_state(object, std::move(next));
+    }
+    std::int32_t compare_configuration_values(ObjectId object, ObjectId other) {
+        const auto window = configuration_window(object);
+        ManagedRoot window_root(runtime, window);
+        const auto other_window = configuration_window(other);
+        ManagedRoot other_window_root(runtime, other_window);
+        const auto &a = configuration_state(object), &b = configuration_state(other);
+        const auto compare_field = [&](ConfigurationField field) -> std::int32_t {
+            runtime.charge_provider_work(1);
+            const auto index = static_cast<std::size_t>(field);
+            if (field == ConfigurationField::font_scale) {
+                if ((a.known[index] == UINT32_MAX && std::isnan(std::bit_cast<float>(a.numbers[index]))) ||
+                    (b.known[index] == UINT32_MAX && std::isnan(std::bit_cast<float>(b.numbers[index])))) return 0;
+                if (a.known[index] == UINT32_MAX && b.known[index] == UINT32_MAX) {
+                    const auto av = std::bit_cast<float>(a.numbers[index]), bv = std::bit_cast<float>(b.numbers[index]);
+                    return av < bv ? -1 : av > bv ? 1 : 0; // Exact SDK < / >, including signed zero.
+                }
+            } else if (a.known[index] == UINT32_MAX && b.known[index] == UINT32_MAX)
+                return std::bit_cast<std::int32_t>(a.numbers[index] - b.numbers[index]); // Java I32 subtraction.
+            if (a.known[index] == b.known[index] && a.remainder_origin == b.remainder_origin &&
+                !((a.numbers[index] ^ b.numbers[index]) & a.known[index])) return 0;
+            bad("CONFIGURATION_UNSUPPORTED", "Configuration ordering lacks complete actual field values");
+        };
+        for (const auto field : {ConfigurationField::font_scale, ConfigurationField::mcc, ConfigurationField::mnc})
+            if (const auto result = compare_field(field)) return result;
+        // Locale list and grammatical gender occur here in SDK order. They are
+        // immutable/unexposed in this profile, so only common source proves zero.
+        if (a.remainder_origin != b.remainder_origin)
+            bad("CONFIGURATION_UNSUPPORTED", "Configuration ordering lacks immutable locale/remainder provenance");
+        for (const auto field : {ConfigurationField::touchscreen, ConfigurationField::keyboard,
+                ConfigurationField::keyboard_hidden, ConfigurationField::hard_keyboard_hidden,
+                ConfigurationField::navigation, ConfigurationField::navigation_hidden,
+                ConfigurationField::orientation, ConfigurationField::color_mode, ConfigurationField::screen_layout,
+                ConfigurationField::ui_mode, ConfigurationField::width_dp, ConfigurationField::height_dp,
+                ConfigurationField::smallest_dp, ConfigurationField::density_dpi})
+            if (const auto result = compare_field(field)) return result;
+        const auto &aw = data_window_configuration(window), &bw = data_window_configuration(other_window);
+        // Unexposed appBounds precedes maxBounds in WindowConfiguration.compareTo.
+        if (aw.remainder_origin != bw.remainder_origin)
+            bad("CONFIGURATION_UNSUPPORTED", "Window ordering lacks immutable source provenance");
+        const auto &ar = surface_rect(aw.references[0].bits), &br = surface_rect(bw.references[0].bits);
+        const std::array left{ar.left, ar.top, ar.right, ar.bottom};
+        const std::array right{br.left, br.top, br.right, br.bottom};
+        for (std::size_t index = 0; index < left.size(); ++index) {
+            runtime.charge_provider_work(1);
+            const auto result = std::bit_cast<std::int32_t>(std::bit_cast<std::uint32_t>(left[index]) - std::bit_cast<std::uint32_t>(right[index]));
+            if (result) return result;
+        }
+        return 0; // Remaining immutable fields, including font weight, share their actual source.
+    }
+    Value configuration_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("CONFIGURATION_ARGUMENT", "Configuration operation requires its receiver");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object);
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(object, configuration_type)) bad("CONFIGURATION_ARGUMENT", "Configuration receiver has the wrong actual type");
+        if (api.name == "<init>") {
+            if (args.size() != 1 && args.size() != 2) bad("CONFIGURATION_ARGUMENT", "Configuration constructor has an invalid descriptor");
+            if (args.size() == 2 && args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits))
+                bad("CONFIGURATION_ARGUMENT", "Configuration copy requires a nullable Configuration reference");
+            ManagedRoot other_root(runtime, args.size() == 2 ? args[1].bits : ObjectId{0});
+            if (runtime.host_state(object)) bad("CONFIGURATION_STATE", "Configuration constructor called twice");
+            const auto window = new_data_window_configuration(0, 0);
+            ManagedRoot window_root(runtime, window);
+            if (runtime.host_state_capacity(object) < sizeof(ConfigurationState))
+                bad("CONFIGURATION_LIMIT", "Configuration initial fields exceed existing managed admission");
+            runtime.charge_provider_work(configuration_field_count * 3);
+            auto metadata = std::make_unique<ConfigurationState>();
+            metadata->owner = this; metadata->references[0] = Value::reference(window);
+            metadata->remainder_origin = UINT64_MAX; // Java-zero fields, before unset()/setTo().
+            runtime.set_host_state(object, std::move(metadata));
+            if (args.size() == 1) return runtime.invoke_virtual_named(object, "unset", "()V");
+            return runtime.invoke_virtual_named(object, "setTo", "(Landroid/content/res/Configuration;)V", args.subspan(1));
+        }
+        (void)configuration_state(object);
+        if (api.name == "unset") {
+            if (args.size() != 1) bad("CONFIGURATION_ARGUMENT", "unset requires only its receiver");
+            (void)runtime.invoke_virtual_named(object, "setToDefaults", "()V");
+            runtime.charge_provider_work(configuration_field_count * 2);
+            update_configuration(object, [](ConfigurationState &next) { next.set(ConfigurationField::font_scale, 0); });
+            return Value::nothing();
+        }
+        if (api.name == "setToDefaults") {
+            if (args.size() != 1) bad("CONFIGURATION_ARGUMENT", "setToDefaults requires only its receiver");
+            const auto window = configuration_window(object);
+            ManagedRoot window_root(runtime, window);
+            const auto intermediate_origin = next_configuration_origin();
+            runtime.charge_provider_work(configuration_field_count * 4);
+            update_configuration(object, [=](ConfigurationState &next) {
+                next.numbers.fill(0); next.known.fill(UINT32_MAX);
+                next.set(ConfigurationField::font_scale, std::bit_cast<std::uint32_t>(1.0f));
+                next.remainder_origin = intermediate_origin; // Later SDK fields are assigned after Window reset.
+            });
+            reset_data_window_configuration(window);
+            runtime.charge_provider_work(configuration_field_count * 2);
+            update_configuration(object, [](ConfigurationState &next) { next.remainder_origin = 0; });
+            return Value::nothing();
+        }
+        if (args.size() < 2 || (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONFIGURATION_ARGUMENT", "Configuration operation requires its actual value argument");
+        const auto other = args[1].bits;
+        ManagedRoot other_root(runtime, other);
+        if (api.name == "equals" && api.signature == "(Ljava/lang/Object;)Z") {
+            try {
+                if (other && !runtime.assignable(other, configuration_type)) return Value::word(0);
+                return runtime.invoke_virtual_named(object, "equals", "(Landroid/content/res/Configuration;)Z", args.subspan(1));
+            } catch (const dex::JavaException &error) {
+                ManagedRoot error_root(runtime, error.object);
+                // The SDK try covers the virtual call too, so an original
+                // typed-equals override's ClassCastException also becomes false.
+                if (runtime.assignable(error.object, "Ljava/lang/ClassCastException;")) return Value::word(0);
+                throw;
+            }
+        }
+        if (api.name == "equals") {
+            if (!other) return Value::word(0);
+            if (other == object) return Value::word(1);
+            const auto result = runtime.invoke_virtual_named(object, "compareTo", "(Landroid/content/res/Configuration;)I", args.subspan(1));
+            return Value::word(static_cast<std::uint32_t>(result.bits) == 0);
+        }
+        if (api.name == "diff" && args.size() == 2) {
+            const std::array parameters{Value::reference(other), Value::word(0), Value::word(0)};
+            return runtime.invoke_virtual_named(object, "diff", "(Landroid/content/res/Configuration;ZZ)I", parameters);
+        }
+        if (!other) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)configuration_state(other);
+        if (api.name == "compareTo") return Value::word(std::bit_cast<std::uint32_t>(compare_configuration_values(object, other)));
+        if (api.name == "diff") {
+            if (args.size() != 4 || args[2].kind != dex::ValueKind::word || args[3].kind != dex::ValueKind::word)
+                bad("CONFIGURATION_ARGUMENT", "Configuration diff requires its original boolean profile flags");
+            if (args[2].bits || args[3].bits)
+                bad("CONFIGURATION_UNSUPPORTED", "Undefined/public-only Configuration diff profiles are not implemented");
+            return Value::word(configuration_diff(object, other));
+        }
+        if (api.name != "setTo" || args.size() != 2) bad("CONFIGURATION_UNSUPPORTED", "Configuration API is outside the implemented value profile");
+        const auto source_window = configuration_window(other);
+        ManagedRoot source_window_root(runtime, source_window);
+        const auto window = configuration_window(object);
+        ManagedRoot window_root(runtime, window);
+        const auto source_origin = configuration_state(other).remainder_origin;
+        const auto intermediate_origin = next_configuration_origin();
+        runtime.charge_provider_work(configuration_field_count * 4);
+        update_configuration(object, [&](ConfigurationState &next) {
+            next = configuration_state(other);
+            next.references[0] = Value::reference(window); // Actual final WindowConfiguration identity.
+            next.remainder_origin = intermediate_origin;
+        });
+        copy_data_window_configuration(window, source_window);
+        runtime.charge_provider_work(configuration_field_count * 2);
+        update_configuration(object, [source_origin](ConfigurationState &next) { next.remainder_origin = source_origin; });
+        return Value::nothing();
+    }
+    const ResourcesManagerState &resources_manager_state() const {
+        if (!launch_viewport) bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Configuration contexts require an admitted virtual display baseline");
+        const auto *metadata = dynamic_cast<const ResourcesManagerState *>(runtime.host_state(resource_object));
+        if (!metadata || metadata->owner != this || metadata->source_origin != resource_source_origin)
+            bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Resources manager baseline has no current authenticated source binding");
+        return *metadata;
+    }
+    template <class Update> void update_resources_manager(std::size_t extra_references, std::size_t extra_keys, Update update) {
+        const auto admitted = runtime.host_state_capacity(resource_object);
+        const auto &previous = resources_manager_state();
+        const auto remaining = [&](std::size_t cost, std::size_t already) {
+            if (already > admitted || cost > admitted - already)
+                bad("RESOURCES_MANAGER_LIMIT", "Resources cache replacement exceeds simultaneous managed admission");
+        };
+        const std::size_t root_count = previous.references.empty() ? 0u : 1u;
+        if (previous.references.size() != previous.override_keys.size() + root_count)
+            bad("RESOURCES_MANAGER_STATE", "Resource cache keys and weak references disagree");
+        std::size_t live_count = 0;
+        for (std::size_t index = 0; index < previous.override_keys.size(); ++index) {
+            runtime.charge_provider_work(1);
+            if (runtime.native_weak_referent(previous.references[index + 1].bits)) ++live_count;
+        }
+        if (extra_references > SIZE_MAX - root_count - live_count || extra_keys > SIZE_MAX - live_count)
+            bad("RESOURCES_MANAGER_LIMIT", "Resources cache entry count overflows");
+        const auto reference_count = root_count + live_count + extra_references;
+        const auto key_count = live_count + extra_keys;
+        const auto old_bytes = previous.bytes();
+        remaining(sizeof(ResourcesManagerState), old_bytes);
+        auto next = std::make_unique<ResourcesManagerState>();
+        next->owner = this; next->baseline = previous.baseline; next->source_origin = previous.source_origin;
+        if (reference_count > (SIZE_MAX - next->bytes()) / sizeof(Value))
+            bad("RESOURCES_MANAGER_LIMIT", "Resources cache reference storage overflows");
+        remaining(next->bytes() + reference_count * sizeof(Value), old_bytes);
+        next->references.reserve(reference_count);
+        remaining(next->bytes(), old_bytes); // Observe actual first capacity before the second allocation.
+        if (key_count > (SIZE_MAX - next->bytes()) / sizeof(ConfigurationValueFacts))
+            bad("RESOURCES_MANAGER_LIMIT", "Resources cache key storage overflows");
+        remaining(next->bytes() + key_count * sizeof(ConfigurationValueFacts), old_bytes);
+        next->override_keys.reserve(key_count);
+        remaining(next->bytes(), old_bytes);
+        if (root_count) {
+            runtime.charge_provider_work(1);
+            next->references.push_back(previous.references[0]);
+        }
+        // No managed allocation or callback occurs after the liveness count.
+        // Reserve actual survivors, so dead entries release their old capacity.
+        for (std::size_t index = 0; index < previous.override_keys.size(); ++index) {
+            runtime.charge_provider_work(1);
+            if (!runtime.native_weak_referent(previous.references[index + 1].bits)) continue;
+            runtime.charge_provider_work(configuration_field_count * 2 + 7);
+            next->override_keys.push_back(previous.override_keys[index]);
+            next->references.push_back(previous.references[index + 1]);
+        }
+        // Mutator copies already-rooted scalar IDs/value snapshots into the
+        // reserved tail; it may not allocate managed objects or reenter.
+        update(*next);
+        remaining(next->bytes(), old_bytes);
+        runtime.set_host_state(resource_object, std::move(next));
+    }
+    ConfigurationValueFacts capture_configuration_facts(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto window = configuration_window(object);
+        ManagedRoot window_root(runtime, window);
+        const auto &metadata = configuration_state(object);
+        const auto &window_metadata = data_window_configuration(window);
+        const auto &bounds = surface_rect(window_metadata.references[0].bits);
+        runtime.charge_provider_work(configuration_field_count * 2 + 6);
+        ConfigurationValueFacts result;
+        result.numbers = metadata.numbers; result.known = metadata.known;
+        result.remainder_origin = metadata.remainder_origin;
+        result.window_origin = window_metadata.remainder_origin;
+        result.max_bounds = {bounds.left, bounds.top, bounds.right, bounds.bottom};
+        return result;
+    }
+    ObjectId materialize_configuration_facts(const ConfigurationValueFacts &facts) {
+        // facts must be a caller-owned value snapshot, never a borrowed view
+        // into host state that a managed allocation can replace or collect.
+        const auto object = runtime.new_object(configuration_type);
+        ManagedRoot object_root(runtime, object);
+        const auto window = runtime.new_object(window_configuration_type);
+        ManagedRoot window_root(runtime, window);
+        const auto bounds = runtime.new_object(rect_type);
+        ManagedRoot bounds_root(runtime, bounds);
+        if (runtime.host_state_capacity(bounds) < sizeof(SurfaceRectState))
+            bad("CONFIGURATION_LIMIT", "Snapshot bounds exceed existing managed admission");
+        runtime.charge_provider_work(4);
+        auto rectangle = std::make_unique<SurfaceRectState>();
+        rectangle->left = facts.max_bounds[0]; rectangle->top = facts.max_bounds[1];
+        rectangle->right = facts.max_bounds[2]; rectangle->bottom = facts.max_bounds[3];
+        runtime.set_host_state(bounds, std::move(rectangle));
+        if (runtime.host_state_capacity(window) < sizeof(WindowConfigurationState))
+            bad("CONFIGURATION_LIMIT", "Snapshot window fields exceed existing managed admission");
+        auto window_metadata = std::make_unique<WindowConfigurationState>();
+        window_metadata->owner = this; window_metadata->remainder_origin = facts.window_origin;
+        window_metadata->references[0] = Value::reference(bounds);
+        runtime.set_host_state(window, std::move(window_metadata));
+        if (runtime.host_state_capacity(object) < sizeof(ConfigurationState))
+            bad("CONFIGURATION_LIMIT", "Snapshot scalar fields exceed existing managed admission");
+        runtime.charge_provider_work(configuration_field_count * 4);
+        auto metadata = std::make_unique<ConfigurationState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(window);
+        metadata->numbers = facts.numbers; metadata->known = facts.known;
+        metadata->remainder_origin = facts.remainder_origin;
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    const ResourcesImplState &resources_impl_state(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const ResourcesImplState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != resources_impl_carrier_type ||
+            metadata->source_origin != resource_source_origin)
+            bad("RESOURCES_IMPL_STATE", "Resources Impl has no current authenticated source binding");
+        return *metadata;
+    }
+    ObjectId new_asset_manager_view() {
+        bind_asset_sources(); // Admit the actual shared source witness outside JNI callbacks.
+        const auto object = runtime.new_object("Landroid/content/res/AssetManager;");
+        ManagedRoot object_root(runtime, object);
+        if (object > native_asset_manager_identity_mask)
+            bad("ASSET_IDENTITY_LIMIT", "AssetManager identity exceeds the native token representation");
+        if (runtime.host_state_capacity(object) < sizeof(AssetManagerObjectState))
+            bad("ASSET_SOURCE_LIMIT", "Asset manager fields exceed existing managed admission");
+        auto metadata = std::make_unique<AssetManagerObjectState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(asset_manager);
+        metadata->native_source_instance = runtime.find_host_state(asset_manager);
+        metadata->native_configuration_origin = resource_source_origin;
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    ObjectId new_resources_impl(ObjectId config, bool compatible, bool original = false) {
+        ManagedRoot configuration_root(runtime, config);
+        (void)configuration_state(config);
+        const auto assets = original ? asset_manager : compatible ? new_asset_manager_view() : ObjectId{0};
+        ManagedRoot assets_root(runtime, assets);
+        if (runtime.class_definition(resources_impl_carrier_type))
+            bad("RESOURCES_IMPL_TYPE", "Package class collides with the native Resources implementation carrier");
+        const auto object = runtime.new_object(resources_impl_carrier_type);
+        ManagedRoot object_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(ResourcesImplState))
+            bad("RESOURCES_IMPL_LIMIT", "Resources implementation fields exceed existing managed admission");
+        auto metadata = std::make_unique<ResourcesImplState>();
+        metadata->owner = this; metadata->source_origin = resource_source_origin; metadata->table_compatible = compatible;
+        metadata->references[ResourcesImplState::configuration_slot] = Value::reference(config);
+        metadata->references[ResourcesImplState::assets_slot] = Value::reference(assets);
+        metadata->references[ResourcesImplState::metrics_slot] = Value::reference(original ? display_metrics : 0);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    ObjectId original_resources_impl() {
+        if (!resources_manager_state().references.empty()) return resources_manager_state().references[0].bits;
+        const auto object = new_resources_impl(configuration_object, true, true);
+        ManagedRoot object_root(runtime, object);
+        update_resources_manager(1, 0, [object](ResourcesManagerState &next) { next.references.push_back(Value::reference(object)); });
+        return object;
+    }
+    ObjectId resources_impl(ObjectId object) {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (object == resource_object) return original_resources_impl();
+        const auto *metadata = dynamic_cast<const ResourcesObjectState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != "Landroid/content/res/Resources;")
+            bad("RESOURCES_STATE", "Resources wrapper was not issued by this session");
+        const auto impl = metadata->references[0].bits;
+        (void)resources_impl_state(impl);
+        return impl;
+    }
+    ObjectId resources_impl_for_override(const ConfigurationValueFacts &raw_key) {
+        const auto original = original_resources_impl();
+        ManagedRoot original_root(runtime, original);
+        ProviderWorkCharge provider_charge{runtime};
+        const SdkResourceWork charge(std::ref(provider_charge));
+        ConfigurationValueFacts empty_key;
+        empty_key.known.fill(UINT32_MAX); // ResourcesKey's actual undefined-default Configuration.
+        const auto original_match = compare_configuration_override_keys(raw_key, empty_key, charge);
+        if (original_match == ConfigurationKeyMatch::equal) return original;
+        if (original_match == ConfigurationKeyMatch::unknown)
+            bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Raw resource key equality lacks complete source facts");
+        {
+            const auto &manager_metadata = resources_manager_state();
+            if (manager_metadata.references.size() != manager_metadata.override_keys.size() + 1)
+                bad("RESOURCES_MANAGER_STATE", "Resources cache keys and weak references disagree");
+            for (std::size_t index = 0; index < manager_metadata.override_keys.size(); ++index) {
+                runtime.charge_provider_work(1);
+                const auto candidate = runtime.native_weak_referent(manager_metadata.references[index + 1].bits);
+                if (!candidate) continue;
+                ManagedRoot candidate_root(runtime, candidate);
+                (void)resources_impl_state(candidate);
+                const auto match = compare_configuration_override_keys(raw_key, manager_metadata.override_keys[index], charge);
+                if (match == ConfigurationKeyMatch::equal) return candidate;
+                if (match == ConfigurationKeyMatch::unknown)
+                    bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Raw resource cache key equality is not known");
+            }
+        }
+        runtime.charge_provider_work(configuration_field_count * 2 + 6);
+        const auto baseline = resources_manager_state().baseline; // Own facts before any managed allocation.
+        const auto effective = merge_configuration_override(baseline, raw_key, charge);
+        const bool compatible = compare_configuration_override_keys(effective, baseline, charge) == ConfigurationKeyMatch::equal;
+        const auto config = materialize_configuration_facts(effective);
+        ManagedRoot configuration_root(runtime, config);
+        const auto object = new_resources_impl(config, compatible);
+        ManagedRoot object_root(runtime, object);
+        const auto weak = runtime.new_native_weak(object);
+        ManagedRoot weak_root(runtime, weak);
+        update_resources_manager(1, 1, [&](ResourcesManagerState &next) {
+            runtime.charge_provider_work(configuration_field_count * 2 + 7);
+            next.override_keys.push_back(raw_key);
+            next.references.push_back(Value::reference(weak));
+        });
+        return object;
+    }
+    ObjectId new_resources_wrapper(ObjectId impl) {
+        ManagedRoot impl_root(runtime, impl);
+        (void)resources_impl_state(impl);
+        const auto object = runtime.new_object("Landroid/content/res/Resources;");
+        ManagedRoot object_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(ResourcesObjectState))
+            bad("RESOURCES_LIMIT", "Resources wrapper storage exceeds existing managed admission");
+        auto metadata = std::make_unique<ResourcesObjectState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(impl);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    Value configured_resources_configuration(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("CONFIGURATION_RECEIVER", "getConfiguration requires its Resources receiver");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object);
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (object == resource_object) return Value::reference(configuration_object);
+        const auto impl = resources_impl(object);
+        return resources_impl_state(impl).references[0];
+    }
+    Value context_resources(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_RESOURCES_ARGUMENT", "getResources requires its actual Context receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context.getResources has no concrete base body");
+        if (api.owner == context_impl_type) {
+            ensure_primary_context_state(object);
+            return context_impl_state(object).references[ContextImplState::resources_slot];
+        }
+        if (api.owner != theme_wrapper_type) bad("CONTEXT_RESOURCES_UNSUPPORTED", "Context resource owner is not implemented");
+        if (generic_theme_wrapper(object)) return theme_wrapper_resources(object);
+        (void)activity_window(object);
+        const auto *previous = dynamic_cast<const ActivityIntentState *>(runtime.host_state(object));
+        if (previous->references[ActivityIntentState::resources_slot].bits)
+            return previous->references[ActivityIntentState::resources_slot];
+        // No native ContextThemeWrapper override-configuration setter is
+        // advertised. Its actual null-override branch caches super.getResources.
+        const ApiSupport base_api{"Landroid/content/ContextWrapper;", "getResources", "()Landroid/content/res/Resources;", ApiStatus::partial, "Actual stored-base delegation"};
+        const auto resource = delegate_wrapper(base_api, args);
+        ManagedRoot resource_root(runtime, resource.bits);
+        if (resource.bits && !runtime.assignable(resource.bits, "Landroid/content/res/Resources;"))
+            bad("CONTEXT_RESOURCES_ARGUMENT", "Context returned a non-Resources object");
+        const auto admitted = runtime.host_state_capacity(object);
+        previous = dynamic_cast<const ActivityIntentState *>(runtime.host_state(object));
+        if (!previous || previous->owner != this || admitted < previous->bytes() || sizeof(ActivityIntentState) > admitted - previous->bytes())
+            bad("CONTEXT_RESOURCES_LIMIT", "Activity resource cache exceeds simultaneous managed admission");
+        auto next = std::make_unique<ActivityIntentState>(*previous);
+        next->references[ActivityIntentState::resources_slot] = Value::reference(resource.bits);
+        runtime.set_host_state(object, std::move(next));
+        return resource;
+    }
+    Value create_configuration_context(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("CONFIGURATION_CONTEXT_ARGUMENT", "Configuration context requires its Context and override Configuration");
+        const auto receiver = args[0].bits, override_config = args[1].bits;
+        ManagedRoot context_root(runtime, receiver), override_root(runtime, override_config);
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context.createConfigurationContext has no concrete base body");
+        if (api.owner == "Landroid/content/ContextWrapper;") return delegate_wrapper(api, args);
+        if (api.owner != context_impl_type) bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Configuration context owner is not implemented");
+        if (!override_config) runtime.raise("Ljava/lang/IllegalArgumentException;", u"overrideConfiguration must not be null");
+        ensure_primary_context_state(receiver);
+        (void)current_display();
+        (void)resources_manager_state();
+        const auto object = runtime.new_object(context_impl_type);
+        ManagedRoot object_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(ContextImplState))
+            bad("CONFIGURATION_CONTEXT_LIMIT", "Configured Context fields exceed existing managed admission");
+        auto initial = std::make_unique<ContextImplState>();
+        initial->owner = this;
+        initial->references[ContextImplState::outer_slot] = Value::reference(object); // Actual constructor default.
+        initial->lineage = context_impl_state(receiver).lineage;
+        initial->user_id = context_impl_state(receiver).user_id;
+        initial->device_id = context_impl_state(receiver).device_id;
+        initial->own_permission_parameters_known = context_impl_state(receiver).own_permission_parameters_known;
+        initial->references[ContextImplState::autofill_options_slot] = context_impl_state(receiver).references[ContextImplState::autofill_options_slot];
+        runtime.set_host_state(object, std::move(initial));
+        const auto display = runtime.invoke_virtual_named(receiver, "getDisplayId", "()I");
+        if (display.kind != dex::ValueKind::word || static_cast<std::uint32_t>(display.bits))
+            bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Configuration context requires its actual admitted default display");
+        // ResourcesKey copies the override after the original display callback.
+        const auto raw_key = capture_configuration_facts(override_config);
+        const auto impl = resources_impl_for_override(raw_key);
+        ManagedRoot impl_root(runtime, impl);
+        const auto resource = new_resources_wrapper(impl);
+        ManagedRoot resource_root(runtime, resource);
+        update_context_impl(object, [resource](ContextImplState &next) { next.references[ContextImplState::resources_slot] = Value::reference(resource); });
+        return Value::reference(object);
+    }
+    void require_resources_update_profile() {
+        const auto *manager_metadata = dynamic_cast<const ResourcesManagerState *>(runtime.host_state(resource_object));
+        if (!manager_metadata) return;
+        if (manager_metadata->owner != this) bad("RESOURCES_MANAGER_STATE", "Resource manager belongs to another session");
+        if (manager_metadata->override_keys.empty()) return;
+        if (!runtime.main_work_budget())
+            bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Configured resource cache updates require the existing admitted main-work owner");
+        if (manager_metadata->references.size() != manager_metadata->override_keys.size() + 1)
+            bad("RESOURCES_MANAGER_STATE", "Resource cache key custody is inconsistent");
+        for (std::size_t index = 0; index < manager_metadata->override_keys.size(); ++index) {
+            runtime.charge_provider_work(1);
+            if (runtime.native_weak_referent(manager_metadata->references[index + 1].bits))
+                bad("CONFIGURATION_CONTEXT_UNSUPPORTED", "Updating live configured resource implementations is not implemented");
+        }
+    }
+    void refresh_resources_manager_baseline(std::uint64_t origin) {
+        const auto *manager_metadata = dynamic_cast<const ResourcesManagerState *>(runtime.host_state(resource_object));
+        if (!manager_metadata) return;
+        if (manager_metadata->owner != this) bad("RESOURCES_MANAGER_STATE", "Resource manager belongs to another session");
+        const auto root_impl = manager_metadata->references.empty() ? ObjectId{0} : manager_metadata->references[0].bits;
+        ManagedRoot impl_root(runtime, root_impl);
+        if (root_impl) {
+            const auto admitted = runtime.host_state_capacity(root_impl);
+            const auto *previous = dynamic_cast<const ResourcesImplState *>(runtime.host_state(root_impl));
+            if (!previous || previous->owner != this || previous->references[0].bits != configuration_object ||
+                admitted < previous->bytes() || sizeof(ResourcesImplState) > admitted - previous->bytes())
+                bad("RESOURCES_IMPL_LIMIT", "Root resource refresh exceeds simultaneous managed admission");
+            auto next = std::make_unique<ResourcesImplState>(*previous);
+            next->source_origin = origin; next->table_compatible = true;
+            runtime.set_host_state(root_impl, std::move(next));
+        }
+        const auto admitted = runtime.host_state_capacity(resource_object);
+        manager_metadata = dynamic_cast<const ResourcesManagerState *>(runtime.host_state(resource_object));
+        if (!manager_metadata || manager_metadata->owner != this || admitted < manager_metadata->bytes() ||
+            sizeof(ResourcesManagerState) > admitted - manager_metadata->bytes())
+            bad("RESOURCES_MANAGER_LIMIT", "Resource baseline refresh exceeds simultaneous managed admission");
+        const auto available = admitted - manager_metadata->bytes();
+        auto next = std::make_unique<ResourcesManagerState>();
+        next->owner = this; next->source_origin = origin;
+        const auto &config = configuration_state(configuration_object); // Native update precedes any guest callback.
+        next->baseline.numbers = config.numbers; next->baseline.known = config.known;
+        next->baseline.remainder_origin = origin; next->baseline.window_origin = origin;
+        next->baseline.max_bounds = manager_metadata->baseline.max_bounds;
+        if (root_impl) {
+            if (available < sizeof(ResourcesManagerState) || sizeof(Value) > available - sizeof(ResourcesManagerState))
+                bad("RESOURCES_MANAGER_LIMIT", "Root implementation reference exceeds simultaneous managed admission");
+            next->references.reserve(1);
+            if (next->bytes() > available)
+                bad("RESOURCES_MANAGER_LIMIT", "Actual root cache capacity exceeds simultaneous managed admission");
+            next->references.push_back(Value::reference(root_impl));
+        }
+        // All non-root weak referents were proved dead before the update. The
+        // replacement releases their keys, wrappers and unused native capacity.
+        runtime.set_host_state(resource_object, std::move(next));
+    }
+    ObjectId new_metrics_object() {
+        const auto facts = current_display();
+        const auto object = runtime.new_object(display_metrics_type);
+        ManagedRoot object_root(runtime, object);
+        if (runtime.host_state_capacity(object) < sizeof(DisplayMetricsState))
+            bad("DISPLAY_METRICS_LIMIT", "DisplayMetrics storage exceeds existing managed admission");
+        auto metadata = std::make_unique<DisplayMetricsState>();
+        metadata->owner = this; metadata->source = facts;
+        runtime.charge_provider_work(1);
+        metadata->density_bits = std::bit_cast<std::uint32_t>(static_cast<float>(facts.configuration.density_dpi) * (1.0f / 160.0f));
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    ObjectId metrics_object() {
+        if (!display_metrics) display_metrics = own(new_metrics_object());
+        return display_metrics;
+    }
+    ObjectId resource_metrics(ObjectId resource) {
+        ManagedRoot resource_root(runtime, resource);
+        (void)compatible_resource_impl(resource);
+        const auto impl = resources_impl(resource);
+        ManagedRoot impl_root(runtime, impl);
+        const auto existing = resources_impl_state(impl).references[ResourcesImplState::metrics_slot].bits;
+        if (existing) return existing;
+        const bool original = impl == original_resources_impl();
+        const auto object = original ? metrics_object() : new_metrics_object();
+        ManagedRoot metrics_root(runtime, object);
+        const auto admitted = runtime.host_state_capacity(impl);
+        const auto &previous = resources_impl_state(impl);
+        if (admitted < previous.bytes() || sizeof(ResourcesImplState) > admitted - previous.bytes())
+            bad("DISPLAY_METRICS_LIMIT", "Implementation metrics cache exceeds simultaneous managed admission");
+        auto next = std::make_unique<ResourcesImplState>(previous);
+        next->references[ResourcesImplState::metrics_slot] = Value::reference(object);
+        runtime.set_host_state(impl, std::move(next));
+        return object;
+    }
+    ObjectId window_configuration_object() {
+        const auto facts = current_display();
+        if (!window_configuration) {
+            const auto object = runtime.new_object(window_configuration_type);
+            ManagedRoot object_root(runtime, object);
+            const auto bounds = runtime.new_object(rect_type);
+            ManagedRoot bounds_root(runtime, bounds);
+            if (runtime.host_state_capacity(object) < sizeof(WindowConfigurationState) + sizeof(SurfaceRectState))
+                bad("WINDOW_CONFIGURATION_LIMIT", "WindowConfiguration and bounds exceed existing managed admission");
+            auto rectangle = std::make_unique<SurfaceRectState>();
+            rectangle->right = static_cast<std::int32_t>(facts.width_px);
+            rectangle->bottom = static_cast<std::int32_t>(facts.height_px);
+            runtime.set_host_state(bounds, std::move(rectangle));
+            auto metadata = std::make_unique<WindowConfigurationState>();
+            metadata->owner = this; metadata->geometry_revision = facts.geometry_revision;
+            metadata->remainder_origin = configuration_state(configuration_object).remainder_origin;
+            metadata->references[0] = Value::reference(bounds);
+            runtime.set_host_state(object, std::move(metadata));
+            window_configuration = own(object);
+        }
+        const auto *previous = dynamic_cast<const ConfigurationState *>(runtime.host_state(configuration_object));
+        if (!previous) bad("CONFIGURATION_STATE", "Configuration has no actual value storage");
+        if (!previous->references[0].bits) {
+            const auto admitted = runtime.host_state_capacity(configuration_object);
+            previous = dynamic_cast<const ConfigurationState *>(runtime.host_state(configuration_object));
+            if (!previous || admitted < previous->bytes() || sizeof(ConfigurationState) > admitted - previous->bytes())
+                bad("WINDOW_CONFIGURATION_LIMIT", "Configuration reference replacement exceeds simultaneous admission");
+            auto next = std::make_unique<ConfigurationState>(*previous);
+            next->references[0] = Value::reference(window_configuration);
+            runtime.set_host_state(configuration_object, std::move(next));
+        } else if (previous->references[0].bits != window_configuration)
+            bad("WINDOW_CONFIGURATION_STATE", "Configuration lost its actual WindowConfiguration identity");
+        return window_configuration;
+    }
+    Value configuration_size(std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+            bad("CONFIGURATION_ARGUMENT", "Configuration size predicate requires its receiver and integer size");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto &metadata = configuration_state(args[0].bits);
+        const auto index = static_cast<std::size_t>(ConfigurationField::screen_layout);
+        if ((metadata.known[index] & 0x0fu) != 0x0fu)
+            bad("CONFIGURATION_UNSUPPORTED", "Screen layout size has no authentic configuration value");
+        const auto size = metadata.numbers[index] & 0x0fu;
+        const auto requested = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+        return Value::word(size && static_cast<std::int32_t>(size) >= requested);
+    }
+    Value maximum_window_bounds(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("WINDOW_CONFIGURATION_ARGUMENT", "getMaxBounds requires its actual WindowConfiguration receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto &metadata = data_window_configuration(args[0].bits);
+        if (args[0].bits == window_configuration && metadata.geometry_revision != current_display().geometry_revision)
+            bad("WINDOW_CONFIGURATION_STATE", "Window bounds do not belong to the authenticated current display");
+        // This is the actual mutable SDK Rect identity. Its Java field writes
+        // cannot alter the separate host viewport receipt or Surface authority.
+        return metadata.references[0];
+    }
+    Value context_display_id(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("DISPLAY_ARGUMENT", "Context.getDisplayId requires its actual receiver");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Abstract Context.getDisplayId has no executable base body");
+        context(receiver);
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            return runtime.invoke_virtual_named(base.bits, "getDisplayId", "()I");
+        }
+        if (api.owner != context_impl_type)
+            bad("DISPLAY_CONTEXT", "Display query requires the actual issued ContextImpl");
+        if (receiver != base_context) (void)context_impl_state(receiver);
+        (void)current_display();
+        return Value::word(0); // SDK DEFAULT_DISPLAY: this receipt owns one virtual display.
+    }
+    float configuration_density(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const DisplayMetricsState *>(runtime.host_state(object));
+        const auto &facts = current_display();
+        if (!metadata || metadata->owner != this ||
+            metadata->source.geometry_revision != facts.geometry_revision || metadata->source.configuration != configuration)
+            bad("VIEW_CONFIGURATION_METRICS", "ViewConfiguration requires the issued current DisplayMetrics");
+        return std::bit_cast<float>(metadata->density_bits);
+    }
+    struct ViewConfigurationQueries {
+        Impl &session;
+        ObjectId context, resources, configuration;
+        std::uint32_t identifier(std::string_view type, std::string_view name) {
+            ProviderWorkCharge provider{session.runtime};
+            const SdkResourceWork charge(std::ref(provider));
+            const auto id = embedded_sdk_resources().identifier(type, name, charge);
+            if (!id) bad("VIEW_CONFIGURATION_RESOURCE", "Required SDK configuration resource is not defined");
+            return id;
+        }
+        Value query(std::string_view type, std::string_view name, std::string_view method, std::string_view signature) {
+            const std::array args{Value::word(identifier(type, name))};
+            return session.runtime.invoke_virtual_named(resources, method, signature, args);
+        }
+    };
+    ObjectId configuration_for_context(ObjectId receiver) {
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot context_root(runtime, receiver);
+        // StrictMode's incorrect-context policy is LAX in this profile. The SDK
+        // density-cache lookup still evaluates these original virtual calls.
+        const auto hot_resources = runtime.invoke_virtual_named(receiver, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot hot_resources_root(runtime, hot_resources.bits);
+        const auto hot_metrics = runtime.invoke_virtual_named(hot_resources.bits, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;");
+        ManagedRoot hot_metrics_root(runtime, hot_metrics.bits);
+        runtime.charge_provider_work(1);
+        const auto density_key = static_cast<std::int32_t>(100.0f * configuration_density(hot_metrics.bits));
+        const auto geometry_revision = current_display().geometry_revision;
+        if (view_configuration) {
+            const auto *cached = dynamic_cast<const ViewConfigurationState *>(runtime.host_state(view_configuration));
+            if (!cached || cached->owner != this || cached->geometry_revision != geometry_revision)
+                bad("VIEW_CONFIGURATION_STATE", "Cached ViewConfiguration is not bound to the current display");
+            if (cached->density_key == density_key) return view_configuration;
+        }
+        const auto object = runtime.new_object(view_configuration_type);
+        ManagedRoot object_root(runtime, object);
+        // Cold construction repeats the SDK resource lookup after allocation.
+        const auto resource = runtime.invoke_virtual_named(receiver, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot resource_root(runtime, resource.bits);
+        const auto metrics_value = runtime.invoke_virtual_named(resource.bits, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;");
+        ManagedRoot metrics_root(runtime, metrics_value.bits);
+        const auto config = runtime.invoke_virtual_named(resource.bits, "getConfiguration", "()Landroid/content/res/Configuration;");
+        ManagedRoot config_root(runtime, config.bits);
+        const auto density = configuration_density(metrics_value.bits);
+        const std::array size_args{Value::word(4)};
+        const bool xlarge = runtime.invoke_virtual_named(config.bits, "isLayoutSizeAtLeast", "(I)Z", size_args).bits != 0;
+        if (config.bits != configuration_object)
+            bad("VIEW_CONFIGURATION_CONFIG", "Cold configuration requires the issued resource Configuration");
+        ViewConfigurationQueries queries{*this, receiver, resource.bits, config.bits};
+        ViewConfigurationSource source;
+        source.context = &queries;
+        source.dimension = [](void *opaque, std::string_view name) {
+            const auto result = static_cast<ViewConfigurationQueries *>(opaque)->query("dimen", name, "getDimensionPixelSize", "(I)I");
+            return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(result.bits));
+        };
+        source.int_value = [](void *opaque, std::string_view name) {
+            const auto result = static_cast<ViewConfigurationQueries *>(opaque)->query("integer", name, "getInteger", "(I)I");
+            return std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(result.bits));
+        };
+        source.boolean = [](void *opaque, std::string_view name) {
+            return static_cast<ViewConfigurationQueries *>(opaque)->query("bool", name, "getBoolean", "(I)Z").bits != 0;
+        };
+        source.float_value = [](void *opaque, std::string_view name) {
+            auto &query = *static_cast<ViewConfigurationQueries *>(opaque);
+            auto &vm = query.session.runtime;
+            const auto value = vm.new_object(typed_value_type);
+            ManagedRoot value_root(vm, value);
+            const std::array initialize{Value::reference(value)};
+            (void)query.session.typed_value_constructor(initialize);
+            const std::array args{Value::word(query.identifier("dimen", name)), Value::reference(value), Value::word(1)};
+            (void)vm.invoke_virtual_named(query.resources, "getValue", "(ILandroid/util/TypedValue;Z)V", args);
+            return std::bit_cast<float>(static_cast<std::uint32_t>(vm.invoke_virtual_named(value, "getFloat", "()F").bits));
+        };
+        source.maximum_bounds = [](void *opaque) {
+            auto &query = *static_cast<ViewConfigurationQueries *>(opaque);
+            auto &session = query.session;
+            if (query.configuration != session.configuration_object)
+                bad("VIEW_CONFIGURATION_CONFIG", "Bounds require the issued Configuration");
+            const auto window = session.window_configuration_object();
+            ManagedRoot window_root(session.runtime, window);
+            const auto bounds = session.runtime.invoke_virtual_named(window, "getMaxBounds", "()Landroid/graphics/Rect;");
+            ManagedRoot bounds_root(session.runtime, bounds.bits);
+            const auto width = session.runtime.invoke_virtual_named(bounds.bits, "width", "()I");
+            const auto height = session.runtime.invoke_virtual_named(bounds.bits, "height", "()I");
+            return ViewConfigurationBounds{std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(width.bits)),
+                std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(height.bits))};
+        };
+        source.has_navigation_bar = [](void *opaque) -> std::optional<bool> {
+            auto &query = *static_cast<ViewConfigurationQueries *>(opaque);
+            const auto display = query.session.runtime.invoke_virtual_named(query.context, "getDisplayId", "()I");
+            if (display.bits != 0)
+                bad("VIEW_CONFIGURATION_DISPLAY", "Navigation policy is unavailable for a foreign display ID");
+            const auto &facts = query.session.current_display();
+            if (!facts.has_navigation_bar)
+                bad("VIEW_CONFIGURATION_NAVIGATION", "Navigation policy lacks an authenticated host receipt");
+            return *facts.has_navigation_bar;
+        };
+        source.charge = [](void *opaque, std::uint64_t count) {
+            static_cast<ViewConfigurationQueries *>(opaque)->session.runtime.charge_provider_work(count);
+        };
+        const auto parameters = load_view_configuration(density, xlarge, view_menu_key, source);
+        if (current_display().geometry_revision != geometry_revision)
+            bad("VIEW_CONFIGURATION_STALE", "Display changed during cold configuration callbacks");
+        if (runtime.host_state_capacity(object) < sizeof(ViewConfigurationState))
+            bad("VIEW_CONFIGURATION_LIMIT", "ViewConfiguration exceeds existing managed admission");
+        auto metadata = std::make_unique<ViewConfigurationState>();
+        metadata->owner = this; metadata->references[0] = Value::reference(resource.bits);
+        metadata->geometry_revision = geometry_revision; metadata->density_key = density_key;
+        metadata->parameters = parameters;
+        runtime.set_host_state(object, std::move(metadata));
+        // Reentrant original callbacks may have completed another cold object.
+        // SDK cache publication replaces that entry; retained guest references
+        // continue to trace the old object independently of this cache root.
+        const auto previous = view_configuration;
+        own(object);
+        view_configuration = object;
+        if (previous) disown(previous);
+        return object;
+    }
+    Value view_configuration_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_CONFIGURATION_ARGUMENT", "ViewConfiguration requires its Context or actual receiver");
+        if (api.name == "get") return Value::reference(configuration_for_context(args[0].bits));
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const ViewConfigurationState *>(runtime.host_state(args[0].bits));
+        if (!metadata || metadata->owner != this || metadata->geometry_revision != current_display().geometry_revision)
+            bad("VIEW_CONFIGURATION_STATE", "Receiver is not an issued current ViewConfiguration");
+        if (api.name == "getScaledTouchSlop")
+            return Value::word(std::bit_cast<std::uint32_t>(metadata->parameters.touch_slop));
+        if (api.name == "getScaledAmbiguousGestureMultiplier")
+            return Value::word(std::bit_cast<std::uint32_t>(metadata->parameters.ambiguous_gesture_multiplier));
+        bad("VIEW_CONFIGURATION_UNSUPPORTED", "ViewConfiguration method has no implemented value consumer");
+    }
+    std::uint32_t theme_target_sdk(ObjectId receiver) {
+        ManagedRoot receiver_root(runtime, receiver);
+        const auto info = runtime.invoke_virtual_named(receiver, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+        ManagedRoot info_root(runtime, info.bits);
+        context(receiver);
+        if (!info.bits) runtime.raise("Ljava/lang/NullPointerException;", u"ApplicationInfo is null during theme selection");
+        if (!application_info || info.bits != application_info)
+            bad("THEME_APPLICATION_INFO_UNSUPPORTED", "Theme default selection requires the actual canonical ApplicationInfo");
+        const auto &metadata = application_info_state(info.bits);
+        if (!metadata.target_known)
+            bad("THEME_APPLICATION_INFO_UNSUPPORTED", "Theme selection lacks actual ApplicationInfo target SDK metadata");
+        // Java compares the mutable public int as signed. Every negative value
+        // selects the oldest default-theme branch, represented here by zero.
+        // The immutable held target still governs host admission and policy.
+        const auto sdk = std::bit_cast<std::int32_t>(metadata.target_sdk);
+        return sdk < 0 ? 0u : static_cast<std::uint32_t>(sdk);
+    }
+    void initialize_base_theme() {
+        if (!base_theme) base_theme = own(new_theme(resource_object));
+        theme_apply(base_theme, base_theme_resource, true);
+    }
+    void initialize_activity_theme(ObjectId receiver) {
+        context(receiver);
+        if (receiver != activity) bad("THEME_CONTEXT", "Theme wrapper is not the actual Activity");
+        ManagedRoot receiver_root(runtime, receiver);
+        const bool first = !current_activity_theme;
+        if (first) {
+            // Execute the real override before publishing the new Theme, as
+            // ContextThemeWrapper does. Retain no state references across it.
+            const auto resource = runtime.invoke_virtual_named(receiver, "getResources", "()Landroid/content/res/Resources;");
+            context(receiver);
+            if (!resource.bits) runtime.raise("Ljava/lang/NullPointerException;", u"Resources is null during theme initialization");
+            (void)compatible_resource_impl(resource.bits);
+            const auto fresh = own(new_theme(resource.bits));
+            if (current_activity_theme) disown(current_activity_theme);
+            current_activity_theme = fresh; // Reentry through the base/onApply sees this exact object.
+            const auto base = runtime.invoke_virtual_named(receiver, "getBaseContext", "()Landroid/content/Context;");
+            ManagedRoot base_root(runtime, base.bits);
+            context(receiver);
+            if (!base.bits) runtime.raise("Ljava/lang/NullPointerException;", u"Base Context is null during theme initialization");
+            if (base.bits != activity_base_context(receiver).bits)
+                bad("THEME_CONTEXT_UNSUPPORTED", "Activity theme initialization requires its actual stored base Context");
+            const auto original = runtime.invoke_virtual_named(base.bits, "getTheme", "()Landroid/content/res/Resources$Theme;");
+            context(receiver);
+            if (original.bits) theme_set_to(current_activity_theme, original.bits);
+        }
+        const auto object = current_activity_theme;
+        ManagedRoot theme_root(runtime, object);
+        const auto style = activity_theme_resource;
+        if (const auto method = override_method(runtime.object_type(receiver), "onApplyThemeResource",
+                "(Landroid/content/res/Resources$Theme;IZ)V")) {
+            const std::array args{Value::reference(receiver), Value::reference(object), Value::word(style), Value::word(first)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else theme_apply(object, style, true);
+        context(receiver);
+    }
+    void initialize_context_impl_theme(ObjectId object) {
+        ManagedRoot context_root(runtime, object);
+        if (!context_impl_state(object).references[ContextImplState::theme_slot].bits) {
+            const auto resource = context_impl_state(object).references[ContextImplState::resources_slot].bits;
+            ManagedRoot resource_root(runtime, resource);
+            const auto theme = new_theme(resource);
+            ManagedRoot theme_root(runtime, theme);
+            update_context_impl(object, [theme](ContextImplState &next) {
+                next.references[ContextImplState::theme_slot] = Value::reference(theme);
+            });
+        }
+        const auto theme = context_impl_state(object).references[ContextImplState::theme_slot].bits;
+        ManagedRoot theme_root(runtime, theme);
+        theme_apply(theme, context_impl_state(object).theme_resource, true);
+    }
+    Value scoped_context_theme(const ApiSupport &api, std::span<const Value> args) {
+        const auto object = args[0].bits;
+        ManagedRoot context_root(runtime, object);
+        if (api.name == "setTheme") {
+            const auto style = static_cast<std::uint32_t>(args[1].bits);
+            if (context_impl_state(object).theme_resource != style) {
+                update_context_impl(object, [style](ContextImplState &next) { next.theme_resource = style; });
+                initialize_context_impl_theme(object);
+            }
+            return Value::nothing();
+        }
+        if (!context_impl_state(object).references[ContextImplState::theme_slot].bits) {
+            // Java captures selectDefaultTheme's first argument before the
+            // original outer Context.getApplicationInfo callback executes.
+            const auto previous_style = context_impl_state(object).theme_resource;
+            const auto outer = context_impl_state(object).references[ContextImplState::outer_slot].bits;
+            ManagedRoot outer_root(runtime, outer);
+            const auto sdk = theme_target_sdk(outer);
+            const auto style = select_default_theme(previous_style, sdk);
+            update_context_impl(object, [style](ContextImplState &next) { next.theme_resource = style; });
+            initialize_context_impl_theme(object);
+        }
+        return context_impl_state(object).references[ContextImplState::theme_slot];
+    }
+    Value context_theme_api(const ApiSupport &api, std::span<const Value> args) {
+        const bool setting = api.name == "setTheme";
+        const bool applying = api.name == "onApplyThemeResource";
+        if (args.size() != (applying ? 4u : setting ? 2u : 1u) || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_ARGUMENT", "Context theme operation has invalid arguments");
+        const auto receiver = args[0].bits;
+        context(receiver);
+        if (api.owner == theme_wrapper_type && generic_theme_wrapper(receiver) && !applying)
+            return theme_wrapper_theme(api, args);
+        if (setting && api.owner == theme_wrapper_type && api.signature == "(Landroid/content/res/Resources$Theme;)V")
+            bad("ACTIVITY_THEME_UNSUPPORTED", "Activity Theme reference replacement requires its distinct actual Activity carrier");
+        if (applying) {
+            if (api.owner != theme_wrapper_type || (receiver != activity && !generic_theme_wrapper(receiver)) ||
+                (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+                args[2].kind != dex::ValueKind::word || args[3].kind != dex::ValueKind::word)
+                bad("THEME_ARGUMENT", "onApplyThemeResource requires an authenticated wrapper, Theme, style and first flag");
+            theme_apply(args[1].bits, static_cast<std::uint32_t>(args[2].bits), true);
+            return Value::nothing();
+        }
+        if (setting && args[1].kind != dex::ValueKind::word)
+            bad("THEME_ARGUMENT", "Theme resource ID must be an integer");
+        if (api.owner == "Landroid/content/Context;")
+            bad("THEME_ABSTRACT", "Abstract Context theme methods have no executable base body");
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            return runtime.invoke_virtual_named(base.bits, api.name,
+                setting ? "(I)V" : "()Landroid/content/res/Resources$Theme;", args.subspan(1));
+        }
+        if (api.owner == context_impl_type) {
+            if (receiver != base_context) return scoped_context_theme(api, args);
+            if (setting) {
+                const auto style = static_cast<std::uint32_t>(args[1].bits);
+                if (base_theme_resource != style) { base_theme_resource = style; initialize_base_theme(); }
+                return Value::nothing();
+            }
+            if (!base_theme) {
+                const auto previous_style = base_theme_resource;
+                const auto outer = application && application_attached ? application : base_context;
+                const auto sdk = theme_target_sdk(outer);
+                context(receiver);
+                base_theme_resource = select_default_theme(previous_style, sdk);
+                initialize_base_theme();
+            }
+            return Value::reference(base_theme);
+        }
+        if (api.owner != theme_wrapper_type || receiver != activity)
+            bad("THEME_CONTEXT", "ContextThemeWrapper is not the actual attached Activity");
+        if (setting) {
+            const auto style = static_cast<std::uint32_t>(args[1].bits);
+            if (activity_theme_resource != style) {
+                activity_theme_resource = style;
+                initialize_activity_theme(receiver);
+            }
+            return Value::nothing();
+        }
+        if (!current_activity_theme) {
+            const auto sdk = theme_target_sdk(receiver);
+            context(receiver);
+            activity_theme_resource = select_default_theme(activity_theme_resource, sdk);
+            initialize_activity_theme(receiver);
+        }
+        return Value::reference(current_activity_theme);
+    }
+    Value theme_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_ARGUMENT", "Theme operation requires its receiver");
+        (void)theme_state(args[0].bits);
+        if (api.name == "getResources" && args.size() == 1)
+            return theme_state(args[0].bits).references[0];
+        if (api.name == "rebase" && args.size() == 1) {
+            ManagedRoot theme_root(runtime, args[0].bits);
+            const auto resource = theme_state(args[0].bits).references[0].bits;
+            ManagedRoot resource_root(runtime, resource);
+            const auto manager = resource_assets(resource);
+            ManagedRoot manager_root(runtime, manager);
+            bind_asset_sources(manager);
+            ProviderWorkCharge provider_charge{runtime};
+            const SdkResourceWork charge(std::ref(provider_charge));
+            // Layers are unresolved keys, so unchanged source/configuration
+            // re-evaluates them directly without a stale resolved-entry cache.
+            for (const auto &layer : theme_state(args[0].bits).layers) {
+                charge(1);
+                (void)actual_style_bag(layer.style, charge);
+            }
+            return Value::nothing();
+        }
+        if (api.name == "applyStyle" && args.size() == 3 && args[1].kind == dex::ValueKind::word && args[2].kind == dex::ValueKind::word) {
+            theme_apply(args[0].bits, static_cast<std::uint32_t>(args[1].bits), args[2].bits != 0);
+            return Value::nothing();
+        }
+        if (api.name == "setTo" && args.size() == 2 && args[1].kind == dex::ValueKind::reference) {
+            theme_set_to(args[0].bits, args[1].bits);
+            return Value::nothing();
+        }
+        if (api.name == "obtainStyledAttributes") return obtain_theme_attributes(args);
+        bad("THEME_ARGUMENT", "Theme operation has invalid arguments");
+    }
+    apk::ResourceConfiguration theme_resource_configuration() const {
+        apk::ResourceConfiguration target{static_cast<std::uint16_t>(configuration.density_dpi), compatibility_sdk,
+                                          apk::ResourceSelectionPolicy::runtime_display};
+        target.orientation = static_cast<std::uint8_t>(configuration.orientation());
+        target.width_dp = static_cast<std::uint16_t>(configuration.screen_width_dp);
+        target.height_dp = static_cast<std::uint16_t>(configuration.screen_height_dp);
+        target.smallest_width_dp = static_cast<std::uint16_t>(configuration.smallest_screen_width_dp);
+        return target;
+    }
+    std::optional<bool> window_theme_boolean(ObjectId object, std::uint32_t attribute) const {
+        try {
+            const auto &metadata = theme_state(object);
+            ProviderWorkCharge provider_charge{runtime};
+            const std::function<void(std::uint64_t)> charge(std::ref(provider_charge));
+            const auto item = resolve_styled_attribute(resources, metadata.layers, attribute, theme_resource_configuration(), charge);
+            if (item.presence == StyledAttributePresence::absent) return false;
+            if (item.presence == StyledAttributePresence::present && item.scalar == StyledScalarStatus::ready &&
+                item.value.type >= 0x10 && item.value.type <= 0x1f) return item.value.data != 0;
+            return {};
+        } catch (const apk::InspectError &error) {
+            if (error.diagnostic.code == "AETHER_RESOURCES_NOT_FOUND" || error.diagnostic.code == "AETHER_RESOURCES_UNSUPPORTED")
+                return {};
+            throw;
+        }
+    }
+    Value action_bar() {
+        if (!activity || !activity_attached)
+            bad("ACTION_BAR_UNSUPPORTED", "ActionBar query requires the attached Activity's window profile");
+        const auto receiver = activity;
+        ManagedRoot receiver_root(runtime, receiver);
+        const auto selected = runtime.invoke_virtual_named(receiver, "getTheme", "()Landroid/content/res/Resources$Theme;");
+        ManagedRoot theme_root(runtime, selected.bits);
+        context(receiver);
+        const auto no_title = window_theme_boolean(selected.bits, 0x01010056u);
+        if (no_title && *no_title) return Value::reference(0);
+        const auto bar_enabled = window_theme_boolean(selected.bits, 0x010102cdu);
+        if (bar_enabled && !*bar_enabled) return Value::reference(0);
+        if (no_title && !*no_title && bar_enabled && *bar_enabled)
+            bad("ACTION_BAR_UNSUPPORTED", "The actual Activity theme requires an unimplemented ActionBar");
+        bad("ACTION_BAR_UNSUPPORTED", "The actual Activity theme does not prove an absent ActionBar");
+    }
+    void validate_asset_sources(const apk::ResourceTable &table, const SdkResourceWork &work = {}) const {
+        const auto *metadata = dynamic_cast<const AssetSourcesState *>(runtime.host_state(asset_manager));
+        if (!metadata) {
+            if (runtime.host_state(asset_manager)) bad("ASSET_SOURCES", "AssetManager has incompatible provider state");
+            return; // No cookie has been issued yet.
+        }
+        const auto sources = table.sources();
+        if (metadata->owner != this || !metadata->sdk_data || !metadata->sdk_size ||
+            metadata->bindings.size() != sources.size() + 1 || !metadata->bindings.front().sdk)
+            bad("ASSET_SOURCES", "AssetManager source custody differs from the actual Resources");
+        const auto same_name = [&](std::string_view left, std::string_view right) {
+            if (work) work(1);
+            if (left.size() != right.size()) return false;
+            for (std::size_t offset = 0; offset < left.size(); ++offset) {
+                if (work) work(1);
+                if (left[offset] != right[offset]) return false;
+            }
+            return true;
+        };
+        std::uint64_t string_base = 0;
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            const auto &source = sources[index];
+            const auto &binding = metadata->bindings[index + 1];
+            if (work) work(1);
+            if (binding.sdk || binding.source_id != index + 1 || !same_name(binding.container, source.container) ||
+                binding.string_count != source.string_count || source.string_base != string_base)
+                bad("ASSET_SOURCES", "Resource reselection changed an issued AssetManager source identity");
+            string_base += source.string_count;
+        }
+    }
+    void bind_asset_sources(ObjectId manager = 0) {
+        if (!manager) manager = asset_manager;
+        ManagedRoot manager_root(runtime, manager);
+        const auto source_owner = asset_source_owner(manager);
+        ManagedRoot source_root(runtime, source_owner);
+        ProviderWorkCharge provider_charge{runtime};
+        const SdkResourceWork charge(std::ref(provider_charge));
+        validate_asset_sources(resources, charge);
+        if (runtime.host_state(source_owner)) return;
+        const auto admitted = runtime.host_state_capacity(source_owner);
+        constexpr auto work_bytes = sizeof(ProviderWorkCharge) + sizeof(SdkResourceWork);
+        if (admitted < work_bytes) bad("ASSET_SOURCE_LIMIT", "Source-binding callback storage exceeds managed admission");
+        const auto available = admitted - work_bytes;
+        const auto sources = resources.sources();
+        if (sources.size() >= static_cast<std::size_t>(INT32_MAX) || available < sizeof(AssetSourcesState) ||
+            sources.size() + 1 > (available - sizeof(AssetSourcesState)) / sizeof(AssetSourceBinding))
+            bad("ASSET_SOURCE_LIMIT", "Actual source-cookie metadata exceeds its managed admission");
+        const auto sdk_bytes = embedded_sdk_resource_bytes();
+        auto metadata = std::make_unique<AssetSourcesState>();
+        metadata->owner = this; metadata->sdk_data = sdk_bytes.data(); metadata->sdk_size = sdk_bytes.size();
+        metadata->bindings.reserve(sources.size() + 1);
+        if (metadata->bindings.capacity() > (available - sizeof(AssetSourcesState)) / sizeof(AssetSourceBinding))
+            bad("ASSET_SOURCE_LIMIT", "Actual source vector capacity exceeds its managed admission");
+        auto actual_bytes = sizeof(AssetSourcesState) + metadata->bindings.capacity() * sizeof(AssetSourceBinding);
+        const auto admit_name = [&](std::size_t bytes) {
+            if (bytes > available - actual_bytes)
+                bad("ASSET_SOURCE_LIMIT", "Actual source name capacity exceeds its managed admission");
+            actual_bytes += bytes;
+        };
+        charge(1);
+        metadata->bindings.push_back({{}, 0, 0, true});
+        admit_name(metadata->bindings.back().container.capacity() + 1);
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            charge(1);
+            metadata->bindings.push_back({{}, static_cast<std::uint32_t>(index + 1), sources[index].string_count, false});
+            auto &name = metadata->bindings.back().container;
+            const auto previous_capacity = name.capacity();
+            admit_name(previous_capacity + 1);
+            const auto growth = sources[index].container.size() > previous_capacity ? sources[index].container.size() - previous_capacity : 0;
+            if (growth > available - actual_bytes)
+                bad("ASSET_SOURCE_LIMIT", "Actual source name exceeds its managed admission");
+            charge(sources[index].container.size()); charge(1);
+            name.assign(sources[index].container);
+            if (name.capacity() > previous_capacity) admit_name(name.capacity() - previous_capacity);
+        }
+        charge(metadata->bindings.size()); // One final actual capacity consistency scan.
+        if (metadata->bytes() != actual_bytes)
+            bad("ASSET_SOURCE_LIMIT", "Source metadata capacity accounting is inconsistent");
+        runtime.set_host_state(source_owner, std::move(metadata));
+        validate_asset_sources(resources, charge);
+    }
+    // Trusted JNI callback helper: fixed live state only, with no allocation,
+    // collection, class loading, guest dispatch or work-context creation.
+    std::uint64_t *native_manager_issuance(ObjectId object) const noexcept {
+        if (!attached || !object || object > native_asset_manager_identity_mask || !asset_manager) return nullptr;
+        const auto *sources = dynamic_cast<const AssetSourcesState *>(runtime.find_host_state(asset_manager));
+        if (!sources || sources->owner != this || !sources->native_prepared ||
+            !sources->sdk_data || !sources->sdk_size || sources->bindings.empty()) return nullptr;
+        if (object == asset_manager) return &sources->native_issued_token;
+        const auto *manager = dynamic_cast<const AssetManagerObjectState *>(runtime.find_host_state(object));
+        if (!manager || manager->owner != this || manager->references[0].bits != asset_manager ||
+            manager->native_source_instance != sources || manager->native_configuration_origin != resource_source_origin)
+            return nullptr;
+        return &manager->native_issued_token;
+    }
+    std::uint32_t asset_cookie(bool sdk, std::uint32_t source_id, ObjectId manager = 0) const {
+        const auto source_owner = asset_source_owner(manager ? manager : asset_manager);
+        const auto *metadata = dynamic_cast<const AssetSourcesState *>(runtime.host_state(source_owner));
+        if (!metadata || metadata->owner != this) bad("ASSET_SOURCES", "No actual source-cookie binding exists");
+        for (std::size_t index = 0; index < metadata->bindings.size(); ++index) {
+            runtime.charge_provider_work(1);
+            const auto &binding = metadata->bindings[index];
+            if (binding.sdk == sdk && (sdk || binding.source_id == source_id))
+                return static_cast<std::uint32_t>(index + 1);
+        }
+        bad("ASSET_SOURCES", "The selected resource has no actual held source cookie");
+    }
+    struct ResourceScalar {
+        apk::ResourceValue value{};
+        std::uint32_t id = 0, flags = 0, source_id = 0;
+        std::uint16_t density = 0;
+        bool sdk = false;
+    };
+    [[noreturn]] void resource_failure(ResourceFailure cause, bool defer = false) {
+        if (defer) throw DeferredResourceFailure{cause};
+        switch (cause) {
+        case ResourceFailure::sdk_absent:
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"SDK resource ID is not defined");
+        case ResourceFailure::sdk_configuration:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"SDK resource selection requires unsupported configuration facts");
+        case ResourceFailure::sdk_scalar:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"SDK resource has no implemented scalar representation");
+        case ResourceFailure::app_configuration:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Resource exists only in unsupported or ineligible configurations");
+        case ResourceFailure::app_absent:
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Resource ID is not defined");
+        case ResourceFailure::app_source:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Resource requires a complex value or unavailable actual-source provenance");
+        case ResourceFailure::app_type:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Dynamic or unknown resource value types are not implemented");
+        case ResourceFailure::cyclic_reference:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Cyclic resource references are unsupported");
+        case ResourceFailure::reference_depth:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Resource reference resolution exceeds 32 levels");
+        case ResourceFailure::drawable_theme:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Drawable theme attributes require source-aware style configuration provenance");
+        case ResourceFailure::drawable_format:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"This runtime drawable file format is not implemented");
+        case ResourceFailure::drawable_absent:
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Selected drawable file is absent from its held package");
+        case ResourceFailure::vector_dimension:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Vector dimensions require unavailable font or physical display metrics");
+        case ResourceFailure::xml_type:
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Resource does not name an XML file");
+        case ResourceFailure::xml_absent:
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Selected XML file is absent from its held package");
+        case ResourceFailure::xml_sdk_backing:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Selected SDK XML has no authenticated embedded backing");
+        }
+        bad("RESOURCE_VALUE_STATE", "Resource failure cause is not recognized");
+    }
+    ResourceScalar resource_scalar(std::uint32_t id, bool defer_exceptions = false) {
+        if ((id >> 24) == 1) {
+            ProviderWorkCharge provider_charge{runtime};
+            const SdkResourceWork charge(std::ref(provider_charge));
+            const auto selected = embedded_sdk_resources().scalar(id, theme_resource_configuration(), charge);
+            if (selected.status == SdkResourceStatus::absent)
+                resource_failure(ResourceFailure::sdk_absent, defer_exceptions);
+            if (selected.status == SdkResourceStatus::unresolved)
+                resource_failure(ResourceFailure::sdk_configuration, defer_exceptions);
+            if (selected.complex || (selected.status == SdkResourceStatus::unsupported && selected.value.type != 3))
+                resource_failure(ResourceFailure::sdk_scalar, defer_exceptions);
+            return {{selected.source_data, selected.value.type}, selected.resource_id, selected.native_flags,
+                     0, selected.density, true};
+        }
+        const auto found = resources.entries().find(id);
+        if (found == resources.entries().end()) {
+            if (resources.declaration_flags(id))
+                resource_failure(ResourceFailure::app_configuration, defer_exceptions);
+            resource_failure(ResourceFailure::app_absent, defer_exceptions);
+        }
+        const auto &selected = found->second;
+        if (selected.complex || !selected.source_id || selected.source_id > resources.sources().size())
+            resource_failure(ResourceFailure::app_source, defer_exceptions);
+        const auto type = selected.value_type;
+        if (type > 6 && (type < 0x10 || type > 0x1f))
+            resource_failure(ResourceFailure::app_type, defer_exceptions);
+        return {{selected.source_data, type}, selected.id, selected.native_flags,
+                 selected.source_id, selected.density, false};
+    }
+    // Shared scalar selection for TypedValue and drawable consumers. The final
+    // selection keeps its actual source/data/density/ID; configuration flags
+    // include every traversed reference. No theme-attribute coercion occurs here.
+    ResourceScalar resolve_resource_scalar(std::uint32_t id, bool resolve_references, bool defer_exceptions = false) {
+        ResourceScalar selected;
+        std::uint32_t flags = 0;
+        std::array<std::uint32_t, 32> visited;
+        for (std::size_t depth = 0; depth < visited.size(); ++depth) {
+            // One actual reference-hop visit; the source reader accounts its
+            // own work independently of this initialized-prefix cycle scan.
+            runtime.charge_provider_work(1);
+            for (std::size_t previous = 0; previous < depth; ++previous) {
+                runtime.charge_provider_work(1);
+                if (visited[previous] == id)
+                    resource_failure(ResourceFailure::cyclic_reference, defer_exceptions);
+            }
+            visited[depth] = id;
+            selected = resource_scalar(id, defer_exceptions);
+            flags |= selected.flags;
+            // Native ResolveReference leaves a zero reference raw, including
+            // when resolveRefs is true. TYPE_ATTRIBUTE is not theme resolution.
+            if (!resolve_references || selected.value.type != 1 || !selected.value.data) {
+                selected.flags = flags;
+                return selected;
+            }
+            id = selected.value.data;
+        }
+        resource_failure(ResourceFailure::reference_depth, defer_exceptions);
+    }
+    Value resource_get_value(std::span<const Value> args) {
+        if (args.size() != 4 || args[0].kind != dex::ValueKind::reference ||
+            args[1].kind != dex::ValueKind::word || args[3].kind != dex::ValueKind::word ||
+            (args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)))
+            bad("RESOURCE_VALUE_ARGUMENT", "getValue requires Resources, ID, TypedValue and resolveRefs flag");
+        const auto output = args[2].bits;
+        if (!output) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot resources_root(runtime, args[0].bits), output_root(runtime, output);
+        const auto manager = resource_assets(args[0].bits);
+        ManagedRoot manager_root(runtime, manager);
+        (void)typed_value_state(output);
+        bind_asset_sources(manager);
+        const auto selected = resolve_resource_scalar(static_cast<std::uint32_t>(args[1].bits), args[3].bits != 0);
+        const auto cookie = asset_cookie(selected.sdk, selected.source_id, manager);
+        ObjectId text = 0;
+        if (selected.value.type == 3) {
+            const auto available = runtime.host_state_capacity(output);
+            const auto old_bytes = typed_value_state(output).bytes();
+            ProviderWorkCharge provider_charge{runtime};
+            const SdkResourceWork charge(std::ref(provider_charge));
+            constexpr auto fixed_work = sizeof(ProviderWorkCharge) + sizeof(SdkResourceWork);
+            if (available < old_bytes + sizeof(TypedValueState) + sizeof(std::u16string) + fixed_work)
+                bad("RESOURCE_VALUE_LIMIT", "Resource string scratch exceeds available managed storage");
+            const auto working = available - old_bytes - sizeof(TypedValueState) - fixed_work;
+            const auto maximum_units = (working - sizeof(std::u16string)) / sizeof(char16_t);
+            if (!maximum_units) bad("RESOURCE_VALUE_LIMIT", "Resource string has no admitted terminator storage");
+            const auto decoded = selected.sdk
+                ? embedded_sdk_resources().pooled_string(selected.value.data, maximum_units - 1, charge)
+                : resources.pooled_string(selected.source_id, selected.value.data, maximum_units - 1);
+            const auto scratch = sizeof(decoded) + (decoded.capacity() + 1) * sizeof(char16_t);
+            if (scratch > working || decoded.size() + 1 > (working - scratch) / sizeof(char16_t))
+                bad("RESOURCE_VALUE_LIMIT", "Owned resource text and its managed copy exceed their admitted peak storage");
+            text = runtime.new_string(decoded);
+        }
+        ManagedRoot text_root(runtime, text);
+        // Reacquire initialized mutable state after all allocations/collection;
+        // nativeCopyValue does not write sourceResourceId, so retain that field.
+        auto next = std::make_unique<TypedValueState>(typed_value_state(output));
+        next->numbers[0] = selected.value.type;
+        next->numbers[1] = selected.value.data;
+        next->numbers[2] = cookie;
+        next->numbers[3] = selected.id;
+        next->numbers[4] = java_configuration_flags(selected.flags);
+        next->numbers[5] = selected.density;
+        next->references[0] = Value::reference(text);
+        runtime.set_host_state(output, std::move(next));
+        return Value::nothing();
+    }
+    Value resource_color_api(const ApiSupport &api, std::span<const Value> args) {
+        const bool themed = api.signature == "(ILandroid/content/res/Resources$Theme;)I";
+        if ((!themed && api.signature != "(I)I") || args.size() != (themed ? 3u : 2u) ||
+            args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word ||
+            (themed && args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)))
+            bad("RESOURCE_COLOR_ARGUMENT", "Color query requires its actual Resources, integer ID and optional Theme");
+        const auto receiver = args[0].bits;
+        ManagedRoot resource_root(runtime, receiver), theme_root(runtime, themed ? args[2].bits : 0);
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!themed) {
+            // Original virtual overload, independent of APK method-reference
+            // inventory. Do not inspect the implementation before its override.
+            const std::array call{args[1], Value::reference(0)};
+            return runtime.invoke_virtual_named(receiver, "getColor", "(ILandroid/content/res/Resources$Theme;)I", call);
+        }
+        (void)compatible_resource_impl(receiver);
+        // Resources calls its private ResourcesImpl.getValue, not the public
+        // overridable Resources.getValue. The existing resolver retains actual
+        // configuration/source identity and reference-hop work/diagnostics.
+        const auto requested = static_cast<std::uint32_t>(args[1].bits);
+        const auto selected = resolve_resource_scalar(requested, true);
+        runtime.charge_provider_work(1);
+        if (selected.value.type >= 0x10 && selected.value.type <= 0x1f)
+            return Value::word(selected.value.data); // Includes every SDK integer/color kind.
+        if (selected.value.type == 3)
+            bad("RESOURCE_COLOR_COMPLEX_UNSUPPORTED", "ColorStateList loading requires its actual source/theme-aware complex-color consumer");
+        // A complete scalar with a non-string/non-integer type is the SDK's
+        // genuine wrong-type branch. Allocate NEW before constructing its message.
+        const auto exception = runtime.new_object("Landroid/content/res/Resources$NotFoundException;");
+        ManagedRoot exception_root(runtime, exception);
+        runtime.charge_provider_work(64);
+        std::array<char16_t, 64> message{}; // Fixed numeric representation, never an app-size allowance.
+        std::size_t length = 0;
+        const auto append = [&](std::u16string_view text) {
+            runtime.charge_provider_work(text.size());
+            for (const auto character : text) message[length++] = character;
+        };
+        const auto hex = [&](std::uint32_t value) {
+            constexpr std::u16string_view digits = u"0123456789abcdef";
+            bool emitted = false;
+            for (int shift = 28; shift >= 0; shift -= 4) {
+                runtime.charge_provider_work(1);
+                const auto digit = (value >> shift) & 15u;
+                if (digit || emitted || !shift) {
+                    runtime.charge_provider_work(1);
+                    message[length++] = digits[digit]; emitted = true;
+                }
+            }
+        };
+        append(u"Resource ID #0x"); hex(requested);
+        append(u" type #0x"); hex(selected.value.type);
+        append(u" is not valid");
+        const auto text = runtime.new_host_string(std::u16string_view(message.data(), length), sizeof(message));
+        ManagedRoot text_root(runtime, text);
+        runtime.raise_existing_with_message_and_cause(exception, text, 0);
+    }
+    Value resource_numeric_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+            bad("RESOURCE_VALUE_ARGUMENT", "Numeric resource query requires its Resources receiver and integer ID");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)compatible_resource_impl(args[0].bits);
+        ManagedRoot resources_root(runtime, args[0].bits);
+        const auto selected = resolve_resource_scalar(static_cast<std::uint32_t>(args[1].bits), true);
+        if (api.name == "getBoolean" || api.name == "getInteger") {
+            if (selected.value.type < 0x10 || selected.value.type > 0x1f)
+                runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Selected resource is not an integer or Boolean value");
+            return Value::word(api.name == "getBoolean" ? static_cast<std::uint32_t>(selected.value.data != 0) : selected.value.data);
+        }
+        if (selected.value.type != 5)
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Selected resource is not a dimension");
+        runtime.charge_provider_work(1);
+        if (api.name == "getDimension")
+            return Value::word(std::bit_cast<std::uint32_t>(dimension_value(selected.value.data, configuration.density_dpi)));
+        const auto pixels = api.name == "getDimensionPixelOffset"
+            ? dimension_pixel_offset(selected.value.data, configuration.density_dpi)
+            : dimension_pixel_size(selected.value.data, configuration.density_dpi);
+        return Value::word(std::bit_cast<std::uint32_t>(pixels));
+    }
+    DrawableSourceFacts drawable_source(std::uint32_t requested, const ResourceScalar &selected, ObjectId manager) {
+        DrawableSourceFacts source;
+        source.requested_id = requested; source.resource_id = selected.id;
+        source.source_id = selected.source_id; source.source_data = selected.value.data;
+        source.cookie = asset_cookie(selected.sdk, selected.source_id, manager);
+        source.selected_flags = resource_scalar(selected.id).flags;
+        source.reference_flags = selected.flags;
+        source.source_density = selected.density; source.target_density = configuration.density_dpi;
+        source.value_type = selected.value.type; source.sdk = selected.sdk;
+        source.configuration = theme_resource_configuration();
+        return source;
+    }
+    Value resource_get_drawable(std::span<const Value> args) {
+        if ((args.size() != 2 && args.size() != 3) || args[0].kind != dex::ValueKind::reference ||
+            args[1].kind != dex::ValueKind::word ||
+            (args.size() == 3 && args[2].kind != dex::ValueKind::reference &&
+                !(args[2].kind == dex::ValueKind::word && !args[2].bits)))
+            bad("DRAWABLE_ARGUMENT", "getDrawable requires Resources, an integer ID and an optional Theme");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)compatible_resource_impl(receiver);
+        const auto theme = args.size() == 3 ? args[2].bits : 0;
+        ManagedRoot resources_root(runtime, receiver), theme_root(runtime, theme);
+        const auto manager = resource_assets(receiver);
+        ManagedRoot manager_root(runtime, manager);
+        if (theme) (void)theme_state(theme);
+        bind_asset_sources(manager);
+        const auto requested = static_cast<std::uint32_t>(args[1].bits);
+        const auto selected = resolve_resource_scalar(requested, true);
+        const auto source = drawable_source(requested, selected, manager);
+        if (selected.value.type >= 0x1c && selected.value.type <= 0x1f) {
+            const auto object = runtime.new_object(color_drawable_type);
+            ManagedRoot object_root(runtime, object);
+            if (runtime.host_state_capacity(object) < sizeof(ColorDrawableObjectState))
+                bad("DRAWABLE_LIMIT", "Color drawable storage exceeds available managed admission");
+            auto metadata = std::make_unique<ColorDrawableObjectState>(this, source, selected.value.data, theme);
+            runtime.set_host_state(object, std::move(metadata));
+            return Value::reference(object);
+        }
+        if (selected.value.type != 3)
+            runtime.raise("Landroid/content/res/Resources$NotFoundException;", u"Resource is not a drawable color or file path");
+        if (selected.sdk)
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"SDK drawable file bytes are not present in the embedded metadata source");
+        if (!resource_file_reader)
+            bad("DRAWABLE_UNSUPPORTED", "Runtime drawable loading requires its held-package member reader");
+        if (runtime.class_definition(vector_state_type))
+            bad("DRAWABLE_TYPE", "Package class collides with the internal vector resource carrier");
+        // Allocate and root both managed owners before measuring native scratch.
+        // No guest callback or managed allocation occurs during parsing.
+        const auto carrier = runtime.new_object(vector_state_type);
+        ManagedRoot carrier_root(runtime, carrier);
+        const auto object = runtime.new_object(vector_drawable_type);
+        ManagedRoot object_root(runtime, object);
+        const auto available = runtime.host_state_capacity(carrier);
+        if (available < sizeof(VectorDrawableState) + sizeof(DrawableObjectState))
+            bad("DRAWABLE_LIMIT", "Vector drawable owners exceed available managed admission");
+        auto metadata = std::make_unique<VectorDrawableState>(this, source, theme);
+        auto instance = std::make_unique<DrawableObjectState>(this, carrier);
+        const auto found = resources.entries().find(selected.id);
+        if (found == resources.entries().end() || found->second.source_id != selected.source_id ||
+            found->second.source_data != selected.value.data || found->second.value_type != 3)
+            bad("DRAWABLE_SOURCE", "Selected drawable no longer matches its actual held resource source");
+        const auto &entry = found->second;
+        const auto path = resources.string_value(entry);
+        const auto &container = resources.sources()[selected.source_id - 1].container;
+        if (entry.container != container)
+            bad("DRAWABLE_SOURCE", "Selected drawable container disagrees with its source-cookie binding");
+        if (!path.ends_with(".xml"))
+            resource_failure(ResourceFailure::drawable_format, true);
+        const auto remaining = [&](std::size_t allowance, std::size_t cost) {
+            if (cost > allowance) bad("DRAWABLE_LIMIT", "Actual drawable storage exceeds available managed admission");
+            return allowance - cost;
+        };
+        auto working = remaining(remaining(available, metadata->bytes()), instance->bytes());
+        // Admit the next copy against actual capacity retained by the previous
+        // assignment. Fresh strings have no old heap allocation to duplicate.
+        (void)remaining(working, path.size() > metadata->path.capacity()
+            ? path.size() - metadata->path.capacity() : 0);
+        runtime.charge_provider_work(path.size());
+        runtime.charge_provider_work(1);
+        metadata->path.assign(path);
+        working = remaining(remaining(available, metadata->bytes()), instance->bytes());
+        (void)remaining(working, container.size() > metadata->container.capacity()
+            ? container.size() - metadata->container.capacity() : 0);
+        runtime.charge_provider_work(container.size());
+        runtime.charge_provider_work(1);
+        metadata->container.assign(container);
+        working = remaining(remaining(available, metadata->bytes()), instance->bytes());
+        struct ProviderCharge {
+            dex::ManagedRuntime &runtime;
+            void operator()(std::uint64_t count) const { runtime.charge_provider_work(count); }
+        } provider_charge{runtime};
+        struct ScalarResolver {
+            Impl &session;
+            std::uint32_t &flags;
+            apk::RuntimeVectorScalar operator()(std::uint8_t type, std::uint32_t data) const {
+                if (type == 2)
+                    session.resource_failure(ResourceFailure::drawable_theme, true);
+                if (type != 1)
+                    bad("DRAWABLE_VALUE", "Vector resolver received a nonreference value");
+                const auto value = session.resolve_resource_scalar(data, true, true);
+                flags |= value.flags;
+                return {value.value.type, value.value.data};
+            }
+        } scalar_resolver{*this, metadata->dependency_flags};
+        // reference_wrapper construction of std::function cannot allocate.
+        const std::function<void(std::uint64_t)> charge(std::ref(provider_charge));
+        const apk::RuntimeVectorResolver resolve(std::ref(scalar_resolver));
+        working = remaining(working, sizeof(provider_charge) + sizeof(scalar_resolver) + sizeof(charge) + sizeof(resolve) +
+                                      sizeof(std::optional<std::vector<std::uint8_t>>));
+        {
+            std::optional<std::vector<std::uint8_t>> encoded;
+            {
+                if (resource_read_active) bad("DRAWABLE_STATE", "Held drawable reader cannot reenter");
+                struct ReadScope {
+                    bool &active;
+                    explicit ReadScope(bool &value) : active(value) { active = true; }
+                    ~ReadScope() { active = false; }
+                } read_scope(resource_read_active);
+                encoded = resource_file_reader(metadata->container, metadata->path, working);
+            }
+            if (!encoded)
+                resource_failure(ResourceFailure::drawable_absent, true);
+            if (encoded->capacity() > working)
+                bad("DRAWABLE_LIMIT", "Encoded drawable capacity exceeds available managed admission");
+            const auto xml = apk::decode_runtime_xml(*encoded,
+                working - (encoded->capacity() - encoded->size()), charge);
+            auto model_working = remaining(working, encoded->capacity());
+            model_working = remaining(model_working, xml.storage_bytes());
+            model_working = remaining(model_working, sizeof(apk::RuntimeVector));
+            metadata->vector = apk::parse_runtime_vector(xml, resolve, model_working, charge);
+        } // Encoded bytes and XML release before publishing native model custody.
+        if ((metadata->vector.width_dimension & 15u) > 1 || (metadata->vector.height_dimension & 15u) > 1)
+            resource_failure(ResourceFailure::vector_dimension, true);
+        (void)remaining(remaining(available, metadata->bytes()), instance->bytes());
+        runtime.set_host_state(carrier, std::move(metadata));
+        runtime.set_host_state(object, std::move(instance));
+        return Value::reference(object);
+    }
+    Value context_get_drawable(std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+            bad("DRAWABLE_ARGUMENT", "Context.getDrawable requires its receiver and integer ID");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver);
+        const auto resources_value = runtime.invoke_virtual_named(receiver, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot resources_root(runtime, resources_value.bits);
+        const auto theme = runtime.invoke_virtual_named(receiver, "getTheme", "()Landroid/content/res/Resources$Theme;");
+        ManagedRoot theme_root(runtime, theme.bits);
+        const std::array arguments{args[1], theme};
+        return runtime.invoke_virtual_named(resources_value.bits, "getDrawable",
+            "(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;", arguments);
+    }
+    std::size_t title_working_capacity() {
+        const auto capacity = runtime.host_state_capacity(activity);
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(activity));
+        if (!metadata) bad("ACTIVITY_TITLE_STATE", "Activity has no authenticated title storage");
+        const auto fixed = metadata->bytes() + sizeof(ActivityIntentState) + sizeof(std::u16string) +
+            sizeof(ProviderWorkCharge) + sizeof(SdkResourceWork);
+        if (capacity < fixed) bad("ACTIVITY_TITLE_LIMIT", "Activity title has no admitted scratch storage");
+        return capacity - fixed;
+    }
+    ObjectId initial_activity_title() {
+        if (!package_metadata || !package_metadata->activity_label_bound)
+            bad("ACTIVITY_TITLE_UNSUPPORTED", "Activity title provenance is unavailable");
+        bind_asset_sources();
+        const auto publish = [&](std::u16string_view text, std::size_t scratch) {
+            const auto capacity = title_working_capacity();
+            if (scratch > capacity || text.size() == SIZE_MAX ||
+                text.size() + 1 > (capacity - scratch) / sizeof(char16_t))
+                bad("ACTIVITY_TITLE_LIMIT", "Activity title and its managed copy exceed admitted storage");
+            runtime.charge_provider_work(text.size());
+            return runtime.new_host_string(text, scratch + sizeof(std::u16string) + sizeof(ActivityIntentState) +
+                sizeof(ProviderWorkCharge) + sizeof(SdkResourceWork));
+        };
+        const auto resolve = [&](const apk::DisplayValue &label) -> std::optional<ObjectId> {
+            if (!label.type || (label.type == 1 && !label.reference)) return {};
+            if (label.type == 3) {
+                const auto capacity = title_working_capacity();
+                if (capacity < sizeof(std::wstring) || label.literal.size() == SIZE_MAX ||
+                    label.literal.size() + 1 > (capacity - sizeof(std::wstring)) / (sizeof(wchar_t) + sizeof(char16_t)))
+                    bad("ACTIVITY_TITLE_LIMIT", "Manifest title conversion exceeds admitted scratch storage");
+                runtime.charge_provider_work(label.literal.size());
+                const auto decoded = unicode(label.literal);
+                return publish(decoded, (decoded.capacity() + 1) * sizeof(char16_t));
+            }
+            if (label.type != 1)
+                bad("ACTIVITY_TITLE_UNSUPPORTED", "Manifest label requires an unimplemented value coercion");
+            ResourceScalar selected;
+            try { selected = resolve_resource_scalar(label.reference, true, true); }
+            catch (const DeferredResourceFailure &failure) {
+                if (failure.cause == ResourceFailure::app_absent || failure.cause == ResourceFailure::sdk_absent) return {};
+                resource_failure(failure.cause);
+            }
+            if (!selected.value.type || (selected.value.type == 1 && !selected.value.data)) return {};
+            if (selected.value.type != 3)
+                bad("ACTIVITY_TITLE_UNSUPPORTED", "Selected label is not a supported authentic string");
+            const auto capacity = title_working_capacity();
+            if (capacity < sizeof(char16_t)) bad("ACTIVITY_TITLE_LIMIT", "Label pool has no admitted terminator storage");
+            const auto maximum_units = capacity / sizeof(char16_t) - 1;
+            ProviderWorkCharge provider_charge{runtime};
+            const SdkResourceWork charge(std::ref(provider_charge));
+            const auto decoded = selected.sdk
+                ? embedded_sdk_resources().pooled_string(selected.value.data, maximum_units, charge)
+                : resources.pooled_string(selected.source_id, selected.value.data, maximum_units);
+            return publish(decoded, (decoded.capacity() + 1) * sizeof(char16_t));
+        };
+        if (const auto title = resolve(package_metadata->activity_label)) return *title;
+        if (const auto title = resolve(package_metadata->application_label)) return *title;
+        return publish(package_metadata->activity_name, 0);
+    }
+    Value activity_title(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("ACTIVITY_TITLE_ARGUMENT", "Activity.getTitle requires its Activity receiver");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver);
+        if (!runtime.assignable(receiver, "Landroid/app/Activity;"))
+            bad("ACTIVITY_TITLE_STATE", "Title receiver is not an Activity");
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!metadata) bad("ACTIVITY_TITLE_STATE", "Activity has no authenticated title storage");
+        if (!metadata->title_known)
+            bad("ACTIVITY_TITLE_UNSUPPORTED", "Activity title was not resolved under admitted startup and held-label provenance");
+        return metadata->references[2];
+    }
+    Value context_class_loader(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_ARGUMENT", "Context.getClassLoader requires its actual receiver");
+        const auto receiver = args[0].bits;
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot receiver_root(runtime, receiver);
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Abstract Context.getClassLoader has no executable base body");
+        context(receiver);
+        if (api.owner == "Landroid/content/ContextWrapper;") {
+            const auto base = wrapper_base_context(receiver);
+            ManagedRoot base_root(runtime, base.bits);
+            return runtime.invoke_virtual_named(base.bits, "getClassLoader", "()Ljava/lang/ClassLoader;");
+        }
+        if (api.owner != context_impl_type)
+            bad("CONTEXT_CLASS_LOADER", "Class loader requires this session's actual base Context");
+        if (receiver != base_context) (void)context_impl_state(receiver);
+        return Value::reference(runtime.class_loader());
+    }
+    const XmlParserState &xml_parser_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const XmlParserState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != xml_parser_type)
+            bad("XML_PARSER_STATE", "XML parser is not an issued parser of this session");
+        return *metadata;
+    }
+    Value resource_get_layout(std::span<const Value> args) {
+        if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+            bad("XML_RESOURCE_ARGUMENT", "Resources.getLayout requires its Resources receiver and integer ID");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)compatible_resource_impl(args[0].bits);
+        ManagedRoot resources_root(runtime, args[0].bits);
+        const auto manager = resource_assets(args[0].bits);
+        ManagedRoot manager_root(runtime, manager);
+        bind_asset_sources(manager);
+        const auto requested = static_cast<std::uint32_t>(args[1].bits);
+        const auto selected = resolve_resource_scalar(requested, true);
+        if (selected.value.type != 3) resource_failure(ResourceFailure::xml_type);
+        const XmlCursorSource source{requested, asset_cookie(selected.sdk, selected.source_id, manager), selected.source_id,
+                                     selected.flags, selected.density, selected.sdk, true};
+        const auto parser = runtime.new_object(xml_parser_type);
+        ManagedRoot parser_root(runtime, parser);
+        const auto admitted = runtime.host_state_capacity(parser);
+        ProviderWorkCharge provider_charge{runtime};
+        const XmlWorkCharge charge(std::ref(provider_charge));
+        const auto remaining = [&](std::size_t available, std::size_t cost) {
+            if (cost > available) bad("XML_RESOURCE_LIMIT", "XML resource storage exceeds existing managed admission");
+            return available - cost;
+        };
+        const auto fixed = sizeof(XmlParserState) + sizeof(provider_charge) + sizeof(charge) +
+            2 * sizeof(std::string) + sizeof(std::u16string) + sizeof(std::optional<std::vector<std::uint8_t>>) + sizeof(apk::Bytes);
+        auto working = remaining(admitted, fixed);
+        std::string path, container;
+        std::optional<std::vector<std::uint8_t>> encoded;
+        apk::Bytes bytes;
+        if (selected.sdk) {
+            // APK and SDK ARSC pools are distinct. Resolve the actual SDK path
+            // first, then borrow only authenticated image-backed file bytes.
+            if (working < 3) bad("XML_RESOURCE_LIMIT", "SDK XML path has no admitted string storage");
+            const auto decoded = embedded_sdk_resources().pooled_string(selected.value.data, working / 3 - 1, charge);
+            const auto decoded_bytes = (decoded.capacity() + 1) * sizeof(char16_t);
+            (void)remaining(remaining(working, decoded_bytes), decoded.size() + 1);
+            path.reserve(decoded.size());
+            (void)remaining(remaining(working, decoded_bytes), path.capacity() + 1);
+            for (const auto unit : decoded) {
+                charge(1);
+                if (unit > 0x7f) bad("XML_RESOURCE_UNSUPPORTED", "SDK XML member paths require supported ASCII source names");
+                charge(1);
+                path.push_back(static_cast<char>(unit));
+            }
+        } else {
+            const auto found = resources.entries().find(selected.id);
+            if (found == resources.entries().end() || found->second.source_id != selected.source_id ||
+                found->second.source_data != selected.value.data || found->second.value_type != 3)
+                bad("XML_RESOURCE_SOURCE", "XML selection no longer matches its actual held ARSC source");
+            const auto &entry = found->second;
+            const auto original_path = resources.string_value(entry);
+            const auto &original_container = resources.sources()[selected.source_id - 1].container;
+            if (entry.container != original_container)
+                bad("XML_RESOURCE_SOURCE", "XML member container disagrees with its source-cookie binding");
+            (void)remaining(remaining(working, original_path.size() + 1), container.capacity() + 1);
+            charge(original_path.size()); charge(1);
+            path.assign(original_path);
+            (void)remaining(remaining(working, path.capacity() + 1), original_container.size() + 1);
+            charge(original_container.size()); charge(1);
+            container = original_container;
+        }
+        working = remaining(remaining(working, path.capacity() + 1), container.capacity() + 1);
+        if (selected.sdk) {
+            const auto embedded = embedded_sdk_resource_file(path, charge);
+            if (!embedded) resource_failure(ResourceFailure::xml_sdk_backing, true);
+            bytes = *embedded;
+        } else {
+            if (!resource_file_reader) bad("XML_RESOURCE_UNSUPPORTED", "XML requires its trusted held-package reader");
+            struct ReadScope {
+                bool &active;
+                explicit ReadScope(bool &value) : active(value) { active = true; }
+                ~ReadScope() { active = false; }
+            };
+            if (resource_read_active) bad("XML_RESOURCE_STATE", "XML member reader cannot reenter");
+            {
+                ReadScope read_scope(resource_read_active);
+                encoded = resource_file_reader(container, path, remaining(working, sizeof(ReadScope)));
+            }
+            if (!encoded) resource_failure(ResourceFailure::xml_absent, true);
+            if (encoded->capacity() > working) bad("XML_RESOURCE_LIMIT", "Encoded XML capacity exceeds existing admission");
+            bytes = *encoded;
+        }
+        const auto excess = encoded ? encoded->capacity() - encoded->size() : 0;
+        auto document = apk::decode_runtime_xml(bytes, remaining(working, excess), charge);
+        auto metadata = std::make_unique<XmlParserState>(this, args[0].bits, std::move(document), source,
+            theme_resource_configuration(), selected.id, selected.value.data);
+        (void)remaining(remaining(admitted, metadata->bytes()),
+            fixed - sizeof(XmlParserState) + sizeof(apk::RuntimeXmlDocument) + path.capacity() + 1 +
+            container.capacity() + 1 + (encoded ? encoded->capacity() : 0));
+        runtime.set_host_state(parser, std::move(metadata));
+        return Value::reference(parser);
+    }
+    void close_xml_parser(ObjectId object) {
+        ManagedRoot parser_root(runtime, object);
+        if (xml_parser_state(object).closed()) return;
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &previous = xml_parser_state(object);
+        if (admitted < previous.bytes() || sizeof(XmlParserState) > admitted - previous.bytes())
+            bad("XML_RESOURCE_LIMIT", "Closing XML state exceeds simultaneous metadata admission");
+        auto next = std::make_unique<XmlParserState>(this);
+        next->started = previous.started; next->decrement_depth = previous.decrement_depth;
+        next->event_type = previous.event_type; next->depth = previous.depth;
+        runtime.set_host_state(object, std::move(next));
+    }
+    Value xml_java_string(ObjectId parser, std::string_view text, std::size_t extra_native_bytes = 0) {
+        ManagedRoot parser_root(runtime, parser);
+        const auto admitted = runtime.host_state_capacity(parser);
+        const auto old_bytes = xml_parser_state(parser).bytes();
+        const auto fixed = sizeof(std::wstring) + sizeof(std::u16string);
+        if (admitted < old_bytes || extra_native_bytes > admitted - old_bytes ||
+            fixed > admitted - old_bytes - extra_native_bytes)
+            bad("XML_RESOURCE_LIMIT", "XML string has no admitted conversion storage");
+        const auto working = admitted - old_bytes - extra_native_bytes - fixed;
+        if (text.size() == SIZE_MAX || text.size() + 1 > working / (sizeof(wchar_t) + sizeof(char16_t)))
+            bad("XML_RESOURCE_LIMIT", "XML string conversion exceeds admitted storage");
+        runtime.charge_provider_work(text.size());
+        const auto decoded = unicode(text);
+        const auto scratch = (decoded.capacity() + 1) * sizeof(char16_t);
+        if (scratch > working || decoded.size() + 1 > (working - scratch) / sizeof(char16_t))
+            bad("XML_RESOURCE_LIMIT", "XML text and its managed copy exceed admitted storage");
+        runtime.charge_provider_work(decoded.size());
+        return Value::reference(runtime.new_host_string(decoded, scratch + fixed + extra_native_bytes));
+    }
+    bool xml_name_matches(std::string_view encoded, std::u16string_view requested) {
+        // Decoded XML owns valid UTF-8. Compare against the guest UTF-16 view
+        // without allocating a second name or retaining guest pointers.
+        std::size_t byte = 0, unit = 0;
+        while (byte < encoded.size()) {
+            runtime.charge_provider_work(1);
+            const auto lead = static_cast<std::uint8_t>(encoded[byte++]);
+            std::uint32_t point = lead;
+            unsigned following = 0;
+            if (lead >= 0xf0) { point = lead & 7u; following = 3; }
+            else if (lead >= 0xe0) { point = lead & 15u; following = 2; }
+            else if (lead >= 0xc0) { point = lead & 31u; following = 1; }
+            for (unsigned index = 0; index < following; ++index) {
+                runtime.charge_provider_work(1);
+                if (byte == encoded.size()) bad("XML_PARSER_STATE", "XML string lost its valid UTF-8 representation");
+                point = (point << 6) | (static_cast<std::uint8_t>(encoded[byte++]) & 63u);
+            }
+            runtime.charge_provider_work(1);
+            if (point <= 0xffff) {
+                if (unit == requested.size() || requested[unit++] != point) return false;
+            } else {
+                point -= 0x10000;
+                if (requested.size() - unit < 2 || requested[unit++] != 0xd800u + (point >> 10)) return false;
+                runtime.charge_provider_work(1);
+                if (requested[unit++] != 0xdc00u + (point & 1023u)) return false;
+            }
+        }
+        return unit == requested.size();
+    }
+    const apk::RuntimeXmlAttribute *xml_named_attribute(ObjectId parser, ObjectId namespace_name, ObjectId name) {
+        const auto &metadata = xml_parser_state(parser);
+        if (metadata.closed()) runtime.raise("Ljava/lang/NullPointerException;", u"Null document");
+        if (!name) runtime.raise("Ljava/lang/NullPointerException;");
+        if (metadata.event_type != 2) return nullptr;
+        const auto namespace_text = namespace_name ? runtime.string(namespace_name) : std::u16string_view{};
+        const auto requested = runtime.string(name);
+        const auto &cursor = metadata.cursor();
+        for (const auto &attribute : cursor.attributes()) {
+            runtime.charge_provider_work(1);
+            const bool present = attribute.namespace_index != apk::runtime_xml_absent;
+            if (present != (namespace_name != 0)) continue;
+            if (present && !xml_name_matches(cursor.document().string(attribute.namespace_index), namespace_text)) continue;
+            if (xml_name_matches(cursor.document().string(attribute.name_index), requested)) return &attribute;
+        }
+        return nullptr;
+    }
+    Value xml_attribute_string(ObjectId parser, const apk::RuntimeXmlAttribute &attribute) {
+        const auto &cursor = xml_parser_state(parser).cursor();
+        if (const auto raw = cursor.raw_string(attribute)) return xml_java_string(parser, *raw);
+        // XmlBlock asks static TypedValue.coerceToString after the raw pool
+        // index is absent. TYPE_STRING has no static pool and returns null.
+        if (attribute.type == 3) return Value::reference(0);
+        if (!attribute.type) runtime.raise("Ljava/lang/IndexOutOfBoundsException;");
+        // Only exact Android scalar representations are emitted here. Floating
+        // point and complex-unit text need Java's distinct formatting contract.
+        std::array<char, 48> buffer{};
+        auto first = buffer.data();
+        auto limit = first + buffer.size();
+        if (attribute.type == 0x12) return xml_java_string(parser, attribute.data ? "true" : "false", sizeof(buffer));
+        int base = 10;
+        bool signed_value = false;
+        if (attribute.type == 1 || attribute.type == 2) {
+            *first++ = attribute.type == 1 ? '@' : '?'; signed_value = true;
+        } else if (attribute.type == 0x11) {
+            *first++ = '0'; *first++ = 'x'; base = 16;
+        } else if (attribute.type >= 0x1c && attribute.type <= 0x1f) {
+            *first++ = '#'; base = 16;
+        } else if (attribute.type >= 0x10 && attribute.type <= 0x1f) signed_value = true;
+        else bad("XML_ATTRIBUTE_UNSUPPORTED", "XML value string coercion requires unimplemented floating or complex formatting");
+        const auto result = signed_value
+            ? std::to_chars(first, limit, std::bit_cast<std::int32_t>(attribute.data), base)
+            : std::to_chars(first, limit, attribute.data, base);
+        if (result.ec != std::errc{}) bad("XML_PARSER_STATE", "Scalar XML formatting exceeded its fixed representation");
+        return xml_java_string(parser, std::string_view(buffer.data(), static_cast<std::size_t>(result.ptr - buffer.data())), sizeof(buffer));
+    }
+    Value xml_parser_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("XML_PARSER_ARGUMENT", "XML parser method requires its actual receiver");
+        const auto parser = args[0].bits;
+        ManagedRoot parser_root(runtime, parser);
+        // Registry descriptors supply the exact shape, including nullable
+        // namespace/name strings and typed scalar defaults.
+        std::size_t argument = 1;
+        for (std::size_t offset = 1; offset < api.signature.size() && api.signature[offset] != ')'; ++argument) {
+            if (argument >= args.size()) bad("XML_PARSER_ARGUMENT", "XML method argument count disagrees with its descriptor");
+            const bool reference = api.signature[offset] == 'L' || api.signature[offset] == '[';
+            if (reference) {
+                if (args[argument].kind != dex::ValueKind::reference &&
+                    !(args[argument].kind == dex::ValueKind::word && !args[argument].bits))
+                    bad("XML_PARSER_ARGUMENT", "XML method requires a nullable reference argument");
+                while (api.signature[offset] == '[') ++offset;
+                if (api.signature[offset] == 'L') offset = api.signature.find(';', offset) + 1;
+                else ++offset;
+            } else {
+                if (args[argument].kind != dex::ValueKind::word)
+                    bad("XML_PARSER_ARGUMENT", "XML method requires a scalar word argument");
+                ++offset;
+            }
+        }
+        if (argument != args.size()) bad("XML_PARSER_ARGUMENT", "XML method has excess arguments");
+        const auto &metadata = xml_parser_state(parser);
+        const auto name = api.name;
+        if (name == "getEventType") return Value::word(metadata.event_type);
+        if (name == "getDepth") return Value::word(metadata.depth);
+        if (name == "close") { close_xml_parser(parser); return Value::nothing(); }
+        if (name == "next" || name == "nextToken") {
+            ProviderWorkCharge provider_charge{runtime};
+            const XmlWorkCharge charge(std::ref(provider_charge));
+            const auto event = metadata.advance(charge);
+            if (event == 1) close_xml_parser(parser);
+            return Value::word(event);
+        }
+        if (name == "getColumnNumber") return Value::word(UINT32_MAX);
+        if (name == "isWhitespace" || name == "isEmptyElementTag" || name == "isAttributeDefault") return Value::word(0);
+        if (name == "getAttributeType") return xml_java_string(parser, "CDATA");
+        if (name == "getInputEncoding") return Value::reference(0);
+        if (name == "getSourceResId" && metadata.closed()) return Value::word(0);
+        if (metadata.closed() && (name == "getName" || name == "getText")) return Value::reference(0);
+        if (metadata.closed() && name == "getNamespace") return xml_java_string(parser, "");
+        if (name == "getAttributeCount" && metadata.event_type != 2) return Value::word(UINT32_MAX);
+        if (metadata.closed()) runtime.raise("Ljava/lang/NullPointerException;", u"Null document");
+        const auto &cursor = metadata.cursor();
+        const auto positioned = cursor.position() != apk::runtime_xml_absent;
+        if (name == "getLineNumber") return Value::word(positioned ? cursor.current().line : UINT32_MAX);
+        if (name == "getPositionDescription") {
+            std::array<char, 64> buffer{};
+            constexpr std::string_view prefix = "Binary XML file line #";
+            std::copy(prefix.begin(), prefix.end(), buffer.begin());
+            const auto result = std::to_chars(buffer.data() + prefix.size(), buffer.data() + buffer.size(),
+                positioned ? std::bit_cast<std::int32_t>(cursor.current().line) : -1);
+            if (result.ec != std::errc{}) bad("XML_PARSER_STATE", "XML position formatting exceeded its fixed representation");
+            return xml_java_string(parser, {buffer.data(), static_cast<std::size_t>(result.ptr - buffer.data())}, sizeof(buffer));
+        }
+        if (name == "getName" || name == "getNamespace" || name == "getText") {
+            const bool tag = metadata.event_type == 2 || metadata.event_type == 3;
+            if (name == "getNamespace") return xml_java_string(parser,
+                positioned && tag ? cursor.document().optional_string(cursor.current().namespace_index) : std::string_view{});
+            if (!positioned || (name == "getText" ? metadata.event_type != 4 : !tag)) return Value::reference(0);
+            return xml_java_string(parser, cursor.document().string(cursor.current().name_index));
+        }
+        if (name == "getAttributeCount") return Value::word(cursor.current().attribute_count);
+        if (name == "getSourceResId") return Value::word(cursor.source().resource_id);
+        if (name == "getIdAttribute" || name == "getClassAttribute" || name == "getStyleAttribute") {
+            const auto *attribute = metadata.event_type == 2 ? cursor.special(name == "getIdAttribute" ? XmlSpecial::id :
+                name == "getClassAttribute" ? XmlSpecial::class_name : XmlSpecial::style) : nullptr;
+            if (name == "getStyleAttribute")
+                return Value::word(attribute && (attribute->type == 1 || attribute->type == 2) ? attribute->data : 0);
+            if (!attribute) return Value::reference(0);
+            if (const auto raw = cursor.raw_string(*attribute)) return xml_java_string(parser, *raw);
+            return Value::reference(0);
+        }
+        const apk::RuntimeXmlAttribute *attribute = nullptr;
+        const bool by_name = api.signature.starts_with("(Ljava/lang/String;Ljava/lang/String;");
+        if (name == "getIdAttributeResourceValue") {
+            if (metadata.event_type == 2) {
+                for (const auto &candidate : cursor.attributes()) {
+                    runtime.charge_provider_work(1);
+                    if (candidate.namespace_index == apk::runtime_xml_absent &&
+                        xml_name_matches(cursor.document().string(candidate.name_index), u"id")) { attribute = &candidate; break; }
+                }
+            }
+        } else if (by_name) attribute = xml_named_attribute(parser, args[1].bits, args[2].bits);
+        else {
+            const auto index = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+            if (metadata.event_type == 2 && index >= 0 && static_cast<std::size_t>(index) < cursor.attributes().size())
+                attribute = &cursor.attribute(static_cast<std::size_t>(index));
+        }
+        if (name == "getAttributeValue") {
+            if (!attribute) {
+                if (by_name) return Value::reference(0);
+                runtime.raise("Ljava/lang/IndexOutOfBoundsException;");
+            }
+            return xml_attribute_string(parser, *attribute);
+        }
+        if (name == "getAttributeNamespace" || name == "getAttributeName") {
+            if (!attribute) runtime.raise("Ljava/lang/IndexOutOfBoundsException;");
+            return xml_java_string(parser, name == "getAttributeName" ? cursor.document().string(attribute->name_index) :
+                cursor.document().optional_string(attribute->namespace_index));
+        }
+        if (name == "getAttributeNameResource") return Value::word(attribute ? attribute->resource_id : 0);
+        const auto fallback = args.back();
+        if (!attribute && !by_name && name == "getAttributeFloatValue")
+            runtime.raise("Ljava/lang/RuntimeException;", u"not a float!");
+        if (!attribute) return fallback;
+        if (name == "getAttributeResourceValue" || name == "getIdAttributeResourceValue")
+            return attribute->type == 1 ? Value::word(attribute->data) : fallback;
+        if (name == "getAttributeFloatValue") {
+            if (attribute->type != 4) runtime.raise("Ljava/lang/RuntimeException;", u"not a float!");
+            return Value::word(attribute->data);
+        }
+        if (name == "getAttributeBooleanValue" || name == "getAttributeIntValue" || name == "getAttributeUnsignedIntValue") {
+            if (attribute->type < 0x10 || attribute->type > 0x1f) return fallback;
+            return Value::word(name == "getAttributeBooleanValue" ? static_cast<std::uint32_t>(attribute->data != 0) : attribute->data);
+        }
+        bad("XML_PARSER_UNSUPPORTED", "XML method has no implemented cursor semantics");
+    }
+    const TypedValueState &typed_value_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(object, typed_value_type))
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"Receiver is not a TypedValue");
+        const auto *metadata = dynamic_cast<const TypedValueState *>(runtime.host_state(object));
+        if (!metadata) bad("TYPED_VALUE_STATE", "TypedValue has no actual initialized field storage");
+        return *metadata;
+    }
+    Value typed_value_constructor(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("TYPED_VALUE_ARGUMENT", "TypedValue constructor requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot root(runtime, object);
+        if (!runtime.assignable(object, typed_value_type))
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"Constructor receiver is not a TypedValue");
+        const auto *previous = dynamic_cast<const TypedValueState *>(runtime.host_state(object));
+        if (!previous && runtime.host_state(object))
+            bad("TYPED_VALUE_STATE", "TypedValue constructor collides with other initialized SDK state");
+        auto next = previous ? std::make_unique<TypedValueState>(*previous) : std::make_unique<TypedValueState>();
+        // The implicit SDK constructor runs only this explicit initializer;
+        // allocation supplies the other zero/null defaults. Do not clear fields
+        // on a repeated constructor invocation that the caller can authenticate.
+        next->numbers[4] = UINT32_MAX;
+        runtime.set_host_state(object, std::move(next));
+        return Value::nothing();
+    }
+    const PackageInfoState &package_info_state(ObjectId object) const {
+        if (!runtime.assignable(object, package_info_type))
+            bad("PACKAGE_INFO_RECEIVER", "PackageInfo field requires an actual PackageInfo receiver");
+        const auto *metadata = dynamic_cast<const PackageInfoState *>(runtime.host_state(object));
+        if (!metadata) bad("PACKAGE_INFO_STATE", "PackageInfo has no initialized value record");
+        return *metadata;
+    }
+    ObjectId package_info_snapshot() {
+        if (!package_metadata) bad("PACKAGE_INFO_UNSUPPORTED", "PackageInfo requires the held-manifest metadata binding");
+        if (package_metadata->version_name_resource)
+            bad("PACKAGE_INFO_UNSUPPORTED", "Resource-valued versionName requires immutable nonconfiguration package-parse resolution");
+        const auto object = runtime.new_object(package_info_type);
+        ManagedRoot object_root(runtime, object);
+        auto metadata = std::make_unique<PackageInfoState>();
+        metadata->version_code = package_metadata->version_code;
+        metadata->version_code_major = package_metadata->version_code_major;
+        metadata->references[0] = Value::reference(package_string());
+        const auto version_name = package_metadata->version_name
+            ? runtime.new_string(*package_metadata->version_name) : ObjectId{0};
+        ManagedRoot version_root(runtime, version_name);
+        metadata->references[1] = Value::reference(version_name);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    Value package_info_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference || !runtime.assignable(args[0].bits, package_info_type))
+            bad("PACKAGE_INFO_ARGUMENT", "PackageInfo operation requires its actual receiver");
+        const auto object = args[0].bits;
+        if (api.name == "<init>" && api.signature == "()V" && args.size() == 1) {
+            if (!runtime.host_state(object)) runtime.set_host_state(object, std::make_unique<PackageInfoState>());
+            else (void)package_info_state(object); // Its genuine empty constructor does not reset existing values.
+            return Value::nothing();
+        }
+        const auto &metadata = package_info_state(object);
+        if (api.name == "getLongVersionCode" && api.signature == "()J" && args.size() == 1)
+            return Value::wide((std::uint64_t(metadata.version_code_major) << 32) | metadata.version_code);
+        if (api.name == "setLongVersionCode" && api.signature == "(J)V" && args.size() == 2 && args[1].kind == dex::ValueKind::wide) {
+            auto next = std::make_unique<PackageInfoState>(metadata);
+            next->version_code = static_cast<std::uint32_t>(args[1].bits);
+            next->version_code_major = static_cast<std::uint32_t>(args[1].bits >> 32);
+            runtime.set_host_state(object, std::move(next));
+            return Value::nothing();
+        }
+        bad("PACKAGE_INFO_UNSUPPORTED", "PackageInfo operation is outside its implemented value profile");
+    }
     ObjectId app_info() {
-        if (!application_info) application_info = own(runtime.new_object(application_info_type));
+        if (!application_info) {
+            const auto object = runtime.new_object(application_info_type);
+            ManagedRoot object_root(runtime, object);
+            if (runtime.host_state_capacity(object) < sizeof(ApplicationInfoState))
+                bad("APPLICATION_INFO_LIMIT", "ApplicationInfo storage exceeds existing managed admission");
+            auto metadata = std::make_unique<ApplicationInfoState>();
+            metadata->owner = this;
+            if (package_metadata) {
+                metadata->target_known = package_metadata->application_target_sdk.has_value();
+                metadata->target_sdk = package_metadata->application_target_sdk.value_or(0);
+                if (package_metadata->supports_rtl_bound) {
+                    const auto raw = package_metadata->supports_rtl;
+                    metadata->rtl_known = raw.type == apk::manifest_absent_type || raw.type == 0 ||
+                        (raw.type == 1 && raw.data == 0) || (raw.type >= 0x10 && raw.type <= 0x1f);
+                    metadata->supports_rtl = raw.type >= 0x10 && raw.type <= 0x1f && raw.data != 0;
+                }
+            }
+            runtime.set_host_state(object, std::move(metadata));
+            application_info = own(object);
+        }
         return application_info;
     }
-    ObjectId package_string() {
-        if (!package_name) package_name = own(runtime.new_string(unicode(package)));
+    const ApplicationInfoState &application_info_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const ApplicationInfoState *>(runtime.host_state(object));
+        if (object != application_info || !metadata || metadata->owner != this)
+            bad("APPLICATION_INFO_STATE", "ApplicationInfo is not this session's issued metadata object");
+        return *metadata;
+    }
+    Value application_info_rtl(std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("APPLICATION_INFO_ARGUMENT", "hasRtlSupport requires its actual ApplicationInfo receiver");
+        const auto &metadata = application_info_state(args[0].bits);
+        if (!metadata.rtl_known)
+            bad("APPLICATION_INFO_UNSUPPORTED", "Application RTL support lacks immutable manifest Boolean provenance");
+        return Value::word(metadata.supports_rtl);
+    }
+    ObjectId fingerprint_string() {
+        // Opaque Aether compatibility-build profile identity, never an Android
+        // device identity, attestation value or machine/user identifier.
+        if (!build_fingerprint_string)
+            build_fingerprint_string = own(runtime.new_string(unicode(build::runtime_fingerprint)));
+        return build_fingerprint_string;
+    }
+    ObjectId package_string(bool charge_work = false) {
+        if (!package_name) {
+            ManagedRoot package_root(runtime, loaded_package);
+            const auto admitted = runtime.host_state_capacity(loaded_package);
+            const auto *previous = runtime.host_state(loaded_package);
+            const auto old_bytes = previous ? previous->bytes() : 0;
+            constexpr auto wrappers = sizeof(std::wstring) + sizeof(std::u16string);
+            if (admitted < old_bytes || wrappers > admitted - old_bytes || package.size() == SIZE_MAX ||
+                package.size() + 1 > (admitted - old_bytes - wrappers) / (sizeof(wchar_t) + sizeof(char16_t)))
+                bad("PACKAGE_STRING_LIMIT", "Package-name conversion exceeds admitted simultaneous storage");
+            if (charge_work) runtime.charge_provider_work(package.size());
+            const auto decoded = unicode(package);
+            package_name = own(runtime.new_host_string(decoded, sizeof(decoded) + (decoded.capacity() + 1) * sizeof(char16_t)));
+        }
         return package_name;
     }
     void bind_package() {
@@ -975,24 +6834,1408 @@ struct ActivitySession::Impl {
     ObjectId construct_activity() {
         if (activity || !factory_activity_active)
             bad("ACTIVITY_CONSTRUCTOR", "Activity construction is not active or already occurred");
+        activity_theme_resource = 0;
         activity = own(runtime.new_object(activity_type));
         if (!runtime.assignable(activity, "Landroid/app/Activity;"))
             bad("ACTIVITY", "Launch class does not extend Activity");
         // Activity.mIntent is null during construction. Framework attach
         // supplies the real launch record after the constructor returns.
-        runtime.set_host_state(activity, std::make_unique<ActivityIntentState>());
+        auto metadata = std::make_unique<ActivityIntentState>();
+        metadata->owner = this;
+        runtime.set_host_state(activity, std::move(metadata));
         const std::array args{Value::reference(activity)};
-        (void)runtime.invoke(runtime.lookup(activity_type, "<init>", "()V", false), args);
+        if (activity_type == native_activity_type) native_constructor(activity);
+        else (void)runtime.invoke(runtime.lookup(activity_type, "<init>", "()V", false), args);
         return activity;
+    }
+    void native_constructor(ObjectId receiver) {
+        if (!factory_activity_active || receiver != activity || !receiver || native_constructed ||
+            !runtime.assignable(receiver, native_activity_type))
+            bad("NATIVE_ACTIVITY_CONSTRUCTOR", "NativeActivity base construction is inactive or repeated");
+        native_constructed = true;
     }
     ObjectId main_loop() {
         if (!main_looper)
             main_looper = own(runtime.new_object(looper_type));
         return main_looper;
     }
+    const BinderWarnSupplierState &binder_warning_state(ObjectId object) const {
+        if (!object) bad("BINDER_STATIC_STATE", "Binder warning supplier has not been committed");
+        const auto *metadata = dynamic_cast<const BinderWarnSupplierState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || runtime.object_type(object) != binder_warn_supplier_type)
+            bad("BINDER_STATIC_STATE", "Binder warning fields belong to another functional carrier");
+        return *metadata;
+    }
+    void initialize_binder_static_fields() {
+        // IBinder declares a default method, so its initialization precedes the
+        // Binder body. Its complete source fields are constant expressions.
+        runtime.initialize(window_binder_type);
+        if (binder_warn_supplier)
+            bad("BINDER_STATIC_STATE", "Binder static initialization cannot be replayed");
+        // The remaining source primitive/null initializers have no allocating
+        // effects. In particular sWarnOnBlocking starts false, not a captured
+        // constant in the deferred supplier body.
+        const auto supplier = runtime.new_object(binder_warn_supplier_type);
+        ManagedRoot supplier_root(runtime, supplier);
+        ProviderStorageReservation supplier_storage(runtime);
+        supplier_storage.resize(sizeof(BinderWarnSupplierState));
+        runtime.charge_provider_work(1);
+        auto supplier_metadata = std::make_unique<BinderWarnSupplierState>();
+        supplier_metadata->owner = this;
+        runtime.charge_provider_work(2); // Actual two traced null fields validated at publication.
+        supplier_storage.publish(supplier, std::move(supplier_metadata));
+        // This core factory neither calls Supplier.get nor reads the UID. The
+        // supplied object remains local until the source ThreadLocal store.
+        const auto local = runtime.new_supplied_thread_local(supplier);
+        ManagedRoot local_root(runtime, local);
+        const auto &warning_fields = binder_warning_state(supplier);
+        runtime.charge_provider_work(3); // Retained class root and actual static field publication.
+        runtime.retain(supplier);
+        binder_warn_supplier = supplier; // Fixed root, not an unadmitted native vector.
+        warning_fields.references[0] = Value::reference(local);
+        // This later lambda creation follows the earlier withInitial/store.
+        const auto provider = runtime.new_object(binder_work_source_type);
+        ManagedRoot provider_root(runtime, provider);
+        ProviderStorageReservation provider_storage(runtime);
+        provider_storage.resize(sizeof(BinderWorkSourceState));
+        runtime.charge_provider_work(1);
+        auto provider_metadata = std::make_unique<BinderWorkSourceState>();
+        provider_metadata->owner = this;
+        provider_storage.publish(provider, std::move(provider_metadata));
+        runtime.charge_provider_work(1);
+        binder_warning_state(supplier).references[1] = Value::reference(provider);
+    }
+    Value binder_static_function_api(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (api.owner == binder_type && api.name == "setWarnOnBlocking" && api.signature == "(Z)V") {
+            if (args.size() != 1 || args[0].kind != dex::ValueKind::word)
+                bad("BINDER_ARGUMENT", "setWarnOnBlocking requires its actual boolean argument");
+            const auto &warning_fields = binder_warning_state(binder_warn_supplier);
+            runtime.charge_provider_work(1);
+            warning_fields.warn_on_blocking = args[0].bits != 0;
+            return Value::nothing();
+        }
+        if (api.name == "<init>")
+            bad("BINDER_FUNCTIONAL_CONSTRUCTOR_UNSUPPORTED", "Translated Binder carriers are created only by their source-bound class initializer");
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("BINDER_ARGUMENT", "Binder functional callback requires its actual receiver");
+        const auto receiver = args[0].bits;
+        ManagedRoot receiver_root(runtime, receiver);
+        if (api.owner == binder_warn_supplier_type && api.name == "get" && api.signature == "()Ljava/lang/Object;") {
+            if (args.size() != 1 || !receiver || receiver != binder_warn_supplier)
+                bad("BINDER_STATIC_STATE", "Supplier callback does not use this session's actual static carrier");
+            const auto &warning_fields = binder_warning_state(receiver);
+            runtime.charge_provider_work(1);
+            const bool current_warning = warning_fields.warn_on_blocking;
+            return Value::reference(runtime.boolean_value_of(current_warning));
+        }
+        if (api.owner == binder_work_source_type && api.name == "resolveWorkSourceUid" && api.signature == "(I)I") {
+            if (args.size() != 2 || args[1].kind != dex::ValueKind::word || !receiver)
+                bad("BINDER_ARGUMENT", "Work-source callback requires its receiver and original int argument");
+            const auto *provider_metadata = dynamic_cast<const BinderWorkSourceState *>(runtime.host_state(receiver));
+            if (!provider_metadata || provider_metadata->owner != this || runtime.object_type(receiver) != binder_work_source_type ||
+                binder_warning_state(binder_warn_supplier).references[1].bits != receiver)
+                bad("BINDER_STATIC_STATE", "Work-source callback does not use this session's actual static carrier");
+            runtime.charge_provider_work(1); // Original untrusted argument is intentionally not used.
+            const ApiSupport uid{binder_type, "getCallingUid", "()I", ApiStatus::partial, "Actual deferred Binder work-source UID body"};
+            return host.invoke_api(runtime, uid, {});
+        }
+        bad("BINDER_FUNCTIONAL_UNSUPPORTED", "Translated Binder functional operation has no source-bound implementation");
+    }
+    const BinderState &binder_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const BinderState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || metadata->binder_fields().size() != 2 ||
+            !runtime.assignable(object, binder_type))
+            bad("BINDER_STATE", "Binder fields do not belong to this session's actual receiver");
+        return *metadata;
+    }
+    void initialize_binder_holder(ObjectId object, std::unique_ptr<BinderState> metadata,
+            ProviderStorageReservation &storage, ObjectId descriptor) {
+        ManagedRoot object_root(runtime, object), descriptor_root(runtime, descriptor);
+        if (!metadata || metadata->owner != this || metadata->holder || metadata->object_stored || metadata->cleanup_registered ||
+            metadata->binder_fields().size() != 2 || metadata->values().size() < 2 ||
+            metadata->binder_fields().data() != metadata->values().data())
+            bad("BINDER_CONSTRUCTOR_STATE_UNSUPPORTED", "Pending Binder metadata does not preserve its concrete traced field layout");
+        if (runtime.host_state(object))
+            bad("BINDER_CONSTRUCTOR_STATE_UNSUPPORTED", "Binder construction cannot replace existing or partially initialized subtype state");
+        const auto header_bytes = metadata->bytes();
+        if (header_bytes > SIZE_MAX - sizeof(LocalBinderHolder) || storage.bytes() < header_bytes + sizeof(LocalBinderHolder))
+            bad("BINDER_CONSTRUCTOR_LIMIT", "Concrete Binder header and holder were not admitted before allocation");
+        // Every reference, including a subtype's earlier outer store, is held by
+        // independent caller roots until this exact concrete state is published.
+        runtime.charge_provider_work(metadata->values().size());
+        runtime.charge_provider_work(1);
+        metadata->holder = std::make_unique<LocalBinderHolder>();
+        if (!metadata->native_object())
+            bad("BINDER_NATIVE_HOLDER", "Local Binder holder allocation produced no actual native object");
+        runtime.charge_provider_work(1);
+        metadata->object_stored = true;
+        auto *const constructor_state = metadata.get();
+        // All remaining fixed-store work is admitted while pending RAII still
+        // frees the holder on failure. Successful publication has no GC/callback.
+        runtime.charge_provider_work(3);
+        storage.publish(object, std::move(metadata));
+        constructor_state->cleanup_registered = true;
+        constructor_state->binder_fields()[1] = Value::reference(descriptor);
+        constructor_state->descriptor_stored = true;
+    }
+    Value binder_api(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("BINDER_ARGUMENT", "Binder operation requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        const auto nullable_reference = [](Value value) {
+            return value.kind == dex::ValueKind::reference || (value.kind == dex::ValueKind::word && !value.bits);
+        };
+        if (api.name == "attachInterface") {
+            if (api.signature != "(Landroid/os/IInterface;Ljava/lang/String;)V" || args.size() != 3 ||
+                !nullable_reference(args[1]) || !nullable_reference(args[2]))
+                bad("BINDER_ARGUMENT", "attachInterface requires its nullable interface and descriptor references");
+            // All incoming references are independent roots before validation or
+            // any potential class loading. No String copy changes their identities.
+            ManagedRoot interface_root(runtime, args[1].bits), descriptor_root(runtime, args[2].bits);
+            if (args[1].bits && !runtime.assignable(args[1].bits, binder_interface_type))
+                bad("BINDER_ARGUMENT", "Binder interface owner has the wrong runtime type");
+            if (args[2].bits && runtime.object_type(args[2].bits) != "Ljava/lang/String;")
+                bad("BINDER_ARGUMENT", "Binder descriptor is not a String");
+            const auto &metadata = binder_state(object);
+            const auto fields = metadata.binder_fields();
+            // Only fixed traced cells change; no COW, allocation, collection or
+            // callback can slice or erase a concrete SDK subtype's additional data.
+            runtime.charge_provider_work(1);
+            fields[0] = Value::reference(args[1].bits);
+            runtime.charge_provider_work(2);
+            fields[1] = Value::reference(args[2].bits);
+            metadata.descriptor_stored = true;
+            return Value::nothing();
+        }
+        if (api.name != "<init>")
+            bad("BINDER_UNSUPPORTED", "Binder operation is outside the local-holder construction/field profile");
+        if (api.signature == "()V") {
+            if (args.size() != 1) bad("BINDER_ARGUMENT", "Binder constructor has unexpected arguments");
+            const ApiSupport delegated{binder_type, "<init>", "(Ljava/lang/String;)V", ApiStatus::partial, "Actual SDK Binder descriptor constructor"};
+            const std::array call{Value::reference(object), Value::reference(0)};
+            return host.invoke_api(runtime, delegated, call);
+        }
+        if (api.signature != "(Ljava/lang/String;)V" || args.size() != 2 || !nullable_reference(args[1]))
+            bad("BINDER_ARGUMENT", "Binder constructor requires its nullable String descriptor");
+        ManagedRoot descriptor_root(runtime, args[1].bits);
+        if (!runtime.assignable(object, binder_type)) bad("BINDER_ARGUMENT", "Constructor receiver is not a Binder");
+        if (args[1].bits && runtime.object_type(args[1].bits) != "Ljava/lang/String;")
+            bad("BINDER_ARGUMENT", "Binder descriptor is not a String");
+        if (runtime.host_state(object))
+            bad("BINDER_CONSTRUCTOR_STATE_UNSUPPORTED", "Binder construction cannot replace existing or partially initialized subtype state");
+        // The translated cleanup backend is managed HostState lifetime, not a
+        // Java NativeAllocationRegistry frontend. Charge actual header+holder,
+        // never the SDK registry's native-allocation estimate.
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(PlainBinderState) + sizeof(LocalBinderHolder));
+        runtime.charge_provider_work(1); // Actual concrete header construction; helper meters its reference span.
+        auto metadata = std::make_unique<PlainBinderState>();
+        metadata->owner = this;
+        initialize_binder_holder(object, std::move(metadata), storage, args[1].bits);
+        return Value::nothing();
+    }
+    ObjectId accessibility_descriptor_literal() {
+        if (!accessibility_client_descriptor) {
+            constexpr std::u16string_view descriptor = u"android.view.accessibility.IAccessibilityManagerClient";
+            runtime.charge_provider_work(descriptor.size());
+            // Immutable compiled-profile literal: no live allocated native
+            // buffer overlaps this managed String allocation.
+            const auto text = runtime.new_host_string(descriptor, 0);
+            ManagedRoot text_root(runtime, text);
+            const auto literal = runtime.invoke_virtual_named(text, "intern", "()Ljava/lang/String;");
+            if (literal.kind != dex::ValueKind::reference || !literal.bits)
+                bad("ACCESSIBILITY_CLIENT_DESCRIPTOR", "String intern did not return an actual descriptor constant");
+            ManagedRoot literal_root(runtime, literal.bits);
+            accessibility_client_descriptor = own(literal.bits); // Class-space constant, not a client/global Binder pin.
+        }
+        return accessibility_client_descriptor;
+    }
+    void finish_accessibility_stub(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto descriptor = accessibility_descriptor_literal();
+        ManagedRoot descriptor_root(runtime, descriptor);
+        const std::array args{Value::reference(object), Value::reference(descriptor)};
+        // Actual generated Stub invokes this virtual method after Binder super;
+        // owned subclasses may preserve, change or omit its base stores normally.
+        (void)runtime.invoke_virtual_named(object, "attachInterface", "(Landroid/os/IInterface;Ljava/lang/String;)V", args);
+    }
+    Value accessibility_stub_api(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("ACCESSIBILITY_CLIENT_ARGUMENT", "Client Stub operation requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        if (!runtime.assignable(object, accessibility_client_stub_type))
+            bad("ACCESSIBILITY_CLIENT_ARGUMENT", "Client Stub receiver has the wrong runtime ancestry");
+        if (api.name == "asBinder" && api.signature == "()Landroid/os/IBinder;") {
+            runtime.charge_provider_work(1);
+            return Value::reference(object); // Exact generated body; no native peer or queue/constructor authority required.
+        }
+        if (api.name != "<init>" || api.signature != "()V")
+            bad("ACCESSIBILITY_CLIENT_UNSUPPORTED", "Client Stub operation is outside its constructor/identity profile");
+        if (runtime.assignable(object, accessibility_client_type))
+            bad("ACCESSIBILITY_CLIENT_CONSTRUCTOR_UNSUPPORTED", "The SDK anonymous client requires its original outer-before-super composed constructor");
+        const ApiSupport base{binder_type, "<init>", "()V", ApiStatus::partial, "Actual generated Stub Binder superclass"};
+        const std::array call{Value::reference(object)};
+        (void)host.invoke_api(runtime, base, call);
+        finish_accessibility_stub(object);
+        return Value::nothing();
+    }
+    ObjectId new_accessibility_client(ObjectId manager) {
+        // Trusted upcoming manager-constructor consumer only. This creates no
+        // manager and does not publish it or bind any accessibility service.
+        ManagedRoot manager_root(runtime, manager);
+        if (!manager || runtime.object_type(manager) != accessibility_manager_type)
+            bad("ACCESSIBILITY_CLIENT_OUTER", "SDK client construction requires its actual enclosing manager object");
+        const auto object = runtime.new_object(accessibility_client_type);
+        ManagedRoot object_root(runtime, object);
+        if (runtime.host_state(object))
+            bad("ACCESSIBILITY_CLIENT_STATE", "New SDK client already has unrelated object state");
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(AccessibilityClientState) + sizeof(LocalBinderHolder));
+        runtime.charge_provider_work(1);
+        auto metadata = std::make_unique<AccessibilityClientState>();
+        metadata->owner = this;
+        runtime.charge_provider_work(1);
+        metadata->references[2] = Value::reference(manager); // Attested this$0 store BEFORE invokespecial Stub.<init>.
+        // The very same concrete state carries the earlier outer store through
+        // Binder initialization/publication and the Stub's original virtual hook.
+        initialize_binder_holder(object, std::move(metadata), storage, 0);
+        finish_accessibility_stub(object);
+        return object; // Caller must immediately retain before any next allocation.
+    }
+    void initialize_accessibility_manager_statics() {
+        if (accessibility_instance_sync)
+            bad("ACCESSIBILITY_CLASS_INITIALIZATION_STATE", "AccessibilityManager static initialization cannot be replayed");
+        const auto sync = runtime.new_object("Ljava/lang/Object;");
+        ManagedRoot sync_root(runtime, sync);
+        // Object's existing core no-arg constructor has no fields/callbacks.
+        // Publish only the completed source static Object, never a Manager.
+        runtime.charge_provider_work(2);
+        runtime.retain(sync);
+        accessibility_instance_sync = sync;
+    }
+    ObjectId new_accessibility_my_callback(ObjectId manager) {
+        ManagedRoot manager_root(runtime, manager);
+        if (!manager || runtime.object_type(manager) != accessibility_manager_type)
+            bad("ACCESSIBILITY_CALLBACK_STATE", "Private callback requires its actual final SDK enclosing Manager");
+        const auto callback_object = runtime.new_object(accessibility_my_callback_type);
+        ManagedRoot callback_root(runtime, callback_object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(AccessibilityMyCallbackState));
+        runtime.charge_provider_work(1);
+        auto metadata = std::make_unique<AccessibilityMyCallbackState>();
+        metadata->owner = this;
+        runtime.charge_provider_work(2); // Original outer store, then its actual publication validation.
+        metadata->references[0] = Value::reference(manager);
+        storage.publish(callback_object, std::move(metadata));
+        // The attested next invokespecial is Object.<init>(), an empty core
+        // body. No Handler callback/message or Manager constructor runs here.
+        return callback_object; // Caller roots before any managed allocation.
+    }
+    const HandlerState &handler_field_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const HandlerState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || !runtime.assignable(object, handler_type))
+            bad("HANDLER_STATE", "Handler fields do not belong to this session's actual receiver");
+        return *metadata;
+    }
+    const HandlerState &handler_state(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const HandlerState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this || !metadata->initialized || !metadata->queue_bound ||
+            !main_looper || metadata->looper() != main_looper || runtime.object_type(main_looper) != looper_type)
+            bad("HANDLER_STATE", "Handler has no actual initialized main-Looper constructor state");
+        const auto witness = runtime.native_main_queue_witness();
+        if (!witness || witness->owner != &runtime || !witness->identity ||
+            metadata->queue.owner != witness->owner || metadata->queue.identity != witness->identity)
+            bad("HANDLER_QUEUE_UNSUPPORTED", "Handler native main-queue identity is not available in this execution context");
+        // Closed admission changes posting eligibility, never constructor identity.
+        return *metadata;
+    }
+    Value handler_api(ActivitySession &host, const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("HANDLER_ARGUMENT", "Handler operation requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        if (api.name != "<init>") {
+            if (api.name != "getLooper" || api.signature != "()Landroid/os/Looper;" || args.size() != 1)
+                bad("HANDLER_UNSUPPORTED", "Handler operation is outside the constructor/getLooper profile");
+            runtime.charge_provider_work(1);
+            // The final SDK getter reads mLooper even when a constructor failed
+            // after publishing that store; queue authority is a separate check.
+            return Value::reference(handler_field_state(object).looper());
+        }
+        const bool implicit = api.signature == "()V";
+        const bool explicit_looper = api.signature == "(Landroid/os/Looper;)V";
+        const bool callback_form = api.signature == "(Landroid/os/Looper;Landroid/os/Handler$Callback;)V";
+        const bool async_form = api.signature == "(Landroid/os/Looper;Landroid/os/Handler$Callback;Z)V";
+        if ((!implicit && !explicit_looper && !callback_form && !async_form) ||
+            args.size() != (implicit ? 1u : explicit_looper ? 2u : callback_form ? 3u : 4u))
+            bad("HANDLER_UNSUPPORTED", "Handler constructor descriptor is outside the supported main-Looper profile");
+        const auto nullable_reference = [](Value value) {
+            return value.kind == dex::ValueKind::reference || (value.kind == dex::ValueKind::word && !value.bits);
+        };
+        if ((!implicit && !nullable_reference(args[1])) ||
+            ((callback_form || async_form) && !nullable_reference(args[2])) ||
+            (async_form && args[3].kind != dex::ValueKind::word))
+            bad("HANDLER_ARGUMENT", "Handler constructor arguments disagree with their SDK descriptor");
+        const auto callback_object = callback_form || async_form ? args[2].bits : ObjectId{0};
+        ManagedRoot callback_root(runtime, callback_object), looper_root(runtime, implicit ? 0 : args[1].bits);
+        if (runtime.host_state(object)) bad("HANDLER_STATE", "Handler constructor invoked twice");
+        if (!runtime.assignable(object, handler_type)) bad("HANDLER_ARGUMENT", "Constructor receiver is not a Handler");
+        ObjectId looper = implicit ? 0 : args[1].bits;
+        if (implicit) {
+            // Original static body through the canonical provider, independent
+            // of which SDK method references happen to occur in the APK.
+            const ApiSupport looper_api{looper_type, "myLooper", "()Landroid/os/Looper;", ApiStatus::partial, "Actual SDK current Looper query"};
+            const auto current = host.invoke_api(runtime, looper_api, {});
+            if (current.kind != dex::ValueKind::reference)
+                bad("HANDLER_LOOPER", "Current Looper provider returned a nonreference");
+            looper = current.bits; looper_root.reset(looper);
+        }
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(HandlerState));
+        runtime.charge_provider_work(4); // Fixed header construction plus three reference validations.
+        auto metadata = std::make_unique<HandlerState>();
+        metadata->owner = this;
+        runtime.charge_provider_work(1);
+        metadata->references[0] = Value::reference(looper); // SDK first store, retained even on raw queue-access failure.
+        auto *const constructor_state = metadata.get();
+        storage.publish(object, std::move(metadata));
+        if (!looper) {
+            if (implicit) runtime.raise("Ljava/lang/RuntimeException;");
+            runtime.raise("Ljava/lang/NullPointerException;");
+        }
+        if (!main_looper || looper != main_looper || runtime.object_type(looper) != looper_type)
+            bad("HANDLER_LOOPER_UNSUPPORTED", "Handler requires the actual canonical main Looper");
+        const auto witness = runtime.native_main_queue_witness();
+        if (!witness || witness->owner != &runtime || !witness->identity)
+            bad("HANDLER_QUEUE_UNSUPPORTED", "The supplied Looper has no available authentic native main-queue witness");
+        // No allocation, GC, callbacks or reentry occur through these final fixed
+        // stores. Callback is not touched until the original queue read succeeds.
+        runtime.charge_provider_work(4);
+        constructor_state->queue = *witness;
+        constructor_state->queue_bound = true;
+        runtime.charge_provider_work(1);
+        constructor_state->references[1] = Value::reference(callback_object);
+        runtime.charge_provider_work(1);
+        constructor_state->asynchronous = async_form && args[3].bits != 0;
+        runtime.charge_provider_work(2);
+        constructor_state->shared = false; // Original two/three-argument delegation supplies shared=false.
+        constructor_state->initialized = true;
+        return Value::nothing();
+    }
+    const SurfaceObjectState &surface_state(ObjectId object) const {
+        const auto *value = dynamic_cast<const SurfaceObjectState *>(runtime.host_state(object));
+        if (!value || value->owner != this) bad("SURFACE_IDENTITY", "Surface belongs to another session");
+        return *value;
+    }
+    const SurfaceHolderState &holder_state(ObjectId object) const {
+        const auto *value = dynamic_cast<const SurfaceHolderState *>(runtime.host_state(object));
+        if (!value || value->owner != this) bad("SURFACE_IDENTITY", "SurfaceHolder belongs to another session");
+        return *value;
+    }
+    const SurfaceRectState &surface_rect(ObjectId object) const {
+        const auto *value = dynamic_cast<const SurfaceRectState *>(runtime.host_state(object));
+        if (!value) bad("SURFACE_FRAME", "Rect storage is unavailable");
+        return *value;
+    }
+    const LayoutParamsState &layout_params(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const LayoutParamsState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("LAYOUT_PARAMS", "LayoutParams storage belongs to another or uninitialized session");
+        return *metadata;
+    }
+    ObjectId new_frame_params(ObjectId source = 0) {
+        ManagedRoot source_root(runtime, source);
+        auto copied = geometry::default_frame_parameters();
+        if (source) {
+            const auto prior = layout_params(source);
+            copied.width = prior.width; copied.height = prior.height;
+            copied.margins = {prior.left, prior.top, prior.right, prior.bottom};
+            copied.gravity = prior.gravity;
+            copied = geometry::generated_frame_parameters(copied, runtime.assignable(source, margin_params_type),
+                runtime.assignable(source, frame_params_type), view_preserve_margin_params ? 24u : 0u);
+        }
+        auto metadata = std::make_unique<LayoutParamsState>();
+        metadata->owner = this;
+        metadata->width = copied.width; metadata->height = copied.height;
+        metadata->left = copied.margins.left; metadata->top = copied.margins.top;
+        metadata->right = copied.margins.right; metadata->bottom = copied.margins.bottom;
+        metadata->gravity = copied.gravity;
+        const auto object = runtime.new_object(frame_params_type);
+        ManagedRoot root(runtime, object);
+        runtime.set_host_state(object, std::move(metadata));
+        return object;
+    }
+    std::optional<dex::Index> metered_layout_policy_override(ObjectId object, std::string_view name,
+            std::string_view signature, std::string_view sdk_signature) {
+        const auto equal = [&](std::string_view actual, std::string_view expected) {
+            runtime.charge_provider_work(1);
+            if (actual.size() != expected.size()) return false;
+            for (std::size_t offset = 0; offset < expected.size(); ++offset) {
+                runtime.charge_provider_work(1);
+                if (actual[offset] != expected[offset]) return false;
+            }
+            return true;
+        };
+        const auto exact = [&](std::string_view expected) -> std::optional<dex::Index> {
+            auto type = runtime.object_type(object);
+            for (unsigned depth = 0; depth < 256; ++depth) {
+                runtime.charge_provider_work(1);
+                const auto *definition = runtime.class_definition(type);
+                if (!definition) return {};
+                for (const auto index : definition->virtual_methods) {
+                    runtime.charge_provider_work(1);
+                    const auto &method = runtime.image().methods.at(index);
+                    if (!(method.flags & 5u) || !equal(method.name, name)) continue;
+                    const auto &actual = runtime.image().prototypes.at(method.prototype).descriptor;
+                    if (equal(actual, expected)) return index;
+                }
+                if (definition->superclass == dex::no_index) return {};
+                type = runtime.image().types.at(definition->superclass);
+            }
+            bad("CLASS_LIMIT", "Layout policy override hierarchy exceeds the existing class bound");
+        };
+        // DEX dispatch includes the return descriptor. An ancestor's real
+        // requested-signature bridge must execute before considering any typed
+        // method, including all effects in that actual bridge body.
+        if (const auto method = exact(signature)) return method;
+        if (!equal(signature, sdk_signature)) return exact(sdk_signature);
+        return {};
+    }
+    Value dispatch_layout_parameter_policy(ObjectId parent, std::string_view name, std::string_view signature,
+            std::span<const Value> arguments = {}) {
+        if (arguments.size() > 2) bad("LAYOUT_PARAMS_ARGUMENT", "Layout policy argument count is invalid");
+        ManagedRoot parent_root(runtime, parent), arg0_root(runtime, arguments.empty() ? 0 : arguments[0].bits),
+            arg1_root(runtime, arguments.size() < 2 ? 0 : arguments[1].bits);
+        const std::array full{Value::reference(parent), arguments.empty() ? Value::reference(0) : arguments[0],
+            arguments.size() < 2 ? Value::reference(0) : arguments[1]};
+        const auto call = std::span<const Value>(full).first(arguments.size() + 1);
+        auto owner = std::string_view{"Landroid/view/ViewGroup;"};
+        auto sdk_signature = signature;
+        if (name != "onSetLayoutParams") {
+            // SDK virtual policy follows the actual nominal class, including
+            // inherited Frame policy on a ScrollView or an owned subclass.
+            if (runtime.assignable(parent, frame_layout_type)) {
+                owner = frame_layout_type;
+                if (name == "generateDefaultLayoutParams") sdk_signature = "()Landroid/widget/FrameLayout$LayoutParams;";
+            } else if (runtime.assignable(parent, "Landroid/widget/LinearLayout;")) {
+                owner = "Landroid/widget/LinearLayout;";
+                if (name == "generateDefaultLayoutParams") sdk_signature = "()Landroid/widget/LinearLayout$LayoutParams;";
+                else if (name == "generateLayoutParams") sdk_signature = "(Landroid/view/ViewGroup$LayoutParams;)Landroid/widget/LinearLayout$LayoutParams;";
+            }
+        }
+        if (const auto method = metered_layout_policy_override(parent, name, signature, sdk_signature))
+            return runtime.invoke_virtual(*method, call);
+        const ApiSupport base_api{owner, name, sdk_signature, ApiStatus::partial, "Actual protected SDK layout policy"};
+        return layout_parameter_policy(base_api, call);
+    }
+    void dispatch_reset_resolved_drawables(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "resetResolvedDrawables", "()V")) {
+            const std::array args{Value::reference(object)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else {
+            // Java virtual selection follows nominal ancestry even during
+            // View's superclass constructor, before Group initialization flags.
+            const auto owner = runtime.assignable(object, "Landroid/view/ViewGroup;")
+                ? std::string_view{"Landroid/view/ViewGroup;"} : std::string_view{"Landroid/view/View;"};
+            const ApiSupport base_api{owner, "resetResolvedDrawables", "()V", ApiStatus::partial, "Actual protected SDK drawable reset"};
+            const std::array args{Value::reference(object)};
+            (void)topology_view_query(base_api, args);
+        }
+    }
+    Value layout_parameter_policy(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("LAYOUT_PARAMS_ARGUMENT", "Layout policy requires its actual parent receiver");
+        const auto parent = args[0].bits;
+        if (!parent) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot parent_root(runtime, parent);
+        (void)view(parent);
+        runtime.charge_provider_work(1);
+        if (api.name == "onSetLayoutParams") {
+            // Actual ViewGroup hook; Java does not inspect either argument.
+            dispatch_view_layout_request(parent);
+            return Value::nothing();
+        }
+        const auto source = args.size() == 2 ? args[1].bits : ObjectId{0};
+        ManagedRoot source_root(runtime, source);
+        const bool frame = api.owner == frame_layout_type;
+        const bool linear = api.owner == "Landroid/widget/LinearLayout;";
+        const auto target_type = frame ? frame_params_type : linear ? linear_params_type : layout_params_type;
+        if (api.name == "checkLayoutParams")
+            return Value::word(source && ((!frame && !linear) || runtime.assignable(source, target_type)));
+        const bool defaults = api.name == "generateDefaultLayoutParams";
+        if (!defaults && !frame && !linear) return Value::reference(source); // SDK returns p unchanged.
+        const auto orientation = defaults && linear ? view(parent).orientation : 0;
+        if (defaults && linear && orientation != 0 && orientation != 1) return Value::reference(0);
+        const bool margins = !defaults && view_preserve_margin_params && source && runtime.assignable(source, margin_params_type);
+        const bool same_type = margins && runtime.assignable(source, target_type);
+        // Java NEW precedes the chosen copy constructor's source dereference,
+        // including its null failure. Reacquire source storage after allocation.
+        const auto object = runtime.new_object(target_type);
+        ManagedRoot object_root(runtime, object);
+        if (!defaults && !source) runtime.raise("Ljava/lang/NullPointerException;");
+        LayoutParamsState copied;
+        copied.owner = this;
+        // MarginLayoutParams(II) and the base-LayoutParams copy constructor
+        // begin with both absolute margins undefined; typed margin copies below
+        // preserve their actual source flags instead.
+        copied.left_undefined = copied.right_undefined = frame || linear;
+        if (defaults) {
+            copied.width = frame ? -1 : -2; copied.height = frame ? -1 : -2;
+            if (linear) copied.width = orientation == 1 ? -1 : -2;
+        } else {
+            const auto prior = layout_params(source);
+            copied.width = prior.width; copied.height = prior.height;
+            if (margins) {
+                copied.left = prior.left; copied.top = prior.top;
+                copied.right = prior.right; copied.bottom = prior.bottom;
+                copied.left_undefined = prior.left_undefined; copied.right_undefined = prior.right_undefined;
+                copied.rtl_compatibility = prior.rtl_compatibility;
+                copied.layout_direction = prior.layout_direction;
+                if (same_type) {
+                    copied.gravity = prior.gravity;
+                    if (linear) copied.weight_bits = prior.weight_bits;
+                }
+            }
+        }
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(LayoutParamsState));
+        runtime.charge_provider_work(1);
+        auto metadata = std::make_unique<LayoutParamsState>(copied);
+        storage.publish(object, std::move(metadata));
+        return Value::reference(object);
+    }
+    Value topology_view_query(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_ARGUMENT", "View state query requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_TOPOLOGY_UNSUPPORTED", "Topology query requires actual implemented SDK View constructor state");
+        if (api.name == "resolveLayoutParams") { resolve_view_layout_params(object); return Value::nothing(); }
+        if (api.name == "getAnimation") return Value::reference(0); // No supported operation installs mCurrentAnimation.
+        if (api.name == "hasTransientState" || api.name == "isFocusedByDefault") return Value::word(0);
+        if (api.name == "getLayoutDirection") return Value::word(0); // No supported operation resolves RTL.
+        if (api.name == "getRawLayoutDirection") return Value::word(static_cast<std::uint32_t>(view_state(object).raw_layout_direction));
+        if (api.name == "isLayoutDirectionInherited") {
+            const auto raw = runtime.invoke_virtual_named(object, "getRawLayoutDirection", "()I");
+            return Value::word(static_cast<std::uint32_t>(raw.bits) == 2u);
+        }
+        if (api.name == "resetRtlProperties") {
+            // These five calls are virtual, including protected drawables reset.
+            // Each callback sees the preceding stores and may reenter normally.
+            for (const auto operation : {"resetResolvedLayoutDirection", "resetResolvedTextDirection",
+                    "resetResolvedTextAlignment", "resetResolvedPadding"})
+                (void)runtime.invoke_virtual_named(object, operation, "()V");
+            dispatch_reset_resolved_drawables(object);
+            return Value::nothing();
+        }
+        if (api.name == "resetResolvedLayoutDirection" || api.name == "resetResolvedTextDirection" ||
+            api.name == "resetResolvedTextAlignment" || api.name == "resetResolvedPadding" || api.name == "resetResolvedDrawables") {
+            update_view_constructor_state(object, [name = api.name](ViewObjectState &next) {
+                if (name == "resetResolvedLayoutDirection") next.layout_direction_resolved = false;
+                else if (name == "resetResolvedTextDirection") next.resolved_text_direction = 1;
+                else if (name == "resetResolvedTextAlignment") next.resolved_text_alignment = 1;
+                else if (name == "resetResolvedPadding") next.padding_resolved = false;
+                else next.drawables_resolved = false;
+            });
+            if (api.owner == "Landroid/view/ViewGroup;") {
+                // The SDK Group override first executes this View reset, then
+                // queries its child count virtually. Child propagation requires
+                // the corresponding inherited text/padding/drawable state walk.
+                const auto count = runtime.invoke_virtual_named(object, "getChildCount", "()I");
+                if (std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(count.bits)) > 0)
+                    bad("VIEW_RTL_CHILDREN_UNSUPPORTED", "RTL reset propagation over existing children is not implemented");
+            }
+            return Value::nothing();
+        }
+        bad("VIEW_TOPOLOGY_UNSUPPORTED", "Unknown topology state query");
+    }
+    void resolve_view_layout_params(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        const auto params = view_state(object).references[7].bits;
+        ManagedRoot params_root(runtime, params);
+        if (!params) return;
+        const auto direction = runtime.invoke_virtual_named(object, "getLayoutDirection", "()I");
+        const std::array args{direction};
+        (void)runtime.invoke_virtual_named(params, "resolveLayoutDirection", "(I)V", args);
+    }
+    void set_layout_params(ObjectId object, ObjectId params) {
+        if (!params) runtime.raise("Ljava/lang/NullPointerException;", u"Layout parameters cannot be null");
+        ManagedRoot params_root(runtime, params);
+        if (!runtime.assignable(params, layout_params_type)) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        (void)layout_params(params);
+        ManagedRoot object_root(runtime, object);
+        if (view_state(object).view_context_constructor) {
+            // SDK stores first: exceptions or reentry from resolution preserve
+            // the new LayoutParams, and the parent is read only afterwards.
+            update_view_constructor_state(object, [params](ViewObjectState &next) {
+                next.references[7] = Value::reference(params);
+            });
+            // This SDK method is public and virtual. Preserve the original
+            // callback after the store, including reentrant parameter changes.
+            if (const auto method = metered_view_override(object, "resolveLayoutParams", "()V")) {
+                const std::array args{Value::reference(object)};
+                (void)runtime.invoke_virtual(*method, args);
+            } else resolve_view_layout_params(object);
+            const auto parent = view(object).parent;
+            ManagedRoot parent_root(runtime, parent);
+            if (parent) {
+                const std::array args{Value::reference(object), Value::reference(params)};
+                (void)dispatch_layout_parameter_policy(parent, "onSetLayoutParams",
+                    "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", args);
+            }
+            dispatch_view_layout_request(object);
+            surface_dirty = true;
+            return;
+        }
+        if (override_method(runtime.object_type(object), "resolveLayoutParams", "()V"))
+            bad("LAYOUT_UNSUPPORTED", "Custom layout-parameter resolution requires executed layout semantics");
+        if (override_method(runtime.object_type(params), "resolveLayoutDirection", "(I)V"))
+            bad("LAYOUT_UNSUPPORTED", "Custom LayoutParams direction resolution requires executed layout semantics");
+        if (in_tree(object)) cancel_input();
+        auto metadata = std::make_unique<ViewObjectState>(view_state(object));
+        metadata->references[7] = Value::reference(params);
+        runtime.set_host_state(object, std::move(metadata));
+        surface_dirty = true;
+    }
+    void dispatch_set_layout_params(ObjectId object, ObjectId params) {
+        ManagedRoot object_root(runtime, object), params_root(runtime, params);
+        const std::array args{Value::reference(params)};
+        (void)runtime.invoke_virtual_named(object, "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V", args);
+    }
+    void require_renderable_subtree(ObjectId object) {
+        // Constructor-only generic Views must not become blank host widgets.
+        // Inspect existing tree metadata only: no class loading or callbacks.
+        std::array<ObjectId, 256> pending{};
+        pending[0] = object;
+        std::size_t count = 1;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto &node = view(pending[index]);
+            if (node.kind == ViewKind::view)
+                bad("VIEW_RENDER_UNSUPPORTED", "Generic View measurement, layout, drawing and attachment lifecycle are not implemented");
+            for (const auto child : node.children) {
+                if (count == pending.size()) bad("VIEW_LIMIT", "View subtree exceeds the existing view bound");
+                pending[count++] = child;
+            }
+        }
+    }
+    void validate_child_attachment(ObjectId parent, ObjectId child) {
+        const auto &container = view(parent);
+        const auto &node = view(child);
+        if (in_tree(parent)) require_renderable_subtree(child);
+        if (node.parent || child == content)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"View already belongs to a parent or window");
+        if (container.kind == ViewKind::frame_layout &&
+            (in_tree(parent) || !view_state(parent).group_constructor || !view_state(child).view_context_constructor) &&
+            (!container.children.empty() || (node.kind != ViewKind::frame_layout && node.kind != ViewKind::surface_view)))
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"FrameLayout supports only a single fill FrameLayout/SurfaceView child");
+        if (container.kind == ViewKind::scroll_view && !container.children.empty())
+            runtime.raise("Ljava/lang/IllegalStateException;", u"ScrollView can host only one direct child");
+        auto object = parent;
+        for (unsigned depth = 0; object && depth < 256; ++depth) {
+            runtime.charge_provider_work(1);
+            if (object == child) runtime.raise("Ljava/lang/IllegalStateException;", u"View tree would contain a cycle");
+            object = view(object).parent;
+        }
+        if (object) bad("VIEW_LIMIT", "View attachment ancestry exceeds the existing bound");
+    }
+    void topology_require_state(ObjectId object, bool group = false) {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor || (group && !view_state(object).group_constructor))
+            bad("VIEW_TOPOLOGY_UNSUPPORTED", "Topology mutation requires actual implemented View/ViewGroup constructor state");
+    }
+    void topology_accessibility_notification(ObjectId parent) {
+        ManagedRoot parent_root(runtime, parent);
+        if (const auto method = metered_view_override(parent, "notifySubtreeAccessibilityStateChangedIfNeeded", "()V")) {
+            const std::array args{Value::reference(parent)};
+            (void)runtime.invoke_virtual(*method, args);
+            return;
+        }
+        // SDK obtains AccessibilityManager before checking its AttachInfo. The
+        // absent manager implementation cannot be replaced by an early no-op.
+        bad("VIEW_ACCESSIBILITY_MANAGER_UNSUPPORTED", "Subtree notification requires actual AccessibilityManager initialization");
+    }
+    void topology_require_no_unhandled_keys(ObjectId object) {
+        topology_require_state(object);
+        // Bootstrap package-private hasUnhandledKeyListener cannot be
+        // overridden by app-loader subclasses. The admitted API has no way to
+        // install the listener list or a nonzero child-listener count.
+    }
+    void topology_require_no_default_focus(ObjectId object) {
+        topology_require_state(object);
+        // Bootstrap hasDefaultFocus calls final isFocusedByDefault. No admitted
+        // setter or accepted XML attribute can set it, and true-child insertion
+        // is refused before a default-focus chain can be installed.
+    }
+    Value topology_group_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_TOPOLOGY_ARGUMENT", "Tree operation requires its actual parent receiver");
+        const auto parent = args[0].bits;
+        if (!parent) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot parent_root(runtime, parent);
+        if (api.name == "indexOfChild") {
+            const auto child = args[1].bits;
+            const auto &children = view(parent).children;
+            for (std::size_t index = 0; index < children.size(); ++index) {
+                runtime.charge_provider_work(1);
+                if (children[index] == child) return Value::word(static_cast<std::uint32_t>(index));
+            }
+            return Value::word(UINT32_MAX);
+        }
+        const auto child = args[1].bits;
+        ManagedRoot child_root(runtime, child);
+        if (api.name == "removeViewInLayout") {
+            const std::array index_args{Value::reference(child)};
+            const auto selected = runtime.invoke_virtual_named(parent, "indexOfChild", "(Landroid/view/View;)I", index_args);
+            const auto index = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(selected.bits));
+            if (index < 0) return Value::nothing();
+            topology_require_state(parent, true);
+            topology_require_state(child);
+            // Focus/transition/physical detach need their own concrete consumers;
+            // the genuine off-tree default path owns none of these states.
+            if (in_tree(parent) || view(child).focused || focused_view == child)
+                bad("VIEW_REMOVE_IN_LAYOUT_UNSUPPORTED", "Focused or presented child removal requires its actual lifecycle path");
+            dispatch_visibility_accessibility_clear(child);
+            // Unlike removeView, do not cancel unrelated global input or focus.
+            if (pointer_target == child || key_target == child)
+                bad("VIEW_REMOVE_INPUT_UNSUPPORTED", "Removal of an active input target requires its original targeted cancellation");
+            if (touch_gesture) for (std::size_t slot = 0; slot < touch_gesture->count; ++slot) {
+                runtime.charge_provider_work(1);
+                if (touch_gesture->routes[slot].object == child || touch_gesture->routes[slot].child == child)
+                    bad("VIEW_REMOVE_INPUT_UNSUPPORTED", "Removal of a routed touch target requires its original targeted cancellation");
+            }
+            const auto animation = runtime.invoke_virtual_named(child, "getAnimation", "()Landroid/view/animation/Animation;");
+            if (animation.kind != dex::ValueKind::reference)
+                bad("VIEW_TOPOLOGY_ARGUMENT", "Animation callback returned a nonreference");
+            ManagedRoot animation_root(runtime, animation.bits);
+            if (animation.bits) bad("VIEW_REMOVE_ANIMATION_UNSUPPORTED", "Disappearing child animation is not implemented");
+            const auto transient = runtime.invoke_virtual_named(child, "hasTransientState", "()Z");
+            if (transient.bits) bad("VIEW_REMOVE_TRANSIENT_UNSUPPORTED", "Transient-state child bookkeeping is not implemented");
+            // The cached Java index survives callbacks. A changed slot cannot
+            // be emulated by silently finding/removing a different current child.
+            if (in_tree(parent) || static_cast<std::size_t>(index) >= view(parent).children.size() ||
+                view(parent).children[static_cast<std::size_t>(index)] != child || view(child).parent != parent)
+                bad("VIEW_REMOVE_REENTRANT_UNSUPPORTED", "Removal callbacks changed the cached child slot or parent custody");
+            (void)erase_view_child(runtime, view(parent).children, static_cast<std::size_t>(index));
+            view(child).parent = 0;
+            surface_dirty = true; ++metrics.view_revision;
+            topology_require_no_unhandled_keys(child);
+            // The admitted no-default-focus profile has no parent default chain.
+            dispatch_hierarchy_hook(parent, child, false);
+            const auto visibility = runtime.invoke_virtual_named(child, "getVisibility", "()I");
+            if (static_cast<std::uint32_t>(visibility.bits) != 8u) topology_accessibility_notification(parent);
+            return Value::nothing();
+        }
+        if (api.name != "addView") bad("VIEW_TOPOLOGY_ARGUMENT", "Unknown tree operation");
+        if (api.signature == "(Landroid/view/View;)V") {
+            const std::array call{Value::reference(child), Value::word(UINT32_MAX)};
+            return runtime.invoke_virtual_named(parent, "addView", "(Landroid/view/View;I)V", call);
+        }
+        if (api.signature == "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V") {
+            const std::array call{Value::reference(child), Value::word(UINT32_MAX), args[2]};
+            return runtime.invoke_virtual_named(parent, "addView", "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V", call);
+        }
+        if (!child) runtime.raise("Ljava/lang/IllegalArgumentException;", u"Cannot add a null child view to a ViewGroup");
+        (void)view(child);
+        auto index = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[2].bits));
+        if (api.signature == "(Landroid/view/View;I)V") {
+            const auto current = runtime.invoke_virtual_named(child, "getLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;");
+            if (current.kind != dex::ValueKind::reference)
+                bad("VIEW_TOPOLOGY_ARGUMENT", "LayoutParams callback returned a nonreference");
+            ManagedRoot params_root(runtime, current.bits);
+            ObjectId params = current.bits;
+            if (!params) {
+                const auto generated = dispatch_layout_parameter_policy(parent, "generateDefaultLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;");
+                if (generated.kind != dex::ValueKind::reference)
+                    bad("VIEW_TOPOLOGY_ARGUMENT", "Default layout policy returned a nonreference");
+                params = generated.bits; params_root.reset(params);
+                if (!params) runtime.raise("Ljava/lang/IllegalArgumentException;", u"generateDefaultLayoutParams() cannot return null");
+            }
+            const std::array call{Value::reference(child), Value::word(std::bit_cast<std::uint32_t>(index)), Value::reference(params)};
+            return runtime.invoke_virtual_named(parent, "addView", "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V", call);
+        }
+        ObjectId params = args[3].bits;
+        ManagedRoot params_root(runtime, params);
+        dispatch_view_layout_request(parent);
+        dispatch_view_invalidate(parent, true);
+        topology_require_state(parent, true);
+        topology_require_state(child);
+        const auto prior_parent = runtime.invoke_virtual_named(child, "getParent", "()Landroid/view/ViewParent;");
+        if (prior_parent.bits) runtime.raise("Ljava/lang/IllegalStateException;", u"The specified child already has a parent");
+        const std::array check_args{Value::reference(params)};
+        const auto accepted = dispatch_layout_parameter_policy(parent, "checkLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Z", check_args);
+        if (!accepted.bits) {
+            const auto converted = dispatch_layout_parameter_policy(parent, "generateLayoutParams",
+                "(Landroid/view/ViewGroup$LayoutParams;)Landroid/view/ViewGroup$LayoutParams;", check_args);
+            if (converted.kind != dex::ValueKind::reference)
+                bad("VIEW_TOPOLOGY_ARGUMENT", "Layout conversion returned a nonreference");
+            params = converted.bits; params_root.reset(params);
+        }
+        dispatch_set_layout_params(child, params);
+        if (view(child).parent || child == content)
+            bad("VIEW_ADD_REENTRANT_UNSUPPORTED", "Layout callbacks changed the child's actual parent/window custody");
+        validate_child_attachment(parent, child);
+        if (!view_state(parent).group_children_initialized)
+            runtime.raise("Ljava/lang/NullPointerException;", u"ViewGroup child storage is not initialized");
+        if (index < 0) index = static_cast<std::int32_t>(view(parent).children.size());
+        if (static_cast<std::size_t>(index) > view(parent).children.size())
+            runtime.raise("Ljava/lang/IndexOutOfBoundsException;", u"index exceeds ViewGroup child count");
+        insert_view_child(runtime, view(parent).children, static_cast<std::size_t>(index), child);
+        view(child).parent = parent;
+        surface_dirty = true; ++metrics.view_revision;
+        topology_require_no_unhandled_keys(child);
+        const auto child_focus = runtime.invoke_virtual_named(child, "hasFocus", "()Z");
+        if (child_focus.bits) bad("VIEW_ADD_FOCUS_UNSUPPORTED", "Focused child insertion requires actual requestChildFocus bookkeeping");
+        const auto inherited = runtime.invoke_virtual_named(child, "isLayoutDirectionInherited", "()Z");
+        if (inherited.bits) (void)runtime.invoke_virtual_named(child, "resetRtlProperties", "()V");
+        dispatch_hierarchy_hook(parent, child, true);
+        const auto transient = runtime.invoke_virtual_named(child, "hasTransientState", "()Z");
+        if (transient.bits) bad("VIEW_ADD_TRANSIENT_UNSUPPORTED", "Transient child insertion requires actual parent transient-state bookkeeping");
+        const auto visibility = runtime.invoke_virtual_named(child, "getVisibility", "()I");
+        if (static_cast<std::uint32_t>(visibility.bits) != 8u) topology_accessibility_notification(parent);
+        if (drag_sequence && in_tree(parent)) bad("VIEW_ADD_DRAG_UNSUPPORTED", "Child insertion into an active drag requires original drag bookkeeping");
+        topology_require_no_default_focus(child);
+        const auto constructor_context = view_state(parent).references[9].bits;
+        ManagedRoot context_root(runtime, constructor_context);
+        const auto compatibility = runtime.invoke_virtual_named(constructor_context, "isAutofillCompatibilityEnabled", "()Z");
+        if (compatibility.bits)
+            (void)runtime.invoke_virtual_named(child, "getAccessibilityNodeProvider", "()Landroid/view/accessibility/AccessibilityNodeProvider;");
+        return Value::nothing();
+    }
+    void dispatch_hierarchy_hook(ObjectId parent, ObjectId child, bool added) {
+        ManagedRoot parent_root(runtime, parent), child_root(runtime, child);
+        const std::array args{Value::reference(child)};
+        (void)runtime.invoke_virtual_named(parent, added ? "onViewAdded" : "onViewRemoved", "(Landroid/view/View;)V", args);
+    }
+    bool fill_params(ObjectId object) const {
+        const auto params = view_state(object).references[7].bits;
+        if (!params || !runtime.assignable(params, frame_params_type)) return false;
+        if (override_method(runtime.object_type(params), "resolveLayoutDirection", "(I)V"))
+            bad("LAYOUT_UNSUPPORTED", "Custom LayoutParams direction resolution cannot prove viewport fill");
+        const auto &metadata = layout_params(params);
+        // With identical parent/child extents and zero margins, every gravity
+        // branch has zero offset. Relative-margin setters remain unsupported.
+        return metadata.width == -1 && metadata.height == -1 && !metadata.left && !metadata.top &&
+            !metadata.right && !metadata.bottom;
+    }
+    ObjectId fill_surface_target() {
+        if (!content) return 0;
+        if (content == native_content_view && view(content).kind == ViewKind::native_content) {
+            if (!native_created || !fill_params(content) || !view(content).children.empty())
+                bad("NATIVE_CONTENT_STATE", "Native content requires its live exact fill consumer");
+            return content;
+        }
+        bool contains_surface = false;
+        for (const auto &[id, node] : views)
+            if (node.kind == ViewKind::surface_view && in_tree(id)) { contains_surface = true; break; }
+        if (!contains_surface) return 0;
+        auto object = content;
+        for (unsigned depth = 0; depth < 256; ++depth) {
+            const auto &node = view(object);
+            if (node.kind != ViewKind::frame_layout && node.kind != ViewKind::surface_view)
+                bad("SURFACE_UNSUPPORTED", "Native SurfaceView requires only viewport-fill FrameLayout ancestors");
+            if (!fill_params(object))
+                bad("SURFACE_UNSUPPORTED", "Native SurfaceView requires actual MATCH_PARENT parameters and zero margins");
+            const auto type = runtime.object_type(object);
+            if (override_method(type, "onMeasure", "(II)V") || override_method(type, "onLayout", "(ZIIII)V") ||
+                override_method(type, "layout", "(IIII)V") ||
+                (node.kind == ViewKind::frame_layout &&
+                    override_method(type, "measureChildWithMargins", "(Landroid/view/View;IIII)V")))
+                bad("SURFACE_UNSUPPORTED", "Custom native-surface measurement/layout requires executed geometry proof");
+            if (node.kind == ViewKind::surface_view) {
+                if (!node.children.empty()) bad("SURFACE_UNSUPPORTED", "SurfaceView cannot compose child overlays");
+                return object;
+            }
+            if (node.children.size() != 1)
+                bad("SURFACE_UNSUPPORTED", "Native FrameLayout chain requires exactly one child without overlays");
+            object = node.children.front();
+        }
+        bad("SURFACE_UNSUPPORTED", "Native fill chain exceeds the existing View bound");
+    }
+    template <class Update> void update_layout_params(ObjectId object, Update update) {
+        ManagedRoot object_root(runtime, object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(LayoutParamsState));
+        const auto &previous = layout_params(object);
+        runtime.charge_provider_work(1);
+        auto next = std::make_unique<LayoutParamsState>(previous);
+        update(*next); // Private scalar-only update; no allocation or guest reentry.
+        storage.publish(object, std::move(next));
+    }
+    std::int32_t required_layout_value(ObjectId values, std::uint32_t index) {
+        ManagedRoot values_root(runtime, values);
+        if (!values) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const TypedArrayState *>(runtime.host_state(values));
+        if (!metadata || metadata->owner != this)
+            bad("LAYOUT_PARAMS_UNSUPPORTED", "LayoutParams requires an actual owned TypedArray");
+        if (metadata->recycled) runtime.raise("Ljava/lang/RuntimeException;", u"Cannot use a recycled TypedArray");
+        if (index >= metadata->cells.size()) runtime.raise("Ljava/lang/ArrayIndexOutOfBoundsException;");
+        const auto cell = metadata->cells[index].snapshot;
+        if (cell.presence == StyledAttributePresence::present && cell.scalar == StyledScalarStatus::ready) {
+            if (cell.value.type >= 0x10 && cell.value.type <= 0x1f) return std::bit_cast<std::int32_t>(cell.value.data);
+            if (cell.value.type == 5) {
+                runtime.charge_provider_work(1);
+                return dimension_pixel_size(cell.value.data, configuration.density_dpi);
+            }
+        }
+        runtime.raise("Ljava/lang/UnsupportedOperationException;", u"You must supply a supported layout dimension attribute");
+    }
+    Value layout_set_base_attributes(std::span<const Value> args) {
+        if (args.size() != 4 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+            args[2].kind != dex::ValueKind::word || args[3].kind != dex::ValueKind::word)
+            bad("LAYOUT_PARAMS_ARGUMENT", "setBaseAttributes requires its actual parameters, TypedArray and two indexes");
+        ManagedRoot object_root(runtime, args[0].bits), values_root(runtime, args[1].bits);
+        (void)layout_params(args[0].bits);
+        const auto width = required_layout_value(args[1].bits, static_cast<std::uint32_t>(args[2].bits));
+        update_layout_params(args[0].bits, [width](LayoutParamsState &next) { next.width = width; });
+        // Preserve the original width store if the later height lookup throws.
+        const auto height = required_layout_value(args[1].bits, static_cast<std::uint32_t>(args[3].bits));
+        update_layout_params(args[0].bits, [height](LayoutParamsState &next) { next.height = height; });
+        return Value::nothing();
+    }
+    std::optional<dex::Index> metered_view_override(ObjectId object, std::string_view name, std::string_view signature) {
+        const auto equal = [&](std::string_view actual, std::string_view expected) {
+            runtime.charge_provider_work(1);
+            if (actual.size() != expected.size()) return false;
+            for (std::size_t index = 0; index < expected.size(); ++index) {
+                runtime.charge_provider_work(1);
+                if (actual[index] != expected[index]) return false;
+            }
+            return true;
+        };
+        auto type = runtime.object_type(object);
+        for (unsigned depth = 0; depth < 256; ++depth) {
+            runtime.charge_provider_work(1);
+            const auto *definition = runtime.class_definition(type);
+            if (!definition) return {};
+            for (const auto index : definition->virtual_methods) {
+                runtime.charge_provider_work(1);
+                const auto &method = runtime.image().methods.at(index);
+                if (equal(method.name, name) && equal(runtime.image().prototypes.at(method.prototype).descriptor, signature)) return index;
+            }
+            if (definition->superclass == dex::no_index) return {};
+            type = runtime.image().types.at(definition->superclass);
+        }
+        bad("CLASS_LIMIT", "Constructor override hierarchy exceeds the existing limit");
+    }
+    void dispatch_layout_base_attributes(ObjectId object, ObjectId values, WidgetStyleable kind) {
+        ManagedRoot object_root(runtime, object), values_root(runtime, values);
+        const std::array args{Value::reference(object), Value::reference(values),
+            Value::word(widget_attribute_slot(kind, "layout_width")), Value::word(widget_attribute_slot(kind, "layout_height"))};
+        if (const auto method = metered_view_override(object, "setBaseAttributes", "(Landroid/content/res/TypedArray;II)V"))
+            (void)runtime.invoke_virtual(*method, args);
+        else (void)layout_set_base_attributes(args);
+    }
+    Value layout_params_xml_constructor(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() != 3 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+            (args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)))
+            bad("LAYOUT_PARAMS_ARGUMENT", "LayoutParams XML constructor requires its receiver, Context and AttributeSet");
+        const auto object = args[0].bits;
+        ManagedRoot object_root(runtime, object), context_root(runtime, args[1].bits), attrs_root(runtime, args[2].bits);
+        context(args[1].bits);
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!runtime.assignable(object, api.owner))
+            bad("LAYOUT_PARAMS_ARGUMENT", "LayoutParams constructor receiver does not match its actual SDK declaration");
+        if (runtime.host_state(object)) bad("LAYOUT_PARAMS", "LayoutParams constructor called twice");
+        if (runtime.host_state_capacity(object) < sizeof(LayoutParamsState))
+            bad("LAYOUT_PARAMS_LIMIT", "LayoutParams initial fields exceed existing managed admission");
+        auto initial = std::make_unique<LayoutParamsState>();
+        initial->owner = this;
+        initial->gravity = 0; // Java allocation zero, before subclass initializers.
+        runtime.set_host_state(object, std::move(initial));
+        const bool margins = api.owner != layout_params_type;
+        const auto kind = margins ? WidgetStyleable::view_group_margin_layout : WidgetStyleable::view_group_layout;
+        const auto values = obtain_widget_attributes(args[1].bits, args[2].bits, kind, false);
+        ManagedRoot values_root(runtime, values);
+        dispatch_layout_base_attributes(object, values, kind);
+        if (margins) {
+            const auto margin = widget_dimension(values, kind, "layout_margin", -1);
+            auto left = margin, top = margin, right = margin, bottom = margin;
+            bool left_undefined = false, right_undefined = false;
+            if (margin < 0) {
+                const auto horizontal = widget_dimension(values, kind, "layout_marginHorizontal", -1);
+                const auto vertical = widget_dimension(values, kind, "layout_marginVertical", -1);
+                if (horizontal >= 0) left = right = horizontal;
+                else {
+                    left = widget_dimension(values, kind, "layout_marginLeft", INT32_MIN);
+                    right = widget_dimension(values, kind, "layout_marginRight", INT32_MIN);
+                    left_undefined = left == INT32_MIN; right_undefined = right == INT32_MIN;
+                    if (left_undefined) left = 0;
+                    if (right_undefined) right = 0;
+                }
+                const auto start = widget_dimension(values, kind, "layout_marginStart", INT32_MIN);
+                const auto end = widget_dimension(values, kind, "layout_marginEnd", INT32_MIN);
+                if (start != INT32_MIN || end != INT32_MIN)
+                    bad("LAYOUT_PARAMS_UNSUPPORTED", "Relative XML margins require actual direction-resolution semantics");
+                if (vertical >= 0) top = bottom = vertical;
+                else {
+                    top = widget_dimension(values, kind, "layout_marginTop", 0);
+                    bottom = widget_dimension(values, kind, "layout_marginBottom", 0);
+                }
+            }
+            update_layout_params(object, [=](LayoutParamsState &next) {
+                next.left = left; next.top = top; next.right = right; next.bottom = bottom;
+                next.left_undefined = left_undefined; next.right_undefined = right_undefined;
+            });
+            // The SDK performs this original Context call after storing margins.
+            // Reacquire parameter state after callbacks so their writes survive.
+            const auto info = runtime.invoke_virtual_named(args[1].bits, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+            ManagedRoot info_root(runtime, info.bits);
+            const auto rtl = runtime.invoke_virtual_named(info.bits, "hasRtlSupport", "()Z");
+            if (rtl.kind != dex::ValueKind::word) bad("LAYOUT_PARAMS_STATE", "ApplicationInfo returned nonboolean RTL support");
+            update_layout_params(object, [supported = rtl.bits != 0](LayoutParamsState &next) { next.rtl_compatibility = !supported; });
+        }
+        (void)runtime.invoke_virtual_named(values, "recycle", "()V");
+        if (api.owner == frame_params_type || api.owner == linear_params_type) {
+            update_layout_params(object, [](LayoutParamsState &next) { next.gravity = -1; });
+            const auto subclass_kind = api.owner == frame_params_type ? WidgetStyleable::frame_layout_layout : WidgetStyleable::linear_layout_layout;
+            const auto subclass_values = obtain_widget_attributes(args[1].bits, args[2].bits, subclass_kind, false);
+            ManagedRoot subclass_values_root(runtime, subclass_values);
+            (void)widget_snapshot(subclass_values, subclass_kind);
+            if (api.owner == linear_params_type) {
+                const auto weight = widget_cell(subclass_values, subclass_kind, "layout_weight");
+                std::uint32_t weight_bits = 0;
+                if (weight.presence != StyledAttributePresence::absent) {
+                    if (weight.presence != StyledAttributePresence::present || weight.scalar != StyledScalarStatus::ready)
+                        bad("LAYOUT_PARAMS_UNSUPPORTED", "Linear weight requires a supported actual scalar");
+                    if (weight.value.type == 4) weight_bits = weight.value.data;
+                    else if (weight.value.type >= 0x10 && weight.value.type <= 0x1f) {
+                        runtime.charge_provider_work(1);
+                        weight_bits = std::bit_cast<std::uint32_t>(static_cast<float>(std::bit_cast<std::int32_t>(weight.value.data)));
+                    } else bad("LAYOUT_PARAMS_UNSUPPORTED", "Linear weight string coercion is not implemented");
+                }
+                update_layout_params(object, [weight_bits](LayoutParamsState &next) { next.weight_bits = weight_bits; });
+            }
+            const auto gravity = widget_integer(subclass_values, subclass_kind, "layout_gravity", -1);
+            update_layout_params(object, [gravity](LayoutParamsState &next) { next.gravity = gravity; });
+            (void)runtime.invoke_virtual_named(subclass_values, "recycle", "()V");
+        }
+        return Value::nothing();
+    }
+    Value layout_params_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.name == "setBaseAttributes") return layout_set_base_attributes(args);
+        if (api.name == "resolveLayoutDirection") {
+            if (args.size() != 2 || !args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            ManagedRoot params_root(runtime, args[0].bits);
+            (void)layout_params(args[0].bits);
+            runtime.charge_provider_work(1);
+            if (api.owner == margin_params_type) {
+                const auto direction = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+                // This profile has no relative-margin setter/accepted XML input.
+                // SDK still stores valid direction bits before its no-relative return.
+                if (direction == 0 || direction == 1)
+                    update_layout_params(args[0].bits, [direction](LayoutParamsState &next) { next.layout_direction = direction; });
+            }
+            return Value::nothing();
+        }
+        if (args.empty() || !args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        if (api.name != "<init>") bad("LAYOUT_UNSUPPORTED", "LayoutParams method is outside the fill profile");
+        if (api.signature == "(Landroid/content/Context;Landroid/util/AttributeSet;)V")
+            return layout_params_xml_constructor(api, args);
+        const auto object = args[0].bits;
+        if (runtime.host_state(object)) bad("LAYOUT_PARAMS", "LayoutParams constructor called twice");
+        auto metadata = std::make_unique<LayoutParamsState>(); metadata->owner = this;
+        if (args.size() == 2) {
+            if (!args[1].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            const auto &source = layout_params(args[1].bits);
+            metadata->width = source.width; metadata->height = source.height;
+            if (api.signature.find("MarginLayoutParams;") != std::string_view::npos ||
+                api.signature.find("FrameLayout$LayoutParams;") != std::string_view::npos) {
+                metadata->left = source.left; metadata->top = source.top;
+                metadata->right = source.right; metadata->bottom = source.bottom;
+            }
+            if (api.signature == "(Landroid/widget/FrameLayout$LayoutParams;)V") metadata->gravity = source.gravity;
+        } else {
+            if (args.size() != 3 && args.size() != 4) bad("LAYOUT_PARAMS", "LayoutParams requires real width/height");
+            metadata->width = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+            metadata->height = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[2].bits));
+            if (args.size() == 4) {
+                if (api.owner == linear_params_type) metadata->weight_bits = static_cast<std::uint32_t>(args[3].bits);
+                else metadata->gravity = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[3].bits));
+            }
+        }
+        runtime.set_host_state(object, std::move(metadata));
+        return Value::nothing();
+    }
+    void bind_surface(ObjectId object, std::shared_ptr<NativeWindowProducer> producer) {
+        const auto &current = surface_state(object);
+        if (current.producer == producer) return;
+        if (current.generation == static_cast<std::uint32_t>(INT32_MAX)) bad("SURFACE_LIMIT", "Surface generation exhausted");
+        auto next = std::make_unique<SurfaceObjectState>(current);
+        next->producer = std::move(producer);
+        ++next->generation;
+        runtime.set_host_state(object, std::move(next));
+    }
+    ObjectId initialize_surface_view(ObjectId object) {
+        const auto holder = runtime.new_object(surface_holder_impl_type);
+        ManagedRoot holder_root(runtime, holder);
+        const auto surface = runtime.new_object(surface_type);
+        ManagedRoot surface_root(runtime, surface);
+        auto surface_metadata = std::make_unique<SurfaceObjectState>(); surface_metadata->owner = this;
+        runtime.set_host_state(surface, std::move(surface_metadata));
+        const auto frame = runtime.new_object(rect_type);
+        ManagedRoot frame_root(runtime, frame);
+        runtime.set_host_state(frame, std::make_unique<SurfaceRectState>());
+        auto holder_metadata = std::make_unique<SurfaceHolderState>();
+        holder_metadata->owner = this;
+        holder_metadata->references[0] = Value::reference(object);
+        holder_metadata->references[1] = Value::reference(surface);
+        holder_metadata->references[2] = Value::reference(frame);
+        runtime.set_host_state(holder, std::move(holder_metadata));
+        return holder;
+    }
+    void notify_surface(const ActiveSurface &surface, bool created, bool destroyed) {
+        if (view(surface.view).kind == ViewKind::native_content) {
+            NativeActivityRequest request;
+            request.stage = destroyed ? NativeActivityStage::window_destroyed : created
+                ? NativeActivityStage::window_created : NativeActivityStage::window_resized;
+            request.activity = activity; request.asset_manager = native_activity_assets();
+            request.content_view = surface.view; request.configuration = configuration;
+            request.window_generation = surface.request.window_generation;
+            request.window_producer = surface.producer;
+            request.window_geometry = {surface.admission.width, surface.admission.height, surface.admission.format};
+            if (!native_created || !native_activity_observer || native_dispatching)
+                bad("NATIVE_ACTIVITY_STATE", "Native window lifecycle requires its live owner and observer");
+            const auto observer = native_activity_observer;
+            native_dispatching = true;
+            struct End { bool &active; ~End() { active = false; } } end{native_dispatching};
+            ManagedRoot activity_root(runtime, activity), view_root(runtime, surface.view), asset_root(runtime, request.asset_manager);
+            runtime.run_host_callback([&] { apply_native_result(request, observer(request)); });
+            return;
+        }
+        const auto &current = holder_state(surface.holder);
+        struct Snapshot {
+            dex::ManagedRuntime &runtime;
+            std::array<ObjectId, 64> callbacks{};
+            std::size_t count = 0;
+            ~Snapshot() { for (std::size_t n = 0; n < count; ++n) runtime.release(callbacks[n]); }
+        } snapshot{runtime};
+        for (std::size_t n = 0; n < current.count; ++n) {
+            const auto object = current.references[3 + n].bits;
+            runtime.retain(object);
+            snapshot.callbacks[snapshot.count++] = object;
+        }
+        surface_creating = created;
+        struct Reset { bool &creating; ~Reset() { creating = false; } } reset{surface_creating};
+        const std::array args{Value::reference(surface.holder), Value::word(static_cast<std::uint32_t>(surface.admission.format)),
+            Value::word(surface.admission.width), Value::word(surface.admission.height)};
+        for (unsigned event = 0; event < (created ? 2u : 1u); ++event) {
+            const bool first = created && !event;
+            const auto name = destroyed ? "surfaceDestroyed" : first ? "surfaceCreated" : "surfaceChanged";
+            const auto signature = destroyed || first ? "(Landroid/view/SurfaceHolder;)V"
+                                                     : "(Landroid/view/SurfaceHolder;III)V";
+            for (std::size_t n = 0; n < snapshot.count; ++n)
+                (void)runtime.invoke_virtual_named(snapshot.callbacks[n], name, signature,
+                    std::span<const Value>(args).first(destroyed || first ? 1 : 4));
+        }
+    }
+    void retire_native_surface(bool notify) {
+        if (!active_surface) return;
+        if (notify) cancel_input();
+        const auto retiring = *active_surface;
+        if (!notify) {
+            // Exceptional/terminal destruction performs no IPC or guest work.
+            // Whole-session native shutdown/host teardown owns the final drain.
+            if (retiring.surface) runtime.set_host_state(retiring.surface, {}); // Native content has no Java Surface.
+            active_surface.reset();
+            return;
+        }
+        ManagedRoot view_root(runtime, retiring.view), holder_root(runtime, retiring.holder), surface_root(runtime, retiring.surface);
+        std::exception_ptr callback_error;
+        try { notify_surface(retiring, false, true); } catch (...) { callback_error = std::current_exception(); }
+        if (runtime.process_state()->exit_status()) {
+            if (retiring.surface) runtime.set_host_state(retiring.surface, {});
+            active_surface.reset();
+            if (callback_error) std::rethrow_exception(callback_error);
+            return;
+        }
+        if (!native_surface_observer) bad("SURFACE_STATE", "Native surface retirement has no host observer");
+        auto request = retiring.request;
+        request.action = NativeSurfaceRequest::Action::abandon;
+        request.producer = retiring.admission.producer;
+        const auto ack = native_surface_observer(request);
+        if (ack.producer != retiring.admission.producer || ack.backend_token != retiring.admission.backend_token ||
+            ack.width != retiring.admission.width || ack.height != retiring.admission.height || ack.format != retiring.admission.format)
+            bad("SURFACE_ACK", "Native surface retirement acknowledgement changed its producer");
+        native_window_registry->abandon(retiring.producer); // Only after actual host EGL drain ACK.
+        if (retiring.surface) bind_surface(retiring.surface, {});
+        active_surface.reset();
+        if (callback_error) std::rethrow_exception(callback_error);
+    }
+    void reconcile_surface() {
+        if (reconciling_surface || !callback.empty() || !input_events.empty() || dispatching_drag)
+            bad("SURFACE_REENTRANT", "Surface reconciliation requires normal owner execution");
+        if (terminal_cleanup || !attached || state == Lifecycle::failed || runtime.process_state()->exit_status()) return;
+        reconciling_surface = true;
+        struct Reset { bool &active; ~Reset() { active = false; } } reset{reconciling_surface};
+        for (unsigned transition = 0; transition < 16; ++transition) {
+            if (active_surface && surface_dirty && (touch_gesture || native_pointer)) { cancel_input(); continue; }
+            const bool available = activity_attached && visible && !suspended && state != Lifecycle::empty &&
+                state != Lifecycle::stopped && state != Lifecycle::destroyed && state != Lifecycle::failed;
+            if (available && !surface_dirty && !surface_recreate &&
+                (!active_surface || (active_surface->request.root == content &&
+                    active_surface->request.window_generation == window_generation))) return;
+            const auto target = available ? fill_surface_target() : 0;
+            if (active_surface && (!target || active_surface->view != target ||
+                active_surface->request.window_generation != window_generation ||
+                active_surface->request.root != content || surface_recreate)) {
+                retire_native_surface(true);
+                surface_recreate = false;
+                surface_dirty = true; // A changed root/incarnation needs one genuine new admission.
+                continue; // Destruction callbacks may replace the content root.
+            }
+            if (!target) { surface_dirty = false; return; }
+            if (!surface_dirty) return; // Includes an initially deferred, still-unbound root.
+            if (!native_surface_observer)
+                bad("SURFACE_UNSUPPORTED", "A real host admission observer is required for SurfaceView");
+            const bool native = view(target).kind == ViewKind::native_content;
+            const auto holder = native ? ObjectId{0} : view_state(target).references[6].bits;
+            const auto surface = native ? ObjectId{0} : holder_state(holder).references[1].bits;
+            ManagedRoot target_root(runtime, target), holder_root(runtime, holder), surface_root(runtime, surface);
+            const NativeSurfaceRequest request{NativeSurfaceRequest::Action::admit, target, window_generation, 0,
+                orientation_request, content};
+            surface_dirty = false; // Callback mutations below may request a later real transition.
+            const auto admission = native_surface_observer(request);
+            if (!admission.producer && !admission.backend_token && !admission.width &&
+                !admission.height && !admission.format)
+                return; // Deferred actual visibility; a real signal/place/configuration dirties it again.
+            if (!admission.producer || !admission.backend_token || !admission.width || admission.width > 1024 ||
+                !admission.height || admission.height > 1024 || admission.format != 1)
+                bad("SURFACE_ACK", "Host returned an invalid actual SurfaceView admission");
+            const bool created = !active_surface;
+            if (active_surface && (admission.producer != active_surface->admission.producer ||
+                admission.backend_token != active_surface->admission.backend_token))
+                bad("SURFACE_ACK", "Host replaced a producer without surface destruction");
+            const bool changed = created || admission.width != active_surface->admission.width ||
+                admission.height != active_surface->admission.height || admission.format != active_surface->admission.format;
+            auto producer = created ? native_window_registry->publish(admission.producer, admission.backend_token,
+                {admission.width, admission.height, admission.format}) : active_surface->producer;
+            if (!created) native_window_registry->update(producer, {admission.width, admission.height, admission.format});
+            if (!native) {
+                if (created) bind_surface(surface, producer); // A Java release is never undone by a resize.
+                auto frame = std::make_unique<SurfaceRectState>();
+                frame->right = static_cast<std::int32_t>(admission.width); frame->bottom = static_cast<std::int32_t>(admission.height);
+                runtime.set_host_state(holder_state(holder).references[2].bits, std::move(frame));
+            }
+            active_surface = ActiveSurface{target, holder, surface, request, admission, std::move(producer)};
+            surface_recreate = false;
+            if (changed) notify_surface(*active_surface, created, false);
+            // A callback can replace content; settle it before returning a state.
+            if (content != request.root || !activity_attached || !visible || suspended || surface_dirty) continue;
+            return;
+        }
+        bad("SURFACE_LIMIT", "Surface callbacks did not settle after sixteen transitions");
+    }
+    Value surface_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || !args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto receiver = args[0].bits;
+        if (api.owner == surface_callback_type)
+            bad("SURFACE_CALLBACK", "Abstract SurfaceHolder callback cannot execute directly");
+        if (api.owner == surface_type) {
+            if (api.name == "<init>") {
+                if (runtime.host_state(receiver)) bad("SURFACE_STATE", "Surface constructor called twice");
+                auto metadata = std::make_unique<SurfaceObjectState>(); metadata->owner = this;
+                runtime.set_host_state(receiver, std::move(metadata));
+                return Value::nothing();
+            }
+            const auto &metadata = surface_state(receiver);
+            if (api.name == "isValid") return Value::word(metadata.producer != nullptr);
+            if (api.name == "getGenerationId") return Value::word(metadata.generation);
+            if (api.name == "release") { bind_surface(receiver, {}); return Value::nothing(); }
+        } else if (api.owner == rect_type) {
+            if (api.name == "<init>") {
+                if (runtime.host_state(receiver)) bad("SURFACE_FRAME", "Rect constructor called twice");
+                auto metadata = std::make_unique<SurfaceRectState>();
+                if (args.size() == 5) {
+                    metadata->left = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+                    metadata->top = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[2].bits));
+                    metadata->right = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[3].bits));
+                    metadata->bottom = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[4].bits));
+                }
+                runtime.set_host_state(receiver, std::move(metadata)); return Value::nothing();
+            }
+            const auto &metadata = surface_rect(receiver);
+            if (api.name == "width") return Value::word(static_cast<std::uint32_t>(metadata.right) - static_cast<std::uint32_t>(metadata.left));
+            if (api.name == "height") return Value::word(static_cast<std::uint32_t>(metadata.bottom) - static_cast<std::uint32_t>(metadata.top));
+        } else {
+            const auto &metadata = holder_state(receiver);
+            if (api.name == "getSurface") return metadata.references[1];
+            if (api.name == "getSurfaceFrame") return metadata.references[2];
+            if (api.name == "isCreating")
+                return Value::word(surface_creating && active_surface && active_surface->holder == receiver);
+            if (api.name == "addCallback" || api.name == "removeCallback") {
+                if (args.size() != 2) bad("SURFACE_ARGUMENT", "Callback operation requires one callback");
+                const auto listener = args[1].bits;
+                if (!listener) runtime.raise("Ljava/lang/NullPointerException;");
+                if (!runtime.assignable(listener, surface_callback_type)) runtime.raise("Ljava/lang/IllegalArgumentException;");
+                const auto revision = metadata.revision;
+                struct Snapshot {
+                    dex::ManagedRuntime &runtime;
+                    std::array<ObjectId, 64> callbacks{};
+                    std::size_t count = 0;
+                    ~Snapshot() { for (std::size_t n = 0; n < count; ++n) runtime.release(callbacks[n]); }
+                } snapshot{runtime};
+                for (std::size_t n = 0; n < metadata.count; ++n) {
+                    const auto object = metadata.references[3 + n].bits;
+                    runtime.retain(object); snapshot.callbacks[snapshot.count++] = object;
+                }
+                std::size_t found = metadata.count;
+                for (std::size_t n = 0; n < snapshot.count; ++n) {
+                    const std::array values{Value::reference(snapshot.callbacks[n])};
+                    const bool equal = listener == snapshot.callbacks[n] ||
+                        runtime.invoke_virtual_named(listener, "equals", "(Ljava/lang/Object;)Z", values).bits != 0;
+                    if (holder_state(receiver).revision != revision)
+                        bad("SURFACE_REENTRANT", "Callback equality mutated the same SurfaceHolder registry");
+                    if (equal) { found = n; break; }
+                }
+                if ((api.name == "addCallback") == (found < snapshot.count)) return Value::nothing();
+                auto next = std::make_unique<SurfaceHolderState>(holder_state(receiver));
+                if (next->revision == UINT64_MAX) bad("SURFACE_LIMIT", "Surface callback registry revision exhausted");
+                ++next->revision;
+                if (api.name == "addCallback") {
+                    if (next->count == 64) bad("SURFACE_LIMIT", "Surface callback capacity exceeded");
+                    next->references[3 + next->count++] = Value::reference(listener);
+                } else {
+                    for (auto n = found; n + 1 < next->count; ++n) next->references[3 + n] = next->references[4 + n];
+                    next->references[3 + --next->count] = Value::reference(0);
+                }
+                runtime.set_host_state(receiver, std::move(next));
+                return Value::nothing();
+            }
+        }
+        bad("SURFACE_UNSUPPORTED", "Surface method is outside the root-fill profile");
+    }
     void cleanup(bool report_input_errors=true) {
         if (!input_events.empty() || dispatching_drag)
             bad("INPUT_REENTRANT", "Cannot dispose framework during input dispatch");
+        cancel_native_keys();
+        native_completion_target->owner = nullptr;
+        abandon_touch_input(); // Terminal/destructor custody release has no guest execution.
+        retire_native_surface(false);
+        resource_file_reader = {}; package_metadata.reset(); activity_theme.reset(); bound_target_sdk.reset();
+        base_theme = current_activity_theme = 0; base_theme_resource = activity_theme_resource = 0;
+        native_surface_observer = {};
+        native_activity_observer = {};
+        native_pointer_observer = {};
+        native_key_observer = {}; key_completion_observer = {};
+        native_pointer.reset(); native_queue_created = false; native_content_view = 0;
+        native_constructed = native_create_attempted = native_created = false;
         clear_soft_input_requests();
         clear_drag_sequence();
         std::exception_ptr drag_error;
@@ -1015,9 +8258,10 @@ struct ActivitySession::Impl {
         if(input_closed.error!=host::FileError::none && !input_cleanup_failed) {
             input_cleanup_failed=true;++metrics.unsupported_services;
         }
-        for (const auto &[id, view] : views) {
+        for (auto &[id, current] : views) {
             (void)id;
-            runtime.release(view.listener);
+            runtime.release(current.listener);
+            release_view_child_storage(runtime, current.children);
         }
         views.clear();
         unscrolled_bounds.clear();
@@ -1026,15 +8270,39 @@ struct ActivitySession::Impl {
             runtime.release(object);
         owned.clear();
         application = resource_object = package_manager = content_resolver = activity = content = main_looper = files_directory = base_context = activity_thread = 0;
+        layout_inflater_service_name = inflater_constructor_cache = 0;
+        accessibility_client_descriptor = 0;
+        runtime.release(binder_warn_supplier);
+        binder_warn_supplier = 0;
+        runtime.release(array_map_class_space);
+        array_map_class_space = 0;
+        runtime.release(accessibility_instance_sync);
+        accessibility_instance_sync = 0;
+        inflater_theme_attributes = inflater_class_attribute_name = 0;
+        inflater_prefix_names.fill(0);
+        inflater_constructor_count = 0;
+        asset_manager = 0;
         bound_application = loaded_package = data_directory = 0;
         application_info = package_name = component_factory = selected_loader = launch_intent = 0;
         configuration_object = 0;
+        display_metrics = window_configuration = 0;
+        view_configuration = 0;
+        view_menu_key = {};
+        linear_compatibility_done = false; linear_remeasure_weighted_children = true;
+        view_compatibility_done = view_preserve_margin_params = view_default_focus_highlight = false;
+        view_compatibility_pre_target = view_compatibility_post_target = 0;
+        launch_viewport.reset();
+        view_styleable_ids = view_styleable_ordinals = 0;
+        widget_styleables.fill({});
         notification_manager = 0;
         clipboard_manager = clipboard_name = plain_text_mime = 0;
+        build_fingerprint_string = 0;
         clipboard = nullptr;
         input_method_manager = input_method_name = 0;
         buffer_modes.fill(0);
+        porter_duff_modes.fill(0);
         application_attached = activity_attached = application_published = false;
+        activity_base_attach_active = false; pending_activity_base = 0;
         pointer_target = key_target = focused_view = 0;
         held_key = 0;
         if (attached) {
@@ -1268,6 +8536,13 @@ struct ActivitySession::Impl {
         called_super=true;
         if(event=="onConfigurationChanged" && argument)
             dispatch_components(activity,argument->bits);
+        if (event == "onLowMemory") {
+            ComponentSnapshot snapshot(runtime, lifecycle_state(), activity);
+            for (std::size_t n = 0; n < snapshot.count; ++n) {
+                if (!snapshot.values[n].bits) runtime.raise("Ljava/lang/NullPointerException;");
+                (void)runtime.invoke_virtual_named(snapshot.values[n].bits, "onLowMemory", "()V");
+            }
+        }
         if (event == "onSaveInstanceState" || event == "onRestoreInstanceState") {
             if (!argument) bad("SAVED_STATE", "State callback requires a Bundle");
             const auto key = runtime.new_string(u"aether:view-focus-id");
@@ -1300,6 +8575,190 @@ struct ActivitySession::Impl {
         }
         notify_lifecycle(event,{},argument);
     }
+    void preflight_content_commit() const {
+        if (attachment_revision == UINT64_MAX)
+            bad("CONTENT_REVISION_LIMIT", "Logical Activity content revision is exhausted");
+    }
+    void commit_content_root(ObjectId object) {
+        if (!object || !views.contains(object))
+            bad("CONTENT_ROOT", "Logical content commit requires an initialized session View");
+        preflight_content_commit();
+        content = object;
+        ++attachment_revision;
+    }
+    void install_native_content() {
+        if (native_content_view || views.size() >= 256)
+            bad("NATIVE_CONTENT_STATE", "NativeActivity requires one fresh bounded native content leaf");
+        preflight_content_commit();
+        const auto object = runtime.new_object(native_content_type);
+        ManagedRoot root(runtime, object);
+        ViewState node;
+        node.object = object; node.kind = ViewKind::native_content;
+        auto metadata = std::make_unique<ViewObjectState>();
+        metadata->references[9] = Value::reference(activity);
+        runtime.set_host_state(object, std::move(metadata));
+        own(object);
+        views.emplace(object, std::move(node));
+        native_content_view = object;
+        const auto params = new_frame_params();
+        set_layout_params(object, params);
+        cancel_input(); focus(0);
+        commit_content_root(object);
+        surface_recreate = active_surface.has_value(); surface_dirty = true;
+        unscrolled_bounds.clear(); apply_scroll_layout();
+        ++metrics.view_revision;
+        focus(object);
+    }
+    void apply_native_result(const NativeActivityRequest &request, const NativeActivityResult &result,
+                             ObjectId saved_bundle = 0) {
+        if (request.stage != NativeActivityStage::save_state) {
+            if (result.saved_state_present || !result.saved_state.empty())
+                bad("NATIVE_ACTIVITY_RESULT", "Only the native save callback may return saved-state bytes");
+            return;
+        }
+        if (!result.saved_state_present) {
+            if (!result.saved_state.empty())
+                bad("NATIVE_ACTIVITY_RESULT", "Absent native saved state cannot contain bytes");
+            return; // Absence never removes or overwrites an existing Bundle key.
+        }
+        if (result.saved_state.empty() || result.saved_state.size() > 65536)
+            bad("NATIVE_ACTIVITY_STATE_LIMIT", "Native saved-state output requires 1..65536 bytes");
+        if (!saved_bundle) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto array = runtime.new_array("[B", static_cast<std::int32_t>(result.saved_state.size()));
+        ManagedRoot array_root(runtime, array);
+        for (std::size_t n = 0; n < result.saved_state.size(); ++n)
+            runtime.array_set(array, static_cast<std::int32_t>(n), Value::word(result.saved_state[n]));
+        const auto key = runtime.new_string(u"android:native_state");
+        ManagedRoot key_root(runtime, key);
+        const std::array args{Value::reference(saved_bundle), Value::reference(key), Value::reference(array)};
+        (void)invoke_bundle(runtime, bundle_type, "putByteArray", "(Ljava/lang/String;[B)V", args);
+    }
+    ObjectId native_activity_assets() const {
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(activity));
+        if (!metadata || metadata->owner != this || !metadata->references[ActivityIntentState::native_assets_slot].bits)
+            bad("NATIVE_ACTIVITY_STATE", "NativeActivity has no captured creation AssetManager");
+        return metadata->references[ActivityIntentState::native_assets_slot].bits;
+    }
+    void retain_native_activity_assets(ObjectId manager) {
+        ManagedRoot activity_root(runtime, activity), manager_root(runtime, manager);
+        if (manager) (void)asset_source_owner(manager);
+        const auto admitted = runtime.host_state_capacity(activity);
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(activity));
+        if (!metadata || metadata->owner != this || admitted < metadata->bytes() ||
+            sizeof(ActivityIntentState) > admitted - metadata->bytes())
+            bad("NATIVE_ACTIVITY_LIMIT", "Native manager custody exceeds simultaneous managed admission");
+        auto next = std::make_unique<ActivityIntentState>(*metadata);
+        next->references[ActivityIntentState::native_assets_slot] = Value::reference(manager);
+        runtime.set_host_state(activity, std::move(next));
+    }
+    void native_queue_lifecycle(bool create) {
+        if (!native_activity_observer || !native_created || (create ? native_queue_created : !native_queue_created))
+            bad("NATIVE_INPUT_STATE", "Native queue lifecycle does not match its live Activity instance");
+        if (create && !native_pointer_observer)
+            bad("NATIVE_INPUT_UNSUPPORTED", "Native content requires its authenticated input queue sink");
+        if (!create) cancel_input(); // Queue retirement must follow the actual terminal pointer sample.
+        NativeActivityRequest request;
+        request.stage = create ? NativeActivityStage::input_queue_created : NativeActivityStage::input_queue_destroyed;
+        request.activity = activity; request.asset_manager = native_activity_assets();
+        request.content_view = native_content_view; request.configuration = configuration;
+        request.window_generation = window_generation;
+        const auto observer = native_activity_observer;
+        if (!create) native_queue_created = false; // A failed destruction is never replayed.
+        native_completion_queue = 0;
+        apply_native_result(request, observer(request));
+        if (create) native_queue_created = true;
+    }
+    void native_lifecycle(std::string_view event, std::optional<Value> argument = {}) {
+        if (!activity || !activity_attached || !native_constructed || !runtime.assignable(activity, native_activity_type))
+            bad("NATIVE_ACTIVITY_STATE", "Native lifecycle requires the attached constructed NativeActivity");
+        if (native_dispatching)
+            bad("NATIVE_ACTIVITY_REENTRANT", "Native lifecycle dispatch cannot recurse");
+        if (callback != event && !(event == "onLowMemory" && callback.empty()))
+            bad("LIFECYCLE_STATE", "Native lifecycle base call occurs outside its matching callback");
+        NativeActivityRequest request;
+        request.activity = activity;
+        if (event != "onCreate") request.asset_manager = native_activity_assets();
+        request.configuration = configuration;
+        request.window_generation = window_generation;
+        bool before_base = false;
+        if (event == "onCreate") {
+            if (native_create_attempted)
+                bad("NATIVE_ACTIVITY_STATE", "NativeActivity creation cannot be repeated or retried");
+            native_create_attempted = true; // Consume this incarnation before any original guest callback.
+            const auto actual_base = activity_base_context(activity).bits;
+            const auto *base_metadata = dynamic_cast<const ContextImplState *>(runtime.find_host_state(actual_base));
+            if (!base_metadata || base_metadata->owner != this || runtime.object_type(actual_base) != context_impl_type ||
+                base_metadata->lineage != actual_base || base_metadata->references[ContextImplState::resources_slot].bits != resource_object)
+                bad("NATIVE_ACTIVITY_CONTEXT_UNSUPPORTED", "Wrapped or scoped NativeActivity creation requires its actual package and private-path getter sequence");
+            request.stage = NativeActivityStage::create;
+            before_base = true;
+            require_private_root();
+            install_native_content();
+            ObjectId saved = 0;
+            if (argument && argument->bits) {
+                const auto key = runtime.new_string(u"android:native_state");
+                ManagedRoot key_root(runtime, key);
+                const std::array args{*argument, Value::reference(key)};
+                saved = invoke_bundle(runtime, bundle_type, "getByteArray", "(Ljava/lang/String;)[B", args).bits;
+            }
+            ManagedRoot saved_root(runtime, saved);
+            // Java evaluates getAssets once in loadNativeCode's argument list,
+            // after the path/saved-state queries and before native publication.
+            const auto manager = runtime.invoke_virtual_named(activity, "getAssets", "()Landroid/content/res/AssetManager;");
+            if (manager.kind != dex::ValueKind::reference)
+                bad("NATIVE_ACTIVITY_ASSETS", "NativeActivity.getAssets returned a nonreference value");
+            ManagedRoot manager_root(runtime, manager.bits);
+            if (!manager.bits) runtime.raise("Ljava/lang/NullPointerException;");
+            retain_native_activity_assets(manager.bits);
+            request.asset_manager = manager.bits;
+            // Materialize native transport strings only after the managed
+            // getter, so native scratch does not overlap guest allocations.
+            request.internal_data_path = narrow(logical_data_path() + u"/files");
+            // Keep the managed source array through the original getter;
+            // native copying starts afterward, with no native buffer across it.
+            if (saved) {
+                request.saved_state_present = true;
+                const auto size = runtime.array_length(saved);
+                if (size > 65536) bad("NATIVE_ACTIVITY_STATE_LIMIT", "Native saved state exceeds 65536 bytes");
+                request.saved_state.reserve(size);
+                for (std::size_t n = 0; n < size; ++n)
+                    request.saved_state.push_back(static_cast<std::uint8_t>(runtime.array_get(saved, static_cast<std::int32_t>(n)).bits));
+            }
+        } else {
+            if (!native_created) bad("NATIVE_ACTIVITY_STATE", "NativeActivity has no live created native instance");
+            if (event == "onStart") request.stage = NativeActivityStage::start;
+            else if (event == "onResume") request.stage = NativeActivityStage::resume;
+            else if (event == "onPause") request.stage = NativeActivityStage::pause;
+            else if (event == "onStop") request.stage = NativeActivityStage::stop;
+            else if (event == "onDestroy") { request.stage = NativeActivityStage::destroy; before_base = true; }
+            else if (event == "onConfigurationChanged") request.stage = NativeActivityStage::configuration_changed;
+            else if (event == "onLowMemory") request.stage = NativeActivityStage::low_memory;
+            else if (event == "onSaveInstanceState") request.stage = NativeActivityStage::save_state;
+            else if (event == "onWindowFocusChanged") {
+                request.stage = NativeActivityStage::window_focus;
+                request.focused = argument && argument->bits;
+            } else bad("NATIVE_ACTIVITY_UNSUPPORTED", "Native lifecycle event is unsupported");
+        }
+        request.content_view = native_content_view;
+        if (!native_activity_observer)
+            bad("NATIVE_ACTIVITY_UNSUPPORTED", "NativeActivity requires an authenticated native lifecycle binding");
+        ManagedRoot activity_root(runtime, activity), asset_root(runtime, request.asset_manager);
+        const auto saved_bundle = request.stage == NativeActivityStage::save_state && argument ? argument->bits : ObjectId{0};
+        ManagedRoot saved_root(runtime, saved_bundle);
+        const auto observer = native_activity_observer;
+        native_dispatching = true;
+        struct End { bool &active; ~End() { active = false; } } end{native_dispatching};
+        if (!before_base) normal_lifecycle(event, argument);
+        if (request.stage == NativeActivityStage::destroy && native_queue_created) native_queue_lifecycle(false);
+        apply_native_result(request, observer(request), saved_bundle);
+        if (request.stage == NativeActivityStage::create) native_created = true;
+        if (request.stage == NativeActivityStage::destroy) {
+            native_created = false;
+            retain_native_activity_assets(0);
+        }
+        if (before_base) normal_lifecycle(event, argument);
+        if (request.stage == NativeActivityStage::create) native_queue_lifecycle(true);
+    }
     void post_resume() {
         callback="onPostResume";called_super=false;
         if(const auto method=override_method(activity_type,"onPostResume","()V")) {
@@ -1329,7 +8788,12 @@ struct ActivitySession::Impl {
                 if (!called_super && name != "onWindowFocusChanged" && name != "onSaveInstanceState" &&
                     name != "onRestoreInstanceState")
                     bad("SUPER_NOT_CALLED", "Activity callback did not call super." + std::string(name));
-            } else normal_lifecycle(name,argument);
+            } else if (runtime.assignable(activity, native_activity_type) &&
+                (name == "onCreate" || name == "onStart" || name == "onResume" || name == "onPause" ||
+                 name == "onStop" || name == "onDestroy" || name == "onConfigurationChanged" ||
+                 name == "onLowMemory" || name == "onWindowFocusChanged" || name == "onSaveInstanceState"))
+                runtime.run_host_callback([&] { native_lifecycle(name, argument); });
+            else normal_lifecycle(name,argument);
             if(name=="onResume")post_resume();
             notify_lifecycle(name,"Post",argument);
             ++metrics.lifecycle_callbacks;
@@ -1341,6 +8805,7 @@ struct ActivitySession::Impl {
         }
     }
     void create_activity(ObjectId saved = 0, ObjectId custom_intent = 0) {
+        if (finishing) bad("ACTIVITY_FINISHING", "A finishing Activity cannot create a successor");
         factory_activity_active = true;
         struct EndFactory { bool &active; ~EndFactory() { active = false; } } end{factory_activity_active};
         if (component_factory) {
@@ -1358,12 +8823,62 @@ struct ActivitySession::Impl {
                 bad("FACTORY_ACTIVITY_UNSUPPORTED", "Factory did not return the actual declared Activity");
         } else construct_activity();
         factory_activity_active = false;
+        // Initial title resolution joins the retained startup ledger. Legacy
+        // host setup without that admission keeps an explicitly unknown title.
+        const bool title_known = package_metadata && package_metadata->activity_label_bound && runtime.main_work_budget().has_value();
+        const auto title = title_known ? initial_activity_title() : ObjectId{0};
+        ManagedRoot title_root(runtime, title);
         // The factory receives the original launch record. Android relaunch
         // restores a captured nonnull custom mIntent after normal attach;
         // a captured null falls back to the original record Intent.
-        runtime.set_host_state(activity, std::make_unique<ActivityIntentState>(
-            custom_intent ? custom_intent : launch_intent));
+        // A real SDK attachment event is its own bounded host invocation.
+        // Retained startup keeps its selected aggregate ledger; legacy direct
+        // startup gains the same actual provider-work boundary as other events.
+        runtime.run_host_callback([&] { attach_activity_context(activity); });
+        const auto window = attach_window(activity);
+        ManagedRoot window_root(runtime, window);
+        {
+            const auto window_admitted = runtime.host_state_capacity(activity);
+            const auto *previous = dynamic_cast<const ActivityIntentState *>(runtime.host_state(activity));
+            if (!previous || previous->owner != this || window_admitted < previous->bytes() ||
+                sizeof(ActivityIntentState) > window_admitted - previous->bytes())
+                bad("ACTIVITY_CONTEXT_LIMIT", "Activity Window assignment exceeds simultaneous managed admission");
+            auto with_window = std::make_unique<ActivityIntentState>(*previous);
+            with_window->references[1] = Value::reference(window);
+            runtime.set_host_state(activity, std::move(with_window));
+        }
+        // SDK Activity.attach publishes mWindow before private-factory hooks,
+        // and publishes mApplication/mIntent/mTitle only after those hooks.
+        const auto inflater = runtime.invoke_virtual_named(window, "getLayoutInflater", "()Landroid/view/LayoutInflater;");
+        ManagedRoot inflater_root(runtime, inflater.bits);
+        const std::array private_factory_args{Value::reference(activity)};
+        (void)runtime.invoke_virtual_named(inflater.bits, "setPrivateFactory", "(Landroid/view/LayoutInflater$Factory2;)V", private_factory_args);
+        const auto admitted = runtime.host_state_capacity(activity);
+        const auto *activity_metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(activity));
+        if (!activity_metadata || !activity_metadata->base_attached)
+            bad("ACTIVITY_CONTEXT", "Activity lost its base attachment state");
+        if (admitted < activity_metadata->bytes() || sizeof(ActivityIntentState) > admitted - activity_metadata->bytes())
+            bad("ACTIVITY_CONTEXT_LIMIT", "Completed Activity metadata exceeds simultaneous managed admission");
+        auto completed = std::make_unique<ActivityIntentState>(*activity_metadata);
+        completed->references[0] = Value::reference(custom_intent ? custom_intent : launch_intent);
+        completed->references[1] = Value::reference(window);
+        completed->references[2] = Value::reference(title);
+        completed->references[ActivityIntentState::application_slot] = Value::reference(application);
+        completed->title_known = title_known;
+        runtime.set_host_state(activity, std::move(completed));
         activity_attached = true;
+        std::uint32_t selected_theme = 0;
+        if (activity_theme) {
+            const auto value = *activity_theme;
+            if (value.type == 1) selected_theme = value.data;
+            else if (value.type != apk::manifest_absent_type && value.type != 0 &&
+                     !((value.type == 0x10 || value.type == 0x11) && !value.data))
+                bad("THEME_UNSUPPORTED", "Activity manifest theme has no supported resource identity");
+        }
+        if (selected_theme) {
+            const std::array theme_args{Value::word(selected_theme)};
+            (void)runtime.invoke_virtual_named(activity, "setTheme", "(I)V", theme_args);
+        }
         deliver("onCreate", Lifecycle::created, "(Landroid/os/Bundle;)V", Value::reference(saved));
         deliver("onStart", Lifecycle::started);
         if (saved)
@@ -1375,26 +8890,37 @@ struct ActivitySession::Impl {
             deliver("onStop", Lifecycle::stopped);
     }
     void retire_activity() {
+        // This helper belongs to configuration recreation. Ordinary close
+        // retires through its existing onDestroy/cleanup path instead.
+        if (finishing) bad("ACTIVITY_FINISHING", "A finishing Activity cannot retire for recreation");
+        retire_native_surface(true); // Preserve the stored admitted window incarnation.
+        surface_dirty = true;
         clear_drag_sequence();
         release_drop_grants();
         retire_soft_input_window();
         cancel_input();
         focus(0);
         retire_components(activity);
-        for (const auto &[id, current] : views) {
+        for (auto &[id, current] : views) {
             runtime.release(current.listener);
+            release_view_child_storage(runtime, current.children);
             disown(id);
         }
         views.clear();
         unscrolled_bounds.clear();
         disown(activity);
+        if (current_activity_theme) disown(current_activity_theme);
+        current_activity_theme = 0; activity_theme_resource = 0;
         activity = content = 0;
+        native_content_view = 0; native_queue_created = false; native_pointer.reset();
+        native_constructed = native_create_attempted = native_created = false;
         activity_attached = false;
         focused = false;
         state = Lifecycle::empty;
         ++metrics.view_revision;
     }
     void apply_configuration_change() {
+        if (finishing) { pending_configuration = 0; return; }
         if (!pending_configuration || !activity) return;
         if (!callback.empty() || !input_events.empty() || dispatching_drag)
             bad("CONFIGURATION_REENTRANT", "Configuration cannot interrupt a lifecycle or input callback");
@@ -1431,6 +8957,7 @@ struct ActivitySession::Impl {
             deliver("onStop", Lifecycle::stopped);
         if (target_sdk >= 28)
             deliver("onSaveInstanceState", state, "(Landroid/os/Bundle;)V", Value::reference(saved));
+        retire_native_surface(true);
         deliver("onDestroy", Lifecycle::destroyed);
         retire_activity();
         changing_configuration = 0;
@@ -1449,15 +8976,26 @@ struct ActivitySession::Impl {
     void context(ObjectId object) const {
         if (object == base_context && base_context)
             return;
+        if (object && runtime.object_type(object) == context_impl_type) {
+            (void)context_impl_state(object);
+            return;
+        }
         if (object == application && application) {
             if (!application_attached)
                 runtime.raise("Ljava/lang/NullPointerException;", u"Application base Context is not attached");
             return;
         }
         if (object == activity && activity) {
-            if (!activity_attached)
+            if (!activity_base_context(object).bits)
                 runtime.raise("Ljava/lang/NullPointerException;", u"Activity base Context is not attached");
             return;
+        }
+        if (object) {
+            if (const auto *wrapper = dynamic_cast<const ContextWrapperState *>(runtime.host_state(object)); wrapper && wrapper->owner == this)
+                return; // Authentication only; each original wrapper body delegates its actual mBase.
+            const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(object));
+            if (metadata && metadata->owner == this && metadata->base_attached &&
+                metadata->references[ActivityIntentState::base_slot].bits) return;
         }
         bad("CONTEXT", "Context is not attached to this application");
     }
@@ -2092,9 +9630,15 @@ struct ActivitySession::Impl {
     }
     bool clickable(ObjectId object) {
         const auto &node = view(object);
-        return node.kind == ViewKind::checkbox || node.listener != 0;
+        return node.kind == ViewKind::checkbox || node.listener != 0 ||
+            (view_state(object).xml_initialized && node.clickable);
     }
-    bool focusable(ObjectId object) { return view(object).kind == ViewKind::edit_text || clickable(object); }
+    bool focusable(ObjectId object) {
+        const auto &metadata = view_state(object);
+        if (metadata.xml_initialized)
+            return metadata.focusable_mode == 1 || (metadata.focusable_mode == 16 && clickable(object));
+        return view(object).kind == ViewKind::edit_text || view(object).kind == ViewKind::native_content || clickable(object);
+    }
     const DragObjectState &drag_object(ObjectId object, DragObjectKind kind) {
         if (!object) runtime.raise("Ljava/lang/NullPointerException;");
         const auto *stored = dynamic_cast<const DragObjectState *>(runtime.host_state(object));
@@ -2474,7 +10018,9 @@ struct ActivitySession::Impl {
         if (object != content || node.children.empty()) return;
         const auto next = std::clamp(y, 0, node.scroll_range_y);
         if (node.scroll_y == next) return;
-        node.scroll_y = next;
+        cancel_input();
+        if (!views.contains(object) || object != content || view(object).kind != ViewKind::scroll_view) return;
+        view(object).scroll_y = std::clamp(next, 0, view(object).scroll_range_y);
         ++metrics.view_revision;
         apply_scroll_layout();
     }
@@ -2508,9 +10054,10 @@ struct ActivitySession::Impl {
             ? (bottom - top > height ? top : bottom - height) : offset;
         if (height > 0 && target != offset) dispatch_scroll_to(content, 0, target);
     }
-    void focus(ObjectId object) {
+    void focus(ObjectId object, bool from_touch = false) {
         if (focused_view == object)
             return;
+        if (!from_touch) cancel_input();
         const auto previous = focused_view;
         clear_soft_input_requests();
         retire_ime(true);
@@ -2528,48 +10075,609 @@ struct ActivitySession::Impl {
             view(focused_view).focused = true;
         ++metrics.view_revision;
     }
-    void cancel_input() {
+    void clear_input_state() noexcept {
         const bool changed = pointer_target || key_target;
-        if (pointer_target)
-            view(pointer_target).pressed = false;
-        if (key_target)
-            view(key_target).pressed = false;
+        if (const auto found = views.find(pointer_target); found != views.end()) found->second.pressed = false;
+        if (const auto found = views.find(key_target); found != views.end()) found->second.pressed = false;
         pointer_target = key_target = 0;
-        held_key = 0;
+        pointer_id = held_key = 0;
         if (changed)
             ++metrics.view_revision;
     }
-    bool default_pointer(const PointerInput &event) {
-        if (state != Lifecycle::resumed || !content)
-            return false;
-        if (event.action == PointerAction::cancel) {
-            const bool handled = pointer_target != 0;
-            cancel_input();
-            return handled;
+    void abandon_touch_input() noexcept {
+        // Saturation retires this authority permanently rather than wrapping
+        // an old queued capture into a new input incarnation.
+        if (input_generation != UINT64_MAX) ++input_generation;
+        native_pointer.reset();
+        touch_gesture.reset();
+        clear_input_state();
+    }
+    std::optional<std::uint64_t> input_uptime() const {
+        if (!time) return {};
+        host::MonotonicTime now;
+        if (time->read_uptime(now) != host::TimeStatus::ok) return {};
+        constexpr auto maximum = static_cast<std::uint64_t>(INT64_MAX);
+        if (now.nanoseconds >= 1'000'000'000 || now.seconds > (maximum - now.nanoseconds / 1'000'000) / 1000)
+            bad("INPUT_TIME", "Input uptime does not fit nonnegative Java milliseconds");
+        return now.seconds * 1000 + now.nanoseconds / 1'000'000;
+    }
+    MotionSample public_motion(const InputData &data) const {
+        const auto &input = *data.pointer;
+        const auto &gesture = *data.gesture;
+        // A missing fresh event time does not erase the captured original DOWN.
+        return {input.action, input.pointer, input.source, input.x * data.pixels_per_dp,
+                input.y * data.pixels_per_dp, input.time_known, gesture.down_time_known,
+                gesture.down_time_known ? gesture.down_time_ms : 0, input.event_time_ms};
+    }
+    const MotionObjectState &motion_state(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const MotionObjectState *>(runtime.host_state(object));
+        if (!metadata) bad("INPUT", "MotionEvent has no initialized value payload");
+        return *metadata;
+    }
+    MotionSample motion_value(ObjectId object) {
+        const auto &metadata = motion_state(object);
+        if (metadata.recycled) runtime.raise("Ljava/lang/IllegalStateException;", u"MotionEvent has been recycled");
+        if (!metadata.borrowed) return metadata.sample;
+        const auto found = input_events.find(object);
+        if (found == input_events.end() || !found->second.pointer)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"Framework MotionEvent expired; obtain a copy during dispatch");
+        return public_motion(found->second);
+    }
+    Value motion_api(const ApiSupport &api, std::span<const Value> args) {
+        const auto name = api.name;
+        if (name == "obtain" || name == "obtainNoHistory") {
+            if (args.size() != 1 || (args[0].kind != dex::ValueKind::reference &&
+                !(args[0].kind == dex::ValueKind::word && !args[0].bits)))
+                bad("INPUT_ARGUMENT", "MotionEvent copy requires one event reference");
+            if (!args[0].bits || !runtime.assignable(args[0].bits, motion_event_type))
+                runtime.raise("Ljava/lang/IllegalArgumentException;", u"MotionEvent source must be nonnull");
+            const auto sample = motion_value(args[0].bits);
+            const auto object = runtime.new_object(motion_event_type);
+            ManagedRoot root(runtime, object);
+            auto metadata = std::make_unique<MotionObjectState>();
+            metadata->sample = sample;
+            runtime.set_host_state(object, std::move(metadata));
+            return Value::reference(object);
         }
-        if (event.action == PointerAction::down) {
-            if (pointer_target)
-                return false; // Single-pointer subset; do not replace a live gesture.
-            cancel_input();
-            pointer_target = hit(content, event.x, event.y);
-            pointer_id = event.pointer;
-            if (!pointer_target)
+        if (args.empty()) bad("INPUT_ARGUMENT", "MotionEvent method requires its receiver");
+        const auto object = args[0].bits;
+        if (name == "recycle") {
+            const auto &metadata = motion_state(object);
+            if (metadata.recycled) runtime.raise("Ljava/lang/RuntimeException;", u"MotionEvent recycled twice");
+            if (metadata.borrowed)
+                runtime.raise("Ljava/lang/IllegalStateException;", u"Framework owns this MotionEvent; recycle only obtained copies");
+            auto next = std::make_unique<MotionObjectState>(metadata);
+            next->recycled = true;
+            runtime.set_host_state(object, std::move(next));
+            return Value::nothing();
+        }
+        const auto sample = motion_value(object);
+        if (name == "getSource") return Value::word(sample.source);
+        if ((name == "getX" || name == "getY") && args.size() == 2 && args[1].bits)
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"Only pointer index zero is present");
+        if (name == "getX") return Value::word(std::bit_cast<std::uint32_t>(sample.x));
+        if (name == "getY") return Value::word(std::bit_cast<std::uint32_t>(sample.y));
+        if (name == "getAction" || name == "getActionMasked") return Value::word(static_cast<std::uint32_t>(sample.action));
+        if (name == "getActionIndex" || name == "getHistorySize") return Value::word(0);
+        if (name == "getPointerCount") return Value::word(1);
+        if (name == "findPointerIndex")
+            return Value::word(static_cast<std::uint32_t>(args[1].bits) == sample.pointer ? 0u : UINT32_MAX);
+        if (name == "getPointerId") {
+            if (args[1].bits) runtime.raise("Ljava/lang/IllegalArgumentException;", u"Only pointer index zero is present");
+            return Value::word(sample.pointer);
+        }
+        if (name == "getDownTime" || name == "getEventTime") {
+            if (name == "getDownTime" ? !sample.down_time_known : !sample.time_known)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"MotionEvent has no captured uptime timestamp");
+            return Value::wide(name == "getDownTime" ? sample.down_time_ms : sample.event_time_ms);
+        }
+        bad("INPUT", "MotionEvent method is outside the captured-value profile");
+    }
+    void flush_touch_cancel() {
+        if (!touch_gesture || !touch_gesture->cancel_requested) return;
+        bool delivered = touch_gesture->accepted;
+        for (std::size_t n = 0; n < touch_gesture->count; ++n) delivered = delivered || touch_gesture->routes[n].accepted;
+        // A DOWN callback that has not yet accepted cannot own a target yet.
+        // Defer that case until its real return value is known. Established
+        // custody is canceled immediately, including before ordinary detachment.
+        if (!delivered && (touch_dispatch_depth || !input_events.empty())) return;
+        auto retiring = std::exchange(touch_gesture, {});
+        if (terminal_cleanup || runtime.process_state()->exit_status()) return;
+        if (!delivered) return;
+        retiring->canceling = true; // Consume custody before guest cancellation can reenter.
+        auto cancel = retiring->last;
+        cancel.action = PointerAction::cancel;
+        cancel.time_known = false;
+        cancel.down_time_ms = cancel.event_time_ms = 0;
+        if (const auto now = input_uptime(); now && retiring->down_time_known && *now >= retiring->down_time_ms &&
+            (!retiring->last_known_event_time_ms || *now >= *retiring->last_known_event_time_ms)) {
+            cancel.time_known = true;
+            cancel.down_time_ms = retiring->down_time_ms;
+            cancel.event_time_ms = *now;
+        }
+        InputData data;
+        data.pointer = cancel;
+        data.pixels_per_dp = retiring->pixels_per_dp;
+        data.gesture = std::move(retiring);
+        data.native_fallback = data.gesture->native_fallback;
+        sending_touch_cancel = true;
+        struct Reset { bool &flag; ~Reset() { flag = false; } } reset{sending_touch_cancel};
+        (void)dispatch_input(std::move(data));
+    }
+    void cancel_input() {
+        if (input_generation == UINT64_MAX)
+            bad("INPUT_GENERATION", "Input generation is exhausted");
+        ++input_generation;
+        cancel_native_keys();
+        clear_input_state();
+        if (terminal_cleanup || runtime.process_state()->exit_status()) { touch_gesture.reset(); native_pointer.reset(); return; }
+        cancel_native_pointer();
+        if (touch_gesture) touch_gesture->cancel_requested = true;
+        flush_touch_cancel();
+    }
+    void cancel_native_pointer() {
+        if (!native_pointer) return;
+        auto cancel = *native_pointer;
+        native_pointer.reset(); // A throwing sink must never cause a terminal event to be replayed.
+        cancel.synthetic_cancel = true;
+        cancel.sample.action = PointerAction::cancel;
+        const auto now = input_uptime();
+        if (now && *now >= cancel.down_time_ms && *now >= cancel.sample.event_time_ms) {
+            cancel.sample.time_known = true;
+            cancel.sample.down_time_ms = cancel.down_time_ms;
+            cancel.sample.event_time_ms = *now;
+        } else {
+            cancel.sample.time_known = false;
+            cancel.sample.down_time_ms = cancel.sample.event_time_ms = 0;
+        }
+        if (!native_pointer_observer || !native_queue_created || !native_pointer_observer(cancel))
+            bad("NATIVE_INPUT_CANCEL", "Native input queue refused its required terminal sample");
+    }
+    bool native_pointer_input(const PointerInput &sample) {
+        if (state != Lifecycle::resumed || !native_created || !native_queue_created ||
+            input_generation == UINT64_MAX ||
+            !native_pointer_observer || content != native_content_view || !active_surface ||
+            active_surface->view != native_content_view || !sample.root || !sample.native_producer ||
+            !sample.time_known || !sample.capture_dpi) return false;
+        const bool down = sample.action == PointerAction::down;
+        if (down) {
+            if (native_pointer) return false;
+            const auto scale = static_cast<float>(sample.capture_dpi) / 96.0f;
+            if (sample.x < 0 || sample.y < 0 || sample.x * scale >= static_cast<float>(sample.native_width) ||
+                sample.y * scale >= static_cast<float>(sample.native_height)) return false;
+        } else {
+            if (!native_pointer) return false;
+            const auto &last = native_pointer->sample;
+            if (sample.pointer != last.pointer || sample.source != last.source || sample.root != last.root ||
+                sample.native_producer != last.native_producer || sample.native_width != last.native_width ||
+                sample.native_height != last.native_height || sample.capture_dpi != last.capture_dpi ||
+                sample.down_time_ms != native_pointer->down_time_ms || sample.event_time_ms < last.event_time_ms)
                 return false;
+        }
+        NativeActivityPointerInput input;
+        input.activity = activity; input.root = content;
+        input.window_generation = window_generation; input.input_generation = input_generation;
+        input.sample = sample; input.down_time_known = true; input.down_time_ms = sample.down_time_ms;
+        if (!native_pointer_observer(input))
+            bad("NATIVE_INPUT_ADMISSION", "Native input queue refused an authenticated pointer sample");
+        if (sample.action == PointerAction::up || sample.action == PointerAction::cancel) native_pointer.reset();
+        else native_pointer = std::move(input);
+        ++metrics.pointer_events;
+        return true;
+    }
+    static bool same_key_capture(const KeyInput &a, const KeyInput &b) noexcept {
+        return a.up == b.up && a.code == b.code && a.meta == b.meta && a.repeat == b.repeat &&
+            a.character_status == b.character_status && a.unicode == b.unicode && a.root == b.root &&
+            a.window_generation == b.window_generation && a.input_generation == b.input_generation &&
+            a.capture_generation == b.capture_generation && a.event_time_known == b.event_time_known &&
+            a.down_time_known == b.down_time_known && a.down_time_ms == b.down_time_ms &&
+            a.event_time_ms == b.event_time_ms && a.source_known == b.source_known && a.source == b.source;
+    }
+    PendingNativeKey *pending_native_key(std::uint64_t request) noexcept {
+        if (request) for (auto &key : native_keys) if (key.input.request == request) return &key;
+        return nullptr;
+    }
+    bool key_capture_current(const KeyInput &event) const noexcept {
+        if (!valid_key_input(event) || terminal_cleanup || !attached || !activity_attached ||
+            !activity || state != Lifecycle::resumed) return false;
+        if (!event.root) return true;
+        return event.root == content && event.window_generation == window_generation &&
+            event.input_generation == input_generation && input_generation != UINT64_MAX;
+    }
+    void settle_native_key(std::uint64_t request, KeyDispatchOutcome outcome) {
+        auto *pending = pending_native_key(request);
+        if (!pending) return; // Already settled; delayed queue/main entries have no authority.
+        if (outcome != KeyDispatchOutcome::handled && outcome != KeyDispatchOutcome::unhandled &&
+            outcome != KeyDispatchOutcome::cancelled)
+            bad("NATIVE_KEY_COMPLETION", "Native key requires an actual final outcome");
+        auto input = pending->input;
+        *pending = {}; // Consume exactly once before a trusted sink can fail.
+        // Every terminal result retires any reserved future post-IME pass,
+        // including a Java pre-IME handler consuming the original key. A final
+        // lease may already have been committed, so "not found" is harmless.
+        input.stage = NativeKeyStage::cancel;
+        std::exception_ptr cancellation_failure;
+        try {
+            if (!native_key_observer) bad("NATIVE_KEY_CANCEL", "Native key cancellation owner is missing");
+            (void)native_key_observer(input);
+        } catch (...) { cancellation_failure = std::current_exception(); }
+        if (!key_completion_observer)
+            bad("NATIVE_KEY_COMPLETION", "Native key has no bound final-result collector");
+        key_completion_observer(request, outcome); // Fixed host collector, never IPC or guest work.
+        if (cancellation_failure) {
+            if (!key_completion_failure) key_completion_failure = cancellation_failure;
+            std::rethrow_exception(cancellation_failure);
+        }
+    }
+    void cancel_native_keys() {
+        for (auto &pending : native_keys) {
+            if (!pending.input.request) continue;
+            if (pending.dispatching) pending.cancel_requested = true;
+            else settle_native_key(pending.input.request, KeyDispatchOutcome::cancelled);
+        }
+    }
+    bool native_key_completion_live(const NativeActivityInputCompletion &completion) const {
+        const auto scope = completion.scope.lock();
+        if (!completion.key || !scope || !scope->active || !native_created || !native_queue_created ||
+            content != native_content_view || completion.key->activity != activity ||
+            !key_capture_current(completion.key->sample) ||
+            (native_completion_queue && completion.queue != native_completion_queue)) return false;
+        const auto root = views.find(content);
+        return completion.key->sample.root && root != views.end() && root->second.kind == ViewKind::native_content;
+    }
+    bool native_activity_work_live(const NativeActivityHostWork &work) const {
+        const auto scope = work.scope.lock();
+        return scope && scope->active && !terminal_cleanup && attached && activity_attached && native_created &&
+            activity && activity == work.activity && content == work.content && content == native_content_view &&
+            window_generation == work.window_generation && state != Lifecycle::empty &&
+            state != Lifecycle::destroyed && state != Lifecycle::failed;
+    }
+    void native_activity_work(const NativeActivityHostWork &work) {
+        if (!native_activity_work_live(work)) return;
+        check_text_edit_observer_idle();
+        if (!callback.empty() || !input_events.empty() || native_dispatching || dispatching_drag)
+            bad("NATIVE_ACTIVITY_WORK", "Native host work requires its idle managed main entry");
+        switch (work.operation) {
+        case NativeActivityHostOperation::finish:
+            if (work.arg1 || work.arg2) bad("NATIVE_ACTIVITY_WORK", "Finish has unexpected arguments");
+            if (!finishing) {
+                if (finish_ordinal == UINT64_MAX) bad("ACTIVITY_FINISH_LIMIT", "Activity finish ordinal exhausted");
+                finish_request = ActivityFinishRequest{++finish_ordinal, activity, window_generation};
+                finishing = true; // A real host close command owns later teardown.
+            }
+            return;
+        case NativeActivityHostOperation::show_soft_input:
+        case NativeActivityHostOperation::hide_soft_input: {
+            if (work.arg1 || work.arg2)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Native soft-input requests support only flag zero");
+            const auto manager = input_method_service();
+            ManagedRoot manager_root(runtime, manager);
+            if (work.operation == NativeActivityHostOperation::show_soft_input) {
+                const std::array args{Value::reference(work.content), Value::word(0)};
+                // The current native leaf genuinely declines as a non-editor;
+                // invoke the real policy and never invent a connection or pane.
+                (void)runtime.invoke_virtual_named(manager, "showSoftInput", "(Landroid/view/View;I)Z", args);
+            } else {
+                const auto token = attached_window_token(work.content);
+                ManagedRoot token_root(runtime, token);
+                const std::array args{Value::reference(token), Value::word(0)};
+                (void)runtime.invoke_virtual_named(manager, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z", args);
+            }
+            // As for the real void native exports, SDK acceptance is ignored;
+            // this dispatch never claims native keyboard visibility.
+            return;
+        }
+        case NativeActivityHostOperation::set_window_format:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Native Activity window-format mutation requires a real window policy provider");
+        case NativeActivityHostOperation::set_window_flags:
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Native Activity window flags require a real window policy provider");
+        }
+        bad("NATIVE_ACTIVITY_WORK", "Unknown native host operation");
+    }
+    void native_key_completion(const NativeActivityInputCompletion &completion) {
+        if (!completion.key) bad("NATIVE_KEY_COMPLETION", "Missing captured key completion");
+        const auto input = *completion.key;
+        auto *pending = pending_native_key(input.request);
+        if (!pending) return;
+        if (!completion.queue || !completion.event || input.activity != pending->input.activity ||
+            input.stage != pending->input.stage || !same_key_capture(input.sample, pending->input.sample))
+            bad("NATIVE_KEY_COMPLETION", "Native key completion does not match its reserved capture");
+        if (!native_key_completion_live(completion)) {
+            settle_native_key(input.request, KeyDispatchOutcome::cancelled); return;
+        }
+        check_text_edit_observer_idle();
+        if (!input_events.empty() || native_dispatching || !callback.empty() || pending->dispatching)
+            bad("NATIVE_KEY_COMPLETION", "Native key completion requires its managed main boundary");
+        native_completion_queue = completion.queue;
+        if (completion.handled) { settle_native_key(input.request, KeyDispatchOutcome::handled); return; }
+        if (input.stage != NativeKeyStage::pre_ime && input.stage != NativeKeyStage::post_ime)
+            bad("NATIVE_KEY_COMPLETION", "Native key completion has no executable dispatch stage");
+        pending->dispatching = true;
+        struct DispatchEnd {
+            Impl &p; std::uint64_t request;
+            ~DispatchEnd() { if (auto *key = p.pending_native_key(request)) key->dispatching = false; }
+        } dispatch_end{*this, input.request};
+        InputData data;
+        data.key = input.sample; data.native_fallback = true;
+        data.key_pre_ime = input.stage == NativeKeyStage::pre_ime;
+        data.key_root = input.sample.root;
+        bool handled = false;
+        try { handled = dispatch_input(std::move(data)); }
+        catch (...) {
+            if (auto *key = pending_native_key(input.request)) key->dispatching = false;
+            settle_native_key(input.request, KeyDispatchOutcome::cancelled);
+            throw;
+        }
+        pending = pending_native_key(input.request);
+        if (!pending) bad("NATIVE_KEY_COMPLETION", "Active Java key lost its reserved request");
+        pending->dispatching = false;
+        // A completed post-IME callback owns its real result even if it changed
+        // focus or retired the window. Do not relabel that work cancellation.
+        if (input.stage == NativeKeyStage::post_ime || handled) {
+            settle_native_key(input.request, handled ? KeyDispatchOutcome::handled : KeyDispatchOutcome::unhandled);
+            return;
+        }
+        if (pending->cancel_requested || !native_key_completion_live(completion)) {
+            settle_native_key(input.request, KeyDispatchOutcome::cancelled); return;
+        }
+        // The exact NativeContentView is a non-editor leaf. Current hosted IME
+        // bindings require EditText; an unexpected richer binding must refuse.
+        if (ime || view(content).kind != ViewKind::native_content || !view(content).children.empty() ||
+            view_state(content).references[2].bits) {
+            settle_native_key(input.request, KeyDispatchOutcome::cancelled);
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Native key IME dispatch requires an actual supported IME result provider");
+        }
+        auto next = input; next.stage = NativeKeyStage::post_ime;
+        pending->input = next;
+        if (!native_key_observer || !native_key_observer(next)) {
+            settle_native_key(input.request, KeyDispatchOutcome::cancelled);
+            bad("NATIVE_KEY_ADMISSION", "Native post-IME key reservation was not admitted");
+        }
+    }
+    bool native_completion_live(const NativeActivityInputCompletion &completion) const {
+        const auto scope = completion.scope.lock();
+        const auto &input = completion.input;
+        if (!scope || !scope->active || terminal_cleanup || !attached || !activity_attached ||
+            state != Lifecycle::resumed || !native_created || !native_queue_created ||
+            input_generation == UINT64_MAX || input.input_generation != input_generation ||
+            input.activity != activity || input.root != content || content != native_content_view ||
+            input.window_generation != window_generation || !active_surface ||
+            (native_completion_queue && native_completion_queue != completion.queue)) return false;
+        const auto &surface = *active_surface;
+        return surface.view == input.root && surface.request.root == input.root &&
+            surface.request.window_generation == input.window_generation && surface.producer &&
+            surface.admission.producer == input.sample.native_producer &&
+            surface.admission.width == input.sample.native_width &&
+            surface.admission.height == input.sample.native_height;
+    }
+    void native_pointer_completion(const NativeActivityInputCompletion &completion) {
+        if (!native_completion_live(completion)) return;
+        check_text_edit_observer_idle();
+        if (!input_events.empty() || native_dispatching || !callback.empty())
+            bad("NATIVE_INPUT_COMPLETION", "Native completion requires its managed main callback boundary");
+        const auto &input = completion.input;
+        const auto &sample = input.sample;
+        if (!completion.queue || !completion.event || !input.input_generation || !sample.root ||
+            sample.root != input.root || !sample.native_producer || sample.capture_dpi < 48 || sample.capture_dpi > 960 ||
+            !std::isfinite(sample.x) || !std::isfinite(sample.y) ||
+            std::abs(sample.x) > 65536 || std::abs(sample.y) > 65536 || sample.pointer > 31 ||
+            (sample.source != 0x2002 && sample.source != 0x1002) ||
+            static_cast<unsigned>(sample.action) > 3 ||
+            (!input.synthetic_cancel && !valid_pointer_context(sample)) ||
+            (input.synthetic_cancel && (sample.action != PointerAction::cancel ||
+                (!sample.time_known && (sample.down_time_ms || sample.event_time_ms)))) ||
+            !input.down_time_known || input.down_time_ms > static_cast<std::uint64_t>(INT64_MAX) ||
+            (sample.time_known && (sample.down_time_ms != input.down_time_ms ||
+                sample.event_time_ms < input.down_time_ms || sample.event_time_ms > static_cast<std::uint64_t>(INT64_MAX))))
+            bad("NATIVE_INPUT_COMPLETION", "Native completion has invalid captured motion values");
+        native_completion_queue = completion.queue;
+        const bool down = sample.action == PointerAction::down;
+        const bool terminal = sample.action == PointerAction::up || sample.action == PointerAction::cancel;
+        auto gesture = touch_gesture;
+        if (gesture && (!gesture->native_fallback || gesture->root != input.root ||
+            gesture->owner_activity != input.activity || gesture->generation != input.window_generation ||
+            gesture->last.pointer != sample.pointer || gesture->last.source != sample.source ||
+            gesture->last.native_producer != sample.native_producer ||
+            gesture->last.native_width != sample.native_width || gesture->last.native_height != sample.native_height ||
+            gesture->last.capture_dpi != sample.capture_dpi ||
+            gesture->down_time_known != input.down_time_known || gesture->down_time_ms != input.down_time_ms)) {
+            if (!down) bad("NATIVE_INPUT_COMPLETION", "Native completion does not match the managed touch route");
+            // A real new native DOWN cannot inherit the previous Java route.
+            touch_gesture.reset(); clear_input_state(); gesture.reset();
+        }
+        if (gesture && sample.time_known && gesture->last_known_event_time_ms &&
+            sample.event_time_ms < *gesture->last_known_event_time_ms)
+            bad("NATIVE_INPUT_COMPLETION", "Native completion time regressed");
+        if (completion.handled) {
+            if (gesture) {
+                gesture->last = sample;
+                if (sample.time_known) gesture->last_known_event_time_ms = sample.event_time_ms;
+            }
+            if (terminal || down) { touch_gesture.reset(); clear_input_state(); }
+            return; // Native handling never manufactures a Java UP or CANCEL.
+        }
+        const bool persistent = down || (gesture && gesture->accepted);
+        if (!gesture || down) {
+            if (down && touch_gesture) {
+                touch_gesture.reset(); clear_input_state();
+            }
+            gesture = std::make_shared<TouchGesture>(runtime, input.root, input.activity,
+                input.window_generation, sample, static_cast<float>(sample.capture_dpi) / 96.0f);
+            gesture->native_fallback = true;
+            gesture->down_time_known = input.down_time_known;
+            gesture->down_time_ms = input.down_time_ms;
+            if (down) (void)gesture->route(input.root);
+        }
+        gesture->last = sample;
+        if (sample.time_known) gesture->last_known_event_time_ms = sample.event_time_ms;
+        InputData data;
+        data.pointer = sample; data.gesture = std::move(gesture);
+        data.native_fallback = true; data.persistent_touch = persistent;
+        // Orphan MOVE/UP still reaches the actual Activity callback. The base
+        // window route only receives a stream established by a genuine DOWN.
+        data.allow_view_dispatch = down;
+        if (!down) for (std::size_t n = 0; n < data.gesture->count; ++n)
+            if (data.gesture->routes[n].object == input.root && data.gesture->routes[n].accepted)
+                data.allow_view_dispatch = true;
+        (void)dispatch_input(std::move(data));
+    }
+    InputData &touch_event(ObjectId event) {
+        const auto found = input_events.find(event);
+        if (found == input_events.end()) {
+            const auto *metadata = dynamic_cast<const MotionObjectState *>(runtime.host_state(event));
+            if (metadata && !metadata->borrowed)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Obtained MotionEvent redispatch is not implemented");
+        }
+        if (found == input_events.end() || !found->second.pointer || !found->second.global_pointer || !found->second.gesture)
+            bad("INPUT", "Motion event has expired or belongs to another session");
+        return found->second;
+    }
+    struct TouchCoordinates {
+        InputData &data;
+        PointerInput saved;
+        ObjectId previous;
+        TouchCoordinates(Impl &p, ObjectId object, ObjectId event)
+            : data(p.touch_event(event)), saved(*data.pointer), previous(data.touch_receiver) {
+            const auto absolute = *data.global_pointer;
+            data.pointer = absolute;
+            // Published bounds already contain the supported parent scroll offsets.
+            // Cancellation keeps the last global sample but, like other actions,
+            // exposes it in this receiver's coordinate system.
+            const auto bounds = p.view(object).bounds;
+            data.pointer->x -= bounds.x;
+            data.pointer->y -= bounds.y;
+            data.touch_receiver = object;
+        }
+        ~TouchCoordinates() { data.pointer = saved; data.touch_receiver = previous; }
+    };
+    bool dispatch_view_touch(ObjectId object, ObjectId event) {
+        ManagedRoot object_root(runtime, object), event_root(runtime, event);
+        auto gesture = touch_event(event).gesture;
+        auto &route = gesture->route(object);
+        if (touch_dispatch_depth >= 256) bad("INPUT_REENTRANT", "Touch dispatch exceeds the 256-view route depth");
+        ++touch_dispatch_depth;
+        struct Reset { std::size_t &depth; ~Reset() { --depth; } } reset{touch_dispatch_depth};
+        TouchCoordinates coordinates(*this, object, event);
+        const std::array args{Value::reference(event)};
+        const bool result = runtime.invoke_virtual_named(object, "dispatchTouchEvent", "(Landroid/view/MotionEvent;)Z", args).bits != 0;
+        if (touch_event(event).global_pointer->action == PointerAction::down) route.accepted = result;
+        return result;
+    }
+    bool view_touch_dispatch_base(ObjectId object, ObjectId event, bool group) {
+        ManagedRoot object_root(runtime, object), event_root(runtime, event);
+        TouchCoordinates coordinates(*this, object, event);
+        auto gesture = touch_event(event).gesture;
+        auto &route = gesture->route(object);
+        const auto input = *touch_event(event).global_pointer;
+        const bool down = input.action == PointerAction::down;
+        const bool cancel = input.action == PointerAction::cancel;
+        if (group) {
+            if (down) { route.child = 0; route.disallow = false; }
+            bool intercepted = false;
+            if (!cancel && (down || route.child) && !route.disallow) {
+                const std::array args{Value::reference(event)};
+                intercepted = runtime.invoke_virtual_named(object, "onInterceptTouchEvent", "(Landroid/view/MotionEvent;)Z", args).bits != 0;
+            }
+            if (gesture->cancel_requested && !cancel) return false;
+            if (route.child) {
+                const auto child = route.child;
+                if (cancel || intercepted) {
+                    route.child = 0; // Retire before CANCEL can mutate/reenter the tree.
+                    auto &data = touch_event(event);
+                    const auto saved_global = *data.global_pointer;
+                    const auto saved_local = *data.pointer;
+                    data.global_pointer->action = PointerAction::cancel;
+                    data.pointer->action = PointerAction::cancel;
+                    struct Restore {
+                        InputData &data; PointerInput global, local;
+                        ~Restore() { data.global_pointer = global; data.pointer = local; }
+                    } restore{data, saved_global, saved_local};
+                    const auto result = dispatch_view_touch(child, event);
+                    route.disallow = false;
+                    // AOSP delivers the intercepted sample only as child CANCEL;
+                    // the next sample with no child is delivered to the parent.
+                    return result;
+                }
+                const auto result = dispatch_view_touch(child, event);
+                if (input.action == PointerAction::up) { route.child = 0; route.disallow = false; }
+                return result; // A false MOVE never transfers ownership to this parent.
+            }
+            if (down && !intercepted && !gesture->cancel_requested) {
+                struct Children {
+                    dex::ManagedRuntime &runtime;
+                    std::array<ObjectId, 256> ids{};
+                    std::size_t count = 0;
+                    ~Children() { for (std::size_t n = 0; n < count; ++n) runtime.release(ids[n]); }
+                } snapshot{runtime};
+                for (const auto child : view(object).children) {
+                    runtime.retain(child); snapshot.ids[snapshot.count++] = child;
+                }
+                for (auto n = snapshot.count; n > 0; --n) {
+                    if (gesture->cancel_requested || content != gesture->root || window_generation != gesture->generation) break;
+                    const auto child = snapshot.ids[n - 1];
+                    if (!views.contains(child) || view(child).parent != object || !view(child).bounds.contains(input.x, input.y)) continue;
+                    if (dispatch_view_touch(child, event)) { route.child = child; route.accepted = true; return true; }
+                }
+            }
+        }
+        if (gesture->cancel_requested && !cancel) return false;
+        const auto listener = view_state(object).references[8].bits;
+        bool handled = false;
+        if (listener && view(object).enabled) {
+            ManagedRoot listener_root(runtime, listener);
+            const std::array args{Value::reference(object), Value::reference(event)};
+            handled = runtime.invoke_virtual_named(listener, "onTouch", "(Landroid/view/View;Landroid/view/MotionEvent;)Z", args).bits != 0;
+        }
+        if (!handled && (!gesture->cancel_requested || cancel)) {
+            const std::array args{Value::reference(event)};
+            handled = runtime.invoke_virtual_named(object, "onTouchEvent", "(Landroid/view/MotionEvent;)Z", args).bits != 0;
+        }
+        if (down) route.accepted = handled;
+        if (cancel || input.action == PointerAction::up) route.disallow = false;
+        return handled;
+    }
+    void disallow_touch_intercept(ObjectId object, bool disallow) {
+        auto gesture = touch_gesture;
+        if (!gesture) return;
+        auto &route = gesture->route(object);
+        if (route.disallow == disallow) return;
+        route.disallow = disallow;
+        const auto parent = view(object).parent;
+        if (!parent) return;
+        ManagedRoot parent_root(runtime, parent);
+        const std::array args{Value::word(disallow ? 1u : 0u)};
+        (void)runtime.invoke_virtual_named(parent, "requestDisallowInterceptTouchEvent", "(Z)V", args);
+    }
+    bool view_touch_base(ObjectId object, ObjectId event_object) {
+        const auto event = *touch_event(event_object).global_pointer;
+        const bool eligible = focusable(object);
+        if (!view(object).enabled) {
+            if (pointer_target == object) { view(object).pressed = false; pointer_target = 0; }
+            return eligible;
+        }
+        if (event.action == PointerAction::cancel) {
+            if (pointer_target == object) { view(object).pressed = false; pointer_target = 0; ++metrics.view_revision; }
+            return eligible;
+        }
+        if (!eligible) return false;
+        if (event.action == PointerAction::down) {
+            if (pointer_target && pointer_target != object) return false;
+            pointer_target = object;
+            pointer_id = event.pointer;
             const auto target = pointer_target;
-            focus(target);
+            if (enabled(target)) focus(target, true);
             if (pointer_target != target || focused_view != target || state != Lifecycle::resumed ||
                 !views.contains(target) || !enabled(target) || !focusable(target)) {
                 if (pointer_target == target) { pointer_target = 0; pointer_id = 0; }
-                return false;
+                return true;
             }
             view(target).pressed = true;
             ++metrics.view_revision;
             return true;
         }
-        if (!pointer_target || event.pointer != pointer_id)
-            return false;
+        if (pointer_target != object || event.pointer != pointer_id) return eligible;
         const auto target = pointer_target;
-        const bool inside = enabled(target) && hit(content, event.x, event.y) == target;
+        const bool inside = view(target).enabled && view(target).bounds.contains(event.x, event.y);
         if (event.action == PointerAction::move) {
             if (view(target).pressed != inside) {
                 view(target).pressed = inside;
@@ -2590,10 +10698,106 @@ struct ActivitySession::Impl {
             (void)enqueue_soft_input(target, true, true);
         return true;
     }
+    bool default_pointer(ObjectId event) {
+        auto &data = touch_event(event);
+        const auto gesture = data.gesture;
+        ManagedRoot owner_root(runtime, gesture->owner_activity), event_root(runtime, event);
+        const auto action = data.global_pointer->action;
+        if (gesture->cancel_requested && action != PointerAction::cancel) return false;
+        if (action == PointerAction::down) {
+            (void)runtime.invoke_virtual_named(gesture->owner_activity, "onUserInteraction", "()V", {});
+            // The hook may replace content, change focus or retire this gesture.
+            if (gesture->cancel_requested) return false;
+        }
+        if (data.allow_view_dispatch && gesture->root && views.contains(gesture->root) && dispatch_view_touch(gesture->root, event)) return true;
+        // Root callbacks may retire this gesture or replace its content. Do not
+        // introduce a second non-cancel recipient after that retirement request.
+        if (gesture->cancel_requested && data.global_pointer->action != PointerAction::cancel) return false;
+        const auto previous_pointer = data.pointer;
+        const auto previous_receiver = data.touch_receiver;
+        data.pointer = data.global_pointer; // Activity fallback uses Activity-local coordinates.
+        data.touch_receiver = 0;
+        struct Restore {
+            InputData &data;
+            std::optional<PointerInput> pointer;
+            ObjectId receiver;
+            ~Restore() { data.pointer = pointer; data.touch_receiver = receiver; }
+        } restore{data, previous_pointer, previous_receiver};
+        const std::array args{Value::reference(event)};
+        return runtime.invoke_virtual_named(gesture->owner_activity, "onTouchEvent", "(Landroid/view/MotionEvent;)Z", args).bits != 0;
+    }
+    static KeySample public_key(const KeyInput &input) noexcept {
+        KeySample sample;
+        sample.up = input.up; sample.code = input.code; sample.meta = input.meta; sample.repeat = input.repeat;
+        sample.character_status = input.character_status; sample.unicode = input.unicode;
+        sample.event_time_known = input.event_time_known; sample.down_time_known = input.down_time_known;
+        sample.down_time_ms = input.down_time_ms; sample.event_time_ms = input.event_time_ms;
+        sample.source_known = input.source_known; sample.source = input.source;
+        return sample;
+    }
+    const KeySample &key_value(ObjectId object) const {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const KeyObjectState *>(runtime.host_state(object));
+        if (!metadata)
+            runtime.raise("Ljava/lang/IllegalStateException;", u"KeyEvent has no initialized value payload");
+        return metadata->sample;
+    }
+    Value key_api(const ApiSupport &api, std::span<const Value> args) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference || !args[0].bits)
+            runtime.raise("Ljava/lang/NullPointerException;");
+        const auto object = args[0].bits;
+        if (!runtime.assignable(object, key_event_type))
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"KeyEvent receiver must inherit its value class");
+        if (api.name == "<init>") {
+            if (api.signature != "(Landroid/view/KeyEvent;)V" || args.size() != 2 ||
+                (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+                bad("INPUT_ARGUMENT", "KeyEvent copy requires one event reference");
+            if (runtime.host_state(object))
+                runtime.raise("Ljava/lang/IllegalStateException;", u"KeyEvent is already initialized");
+            if (!args[1].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            if (!runtime.assignable(args[1].bits, key_event_type))
+                runtime.raise("Ljava/lang/IllegalArgumentException;", u"KeyEvent source must inherit its value class");
+            const auto sample = key_value(args[1].bits);
+            runtime.set_host_state(object, std::make_unique<KeyObjectState>(sample));
+            return Value::nothing();
+        }
+        if (api.name == "recycle")
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"KeyEvent values are immutable and not app-recyclable");
+        if (api.name == "dispatch") {
+            if (args.size() != 2) bad("INPUT_ARGUMENT", "KeyEvent dispatch requires one Callback");
+            return Value::word(key_callback(args[1].bits, object));
+        }
+        const auto &sample = key_value(object);
+        if (api.name == "getSource") {
+            if (!sample.source_known)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"KeyEvent has no captured source");
+            return Value::word(sample.source);
+        }
+        if (api.name == "getDownTime" || api.name == "getEventTime") {
+            if (api.name == "getDownTime" ? !sample.down_time_known : !sample.event_time_known)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"KeyEvent has no captured uptime timestamp");
+            return Value::wide(api.name == "getDownTime" ? sample.down_time_ms : sample.event_time_ms);
+        }
+        if (api.name == "getAction") return Value::word(sample.up ? 1u : 0u);
+        if (api.name == "getKeyCode") return Value::word(sample.code);
+        if (api.name == "getMetaState") return Value::word(sample.meta);
+        if (api.name == "getRepeatCount") return Value::word(sample.repeat);
+        if (api.name == "getUnicodeChar") {
+            if (sample.character_status == KeyCharacterStatus::unsupported ||
+                (args.size() == 2 && static_cast<std::uint32_t>(args[1].bits) != sample.meta))
+                runtime.raise("Ljava/lang/UnsupportedOperationException;",
+                    u"Unicode mapping supports only the captured ordinary BMP key and modifier state");
+            return Value::word(sample.unicode);
+        }
+        bad("INPUT", "KeyEvent method is outside the captured-value profile");
+    }
     KeyInput key_event(ObjectId event) const {
         const auto found = input_events.find(event);
-        if (found == input_events.end() || !found->second.key)
+        if (found == input_events.end() || !found->second.key) {
+            if (event && dynamic_cast<const KeyObjectState *>(runtime.host_state(event)))
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Retained or copied KeyEvent redispatch is not implemented");
             bad("INPUT", "Key event has expired or belongs to another session");
+        }
         return *found->second.key;
     }
     bool key_callback(ObjectId receiver, ObjectId event) {
@@ -2669,6 +10873,25 @@ struct ActivitySession::Impl {
         const std::array args{Value::reference(event)};
         return runtime.invoke_virtual_named(object, "dispatchKeyEvent", "(Landroid/view/KeyEvent;)Z", args).bits != 0;
     }
+    bool view_key_pre_ime(ObjectId object, ObjectId event, bool group) {
+        ManagedRoot receiver_root(runtime, object), event_root(runtime, event);
+        const auto input = key_event(event);
+        if (group && focused_view && focused_view != object) {
+            auto child = focused_view;
+            for (unsigned depth = 0; depth < 256 && views.contains(child); ++depth) {
+                const auto parent = view(child).parent;
+                if (parent == object) {
+                    const std::array args{Value::reference(event)};
+                    return runtime.invoke_virtual_named(child, "dispatchKeyEventPreIme", "(Landroid/view/KeyEvent;)Z", args).bits != 0;
+                }
+                if (!parent) break;
+                child = parent;
+            }
+        }
+        if (group && focused_view != object) return false;
+        const std::array args{Value::word(input.code), Value::reference(event)};
+        return runtime.invoke_virtual_named(object, "onKeyPreIme", "(ILandroid/view/KeyEvent;)Z", args).bits != 0;
+    }
     bool view_key_dispatch_base(ObjectId object, ObjectId event, bool group) {
         ManagedRoot object_root(runtime, object), event_root(runtime, event);
         const auto input = key_event(event);
@@ -2727,39 +10950,108 @@ struct ActivitySession::Impl {
         return false;
     }
     bool dispatch_input(InputData data) {
-        if (state != Lifecycle::resumed)
+        if (state != Lifecycle::resumed && !sending_touch_cancel)
             return false;
         if (input_events.size() >= 8)
             bad("INPUT_REENTRANT", "Input dispatch nesting quota exceeded");
         const bool motion = data.pointer.has_value();
+        if (motion) {
+            // A host sequence cannot be recursively replaced from one of its
+            // callbacks. Guest virtual dispatch of this same event is supported.
+            for (const auto &[event_id, active_event] : input_events) {
+                (void)event_id;
+                if (active_event.pointer && !sending_touch_cancel) return false;
+            }
+            data.global_pointer = data.pointer;
+            if (!data.gesture) {
+                const auto input = *data.pointer;
+                if (input.action == PointerAction::down) {
+                    if (touch_gesture || !activity) return false;
+                    const auto scale = input.capture_dpi ? static_cast<float>(input.capture_dpi) / 96.0f
+                        : static_cast<float>(configuration.density_dpi) / 160.0f;
+                    data.gesture = std::make_shared<TouchGesture>(runtime, content, activity, window_generation, input, scale);
+                    if (content) (void)data.gesture->route(content); // Pin a present root before the first callback.
+                } else {
+                    if (!touch_gesture || !touch_gesture->accepted) return false;
+                    const auto &last = touch_gesture->last;
+                    if (input.pointer != last.pointer || input.source != last.source || input.root != last.root ||
+                        input.native_producer != last.native_producer || input.native_width != last.native_width ||
+                        input.native_height != last.native_height || input.capture_dpi != last.capture_dpi) return false;
+                    if (input.root && (!input.time_known || !touch_gesture->down_time_known)) return false;
+                    // Unknown original DOWN provenance cannot be repaired by
+                    // claiming a new downTime in a later caller-supplied sample.
+                    if (input.time_known && (!touch_gesture->down_time_known || input.down_time_ms != touch_gesture->down_time_ms))
+                        return false;
+                    if (input.time_known && touch_gesture->last_known_event_time_ms &&
+                        input.event_time_ms < *touch_gesture->last_known_event_time_ms) return false;
+                    data.gesture = touch_gesture;
+                }
+                data.gesture->last = input;
+                if (input.time_known) data.gesture->last_known_event_time_ms = input.event_time_ms;
+            }
+            data.pixels_per_dp = data.gesture->pixels_per_dp;
+        }
         const auto id = runtime.new_object(motion ? "Landroid/view/MotionEvent;" : "Landroid/view/KeyEvent;");
         runtime.retain(id);
         struct End {
             Impl &p;
             ObjectId id;
+            bool active = true;
             ~End() {
-                p.input_events.erase(id);
-                p.runtime.release(id);
+                if (active) { p.input_events.erase(id); p.runtime.release(id); }
             }
         } end{*this, id};
+        if (motion) {
+            auto metadata = std::make_unique<MotionObjectState>();
+            metadata->sample = public_motion(data);
+            metadata->borrowed = true;
+            runtime.set_host_state(id, std::move(metadata));
+        } else runtime.set_host_state(id, std::make_unique<KeyObjectState>(public_key(*data.key)));
         input_events.emplace(id, data);
-        if (motion)
+        if (motion && !data.gesture->canceling) touch_gesture = data.gesture;
+        if (motion && !data.native_fallback)
             ++metrics.pointer_events;
-        else
+        else if (!motion && !data.native_fallback)
             ++metrics.key_events;
+        const auto owner = motion ? data.gesture->owner_activity : activity;
         const auto method =
-            override_method(activity_type, motion ? "dispatchTouchEvent" : "dispatchKeyEvent",
+            override_method(runtime.object_type(owner), motion ? "dispatchTouchEvent" : "dispatchKeyEvent",
                             motion ? "(Landroid/view/MotionEvent;)Z" : "(Landroid/view/KeyEvent;)Z");
+        bool result = false;
         try {
-            if (method) {
-                const std::array args{Value::reference(activity), Value::reference(id)};
-                return runtime.invoke(*method, args).bits != 0;
-            }
-            return motion ? default_pointer(*data.pointer) : default_key(id);
+            if (!motion && data.key_pre_ime) {
+                ManagedRoot root(runtime, data.key_root);
+                const std::array args{Value::reference(id)};
+                result = runtime.invoke_virtual_named(data.key_root, "dispatchKeyEventPreIme", "(Landroid/view/KeyEvent;)Z", args).bits != 0;
+            } else if (method) {
+                ManagedRoot owner_root(runtime, owner);
+                const std::array args{Value::reference(owner), Value::reference(id)};
+                result = runtime.invoke(*method, args).bits != 0;
+            } else result = motion ? default_pointer(id) : default_key(id);
         } catch (...) {
-            cancel_input();
+            abandon_touch_input(); // Unwind never executes more guest callbacks.
             throw;
         }
+        if (motion && !data.gesture->canceling) {
+            if (data.pointer->action == PointerAction::down) data.gesture->accepted = result;
+            if (data.pointer->action == PointerAction::up || data.pointer->action == PointerAction::cancel) {
+                if (touch_gesture == data.gesture) touch_gesture.reset();
+                clear_input_state();
+            } else if (data.pointer->action == PointerAction::down && !result) {
+                // A managed Activity may decline after forwarding DOWN. Cancel
+                // any accepted child route instead of leaving hidden custody.
+                data.gesture->cancel_requested = true;
+            }
+            if (!data.persistent_touch && touch_gesture == data.gesture) {
+                touch_gesture.reset();
+                clear_input_state();
+            }
+        }
+        input_events.erase(id);
+        runtime.release(id);
+        end.active = false;
+        flush_touch_cancel();
+        return result;
     }
     struct EditCall {
         Impl &owner;
@@ -3084,6 +11376,38 @@ struct ActivitySession::Impl {
         const auto &metadata = selection_state(object);
         return end ? metadata.end : metadata.start;
     }
+    ObjectId porter_duff_mode(std::size_t index) {
+        if (index >= porter_duff_modes.size()) bad("ENUM_STATE", "Invalid PorterDuff.Mode ordinal");
+        auto &cached = porter_duff_modes[index];
+        if (!cached)
+            cached = own(runtime.new_host_enum(porter_duff_mode_type, unicode(porter_duff_mode_names[index]),
+                                               static_cast<std::int32_t>(index)));
+        return cached;
+    }
+    Value porter_duff_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.name == "values" && api.signature == "()[Landroid/graphics/PorterDuff$Mode;" && args.empty()) {
+            const auto array = runtime.new_array("[Landroid/graphics/PorterDuff$Mode;",
+                                                 static_cast<std::int32_t>(porter_duff_modes.size()));
+            ManagedRoot array_root(runtime, array);
+            for (std::size_t index = 0; index < porter_duff_modes.size(); ++index)
+                runtime.array_set(array, static_cast<std::int32_t>(index), Value::reference(porter_duff_mode(index)));
+            return Value::reference(array);
+        }
+        if (api.name == "valueOf" && api.signature == "(Ljava/lang/String;)Landroid/graphics/PorterDuff$Mode;" &&
+            args.size() == 1) {
+            if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            const auto requested = runtime.string(args[0].bits);
+            // Match completely before any enum creation can allocate or collect.
+            for (std::size_t index = 0; index < porter_duff_mode_names.size(); ++index) {
+                const auto name = porter_duff_mode_names[index];
+                if (requested.size() == name.size() && std::equal(requested.begin(), requested.end(), name.begin(),
+                    [](char16_t unit, char ascii) { return unit == static_cast<unsigned char>(ascii); }))
+                    return Value::reference(porter_duff_mode(index));
+            }
+            runtime.raise("Ljava/lang/IllegalArgumentException;");
+        }
+        bad("ENUM_UNSUPPORTED", "PorterDuff.Mode supports only its concrete values and valueOf methods");
+    }
     ObjectId mode_object(std::int32_t mode) {
         if (mode < 0 || mode > 2) bad("BUFFER_MODE", "Invalid text buffer mode");
         auto &cached = buffer_modes[static_cast<std::size_t>(mode)];
@@ -3132,6 +11456,7 @@ struct ActivitySession::Impl {
         }
     }
     void check_text_edit_observer_idle() const {
+        if (key_completion_failure) std::rethrow_exception(key_completion_failure);
         check_view_activations();
         if (soft_input_observer_failure) std::rethrow_exception(soft_input_observer_failure);
         if (notifying_soft_input) bad("SOFT_INPUT_OBSERVER_REENTRY", "Trusted soft input sink must not reenter the session");
@@ -4308,10 +12633,1484 @@ struct ActivitySession::Impl {
         }
         return perform_click_base(object, view(object).kind == ViewKind::checkbox);
     }
+    bool actual_style_bag(std::uint32_t style, const SdkResourceWork &charge) {
+        if (!style) return false;
+        charge(1);
+        const auto selected = resources.entries().find(style);
+        if (selected != resources.entries().end()) return selected->second.complex;
+        if ((style >> 24) != 1) {
+            charge(1);
+            if (resources.declaration_flags(style))
+                bad("TYPED_ARRAY_STYLE_UNSUPPORTED", "Style bag exists only in an unavailable configuration");
+            return false;
+        }
+        const auto sdk = embedded_sdk_resources().scalar(style, theme_resource_configuration(), charge);
+        if (sdk.status == SdkResourceStatus::unresolved)
+            bad("TYPED_ARRAY_STYLE_UNSUPPORTED", "SDK style bag selection requires unavailable configuration facts");
+        // GetBag accepts an actual complex entry. Scalar reference aliases are
+        // not silently followed here; staged SDK identities are already mapped.
+        return sdk.status == SdkResourceStatus::found && sdk.complex;
+    }
+    struct StyleSelector {
+        std::uint32_t style = 0, flags = 0;
+    };
+    StyleSelector theme_style_selector(std::span<const ThemeStyleLayer> layers, std::uint32_t attribute,
+                                       const SdkResourceWork &charge) {
+        StyleSelector result;
+        std::array<std::uint32_t, 32> visited;
+        for (std::size_t depth = 0; depth < visited.size(); ++depth) {
+            charge(1);
+            for (std::size_t previous = 0; previous < depth; ++previous) {
+                charge(1);
+                if (visited[previous] == attribute)
+                    bad("TYPED_ARRAY_STYLE_INVALID", "Default style selector has cyclic Theme attribute references");
+            }
+            visited[depth] = attribute;
+            const auto selected = select_theme_attribute(resources, layers, attribute, theme_resource_configuration(), charge);
+            if (selected.status == apk::StyleAttributeStatus::absent) return {};
+            if (selected.status != apk::StyleAttributeStatus::found || !selected.provenance_complete)
+                bad("TYPED_ARRAY_STYLE_UNSUPPORTED", "Style selector requires complete actual Theme source metadata");
+            result.flags |= selected.native_flags;
+            if (selected.value.type == 2) { attribute = selected.value.data; continue; }
+            if (selected.value.type == 1 && actual_style_bag(selected.value.data, charge))
+                result.style = selected.value.data;
+            return result;
+        }
+        bad("TYPED_ARRAY_STYLE_LIMIT", "Default style selector exceeds the existing 32-reference bound");
+    }
+    ObjectId view_styleable_array() {
+        if (view_styleable_ids) {
+            if (!view_styleable_ordinals || runtime.object_type(view_styleable_ids) != "[I" ||
+                runtime.object_type(view_styleable_ordinals) != "[I" ||
+                runtime.array_length(view_styleable_ids) != view_attribute_names().size() ||
+                runtime.array_length(view_styleable_ordinals) != view_attribute_names().size())
+                bad("VIEW_XML_STATE", "View styleable arrays lost their actual SDK shape");
+            return view_styleable_ids;
+        }
+        ProviderWorkCharge provider_charge{runtime};
+        const SdkResourceWork charge(std::ref(provider_charge));
+        const auto arrays = create_styleable_arrays(runtime, view_attribute_names(), charge);
+        ManagedRoot ids_root(runtime, arrays.ids), ordinals_root(runtime, arrays.ordinals);
+        own(arrays.ids);
+        try { own(arrays.ordinals); }
+        catch (...) { disown(arrays.ids); throw; }
+        // Publish only the completed pair. The IDs remain the same real mutable
+        // int[] passed to Context; the private index/name mapping stays fixed.
+        view_styleable_ids = arrays.ids;
+        view_styleable_ordinals = arrays.ordinals;
+        return view_styleable_ids;
+    }
+    StyleableArrays widget_styleable_arrays(WidgetStyleable kind) {
+        const auto names = widget_attribute_names(kind);
+        const auto slot = static_cast<std::size_t>(kind);
+        if (slot >= widget_styleables.size()) bad("WIDGET_STYLEABLE_STATE", "Unknown SDK widget styleable identity");
+        auto &cached = widget_styleables[slot];
+        if (cached.ids) {
+            if (!cached.ordinals || runtime.object_type(cached.ids) != "[I" || runtime.object_type(cached.ordinals) != "[I" ||
+                runtime.array_length(cached.ids) != names.size() || runtime.array_length(cached.ordinals) != names.size())
+                bad("WIDGET_STYLEABLE_STATE", "Widget styleable arrays lost their actual SDK shape");
+            return cached;
+        }
+        ProviderWorkCharge provider_charge{runtime};
+        const SdkResourceWork charge(std::ref(provider_charge));
+        const auto arrays = create_styleable_arrays(runtime, names, charge);
+        ManagedRoot ids_root(runtime, arrays.ids), ordinals_root(runtime, arrays.ordinals);
+        own(arrays.ids);
+        try { own(arrays.ordinals); }
+        catch (...) { disown(arrays.ids); throw; }
+        cached = arrays;
+        return cached;
+    }
+    ObjectId obtain_widget_attributes(ObjectId context_object, ObjectId attrs, WidgetStyleable kind,
+                                     bool with_defaults, std::uint32_t default_attribute = 0, std::uint32_t default_resource = 0) {
+        ManagedRoot context_root(runtime, context_object), attrs_root(runtime, attrs);
+        context(context_object);
+        const auto arrays = widget_styleable_arrays(kind);
+        ManagedRoot ids_root(runtime, arrays.ids), ordinals_root(runtime, arrays.ordinals);
+        const std::array arguments{Value::reference(attrs), Value::reference(arrays.ids),
+            Value::word(default_attribute), Value::word(default_resource)};
+        const auto result = runtime.invoke_virtual_named(context_object, "obtainStyledAttributes", with_defaults
+            ? "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;"
+            : "(Landroid/util/AttributeSet;[I)Landroid/content/res/TypedArray;",
+            std::span<const Value>(arguments).first(with_defaults ? 4u : 2u));
+        if (result.kind != dex::ValueKind::reference && !(result.kind == dex::ValueKind::word && !result.bits))
+            bad("WIDGET_STYLEABLE_STATE", "Widget Context returned a nonreference TypedArray");
+        return result.bits; // Caller roots immediately, before another allocation.
+    }
+    const TypedArrayState &widget_snapshot(ObjectId values, WidgetStyleable kind) {
+        if (!values) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *metadata = dynamic_cast<const TypedArrayState *>(runtime.host_state(values));
+        if (metadata && metadata->owner == this && metadata->recycled)
+            runtime.raise("Ljava/lang/RuntimeException;", u"Cannot use a recycled TypedArray");
+        if (!metadata || metadata->owner != this || metadata->cells.size() != widget_attribute_names(kind).size())
+            bad("WIDGET_STYLEABLE_UNSUPPORTED", "Widget requires its actual complete SDK styleable snapshot");
+        return *metadata;
+    }
+    std::uint32_t widget_attribute_slot(WidgetStyleable kind, std::string_view name) {
+        const auto names = widget_attribute_names(kind);
+        const auto arrays = widget_styleable_arrays(kind);
+        for (std::size_t slot = 0; slot < names.size(); ++slot) {
+            runtime.charge_provider_work(1);
+            const auto ordinal = static_cast<std::uint32_t>(runtime.array_get(arrays.ordinals, static_cast<std::int32_t>(slot)).bits);
+            if (ordinal >= names.size()) bad("WIDGET_STYLEABLE_STATE", "Widget styleable ordinal is outside its immutable inventory");
+            runtime.charge_provider_work(1);
+            if (names[ordinal] == name) return static_cast<std::uint32_t>(slot);
+        }
+        bad("WIDGET_STYLEABLE_STATE", "Required attribute is outside its genuine SDK styleable declaration");
+    }
+    StyledAttributeSnapshot widget_cell(ObjectId values, WidgetStyleable kind, std::string_view name) {
+        const auto slot = widget_attribute_slot(kind, name);
+        return widget_snapshot(values, kind).cells[slot].snapshot;
+    }
+    std::int32_t widget_integer(ObjectId values, WidgetStyleable kind, std::string_view name, std::int32_t fallback) {
+        const auto cell = widget_cell(values, kind, name);
+        if (cell.presence == StyledAttributePresence::absent) return fallback;
+        if (cell.presence != StyledAttributePresence::present || cell.scalar != StyledScalarStatus::ready ||
+            cell.value.type < 0x10 || cell.value.type > 0x1f)
+            bad("WIDGET_STYLEABLE_UNSUPPORTED", "Widget integer coercion is not implemented: " + std::string(name));
+        return std::bit_cast<std::int32_t>(cell.value.data);
+    }
+    std::int32_t widget_dimension(ObjectId values, WidgetStyleable kind, std::string_view name, std::int32_t fallback) {
+        const auto cell = widget_cell(values, kind, name);
+        if (cell.presence == StyledAttributePresence::absent) return fallback;
+        if (cell.presence != StyledAttributePresence::present || cell.scalar != StyledScalarStatus::ready || cell.value.type != 5)
+            bad("WIDGET_STYLEABLE_UNSUPPORTED", "Widget requires an actual dimension: " + std::string(name));
+        runtime.charge_provider_work(1);
+        return dimension_pixel_size(cell.value.data, configuration.density_dpi);
+    }
+    std::int32_t widget_layout_dimension(ObjectId values, WidgetStyleable kind, std::string_view name) {
+        const auto cell = widget_cell(values, kind, name);
+        if (cell.presence == StyledAttributePresence::present && cell.scalar == StyledScalarStatus::ready) {
+            if (cell.value.type >= 0x10 && cell.value.type <= 0x1f) return std::bit_cast<std::int32_t>(cell.value.data);
+            if (cell.value.type == 5) {
+                runtime.charge_provider_work(1);
+                return dimension_pixel_size(cell.value.data, configuration.density_dpi);
+            }
+        }
+        runtime.raise("Ljava/lang/UnsupportedOperationException;", u"You must supply a supported layout dimension attribute");
+    }
+    template <class Update> void update_view_constructor_state(ObjectId object, Update update) {
+        ManagedRoot object_root(runtime, object);
+        ProviderStorageReservation storage(runtime);
+        storage.resize(sizeof(ViewObjectState));
+        const auto &previous = view_state(object);
+        if (!previous.text_edit_events.empty() || !previous.text_mutations.empty())
+            bad("VIEW_CONSTRUCTOR_LIMIT", "Constructor-state mutation requires an empty text-edit history");
+        runtime.charge_provider_work(1 + previous.references.size());
+        auto next = std::make_unique<ViewObjectState>(previous);
+        update(*next); // Private scalar/reference update; callers retain every new reference.
+        storage.publish(object, std::move(next));
+    }
+    Value set_view_over_scroll_mode(ObjectId object, std::int32_t mode) {
+        if (mode < 0 || mode > 2)
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"Invalid overscroll mode");
+        if (mode != 1)
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Nondefault overscroll effects require implemented edge-effect behavior");
+        if (view_state(object).over_scroll_mode == mode) return Value::nothing();
+        update_view_constructor_state(object, [mode](ViewObjectState &next) { next.over_scroll_mode = mode; });
+        return Value::nothing();
+    }
+    void dispatch_constructor_over_scroll(ObjectId object, std::int32_t mode) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "setOverScrollMode", "(I)V")) {
+            const std::array args{Value::reference(object), Value::word(std::bit_cast<std::uint32_t>(mode))};
+            (void)runtime.invoke_virtual(*method, args);
+        } else (void)set_view_over_scroll_mode(object, mode);
+    }
+    void initialize_view_context(ObjectId object, ObjectId constructor_context) {
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context);
+        if (constructor_context) {
+            const auto resource = runtime.invoke_virtual_named(constructor_context, "getResources", "()Landroid/content/res/Resources;");
+            ManagedRoot resource_root(runtime, resource.bits);
+            update_view_constructor_state(object, [resource](ViewObjectState &next) { next.references[10] = resource; });
+        }
+        // mViewFlags is assigned only after the original first getResources
+        // returns. Its defaults overwrite callback edits to these modeled flag
+        // bits, while ID, minimum dimensions, padding and other state survive.
+        update_view_constructor_state(object, [](ViewObjectState &next) {
+            next.visibility = 0; next.focusable_mode = 16; next.will_not_draw = false;
+            next.raw_layout_direction = 2; next.layout_direction_resolved = false;
+            next.resolved_text_direction = next.resolved_text_alignment = 1;
+        });
+        view(object).enabled = true;
+        view(object).clickable = false;
+        const auto config = configuration_for_context(constructor_context);
+        ManagedRoot config_root(runtime, config);
+        const auto slop = runtime.invoke_virtual_named(config, "getScaledTouchSlop", "()I");
+        update_view_constructor_state(object, [slop](ViewObjectState &next) {
+            next.touch_slop = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(slop.bits));
+        });
+        const auto multiplier = runtime.invoke_virtual_named(config, "getScaledAmbiguousGestureMultiplier", "()F");
+        update_view_constructor_state(object, [multiplier](ViewObjectState &next) {
+            next.ambiguous_gesture_multiplier = static_cast<std::uint32_t>(multiplier.bits);
+        });
+        dispatch_constructor_over_scroll(object, 1);
+        // Materialize the real Class identity used by getClass().getName(). The
+        // software node keeps that immutable binary-name source without issuing
+        // a pretend Java RenderNode object or exposing an unimplemented handle.
+        const auto actual_class = runtime.class_object(runtime.object_type(object));
+        ManagedRoot class_root(runtime, actual_class);
+        runtime.charge_provider_work(1);
+        update_view_constructor_state(object, [actual_class](ViewObjectState &next) {
+            next.padding_start = next.padding_end = INT32_MIN;
+            next.references[11] = Value::reference(actual_class);
+            next.software_node.emplace();
+        });
+        if (!view_compatibility_done && constructor_context) {
+            const auto info = runtime.invoke_virtual_named(constructor_context, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+            ManagedRoot info_root(runtime, info.bits);
+            if (!info.bits) runtime.raise("Ljava/lang/NullPointerException;");
+            if (info.bits != application_info)
+                bad("VIEW_APPLICATION_INFO_UNSUPPORTED", "View compatibility requires the actual canonical ApplicationInfo");
+            const auto &info_metadata = application_info_state(info.bits);
+            if (!info_metadata.target_known)
+                bad("VIEW_APPLICATION_INFO_UNSUPPORTED", "View compatibility lacks authentic target SDK metadata");
+            const auto sdk = std::bit_cast<std::int32_t>(info_metadata.target_sdk);
+            runtime.charge_provider_work(1);
+            // These SDK static assignments precede another original Context
+            // callback. Preserve their effects even if it throws or reenters.
+            view_compatibility_pre_target = sdk;
+            view_preserve_margin_params = sdk >= 24;
+            const auto resource = runtime.invoke_virtual_named(constructor_context, "getResources", "()Landroid/content/res/Resources;");
+            ManagedRoot resource_root(runtime, resource.bits);
+            ViewConfigurationQueries query{*this, constructor_context, resource.bits, configuration_object};
+            const auto focus = query.query("bool", "config_useDefaultFocusHighlight", "getBoolean", "(I)Z");
+            view_default_focus_highlight = focus.bits != 0;
+            runtime.charge_provider_work(1);
+            view_compatibility_post_target = sdk;
+            view_compatibility_done = true;
+        }
+    }
+    void dispatch_view_layout_request(ObjectId object) {
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "requestLayout", "()V")) {
+            const std::array args{Value::reference(object)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else request_view_layout(object);
+    }
+    void request_view_layout(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_LAYOUT_REQUEST_UNSUPPORTED", "Layout requests require the actual implemented View constructor profile");
+        // No AttachInfo/ViewRoot is installed by this constructor-only path.
+        // Set the real logical request bits, then preserve parent callbacks.
+        update_view_constructor_state(object, [](ViewObjectState &next) {
+            next.layout_requested = true; next.drawing_invalidated = true;
+        });
+        surface_dirty = true;
+        ++metrics.view_revision;
+        const auto parent = view(object).parent;
+        ManagedRoot parent_root(runtime, parent);
+        if (!parent) return;
+        bool requested;
+        if (const auto method = metered_view_override(parent, "isLayoutRequested", "()Z")) {
+            const std::array args{Value::reference(parent)};
+            requested = runtime.invoke_virtual(*method, args).bits != 0;
+        } else requested = view_state(parent).layout_requested;
+        if (!requested) {
+            // Java reads mParent again after isLayoutRequested: preserve a
+            // callback's reparenting, including a newly-null receiver's NPE.
+            dispatch_view_layout_request(view(object).parent);
+        }
+    }
+    bool base_view_is_opaque(ObjectId object) {
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_OPACITY_UNSUPPORTED", "Opacity requires the actual implemented View constructor and background profile");
+        // This profile admits no background or scrollbars. The SDK's opaque
+        // background/scrollbar mask therefore fails before getFinalAlpha.
+        // SurfaceView inherits this View body; Surface format is a separate fact.
+        return false;
+    }
+    bool dispatch_view_is_opaque(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "isOpaque", "()Z")) {
+            const std::array args{Value::reference(object)};
+            return runtime.invoke_virtual(*method, args).bits != 0;
+        }
+        return base_view_is_opaque(object);
+    }
+    void invalidate_view(ObjectId object, bool invalidate_cache) {
+        ManagedRoot object_root(runtime, object);
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_INVALIDATION_UNSUPPORTED", "Invalidation requires the actual implemented unattached View state");
+        // No animation, transition, GhostView, background or AttachInfo can be
+        // installed by this profile. Invisible nodes take SDK skipInvalidate.
+        if (view_state(object).visibility != 0) {
+            if (view(object).parent)
+                bad("VIEW_INVALIDATION_UNSUPPORTED", "Nonvisible child invalidation requires actual parent transition queries");
+            return;
+        }
+        bool process = [&] {
+            const auto &previous = view_state(object);
+            return (previous.drawn && previous.has_bounds) ||
+                (invalidate_cache && previous.drawing_cache_valid) || !previous.drawing_invalidated;
+        }();
+        if (!process) {
+            const bool opaque = dispatch_view_is_opaque(object);
+            process = opaque != view_state(object).last_is_opaque;
+        }
+        if (!process) return;
+        // Full invalidation calls isOpaque again inside the body. Re-fetch all
+        // state after each original callback; do not reuse a borrowed host state.
+        const bool opaque = dispatch_view_is_opaque(object);
+        update_view_constructor_state(object, [opaque, invalidate_cache](ViewObjectState &next) {
+            next.last_is_opaque = opaque; next.drawn = false; next.drawing_dirty = true;
+            if (invalidate_cache) { next.drawing_invalidated = true; next.drawing_cache_valid = false; }
+        });
+        surface_dirty = true;
+        ++metrics.view_revision;
+    }
+    void dispatch_view_invalidate(ObjectId object, bool invalidate_cache) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "invalidate", "(Z)V")) {
+            const std::array args{Value::reference(object), Value::word(invalidate_cache)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else invalidate_view(object, invalidate_cache);
+    }
+    bool base_view_has_focus(ObjectId object, bool group) {
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_FOCUS_UNSUPPORTED", "Focus query requires actual implemented View state");
+        if (view(object).focused) return true;
+        if (group && !view(object).children.empty() && in_tree(object))
+            bad("VIEW_FOCUS_UNSUPPORTED", "Presented child focus custody is not implemented by this constructor profile");
+        return false;
+    }
+    bool dispatch_visibility_has_focus(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "hasFocus", "()Z")) {
+            const std::array args{Value::reference(object)};
+            return runtime.invoke_virtual(*method, args).bits != 0;
+        }
+        return base_view_has_focus(object, view_state(object).group_constructor);
+    }
+    Value base_view_root(ObjectId object) {
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor || view(object).parent)
+            bad("VIEW_ROOT_UNSUPPORTED", "Root lookup requires the actual parentless View profile");
+        return Value::reference(object);
+    }
+    Value base_view_root_impl(ObjectId object) {
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_ROOT_UNSUPPORTED", "ViewRootImpl lookup requires actual implemented View state");
+        // No operation in this profile installs AttachInfo or a physical ViewRootImpl.
+        return Value::reference(0);
+    }
+    Value dispatch_visibility_root(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "getRootView", "()Landroid/view/View;")) {
+            const std::array args{Value::reference(object)};
+            return runtime.invoke_virtual(*method, args);
+        }
+        return base_view_root(object);
+    }
+    Value dispatch_view_root_impl(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "getViewRootImpl", "()Landroid/view/ViewRootImpl;")) {
+            const std::array args{Value::reference(object)};
+            return runtime.invoke_virtual(*method, args);
+        }
+        return base_view_root_impl(object);
+    }
+    void clear_unattached_accessibility_focus(ObjectId object) {
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_ACCESSIBILITY_FOCUS_UNSUPPORTED", "Accessibility focus clearing requires actual implemented View state");
+        // No API in this profile can install the local accessibility-focus bit.
+        // The subsequent getter is nevertheless virtual and always evaluated.
+        ManagedRoot object_root(runtime, object);
+        const auto root = dispatch_view_root_impl(object);
+        ManagedRoot root_root(runtime, root.bits);
+        if (root.bits)
+            bad("VIEW_ACCESSIBILITY_FOCUS_UNSUPPORTED", "Non-null ViewRootImpl accessibility-focus effects are not implemented");
+    }
+    void dispatch_visibility_accessibility_clear(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "clearAccessibilityFocus", "()V")) {
+            const std::array args{Value::reference(object)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else clear_unattached_accessibility_focus(object);
+    }
+    void set_view_visibility_flags(ObjectId object, std::uint32_t flags) {
+        ManagedRoot object_root(runtime, object);
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).view_context_constructor)
+            bad("VIEW_VISIBILITY_UNSUPPORTED", "Visibility requires the actual implemented View constructor profile");
+        const auto old_visibility = static_cast<std::uint32_t>(view_state(object).visibility);
+        const auto new_visibility = flags & 0xcu; // SDK setFlags masks; it does not validate a Java enum.
+        const auto changed = old_visibility ^ new_visibility;
+        update_view_constructor_state(object, [new_visibility](ViewObjectState &next) {
+            next.visibility = static_cast<std::int32_t>(new_visibility);
+        });
+        if (!changed) return;
+        const auto require_parentless = [&] {
+            if (view(object).parent)
+                bad("VIEW_VISIBILITY_UNSUPPORTED", "Visibility parent/transition and physical attachment effects are not implemented");
+        };
+        require_parentless();
+        if (new_visibility == 0) {
+            update_view_constructor_state(object, [](ViewObjectState &next) { next.drawn = true; });
+            dispatch_view_invalidate(object, true);
+            require_parentless();
+            // needGlobalAttributesUpdate and parent focus notification have no
+            // receiver in the admitted parentless, no-AttachInfo branch.
+        }
+        if (changed & 8u) {
+            dispatch_view_layout_request(object);
+            require_parentless();
+            if (view_state(object).visibility == 8) {
+                const bool has_focus_result = dispatch_visibility_has_focus(object);
+                require_parentless();
+                if (has_focus_result || view(object).focused)
+                    bad("VIEW_VISIBILITY_FOCUS_UNSUPPORTED", "Focused visibility transitions require actual focus-clear effects");
+                dispatch_visibility_accessibility_clear(object);
+                require_parentless();
+                update_view_constructor_state(object, [](ViewObjectState &next) {
+                    next.drawing_cache_valid = false; next.drawn = true;
+                });
+            }
+        }
+        if (changed & 4u) {
+            update_view_constructor_state(object, [](ViewObjectState &next) { next.drawn = true; });
+            if (view_state(object).visibility == 4) {
+                const auto root = dispatch_visibility_root(object);
+                ManagedRoot root_root(runtime, root.bits);
+                require_parentless();
+                // SDK compares this return value only; null and a different
+                // View both enter the same supported false-focus branch.
+                if (root.bits != object) {
+                    const bool has_focus_result = dispatch_visibility_has_focus(object);
+                    require_parentless();
+                    if (has_focus_result || view(object).focused)
+                        bad("VIEW_VISIBILITY_FOCUS_UNSUPPORTED", "Focused visibility transitions require actual focus-clear effects");
+                    dispatch_visibility_accessibility_clear(object);
+                    require_parentless();
+                }
+            }
+        }
+        surface_dirty = true;
+        ++metrics.view_revision;
+    }
+    void set_will_not_draw(ObjectId object, bool value) {
+        ManagedRoot object_root(runtime, object);
+        if (view_state(object).will_not_draw == value) return;
+        update_view_constructor_state(object, [value](ViewObjectState &next) { next.will_not_draw = value; });
+        // View.setFlags processes DRAW_MASK before returning to its caller.
+        dispatch_view_layout_request(object);
+        dispatch_view_invalidate(object, true);
+    }
+    void dispatch_will_not_draw(ObjectId object, bool value) {
+        ManagedRoot object_root(runtime, object);
+        if (const auto method = metered_view_override(object, "setWillNotDraw", "(Z)V")) {
+            const std::array args{Value::reference(object), Value::word(value)};
+            (void)runtime.invoke_virtual(*method, args);
+        } else set_will_not_draw(object, value);
+    }
+    Value widget_setter_base(ObjectId object, std::string_view name, Value argument) {
+        ManagedRoot object_root(runtime, object);
+        (void)view(object);
+        runtime.charge_provider_work(1);
+        if (!view_state(object).group_constructor)
+            bad("WIDGET_SETTER_UNSUPPORTED", "Widget setter requires its actual implemented superclass constructor chain");
+        const auto number = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(argument.bits));
+        const bool enabled = argument.bits != 0;
+        if (name == "setOrientation") {
+            if (number != 0 && number != 1)
+                bad("LINEAR_LAYOUT_UNSUPPORTED", "Unsupported LinearLayout orientation requires implemented measurement semantics");
+            if (view(object).orientation != number) {
+                view(object).orientation = number;
+                dispatch_view_layout_request(object);
+            }
+        } else if (name == "setGravity") {
+            auto gravity = static_cast<std::uint32_t>(number);
+            if (!(gravity & 0x00800007u)) gravity |= 0x00800003u; // START.
+            if (!(gravity & 0x70u)) gravity |= 0x30u; // TOP.
+            const auto value = std::bit_cast<std::int32_t>(gravity);
+            if (view_state(object).linear_gravity != value) {
+                update_view_constructor_state(object, [value](ViewObjectState &next) { next.linear_gravity = value; });
+                dispatch_view_layout_request(object);
+            }
+        } else if (name == "setBaselineAligned") {
+            update_view_constructor_state(object, [enabled](ViewObjectState &next) { next.baseline_aligned = enabled; });
+        } else if (name == "setMeasureAllChildren") {
+            update_view_constructor_state(object, [enabled](ViewObjectState &next) { next.measure_all_children = enabled; });
+        } else if (name == "setDividerDrawable") {
+            if (argument.bits)
+                bad("LINEAR_LAYOUT_UNSUPPORTED", "Nonnull dividers require actual intrinsic dimensions and drawing");
+            // This profile cannot install a divider; SDK null-to-null is an identity no-op.
+        } else if (name == "setDescendantFocusability") {
+            if (number != 0x20000 && number != 0x40000 && number != 0x60000)
+                runtime.raise("Ljava/lang/IllegalArgumentException;", u"Invalid descendant focusability");
+            if (number != 0x20000)
+                bad("VIEW_GROUP_UNSUPPORTED", "Nondefault descendant focus traversal is not implemented");
+            update_view_constructor_state(object, [number](ViewObjectState &next) { next.descendant_focusability = number; });
+        } else if (name == "setLayoutMode") {
+            if (number != -1 && number != 0)
+                bad("VIEW_GROUP_UNSUPPORTED", "Optical layout mode is not implemented");
+            if (view_state(object).layout_mode != number) {
+                if (!view(object).children.empty())
+                    bad("VIEW_GROUP_UNSUPPORTED", "Layout-mode cache invalidation over existing children is not implemented");
+                update_view_constructor_state(object, [number](ViewObjectState &next) { next.layout_mode = number; });
+                dispatch_view_layout_request(object);
+            }
+        } else if (name == "setPersistentDrawingCache") {
+            if (number != 2)
+                bad("VIEW_GROUP_UNSUPPORTED", "Nondefault persistent drawing-cache behavior is not implemented");
+            update_view_constructor_state(object, [number](ViewObjectState &next) { next.persistent_drawing_cache = number; });
+        } else if (name == "setAddStatesFromChildren" || name == "setTransitionGroup" || name == "setTouchscreenBlocksFocus") {
+            if (enabled)
+                bad("VIEW_GROUP_UNSUPPORTED", "Requested child-state, transition or touchscreen focus effects are not implemented");
+        } else {
+            if (!enabled)
+                bad("VIEW_GROUP_UNSUPPORTED", "Nondefault child clipping, caching or motion splitting is not implemented");
+            update_view_constructor_state(object, [name](ViewObjectState &next) {
+                if (name == "setClipChildren") next.clip_children = true;
+                else if (name == "setClipToPadding") next.clip_to_padding = true;
+                else if (name == "setAnimationCacheEnabled") next.animation_cache = true;
+                else if (name == "setAlwaysDrawnWithCacheEnabled") next.always_drawn_with_cache = true;
+                else if (name == "setMotionEventSplittingEnabled") next.split_motion_events = true;
+                else bad("WIDGET_SETTER", "Unknown widget setter");
+            });
+        }
+        return Value::nothing();
+    }
+    void dispatch_widget_setter(ObjectId object, std::string_view name, std::string_view signature, Value argument) {
+        ManagedRoot object_root(runtime, object), argument_root(runtime, argument.kind == dex::ValueKind::reference ? argument.bits : 0);
+        if (const auto method = metered_view_override(object, name, signature)) {
+            const std::array args{Value::reference(object), argument};
+            (void)runtime.invoke_virtual(*method, args);
+        } else (void)widget_setter_base(object, name, argument);
+    }
+    std::int32_t widget_target_sdk(ObjectId constructor_context) {
+        ManagedRoot context_root(runtime, constructor_context);
+        const auto info = runtime.invoke_virtual_named(constructor_context, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;");
+        ManagedRoot info_root(runtime, info.bits);
+        if (!info.bits) runtime.raise("Ljava/lang/NullPointerException;");
+        if (info.bits != application_info || !application_info_state(info.bits).target_known)
+            bad("WIDGET_APPLICATION_INFO_UNSUPPORTED", "Widget compatibility requires the actual known ApplicationInfo target SDK");
+        return std::bit_cast<std::int32_t>(application_info_state(info.bits).target_sdk);
+    }
+    float widget_float(ObjectId values, WidgetStyleable kind, std::string_view name, float fallback) {
+        const auto cell = widget_cell(values, kind, name);
+        if (cell.presence == StyledAttributePresence::absent) return fallback;
+        if (cell.presence != StyledAttributePresence::present || cell.scalar != StyledScalarStatus::ready)
+            bad("WIDGET_STYLEABLE_UNSUPPORTED", "Widget float requires a supported scalar");
+        if (cell.value.type == 4) return std::bit_cast<float>(cell.value.data);
+        if (cell.value.type >= 0x10 && cell.value.type <= 0x1f) {
+            runtime.charge_provider_work(1);
+            return static_cast<float>(std::bit_cast<std::int32_t>(cell.value.data));
+        }
+        bad("WIDGET_STYLEABLE_UNSUPPORTED", "Widget floating string coercion is not implemented");
+    }
+    void initialize_view_group(ObjectId object, ObjectId constructor_context, ObjectId attrs,
+                               std::uint32_t default_attribute, std::uint32_t default_resource) {
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        // ViewGroup field initializers precede initViewGroup. Its private
+        // setFlags draw-mask update runs before the Group flag defaults.
+        update_view_constructor_state(object, [](ViewObjectState &next) { next.layout_mode = -1; });
+        set_will_not_draw(object, true);
+        update_view_constructor_state(object, [](ViewObjectState &next) {
+            next.clip_children = next.clip_to_padding = next.animation_cache = true;
+            next.always_drawn_with_cache = next.split_motion_events = true;
+        });
+        dispatch_widget_setter(object, "setDescendantFocusability", "(I)V", Value::word(0x20000));
+        update_view_constructor_state(object, [](ViewObjectState &next) {
+            next.group_children_initialized = true; next.persistent_drawing_cache = 2;
+        });
+        const auto values = obtain_widget_attributes(constructor_context, attrs, WidgetStyleable::view_group,
+            true, default_attribute, default_resource);
+        ManagedRoot values_root(runtime, values);
+        const auto names = widget_attribute_names(WidgetStyleable::view_group);
+        const auto arrays = widget_styleable_arrays(WidgetStyleable::view_group);
+        ManagedRoot ids_root(runtime, arrays.ids), ordinals_root(runtime, arrays.ordinals);
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            runtime.charge_provider_work(1);
+            const auto cell = widget_snapshot(values, WidgetStyleable::view_group).cells[index].snapshot;
+            if (cell.presence == StyledAttributePresence::absent && !(cell.value.type == 0 && cell.value.data == 1)) continue;
+            const auto ordinal = static_cast<std::uint32_t>(runtime.array_get(arrays.ordinals, static_cast<std::int32_t>(index)).bits);
+            if (ordinal >= names.size()) bad("WIDGET_STYLEABLE_STATE", "ViewGroup styleable ordinal is invalid");
+            const auto name = names[ordinal];
+            const auto integer = [&](std::int32_t fallback) {
+                return widget_integer(values, WidgetStyleable::view_group, name, fallback);
+            };
+            const auto boolean = [&](std::string_view setter, bool fallback) {
+                dispatch_widget_setter(object, setter, "(Z)V", Value::word(integer(fallback ? 1 : 0) != 0));
+            };
+            if (name == "clipChildren") boolean("setClipChildren", true);
+            else if (name == "clipToPadding") boolean("setClipToPadding", true);
+            else if (name == "animationCache") boolean("setAnimationCacheEnabled", true);
+            else if (name == "persistentDrawingCache")
+                dispatch_widget_setter(object, "setPersistentDrawingCache", "(I)V", Value::word(std::bit_cast<std::uint32_t>(integer(2))));
+            else if (name == "addStatesFromChildren") boolean("setAddStatesFromChildren", false);
+            else if (name == "alwaysDrawnWithCache") boolean("setAlwaysDrawnWithCacheEnabled", true);
+            else if (name == "descendantFocusability") {
+                const auto focus = integer(0);
+                if (focus < 0 || focus > 2) runtime.raise("Ljava/lang/ArrayIndexOutOfBoundsException;");
+                dispatch_widget_setter(object, "setDescendantFocusability", "(I)V", Value::word(0x20000u + static_cast<std::uint32_t>(focus) * 0x20000u));
+            } else if (name == "splitMotionEvents") boolean("setMotionEventSplittingEnabled", false);
+            else if (name == "layoutMode")
+                dispatch_widget_setter(object, "setLayoutMode", "(I)V", Value::word(std::bit_cast<std::uint32_t>(integer(-1))));
+            else if (name == "transitionGroup") boolean("setTransitionGroup", false);
+            else if (name == "touchscreenBlocksFocus") boolean("setTouchscreenBlocksFocus", false);
+            else if (name == "animateLayoutChanges") {
+                if (integer(0)) bad("VIEW_GROUP_UNSUPPORTED", "Layout transitions require actual animation scheduling");
+            } else if (name == "layoutAnimation") {
+                if (cell.presence == StyledAttributePresence::unresolved)
+                    bad("VIEW_GROUP_UNSUPPORTED", "Layout animation selection is unresolved");
+                if (cell.resolved_resource && std::bit_cast<std::int32_t>(cell.resolved_resource) > 0)
+                    bad("VIEW_GROUP_UNSUPPORTED", "Layout animation loading is not implemented");
+            } else bad("VIEW_GROUP_UNSUPPORTED", "ViewGroup attribute is not implemented");
+        }
+        (void)runtime.invoke_virtual_named(values, "recycle", "()V");
+    }
+    void initialize_frame_layout(ObjectId object, ObjectId constructor_context, ObjectId attrs,
+                                 std::uint32_t default_attribute, std::uint32_t default_resource, bool xml) {
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        update_view_constructor_state(object, [](ViewObjectState &next) { next.measure_all_children = false; });
+        if (!xml) return; // FrameLayout(Context) only calls ViewGroup(Context).
+        const auto values = obtain_widget_attributes(constructor_context, attrs, WidgetStyleable::frame_layout,
+            true, default_attribute, default_resource);
+        ManagedRoot values_root(runtime, values);
+        if (widget_integer(values, WidgetStyleable::frame_layout, "measureAllChildren", 0))
+            dispatch_widget_setter(object, "setMeasureAllChildren", "(Z)V", Value::word(1));
+        (void)runtime.invoke_virtual_named(values, "recycle", "()V");
+    }
+    void initialize_linear_layout(ObjectId object, ObjectId constructor_context, ObjectId attrs,
+                                  std::uint32_t default_attribute, std::uint32_t default_resource) {
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        // LinearLayout instance initializers run after its ViewGroup super body.
+        update_view_constructor_state(object, [](ViewObjectState &next) {
+            next.baseline_aligned = true; next.baseline_child_index = -1; next.linear_gravity = 0x00800033;
+        });
+        if (!linear_compatibility_done && constructor_context) {
+            const auto sdk = widget_target_sdk(constructor_context);
+            runtime.charge_provider_work(1);
+            linear_remeasure_weighted_children = sdk >= 28;
+            linear_compatibility_done = true;
+        }
+        const auto values = obtain_widget_attributes(constructor_context, attrs, WidgetStyleable::linear_layout,
+            true, default_attribute, default_resource);
+        ManagedRoot values_root(runtime, values);
+        auto value = widget_integer(values, WidgetStyleable::linear_layout, "orientation", -1);
+        if (value >= 0) dispatch_widget_setter(object, "setOrientation", "(I)V", Value::word(static_cast<std::uint32_t>(value)));
+        value = widget_integer(values, WidgetStyleable::linear_layout, "gravity", -1);
+        if (value >= 0) dispatch_widget_setter(object, "setGravity", "(I)V", Value::word(static_cast<std::uint32_t>(value)));
+        if (!widget_integer(values, WidgetStyleable::linear_layout, "baselineAligned", 1))
+            dispatch_widget_setter(object, "setBaselineAligned", "(Z)V", Value::word(0));
+        const auto weight = widget_float(values, WidgetStyleable::linear_layout, "weightSum", -1.0f);
+        update_view_constructor_state(object, [weight](ViewObjectState &next) { next.weight_sum_bits = std::bit_cast<std::uint32_t>(weight); });
+        value = widget_integer(values, WidgetStyleable::linear_layout, "baselineAlignedChildIndex", -1);
+        update_view_constructor_state(object, [value](ViewObjectState &next) { next.baseline_child_index = value; });
+        const bool largest = widget_integer(values, WidgetStyleable::linear_layout, "measureWithLargestChild", 0) != 0;
+        update_view_constructor_state(object, [largest](ViewObjectState &next) { next.use_largest_child = largest; });
+        value = widget_integer(values, WidgetStyleable::linear_layout, "showDividers", 0);
+        update_view_constructor_state(object, [value](ViewObjectState &next) { next.show_dividers = value; });
+        value = widget_dimension(values, WidgetStyleable::linear_layout, "dividerPadding", 0);
+        update_view_constructor_state(object, [value](ViewObjectState &next) { next.divider_padding = value; });
+        const auto divider = widget_cell(values, WidgetStyleable::linear_layout, "divider");
+        if (divider.presence != StyledAttributePresence::absent)
+            bad("LINEAR_LAYOUT_UNSUPPORTED", "Nonnull or unresolved divider loading requires actual Drawable intrinsic dimensions");
+        dispatch_widget_setter(object, "setDividerDrawable", "(Landroid/graphics/drawable/Drawable;)V", Value::reference(0));
+        const auto version = widget_target_sdk(constructor_context);
+        update_view_constructor_state(object, [version](ViewObjectState &next) { next.allow_inconsistent_measurement = version <= 23; });
+        (void)runtime.invoke_virtual_named(values, "recycle", "()V");
+    }
+    Value widget_constructor(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() < 2 || args.size() > 5 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("WIDGET_CONSTRUCTOR_ARGUMENT", "Widget constructor requires its actual receiver and Context");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto constructor_context = args[1].bits;
+        if (args.size() >= 3 && args[2].kind != dex::ValueKind::reference &&
+            !(args[2].kind == dex::ValueKind::word && !args[2].bits))
+            bad("WIDGET_CONSTRUCTOR_ARGUMENT", "Widget AttributeSet must be a nullable reference");
+        for (std::size_t index = 3; index < args.size(); ++index)
+            if (args[index].kind != dex::ValueKind::word)
+                bad("WIDGET_CONSTRUCTOR_ARGUMENT", "Widget default style selectors must be integer IDs");
+        const auto attrs = args.size() >= 3 ? args[2].bits : 0;
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        if (constructor_context) context(constructor_context);
+        if (views.contains(object)) bad("VIEW", "View constructor called twice");
+        if (views.size() >= 256) bad("VIEW_LIMIT", "Application view quota exceeded");
+        ViewState initial;
+        initial.object = object;
+        initial.kind = runtime.assignable(object, frame_layout_type) ? ViewKind::frame_layout
+            : runtime.assignable(object, "Landroid/widget/LinearLayout;") ? ViewKind::linear_layout : ViewKind::view;
+        auto metadata = std::make_unique<ViewObjectState>();
+        metadata->references[9] = Value::reference(constructor_context);
+        metadata->focusable_mode = 0; metadata->group_constructor = true;
+        metadata->view_context_constructor = true;
+        runtime.set_host_state(object, std::move(metadata));
+        own(object); views.emplace(object, std::move(initial)); ++metrics.view_revision;
+        initialize_view_context(object, constructor_context);
+        const auto default_attribute = args.size() >= 4 ? static_cast<std::uint32_t>(args[3].bits) : 0;
+        const auto default_resource = args.size() == 5 ? static_cast<std::uint32_t>(args[4].bits) : 0;
+        const std::array base_args{Value::reference(object), Value::reference(constructor_context), Value::reference(attrs),
+            Value::word(default_attribute), Value::word(default_resource)};
+        apply_view_xml_constructor(object, base_args);
+        initialize_view_group(object, constructor_context, attrs, default_attribute, default_resource);
+        if (api.owner == frame_layout_type)
+            initialize_frame_layout(object, constructor_context, attrs, default_attribute, default_resource, args.size() >= 3);
+        else if (api.owner == "Landroid/widget/LinearLayout;")
+            initialize_linear_layout(object, constructor_context, attrs, default_attribute, default_resource);
+        return Value::nothing();
+    }
+    const ViewObjectState &stub_state(ObjectId object) const {
+        const auto &metadata = view_state(object);
+        if (!metadata.stub_constructor || runtime.object_type(object) != view_stub_type)
+            bad("VIEW_STUB_STATE", "Receiver is not an initialized canonical ViewStub");
+        return metadata;
+    }
+    std::uint32_t stub_resource_id(ObjectId values, std::string_view name, std::uint32_t fallback) {
+        const auto cell = widget_cell(values, WidgetStyleable::view_stub, name);
+        if (cell.presence == StyledAttributePresence::unresolved)
+            bad("VIEW_STUB_RESOURCE_UNSUPPORTED", "ViewStub attribute has unresolved resource provenance");
+        return cell.presence == StyledAttributePresence::present && cell.resolved_resource
+            ? cell.resolved_resource : fallback;
+    }
+    Value stub_inflate(ObjectId object) {
+        ManagedRoot object_root(runtime, object);
+        (void)stub_state(object);
+        // View.getParent is final: read its authentic logical parent field.
+        const auto parent = view(object).parent;
+        ManagedRoot parent_root(runtime, parent);
+        if (!parent || !runtime.assignable(parent, "Landroid/view/ViewGroup;"))
+            runtime.raise("Ljava/lang/IllegalStateException;", u"ViewStub must have a non-null ViewGroup viewParent");
+        if (!stub_state(object).stub_layout_resource)
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"ViewStub must have a valid layoutResource");
+        runtime.raise("Ljava/lang/UnsupportedOperationException;",
+            u"ViewStub inflation requires the genuine inflater and original parent replacement semantics");
+    }
+    Value stub_visibility(ObjectId object, Value argument) {
+        ManagedRoot object_root(runtime, object);
+        const auto weak = stub_state(object).references[12].bits;
+        ManagedRoot weak_root(runtime, weak);
+        if (weak) {
+            const auto inflated = runtime.native_weak_referent(weak);
+            ManagedRoot inflated_root(runtime, inflated);
+            if (!inflated)
+                runtime.raise("Ljava/lang/IllegalStateException;", u"setVisibility called on un-referenced view");
+            const std::array args{argument};
+            return runtime.invoke_virtual_named(inflated, "setVisibility", "(I)V", args);
+        }
+        set_view_visibility_flags(object, static_cast<std::uint32_t>(argument.bits));
+        // Stub tests the original raw argument, not the masked flags stored by View.
+        if (static_cast<std::uint32_t>(argument.bits) == 0 || static_cast<std::uint32_t>(argument.bits) == 4)
+            (void)stub_inflate(object);
+        return Value::nothing();
+    }
+    Value stub_constructor(const ApiSupport &api, std::span<const Value> args) {
+        if (args.size() < 2 || args.size() > 5 || args[0].kind != dex::ValueKind::reference ||
+            (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+            bad("VIEW_STUB_ARGUMENT", "ViewStub constructor requires its receiver and Context");
+        const bool resource_overload = api.signature == "(Landroid/content/Context;I)V";
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto constructor_context = args[1].bits;
+        const auto attrs = !resource_overload && args.size() >= 3 ? args[2].bits : 0;
+        ManagedRoot object_root(runtime, object), context_root(runtime, constructor_context), attrs_root(runtime, attrs);
+        if (runtime.object_type(object) != view_stub_type)
+            bad("VIEW_STUB_TYPE", "ViewStub constructor requires its canonical SDK class");
+        if (constructor_context) context(constructor_context);
+        if (views.contains(object)) bad("VIEW", "View constructor called twice");
+        if (views.size() >= 256) bad("VIEW_LIMIT", "Application view quota exceeded");
+        if (resource_overload) {
+            if (args.size() != 3 || args[2].kind != dex::ValueKind::word)
+                bad("VIEW_STUB_ARGUMENT", "ViewStub layout resource must be an integer ID");
+        } else {
+            if (args.size() >= 3 && args[2].kind != dex::ValueKind::reference &&
+                !(args[2].kind == dex::ValueKind::word && !args[2].bits))
+                bad("VIEW_STUB_ARGUMENT", "ViewStub AttributeSet must be a nullable reference");
+            for (std::size_t index = 3; index < args.size(); ++index)
+                if (args[index].kind != dex::ValueKind::word)
+                    bad("VIEW_STUB_ARGUMENT", "ViewStub default style selectors must be integer IDs");
+        }
+        ViewState initial;
+        initial.object = object; initial.kind = ViewKind::view;
+        auto metadata = std::make_unique<ViewObjectState>();
+        metadata->references[9] = Value::reference(constructor_context);
+        metadata->focusable_mode = 0; metadata->view_context_constructor = true; metadata->stub_constructor = true;
+        runtime.set_host_state(object, std::move(metadata));
+        own(object); views.emplace(object, std::move(initial)); ++metrics.view_revision;
+        // ViewStub calls View(Context), not the View XML constructor.
+        initialize_view_context(object, constructor_context);
+        const auto values = obtain_widget_attributes(constructor_context, attrs, WidgetStyleable::view_stub, true,
+            args.size() >= 4 ? static_cast<std::uint32_t>(args[3].bits) : 0,
+            args.size() == 5 ? static_cast<std::uint32_t>(args[4].bits) : 0);
+        ManagedRoot values_root(runtime, values);
+        auto resource = stub_resource_id(values, "inflatedId", UINT32_MAX);
+        update_view_constructor_state(object, [resource](ViewObjectState &next) { next.stub_inflated_id = resource; });
+        resource = stub_resource_id(values, "layout", 0);
+        update_view_constructor_state(object, [resource](ViewObjectState &next) { next.stub_layout_resource = resource; });
+        resource = stub_resource_id(values, "id", UINT32_MAX);
+        view(object).id = std::bit_cast<std::int32_t>(resource);
+        (void)runtime.invoke_virtual_named(values, "recycle", "()V");
+        const std::array visibility_args{Value::word(8)};
+        (void)runtime.invoke_virtual_named(object, "setVisibility", "(I)V", visibility_args);
+        dispatch_will_not_draw(object, true);
+        // Context-only delegates through Context,int(0). This overwrite occurs
+        // after the complete XML overload and its original visibility callbacks.
+        if (args.size() == 2 || resource_overload) {
+            const auto selected = resource_overload ? static_cast<std::uint32_t>(args[2].bits) : 0;
+            update_view_constructor_state(object, [selected](ViewObjectState &next) { next.stub_layout_resource = selected; });
+        }
+        return Value::nothing();
+    }
+    Value stub_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.name == "<init>") return stub_constructor(api, args);
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_STUB_ARGUMENT", "ViewStub requires its actual receiver");
+        const auto object = args[0].bits;
+        if (!object) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot object_root(runtime, object);
+        (void)stub_state(object);
+        if (api.name == "setVisibility") {
+            if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+                bad("VIEW_STUB_ARGUMENT", "ViewStub visibility requires integer flags");
+            return stub_visibility(object, args[1]);
+        }
+        if (api.name == "inflate") {
+            if (args.size() != 1) bad("VIEW_STUB_ARGUMENT", "ViewStub.inflate requires its receiver");
+            return stub_inflate(object);
+        }
+        if (api.name == "getInflatedId" || api.name == "getLayoutResource" || api.name == "getLayoutInflater") {
+            if (args.size() != 1) bad("VIEW_STUB_ARGUMENT", "ViewStub getter requires its receiver");
+            if (api.name == "getInflatedId") return Value::word(stub_state(object).stub_inflated_id);
+            if (api.name == "getLayoutResource") return Value::word(stub_state(object).stub_layout_resource);
+            return stub_state(object).references[13];
+        }
+        if (api.name == "setInflatedId" || api.name == "setLayoutResource") {
+            if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+                bad("VIEW_STUB_ARGUMENT", "ViewStub resource setter requires an integer ID");
+            const auto value = static_cast<std::uint32_t>(args[1].bits);
+            update_view_constructor_state(object, [&api, value](ViewObjectState &next) {
+                if (api.name == "setInflatedId") next.stub_inflated_id = value;
+                else next.stub_layout_resource = value;
+            });
+            return Value::nothing();
+        }
+        if (api.name == "setLayoutInflater" || api.name == "setOnInflateListener") {
+            if (args.size() != 2 || (args[1].kind != dex::ValueKind::reference &&
+                !(args[1].kind == dex::ValueKind::word && !args[1].bits)))
+                bad("VIEW_STUB_ARGUMENT", "ViewStub object setter requires a nullable reference");
+            const auto value = args[1].bits;
+            ManagedRoot value_root(runtime, value);
+            if (value && !runtime.assignable(value, api.name == "setLayoutInflater" ? layout_inflater_type : stub_listener_type))
+                bad("VIEW_STUB_ARGUMENT", "ViewStub object setter received the wrong runtime type");
+            const auto slot = api.name == "setLayoutInflater" ? 13u : 14u;
+            update_view_constructor_state(object, [slot, value](ViewObjectState &next) { next.references[slot] = Value::reference(value); });
+            return Value::nothing();
+        }
+        bad("VIEW_STUB_UNSUPPORTED", "ViewStub operation has no implemented constructor/accessor profile");
+    }
+    void apply_view_xml_constructor(ObjectId object, std::span<const Value> args) {
+        if (args.size() < 3 || args.size() > 5 || args[1].kind != dex::ValueKind::reference ||
+            (args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits)))
+            bad("VIEW_XML_ARGUMENT", "View XML constructor requires its Context, AttributeSet and actual default style IDs");
+        for (std::size_t index = 3; index < args.size(); ++index)
+            if (args[index].kind != dex::ValueKind::word)
+                bad("VIEW_XML_ARGUMENT", "View default-style selectors must be integer IDs");
+        ManagedRoot view_root(runtime, object), context_root(runtime, args[1].bits), attrs_root(runtime, args[2].bits);
+        if (view(object).kind != ViewKind::view && !view_state(object).group_constructor && !view_state(object).surface_constructor)
+            bad("VIEW_XML_UNSUPPORTED", "Subclass XML constructors require their own actual SDK attribute semantics");
+        const auto source_layout = args[2].bits ? xml_parser_state(args[2].bits).cursor().source().resource_id : 0;
+        const auto ids = view_styleable_array();
+        ManagedRoot ids_root(runtime, ids), ordinals_root(runtime, view_styleable_ordinals);
+        const std::array query{Value::reference(args[2].bits), Value::reference(ids),
+            args.size() >= 4 ? args[3] : Value::word(0), args.size() == 5 ? args[4] : Value::word(0)};
+        const auto values = runtime.invoke_virtual_named(args[1].bits, "obtainStyledAttributes",
+            "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;", query);
+        ManagedRoot values_root(runtime, values.bits);
+        // View evaluates getTheme for retrieveExplicitStyle even when its
+        // debug-only body is disabled. Preserve original override effects and
+        // re-read the returned TypedArray only after that second callback.
+        const auto explicit_theme = runtime.invoke_virtual_named(args[1].bits, "getTheme", "()Landroid/content/res/Resources$Theme;");
+        ManagedRoot explicit_theme_root(runtime, explicit_theme.bits);
+        if (values.kind != dex::ValueKind::reference && !(values.kind == dex::ValueKind::word && !values.bits))
+            bad("VIEW_XML_STATE", "View Context returned no actual TypedArray");
+        if (!values.bits) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto *snapshot = dynamic_cast<const TypedArrayState *>(runtime.host_state(values.bits));
+        const auto names = view_attribute_names();
+        if (snapshot && snapshot->owner == this && snapshot->recycled)
+            runtime.raise("Ljava/lang/RuntimeException;", u"Cannot use a recycled TypedArray");
+        if (!snapshot || snapshot->owner != this || snapshot->cells.size() != names.size())
+            bad("VIEW_XML_UNSUPPORTED", "View requires its actual complete styleable snapshot");
+        struct Parsed {
+            std::int32_t id, visibility, focusable = 16;
+            std::int32_t left, top, right, bottom, minimum_width, minimum_height;
+            std::int32_t all = -1, horizontal = -1, vertical = -1;
+            std::int32_t over_scroll;
+            bool clickable = false, visibility_set = false;
+        } parsed{view(object).id, view_state(object).visibility, 16,
+            view_state(object).padding_left, view_state(object).padding_top, view_state(object).padding_right,
+            view_state(object).padding_bottom, view_state(object).minimum_width, view_state(object).minimum_height,
+            -1, -1, -1, view_state(object).over_scroll_mode};
+        static constexpr std::array ignored{
+            std::string_view{"__removed0"}, std::string_view{"__removed1"}, std::string_view{"__removed3"},
+            std::string_view{"__removed4"}, std::string_view{"__removed5"}, std::string_view{"theme"},
+            std::string_view{"fadingEdge"}, std::string_view{"fadeScrollbars"},
+            std::string_view{"scrollbarFadeDuration"}, std::string_view{"scrollbarDefaultDelayBeforeFade"},
+            std::string_view{"scrollbarSize"}, std::string_view{"scrollbarThumbHorizontal"},
+            std::string_view{"scrollbarThumbVertical"}, std::string_view{"scrollbarTrackHorizontal"},
+            std::string_view{"scrollbarTrackVertical"}, std::string_view{"scrollbarAlwaysDrawHorizontalTrack"},
+            std::string_view{"scrollbarAlwaysDrawVerticalTrack"}, std::string_view{"fadingEdgeLength"}};
+        for (std::size_t index = 0; index < names.size(); ++index) {
+            runtime.charge_provider_work(1);
+            const auto ordinal = static_cast<std::uint32_t>(runtime.array_get(view_styleable_ordinals, static_cast<std::int32_t>(index)).bits);
+            if (ordinal >= names.size()) bad("VIEW_XML_STATE", "View styleable ordinal is outside its immutable inventory");
+            const auto name = names[ordinal];
+            // These no-case/deprecated slots and scrollbar/fading settings are
+            // unread by the supported zero-scrollbar/zero-fading profile. The
+            // enabling selectors below are validated independently, including
+            // Theme defaults. Inflation, not View, consumes android:theme.
+            bool unused = false;
+            for (const auto ignored_name : ignored) {
+                runtime.charge_provider_work(1);
+                if (name == ignored_name) { unused = true; break; }
+            }
+            if (unused) continue;
+            const auto cell = snapshot->cells[index].snapshot;
+            if (cell.presence == StyledAttributePresence::unresolved)
+                bad("VIEW_XML_UNSUPPORTED", "View attribute requires unresolved source or style semantics: " + std::string(name));
+            const bool empty = cell.value.type == 0 && cell.value.data == 1;
+            if (cell.presence == StyledAttributePresence::absent && !empty) continue;
+            const auto integer = [&](std::int32_t fallback) {
+                if (cell.presence == StyledAttributePresence::absent) return fallback;
+                if (cell.scalar != StyledScalarStatus::ready || cell.value.type < 0x10 || cell.value.type > 0x1f)
+                    bad("VIEW_XML_UNSUPPORTED", "View attribute requires implemented integer coercion: " + std::string(name));
+                return std::bit_cast<std::int32_t>(cell.value.data);
+            };
+            const auto dimension = [&](std::int32_t fallback) {
+                if (cell.presence == StyledAttributePresence::absent) return fallback;
+                if (cell.scalar != StyledScalarStatus::ready || cell.value.type != 5)
+                    bad("VIEW_XML_UNSUPPORTED", "View attribute requires an actual dimension: " + std::string(name));
+                runtime.charge_provider_work(1);
+                return dimension_pixel_size(cell.value.data, configuration.density_dpi);
+            };
+            if (name == "id") parsed.id = cell.resolved_resource ? std::bit_cast<std::int32_t>(cell.resolved_resource) : -1;
+            else if (name == "visibility") {
+                const auto visibility = integer(0);
+                if (visibility < 0 || visibility > 2)
+                    bad("VIEW_XML_UNSUPPORTED", "View visibility requires the actual visible/invisible/gone XML enum");
+                if (visibility) { parsed.visibility = visibility == 1 ? 4 : 8; parsed.visibility_set = true; }
+            } else if (name == "clickable") {
+                if (integer(0)) parsed.clickable = true;
+            } else if (name == "focusable") {
+                parsed.focusable = empty ? 16 : cell.value.type == 0x12 ? static_cast<std::int32_t>(integer(0) != 0) : integer(16);
+                if (parsed.focusable != 0 && parsed.focusable != 1 && parsed.focusable != 16)
+                    bad("VIEW_XML_UNSUPPORTED", "View focusability requires its actual Boolean or auto enum");
+            } else if (name == "overScrollMode") parsed.over_scroll = integer(1);
+            else if (name == "minWidth") parsed.minimum_width = dimension(0);
+            else if (name == "minHeight") parsed.minimum_height = dimension(0);
+            else if (name == "padding" || name == "paddingHorizontal" || name == "paddingVertical" ||
+                     name == "paddingLeft" || name == "paddingTop" || name == "paddingRight" || name == "paddingBottom") {
+                const auto padding = dimension(-1);
+                if (padding < 0) bad("VIEW_XML_UNSUPPORTED", "Negative or empty XML padding requires additional SDK padding state");
+                if (name == "padding") parsed.all = padding;
+                else if (name == "paddingHorizontal") parsed.horizontal = padding;
+                else if (name == "paddingVertical") parsed.vertical = padding;
+                else if (name == "paddingLeft") parsed.left = padding;
+                else if (name == "paddingTop") parsed.top = padding;
+                else if (name == "paddingRight") parsed.right = padding;
+                else parsed.bottom = padding;
+            } else if (name == "scrollbars" || name == "requiresFadingEdge" || name == "fitsSystemWindows") {
+                if (integer(0)) bad("VIEW_XML_UNSUPPORTED", "View requires actual scrollbar, fading or inset behavior: " + std::string(name));
+            } else bad("VIEW_XML_UNSUPPORTED", "Participating View effect is not implemented: " + std::string(name));
+        }
+        // ID and minimum dimensions are direct switch-loop stores in SDK View.
+        // Publish them before the second original virtual over-scroll callback;
+        // a callback's later ID write must not be overwritten at final flags.
+        update_view_constructor_state(object, [&parsed](ViewObjectState &next) {
+            next.minimum_width = parsed.minimum_width; next.minimum_height = parsed.minimum_height;
+        });
+        view(object).id = parsed.id;
+        dispatch_constructor_over_scroll(object, parsed.over_scroll);
+        if (parsed.all >= 0) parsed.left = parsed.top = parsed.right = parsed.bottom = parsed.all;
+        else {
+            if (parsed.horizontal >= 0) parsed.left = parsed.right = parsed.horizontal;
+            if (parsed.vertical >= 0) parsed.top = parsed.bottom = parsed.vertical;
+        }
+        const auto admitted = runtime.host_state_capacity(object);
+        const auto &previous = view_state(object);
+        if (!previous.text_edit_events.empty() || !previous.text_mutations.empty() ||
+            admitted < previous.bytes() || sizeof(ViewObjectState) > admitted - previous.bytes())
+            bad("VIEW_XML_LIMIT", "View XML state replacement exceeds simultaneous managed admission");
+        auto next = std::make_unique<ViewObjectState>(previous);
+        next->xml_initialized = true; next->source_layout_id = source_layout;
+        next->focusable_mode = parsed.focusable;
+        next->padding_left = parsed.left; next->padding_top = parsed.top;
+        next->padding_right = parsed.right; next->padding_bottom = parsed.bottom;
+        runtime.set_host_state(object, std::move(next));
+        if (parsed.clickable) view(object).clickable = true;
+        if (parsed.visibility_set) set_view_visibility_flags(object, static_cast<std::uint32_t>(parsed.visibility));
+        ++metrics.view_revision;
+        (void)runtime.invoke_virtual_named(values.bits, "recycle", "()V");
+    }
+    Value obtain_styled_attributes(const ApiSupport &api, std::span<const Value> args) {
+        const bool simple = api.signature == "([I)Landroid/content/res/TypedArray;";
+        const bool defaults = api.signature == "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;";
+        if (!simple && !defaults && api.signature != "(Landroid/util/AttributeSet;[I)Landroid/content/res/TypedArray;")
+            bad("TYPED_ARRAY_ARGUMENT", "Context styled-attribute overload is not implemented");
+        const auto attribute_index = simple ? 1u : 2u;
+        if (args.size() != (simple ? 2u : defaults ? 5u : 3u) ||
+            args[0].kind != dex::ValueKind::reference || args[attribute_index].kind != dex::ValueKind::reference)
+            bad("TYPED_ARRAY_ARGUMENT", "obtainStyledAttributes requires its Context and int array");
+        if (!simple && args[1].kind != dex::ValueKind::reference &&
+            !(args[1].kind == dex::ValueKind::word && !args[1].bits))
+            bad("TYPED_ARRAY_ARGUMENT", "AttributeSet must be a nullable reference");
+        if (defaults && (args[3].kind != dex::ValueKind::word || args[4].kind != dex::ValueKind::word))
+            bad("TYPED_ARRAY_ARGUMENT", "Default-style attributes and resources must be integer IDs");
+        const auto receiver = args[0].bits;
+        const auto set = simple ? ObjectId{0} : args[1].bits;
+        context(receiver);
+        ManagedRoot context_root(runtime, receiver), attributes_root(runtime, args[attribute_index].bits), set_root(runtime, set);
+        // These final Context overloads dispatch virtual getTheme before Theme
+        // inspects the AttributeSet/default styles. Copy attrs after its hooks.
+        const auto selected = runtime.invoke_virtual_named(receiver, "getTheme", "()Landroid/content/res/Resources$Theme;");
+        ManagedRoot theme_root(runtime, selected.bits);
+        context(receiver);
+        if (simple) {
+            const std::array theme_args{Value::reference(selected.bits), args[1]};
+            return obtain_theme_attributes(theme_args);
+        }
+        const std::array theme_args{Value::reference(selected.bits), Value::reference(set), args[attribute_index],
+                                   defaults ? args[3] : Value::word(0), defaults ? args[4] : Value::word(0)};
+        return obtain_theme_attributes(theme_args);
+    }
+    Value obtain_theme_attributes(std::span<const Value> args) {
+        const bool xml = args.size() == 5;
+        const auto attribute_index = xml ? 2u : 1u;
+        if ((args.size() != 2 && !xml) || args[0].kind != dex::ValueKind::reference ||
+            args[attribute_index].kind != dex::ValueKind::reference)
+            bad("TYPED_ARRAY_ARGUMENT", "Theme styled attributes require their Theme and int array");
+        if (xml && ((args[1].kind != dex::ValueKind::reference &&
+                     !(args[1].kind == dex::ValueKind::word && !args[1].bits)) ||
+                    args[3].kind != dex::ValueKind::word || args[4].kind != dex::ValueKind::word))
+            bad("TYPED_ARRAY_ARGUMENT", "Theme AttributeSet/default-style arguments have invalid types");
+        const auto attributes = args[attribute_index].bits;
+        ManagedRoot theme_root(runtime, args[0].bits), attributes_root(runtime, attributes),
+                    set_root(runtime, xml ? args[1].bits : ObjectId{0});
+        (void)theme_state(args[0].bits);
+        if (!attributes) runtime.raise("Ljava/lang/NullPointerException;", u"Attribute array is null");
+        if (runtime.object_type(attributes) != "[I")
+            bad("TYPED_ARRAY_ARGUMENT", "Style attributes require an actual int array");
+        const auto parser = xml ? args[1].bits : ObjectId{0};
+        if (parser) {
+            if (runtime.object_type(parser) != xml_parser_type)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Styled attributes require an issued binary XML AttributeSet");
+            const auto &xml_state = xml_parser_state(parser);
+            if (xml_state.closed() || xml_state.event_type != 2)
+                bad("TYPED_ARRAY_XML_STATE", "XML styled attributes require the actual parser's current start element");
+        }
+        // Snapshot source slots must keep their original held-source identity
+        // even if the first getValue occurs after a display reconfiguration.
+        const auto resource = theme_state(args[0].bits).references[0].bits;
+        ManagedRoot resource_root(runtime, resource);
+        const auto manager = resource_assets(resource);
+        ManagedRoot manager_root(runtime, manager);
+        bind_asset_sources(manager);
+        ProviderWorkCharge provider_charge{runtime};
+        const SdkResourceWork charge(std::ref(provider_charge));
+        const auto &layers = theme_state(args[0].bits).layers;
+        auto default_style = xml && args[3].bits
+            ? theme_style_selector(layers, static_cast<std::uint32_t>(args[3].bits), charge) : StyleSelector{};
+        if (!default_style.style && xml && args[4].bits && actual_style_bag(static_cast<std::uint32_t>(args[4].bits), charge))
+            default_style.style = static_cast<std::uint32_t>(args[4].bits);
+        std::uint32_t xml_style = 0;
+        if (parser) {
+            const auto *style = xml_parser_state(parser).cursor().special(XmlSpecial::style);
+            if (style && style->type == 1 && actual_style_bag(style->data, charge)) xml_style = style->data;
+            else if (style && style->type == 2) {
+                const auto selected_style = theme_style_selector(layers, style->data, charge);
+                xml_style = selected_style.style;
+                // Android 15 ApplyStyle passes def_style_theme_flags to its XML
+                // selector; preserve that actual flag flow, including fallback.
+                default_style.flags |= selected_style.flags;
+            }
+        }
+        const auto count = runtime.array_length(attributes);
+        const auto object = runtime.new_object(typed_array_type);
+        ManagedRoot root(runtime, object);
+        const auto capacity = runtime.host_state_capacity(object);
+        constexpr auto work_storage = sizeof(ProviderWorkCharge) + sizeof(SdkResourceWork) + sizeof(StyleSelector) +
+            sizeof(apk::StyleAttributeResult);
+        if (capacity < sizeof(TypedArrayState) + work_storage ||
+            count > (capacity - sizeof(TypedArrayState) - work_storage) / sizeof(TypedArrayCell))
+            bad("TYPED_ARRAY_LIMIT", "Styled attribute snapshot exceeds the available managed heap");
+        auto metadata = std::make_unique<TypedArrayState>();
+        metadata->owner = this;
+        metadata->references[0] = theme_state(args[0].bits).references[0];
+        charge(count);
+        metadata->cells.resize(count);
+        if (metadata->bytes() > capacity - work_storage)
+            bad("TYPED_ARRAY_LIMIT", "Styled attribute allocation exceeds the available managed heap");
+        for (std::size_t index = 0; index < count; ++index) {
+            charge(1);
+            metadata->cells[index].attribute = static_cast<std::uint32_t>(
+                runtime.array_get(attributes, static_cast<std::int32_t>(index)).bits);
+        }
+        // No callback, safepoint or borrowed ResourceTable index crosses this loop.
+        const auto &selected = theme_state(args[0].bits);
+        for (auto &cell : metadata->cells) {
+            apk::StyleAttributeResult value;
+            auto origin = StyledValueOrigin::resource_table;
+            std::uint32_t source_resource_id = 0;
+            if (parser) {
+                const auto &cursor = xml_parser_state(parser).cursor();
+                if (const auto *raw = cursor.find_attribute(cell.attribute, charge)) {
+                    value.status = apk::StyleAttributeStatus::found;
+                    value.value = {raw->data, raw->type};
+                    value.source_id = cursor.source().source_id;
+                    value.source_data = raw->data;
+                    value.sdk_source = cursor.source().sdk;
+                    value.provenance_complete = cursor.source().provenance_complete;
+                    origin = StyledValueOrigin::xml_pool;
+                    source_resource_id = cursor.source().resource_id;
+                    // ApplyStyle's raw SelectedValue has empty configuration,
+                    // zero dependency flags and an invalid ARSC cookie. The
+                    // parser retains the XML file's own flags independently.
+                }
+            }
+            const auto fall_through = [&] {
+                if (value.status == apk::StyleAttributeStatus::unresolved)
+                    bad("TYPED_ARRAY_STYLE_UNSUPPORTED", "An explicit style has unresolved attribute precedence");
+                return value.status == apk::StyleAttributeStatus::absent ||
+                    (value.value.type == 0 && value.value.data != 1);
+            };
+            if (fall_through() && xml_style) {
+                value = select_style_attribute(resources, xml_style, cell.attribute, theme_resource_configuration(), charge);
+                origin = StyledValueOrigin::resource_table;
+                if (value.status == apk::StyleAttributeStatus::found) source_resource_id = value.source_style;
+            }
+            if (fall_through() && default_style.style) {
+                value = select_style_attribute(resources, default_style.style, cell.attribute, theme_resource_configuration(), charge);
+                value.native_flags |= default_style.flags;
+                origin = StyledValueOrigin::resource_table;
+                if (value.status == apk::StyleAttributeStatus::found) source_resource_id = value.source_style;
+            }
+            if (fall_through()) {
+                cell.snapshot = resolve_styled_attribute(resources, selected.layers, cell.attribute, theme_resource_configuration(), charge);
+                // ApplyStyle does not reset the last explicit source ID when a
+                // raw undefined value eventually falls back to the Theme.
+                cell.snapshot.source_resource_id = source_resource_id;
+            } else cell.snapshot = resolve_styled_value(resources, selected.layers, value, origin,
+                source_resource_id, theme_resource_configuration(), charge);
+        }
+        runtime.set_host_state(object, std::move(metadata));
+        return Value::reference(object);
+    }
+    ObjectId typed_array_state_resource(ObjectId object) const {
+        const auto *metadata = dynamic_cast<const TypedArrayState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("TYPED_ARRAY_STATE", "TypedArray has no authenticated resource owner");
+        return metadata->references[0].bits;
+    }
+    Value typed_array_api(const ApiSupport &api, std::span<const Value> args) {
+        const bool get_value = api.name == "getValue";
+        const bool numeric = api.name == "getInt" || api.name == "getInteger" || api.name == "getFloat" ||
+            api.name == "getDimension" || api.name == "getDimensionPixelOffset" ||
+            api.name == "getDimensionPixelSize" || api.name == "getLayoutDimension";
+        const bool required_layout = api.name == "getLayoutDimension" && api.signature == "(ILjava/lang/String;)I";
+        const auto expected = (api.name == "getBoolean" || api.name == "getResourceId" || get_value || numeric)
+            ? 3u : api.name == "hasValue" ? 2u : 1u;
+        if (args.size() != expected || args[0].kind != dex::ValueKind::reference)
+            bad("TYPED_ARRAY_ARGUMENT", "TypedArray operation has invalid arguments");
+        for (std::size_t index = 1; index < args.size(); ++index)
+            if (!((get_value || required_layout) && index == 2) && args[index].kind != dex::ValueKind::word)
+                bad("TYPED_ARRAY_ARGUMENT", "TypedArray indices and defaults must be scalar values");
+        if (required_layout && args[2].kind != dex::ValueKind::reference &&
+            !(args[2].kind == dex::ValueKind::word && !args[2].bits))
+            bad("TYPED_ARRAY_ARGUMENT", "Required layout dimension name must be a nullable String");
+        const auto object = args[0].bits;
+        ManagedRoot array_root(runtime, object);
+        const auto *metadata = dynamic_cast<const TypedArrayState *>(runtime.host_state(object));
+        if (!metadata || metadata->owner != this)
+            bad("TYPED_ARRAY_STATE", "TypedArray has no snapshot owned by this session");
+        if (metadata->recycled)
+            runtime.raise("Ljava/lang/RuntimeException;", u"Cannot use a recycled TypedArray");
+        if (api.name == "recycle") {
+            const auto admitted = runtime.host_state_capacity(object);
+            metadata = dynamic_cast<const TypedArrayState *>(runtime.host_state(object));
+            if (!metadata || metadata->owner != this || admitted < metadata->bytes() ||
+                sizeof(TypedArrayState) > admitted - metadata->bytes())
+                bad("TYPED_ARRAY_LIMIT", "TypedArray recycle exceeds simultaneous state admission");
+            auto recycled = std::make_unique<TypedArrayState>();
+            recycled->owner = this; recycled->recycled = true;
+            recycled->references = metadata->references;
+            runtime.set_host_state(object, std::move(recycled));
+            return Value::nothing();
+        }
+        if (api.name == "getResources") return metadata->references[0];
+        if (api.name == "length") return Value::word(static_cast<std::uint32_t>(metadata->cells.size()));
+        const auto index = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+        if (index < 0 || static_cast<std::size_t>(index) >= metadata->cells.size())
+            runtime.raise("Ljava/lang/ArrayIndexOutOfBoundsException;", u"TypedArray index out of bounds");
+        const auto cell = metadata->cells[static_cast<std::size_t>(index)].snapshot;
+        if (cell.presence == StyledAttributePresence::unresolved)
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", unicode(
+                "Theme value unresolved: attribute=" + std::to_string(metadata->cells[static_cast<std::size_t>(index)].attribute) +
+                "; style=" + std::to_string(cell.unresolved_style) + "; resource=" + std::to_string(cell.unresolved_resource)));
+        if (api.name == "hasValue") return Value::word(cell.presence == StyledAttributePresence::present);
+        if (numeric) {
+            const auto integer = cell.value.type >= 0x10 && cell.value.type <= 0x1f;
+            const auto ready = cell.scalar == StyledScalarStatus::ready;
+            const auto absent = cell.presence == StyledAttributePresence::absent;
+            if (required_layout && (!ready || (!integer && cell.value.type != 5)))
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"You must supply a supported layout dimension attribute");
+            if (api.name == "getLayoutDimension") {
+                if (ready && integer) return Value::word(cell.value.data);
+                if (!ready || cell.value.type != 5) return args[2];
+                runtime.charge_provider_work(1);
+                return Value::word(std::bit_cast<std::uint32_t>(dimension_pixel_size(cell.value.data, configuration.density_dpi)));
+            }
+            if (absent) return args[2];
+            if (!ready)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray numeric conversion requires a supported actual scalar");
+            if (api.name == "getInt" || api.name == "getInteger") {
+                if (integer) return Value::word(cell.value.data);
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray integer string coercion is not implemented");
+            }
+            if (api.name == "getFloat") {
+                if (cell.value.type == 4) return Value::word(cell.value.data);
+                if (integer) {
+                    runtime.charge_provider_work(1);
+                    const float value = static_cast<float>(std::bit_cast<std::int32_t>(cell.value.data));
+                    return Value::word(std::bit_cast<std::uint32_t>(value));
+                }
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray floating string coercion is not implemented");
+            }
+            if (cell.value.type != 5)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray value is not a dimension");
+            runtime.charge_provider_work(1);
+            if (api.name == "getDimension")
+                return Value::word(std::bit_cast<std::uint32_t>(dimension_value(cell.value.data, configuration.density_dpi)));
+            const auto pixels = api.name == "getDimensionPixelOffset"
+                ? dimension_pixel_offset(cell.value.data, configuration.density_dpi)
+                : dimension_pixel_size(cell.value.data, configuration.density_dpi);
+            return Value::word(std::bit_cast<std::uint32_t>(pixels));
+        }
+        if (get_value) {
+            // Native getValueAt returns false before inspecting outValue when
+            // TYPE_NULL is selected, leaving every previous output field intact.
+            if (cell.presence == StyledAttributePresence::absent) return Value::word(0);
+            if (!cell.provenance_complete || cell.scalar != StyledScalarStatus::ready || cell.value.type == 3)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray value requires complete supported scalar source metadata");
+            if (args[2].kind != dex::ValueKind::reference && !(args[2].kind == dex::ValueKind::word && !args[2].bits))
+                bad("TYPED_ARRAY_ARGUMENT", "TypedArray.getValue output must be a TypedValue reference");
+            const auto output = args[2].bits;
+            if (!output) runtime.raise("Ljava/lang/NullPointerException;");
+            ManagedRoot output_root(runtime, output);
+            (void)typed_value_state(output);
+            const auto resource = typed_array_state_resource(object);
+            ManagedRoot resource_root(runtime, resource);
+            const auto manager = resource_assets(resource);
+            ManagedRoot manager_root(runtime, manager);
+            bind_asset_sources(manager);
+            const auto cookie = cell.value_origin == StyledValueOrigin::xml_pool
+                ? UINT32_MAX : asset_cookie(cell.sdk_source, cell.source_id, manager);
+            const auto admitted = runtime.host_state_capacity(output);
+            const auto old_bytes = typed_value_state(output).bytes();
+            if (admitted < old_bytes || sizeof(TypedValueState) > admitted - old_bytes)
+                bad("TYPED_ARRAY_LIMIT", "TypedValue replacement exceeds admitted simultaneous state storage");
+            auto next = std::make_unique<TypedValueState>(typed_value_state(output));
+            next->numbers[0] = cell.value.type;
+            next->numbers[1] = cell.source_data;
+            next->numbers[2] = cookie;
+            next->numbers[3] = cell.resolved_resource;
+            next->numbers[4] = java_configuration_flags(cell.native_flags);
+            next->numbers[5] = cell.density;
+            next->numbers[6] = cell.source_resource_id;
+            next->references[0] = Value::reference(0);
+            runtime.set_host_state(output, std::move(next));
+            return Value::word(1);
+        }
+        if (api.name == "getResourceId") {
+            const auto id = cell.presence == StyledAttributePresence::present ? cell.resolved_resource : 0;
+            return Value::word(id ? id : static_cast<std::uint32_t>(args[2].bits));
+        }
+        if (api.name == "getBoolean") {
+            if (cell.presence == StyledAttributePresence::absent) return Value::word(args[2].bits != 0);
+            if (cell.scalar == StyledScalarStatus::ready && cell.value.type >= 0x10 && cell.value.type <= 0x1f)
+                return Value::word(cell.value.data != 0);
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"TypedArray boolean coercion for this scalar type is not implemented");
+        }
+        bad("TYPED_ARRAY_UNSUPPORTED", "TypedArray operation is not implemented");
+    }
+    Value bitmap_api(const ApiSupport &api, std::span<const Value> args) {
+        if (api.owner == bitmap_factory_type) {
+            if (api.name != "decodeResource" || api.signature != "(Landroid/content/res/Resources;I)Landroid/graphics/Bitmap;" ||
+                args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[0].bits != resource_object ||
+                args[1].kind != dex::ValueKind::word)
+                bad("BITMAP_ARGUMENT", "decodeResource requires the owning Resources and a resource ID");
+            if (!resource_file_reader) bad("BITMAP_UNSUPPORTED", "Packaged image decoding requires the held-package reader");
+            const auto bitmap = runtime.new_object(bitmap_type);
+            ManagedRoot bitmap_root(runtime, bitmap);
+            const auto capacity = runtime.host_state_capacity(bitmap);
+            struct ProviderCharge {
+                dex::ManagedRuntime &runtime;
+                void operator()(std::uint64_t count) const { runtime.charge_provider_work(count); }
+            } provider_charge{runtime};
+            const apk::RuntimeBitmapWork charge(std::ref(provider_charge));
+            struct ReadScope {
+                bool &active;
+                explicit ReadScope(bool &value) : active(value) { active = true; }
+                ~ReadScope() { active = false; }
+            };
+            const auto remaining = [&](std::size_t allowance, std::size_t cost) {
+                if (cost > allowance) bad("BITMAP_LIMIT", "Actual bitmap storage exceeds available managed admission");
+                return allowance - cost;
+            };
+            const auto string_bytes = [&](std::size_t count) {
+                if (count == SIZE_MAX) bad("BITMAP_LIMIT", "Bitmap source string capacity overflows");
+                return count + 1;
+            };
+            auto working = remaining(capacity, sizeof(BitmapObjectState) + 2 * sizeof(std::string) +
+                sizeof(apk::RuntimeBitmap) + sizeof(std::optional<std::vector<std::uint8_t>>) +
+                sizeof(provider_charge) + sizeof(charge) + sizeof(ReadScope));
+            std::string path, container;
+            std::uint16_t selected_density = 0;
+            {
+                const apk::ResourceEntry *selected = nullptr;
+                try { selected = &resources.value(static_cast<std::uint32_t>(args[1].bits)); }
+                catch (const apk::InspectError &error) {
+                    if (error.diagnostic.code == "AETHER_RESOURCES_NOT_FOUND") return Value::reference(0);
+                    throw;
+                }
+                if (selected->value_type != 3) return Value::reference(0);
+                const auto selected_path = resources.string_value(*selected);
+                (void)remaining(remaining(working, string_bytes(selected_path.size())), string_bytes(container.capacity()));
+                charge(selected_path.size()); charge(1);
+                path.assign(selected_path);
+                (void)remaining(remaining(working, string_bytes(path.capacity())), string_bytes(selected->container.size()));
+                charge(selected->container.size()); charge(1);
+                container.assign(selected->container);
+                selected_density = selected->density;
+            }
+            working = remaining(remaining(working, string_bytes(path.capacity())), string_bytes(container.capacity()));
+            const auto target_density = configuration.density_dpi;
+            if (selected_density == 0xfffe)
+                bad("BITMAP_UNSUPPORTED", "Bitmap anydpi resources require an implemented density contract");
+            const auto source_density = selected_density == 0xffff ? 0u : selected_density ? selected_density : 160u;
+            apk::RuntimeBitmap decoded;
+            {
+                if (resource_read_active) bad("BITMAP_STATE", "Packaged image reader cannot reenter");
+                ReadScope read_scope(resource_read_active);
+                auto encoded = resource_file_reader(container, path, working);
+                if (!encoded) return Value::reference(0);
+                if (encoded->capacity() > working)
+                    bad("BITMAP_LIMIT", "Packaged image bytes exceed the available managed heap");
+                // The decoder accounts input size as well as all live scratch;
+                // account the vector's additional capacity exactly once here.
+                const auto excess = encoded->capacity() - encoded->size();
+                try { decoded = apk::decode_runtime_png(*encoded,
+                    remaining(remaining(working, excess), sizeof(apk::RuntimeBitmap)), charge); }
+                catch (const apk::InspectError &error) {
+                    if (error.diagnostic.code == "AETHER_BITMAP_INVALID") return Value::reference(0);
+                    throw;
+                }
+            } // Encoded bytes and decoder scratch are gone before resampling.
+            if (!decoded.width || !decoded.height || decoded.width > INT32_MAX || decoded.height > INT32_MAX ||
+                decoded.width > working / 4 / decoded.height ||
+                decoded.rgba.size() != std::size_t(decoded.width) * decoded.height * 4 || decoded.rgba.capacity() > working)
+                bad("BITMAP_STATE", "Image decoder returned inconsistent pixel storage");
+            // Linear filtering must operate on premultiplied colors, otherwise
+            // transparent neighboring pixels create incorrect colored fringes.
+            charge(decoded.rgba.size() / 4);
+            for (std::size_t at = 0; at < decoded.rgba.size(); at += 4)
+                for (unsigned channel = 0; channel < 3; ++channel)
+                    decoded.rgba[at + channel] = static_cast<std::uint8_t>(
+                        (unsigned(decoded.rgba[at + channel]) * decoded.rgba[at + 3] + 127) / 255);
+            if (source_density && source_density != target_density) {
+                const float scale = static_cast<float>(target_density) / static_cast<float>(source_density);
+                const float width_value = static_cast<float>(decoded.width) * scale + 0.5f;
+                const float height_value = static_cast<float>(decoded.height) * scale + 0.5f;
+                if (!std::isfinite(width_value) || !std::isfinite(height_value) ||
+                    static_cast<double>(width_value) > INT32_MAX || static_cast<double>(height_value) > INT32_MAX)
+                    bad("BITMAP_LIMIT", "Density-scaled bitmap dimensions are not representable");
+                const auto width = static_cast<std::uint32_t>(width_value);
+                const auto height = static_cast<std::uint32_t>(height_value);
+                if (!width || !height) return Value::reference(0);
+                const auto scaled_available = remaining(remaining(working, decoded.rgba.capacity()), sizeof(std::vector<std::uint8_t>));
+                if (width > scaled_available / 4 / height)
+                    bad("BITMAP_LIMIT", "Source and density-scaled bitmap exceed the available managed heap");
+                const auto scaled_bytes = std::size_t(width) * height * 4;
+                charge(scaled_bytes);
+                std::vector<std::uint8_t> scaled(scaled_bytes);
+                if (scaled.capacity() > scaled_available)
+                    bad("BITMAP_LIMIT", "Density-scaled pixel capacity exceeds the available managed heap");
+                charge(std::uint64_t(width) * height);
+                for (std::uint32_t y = 0; y < height; ++y) {
+                    const double sy = std::clamp((double(y) + 0.5) * decoded.height / height - 0.5,
+                                                 0.0, double(decoded.height - 1));
+                    const auto top = static_cast<std::uint32_t>(sy), bottom = std::min(top + 1, decoded.height - 1);
+                    const auto fy = sy - top;
+                    for (std::uint32_t x = 0; x < width; ++x) {
+                        const double sx = std::clamp((double(x) + 0.5) * decoded.width / width - 0.5,
+                                                     0.0, double(decoded.width - 1));
+                        const auto left = static_cast<std::uint32_t>(sx), right = std::min(left + 1, decoded.width - 1);
+                        const auto fx = sx - left;
+                        for (unsigned channel = 0; channel < 4; ++channel) {
+                            const auto pixel = [&](std::uint32_t xx, std::uint32_t yy) {
+                                return decoded.rgba[(std::size_t(yy) * decoded.width + xx) * 4 + channel];
+                            };
+                            const double upper = pixel(left, top) * (1 - fx) + pixel(right, top) * fx;
+                            const double lower = pixel(left, bottom) * (1 - fx) + pixel(right, bottom) * fx;
+                            scaled[(std::size_t(y) * width + x) * 4 + channel] = static_cast<std::uint8_t>(
+                                std::clamp(std::floor(upper * (1 - fy) + lower * fy + 0.5), 0.0, 255.0));
+                        }
+                    }
+                }
+                decoded.width = width; decoded.height = height; decoded.rgba = std::move(scaled);
+            }
+            auto bitmap_state = std::make_unique<BitmapObjectState>();
+            bitmap_state->width = decoded.width; bitmap_state->height = decoded.height;
+            // nodpi has unscaled pixels and the normal default display density.
+            bitmap_state->density = target_density; bitmap_state->has_alpha = decoded.has_alpha;
+            bitmap_state->rgba = std::move(decoded.rgba);
+            runtime.set_host_state(bitmap, std::move(bitmap_state));
+            return Value::reference(bitmap);
+        }
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("BITMAP_ARGUMENT", "Bitmap operation requires its receiver");
+        const auto bitmap = args[0].bits;
+        const auto *bitmap_state = dynamic_cast<const BitmapObjectState *>(runtime.host_state(bitmap));
+        if (!bitmap_state) bad("BITMAP_STATE", "Bitmap has no owned decoded pixel state");
+        if (api.name == "getWidth") return Value::word(bitmap_state->width);
+        if (api.name == "getHeight") return Value::word(bitmap_state->height);
+        if (api.name == "getDensity") return Value::word(bitmap_state->density);
+        if (api.name == "isRecycled") return Value::word(bitmap_state->recycled);
+        if (api.name == "recycle") {
+            if (!bitmap_state->recycled) {
+                auto recycled = std::make_unique<BitmapObjectState>();
+                recycled->width = bitmap_state->width; recycled->height = bitmap_state->height;
+                recycled->density = bitmap_state->density; recycled->has_alpha = bitmap_state->has_alpha; recycled->recycled = true;
+                runtime.set_host_state(bitmap, std::move(recycled));
+            }
+            return Value::nothing();
+        }
+        bad("BITMAP_UNSUPPORTED", "Bitmap operation has no implemented pixel consumer");
+    }
     std::u16string resource_text(std::uint32_t id, bool strip_styles = false) {
         try {
             return resources.text(id, strip_styles);
         } catch (const apk::InspectError &e) {
+            // Preserve malformed, unsupported and admission diagnostics; only
+            // an actual absent resource becomes the Java missing-ID exception.
+            if (e.diagnostic.code != "AETHER_RESOURCES_NOT_FOUND") throw;
             runtime.raise("Landroid/content/res/Resources$NotFoundException;", unicode(e.what()));
         }
     }
@@ -4328,9 +14127,14 @@ ActivitySession::ActivitySession(dex::ManagedRuntime &runtime, std::string packa
     try {
         p.base_context = p.own(runtime.new_object(context_impl_type));
         p.resource_object = p.own(runtime.new_object("Landroid/content/res/Resources;"));
+        p.asset_manager = p.own(runtime.new_object("Landroid/content/res/AssetManager;"));
         p.configuration_object = p.own(runtime.new_object(configuration_type));
-        runtime.set_host_state(p.configuration_object, std::make_unique<ConfigurationState>(configuration));
-        p.package_manager = p.own(runtime.new_object("Laether/android/PackageManager;"));
+        if (runtime.host_state_capacity(p.configuration_object) < sizeof(ConfigurationState))
+            bad("CONFIGURATION_LIMIT", "Initial configuration fields exceed existing managed admission");
+        auto configuration_metadata = std::make_unique<ConfigurationState>(configuration);
+        configuration_metadata->owner = &p;
+        runtime.set_host_state(p.configuration_object, std::move(configuration_metadata));
+        p.package_manager = p.own(runtime.new_object(session_package_manager_type));
         p.bind_package();
     } catch (...) {
         p.cleanup(false);
@@ -4338,6 +14142,235 @@ ActivitySession::ActivitySession(dex::ManagedRuntime &runtime, std::string packa
     }
 }
 ActivitySession::~ActivitySession() { impl_->cleanup(false); }
+void ActivitySession::set_resource_file_reader(ResourceFileReader reader) {
+    auto &p = *impl_;
+    if (!p.attached || p.activity || p.resource_read_active || p.native_dispatching || !p.callback.empty())
+        bad("RESOURCE_BINDING", "Package resource binding requires initial owner setup before Activity construction");
+    p.resource_file_reader = std::move(reader);
+}
+void ActivitySession::set_launch_viewport(ViewportAdmission viewport) {
+    auto &p = *impl_;
+    if (!p.attached || p.application || p.activity || p.launch_viewport || p.base_theme || !p.callback.empty())
+        bad("VIEWPORT_BINDING", "Launch viewport requires one initial trusted binding before Application or Theme construction");
+    if (!viewport.geometry_revision || !viewport.width_px || !viewport.height_px || !viewport.host_dpi ||
+        viewport.width_px > static_cast<std::uint32_t>(INT32_MAX) || viewport.height_px > static_cast<std::uint32_t>(INT32_MAX) ||
+        !viewport.configuration.valid() || viewport.configuration != p.configuration || viewport.identity != ViewportIdentity{})
+        bad("VIEWPORT_BINDING", "Launch viewport disagrees with its actual initial geometry or resource configuration");
+    // This receipt conveys only the existing host-certified virtual display.
+    // No View tree, Surface, rendering or additional capability is admitted.
+    if (p.runtime.host_state(p.resource_object))
+        bad("VIEWPORT_BINDING", "Initial resource-manager baseline is already bound or incomplete");
+    if (p.runtime.host_state_capacity(p.resource_object) < sizeof(ResourcesManagerState))
+        bad("CONFIGURATION_LIMIT", "Resource-manager baseline exceeds existing managed admission");
+    auto manager_metadata = std::make_unique<ResourcesManagerState>();
+    manager_metadata->owner = &p;
+    const ConfigurationState source(p.configuration); // Private admitted facts, not public mutable VM fields.
+    manager_metadata->baseline.numbers = source.numbers;
+    manager_metadata->baseline.known = source.known;
+    manager_metadata->baseline.remainder_origin = p.resource_source_origin;
+    manager_metadata->baseline.window_origin = p.resource_source_origin;
+    manager_metadata->baseline.max_bounds = {0, 0, static_cast<std::int32_t>(viewport.width_px), static_cast<std::int32_t>(viewport.height_px)};
+    const auto ui_mode_index = static_cast<std::size_t>(ConfigurationField::ui_mode);
+    manager_metadata->baseline.numbers[ui_mode_index] = admitted_virtual_ui_mode;
+    manager_metadata->baseline.known[ui_mode_index] = UINT32_MAX;
+    manager_metadata->source_origin = p.resource_source_origin;
+    p.runtime.set_host_state(p.resource_object, std::move(manager_metadata));
+    const auto admitted = p.runtime.host_state_capacity(p.configuration_object);
+    const auto *previous = dynamic_cast<const ConfigurationState *>(p.runtime.host_state(p.configuration_object));
+    if (!previous || previous->owner != &p || admitted < previous->bytes() || sizeof(ConfigurationState) > admitted - previous->bytes())
+        bad("CONFIGURATION_LIMIT", "Viewport configuration facts exceed simultaneous managed admission");
+    auto configuration_metadata = std::make_unique<ConfigurationState>(*previous);
+    configuration_metadata->set(ConfigurationField::ui_mode, admitted_virtual_ui_mode);
+    p.runtime.set_host_state(p.configuration_object, std::move(configuration_metadata));
+    p.launch_viewport = std::move(viewport);
+}
+void ActivitySession::set_package_metadata(PackageMetadata metadata) {
+    auto &p = *impl_;
+    if (!p.attached || p.application || p.activity || p.package_metadata || !p.callback.empty())
+        bad("PACKAGE_BINDING", "Package metadata requires one initial owner binding before Application construction");
+    if (metadata.version_name && metadata.version_name_resource)
+        bad("PACKAGE_BINDING", "Version name cannot be both a literal and a resource reference");
+    if (metadata.activities.size() > apk::manifest_activity_count ||
+        ((!metadata.activity_meta_data.empty() || metadata.activity_meta_data_bound) &&
+         metadata.activity_meta_data.size() != metadata.activities.size()) ||
+        ((!metadata.activity_config_changes.empty() || metadata.activity_meta_data_bound) &&
+         metadata.activity_config_changes.size() != metadata.activities.size()) ||
+        ((!metadata.activity_recreate_on_config_changes.empty() || metadata.activity_meta_data_bound) &&
+         metadata.activity_recreate_on_config_changes.size() != metadata.activities.size()))
+        bad("PACKAGE_BINDING", "Activity declarations and raw metadata rows have inconsistent source alignment");
+    constexpr auto limit = apk::manifest_activity_bytes;
+    std::size_t retained = 0;
+    const auto add = [&](std::size_t bytes) {
+        if (bytes > limit - retained)
+            bad("PACKAGE_BINDING_LIMIT", "Actual retained package metadata exceeds its existing admission");
+        retained += bytes;
+    };
+    const auto text = [&](const std::string &value) {
+        if (value.capacity() >= limit)
+            bad("PACKAGE_BINDING_LIMIT", "Package metadata string capacity exceeds its existing admission");
+        add(value.capacity() + 1);
+    };
+    const auto wide_text = [&](const std::u16string &value) {
+        if (value.capacity() >= limit / sizeof(char16_t))
+            bad("PACKAGE_BINDING_LIMIT", "Package metadata UTF16 capacity exceeds its existing admission");
+        add((value.capacity() + 1) * sizeof(char16_t));
+    };
+    add(sizeof(PackageMetadata));
+    if (metadata.activities.capacity() > limit / sizeof(apk::Activity) ||
+        metadata.activity_config_changes.capacity() > limit / sizeof(apk::ManifestInteger) ||
+        metadata.activity_recreate_on_config_changes.capacity() > limit / sizeof(apk::ManifestInteger) ||
+        metadata.declared_services.capacity() > limit / sizeof(std::string))
+        bad("PACKAGE_BINDING_LIMIT", "Package inventory capacity exceeds its existing admission");
+    add(metadata.activities.capacity() * sizeof(apk::Activity));
+    add(metadata.activity_config_changes.capacity() * sizeof(apk::ManifestInteger));
+    add(metadata.activity_recreate_on_config_changes.capacity() * sizeof(apk::ManifestInteger));
+    for (const auto &activity_record : metadata.activities) {
+        text(activity_record.name); text(activity_record.target);
+        text(activity_record.label.literal); text(activity_record.icon.literal); text(activity_record.permission.literal);
+    }
+    add(apk::activity_meta_data_storage_size(metadata.activity_meta_data));
+    add(metadata.declared_services.capacity() * sizeof(std::string));
+    for (const auto &service : metadata.declared_services) text(service);
+    text(metadata.activity_label.literal); text(metadata.application_label.literal);
+    wide_text(metadata.activity_name);
+    if (metadata.version_name) wide_text(*metadata.version_name);
+    // All containers transfer ownership without an intermediate inventory copy.
+    // Raw completeness does not authorize treating unresolved keys as absent.
+    p.package_metadata = std::move(metadata);
+}
+void ActivitySession::set_component_query_policy(ImplicitComponentQueryPolicy policy) {
+    auto &p = *impl_;
+    if (policy != ImplicitComponentQueryPolicy::unknown &&
+        policy != ImplicitComponentQueryPolicy::interactive_session_both_classes)
+        bad("COMPONENT_QUERY_POLICY", "Unknown implicit component-query software profile");
+    if (!p.attached || p.component_query_policy_bound || p.application || p.activity || p.component_factory ||
+        p.factory_constructed || p.metrics.api_calls || !p.callback.empty() || p.runtime.has_provider_work_context() ||
+        p.runtime.metrics().instructions || p.runtime.metrics().native_calls)
+        bad("COMPONENT_QUERY_POLICY", "Component-query policy requires one trusted binding before guest execution");
+    p.component_query_policy = policy;
+    p.component_query_policy_bound = true;
+}
+void ActivitySession::set_process_identity(AndroidProcessIdentity identity) {
+    auto &p = *impl_;
+    if (!valid_virtual_android_process_identity(identity))
+        bad("PROCESS_IDENTITY", "Virtual Android process identity does not match the declared per-instance profile");
+    if (!p.attached || p.process_identity || p.application || p.activity || p.component_factory ||
+        p.factory_constructed || p.metrics.api_calls || !p.callback.empty() || p.native_dispatching ||
+        p.runtime.has_provider_work_context() || p.runtime.metrics().instructions || p.runtime.metrics().native_calls ||
+        p.runtime.metrics().managed_calls || p.runtime.metrics().core_calls)
+        bad("PROCESS_IDENTITY", "Process identity requires one trusted binding before framework queries or guest execution");
+    p.process_identity = identity;
+}
+void ActivitySession::set_accessibility_backend_availability(AccessibilityBackendAvailability availability) {
+    auto &p = *impl_;
+    if (availability != AccessibilityBackendAvailability::service_absent)
+        bad("ACCESSIBILITY_BACKEND_BINDING", "Accessibility backend binding requires a known supported lookup availability");
+    if (!p.attached || p.accessibility_backend_bound || p.application || p.activity || p.component_factory ||
+        p.factory_constructed || p.metrics.api_calls || !p.callback.empty() || p.native_dispatching ||
+        p.runtime.has_provider_work_context() || p.runtime.metrics().instructions || p.runtime.metrics().native_calls ||
+        p.runtime.metrics().managed_calls || p.runtime.metrics().core_calls)
+        bad("ACCESSIBILITY_BACKEND_BINDING", "Accessibility backend requires one trusted binding before framework queries or guest execution");
+    p.accessibility_backend_availability = availability;
+    p.accessibility_backend_bound = true;
+}
+void ActivitySession::set_target_sdk(std::uint32_t target_sdk) {
+    auto &p = *impl_;
+    if (!p.attached || p.application || p.activity || p.bound_target_sdk || p.base_theme || !p.callback.empty())
+        bad("THEME_BINDING", "Target SDK requires one initial owner binding before Application construction");
+    p.bound_target_sdk = target_sdk;
+    p.target_sdk = target_sdk;
+}
+void ActivitySession::set_activity_theme(apk::ManifestInteger theme) {
+    auto &p = *impl_;
+    if (!p.attached || p.application || p.activity || p.activity_theme || !p.callback.empty())
+        bad("THEME_BINDING", "Activity theme requires one initial owner binding before Application construction");
+    p.activity_theme = theme; // Preserve unsupported/present/absent kinds without inventing a default theme.
+}
+void ActivitySession::set_native_activity_observer(NativeActivityObserver observer) {
+    auto &p = *impl_;
+    if (!p.attached || p.activity || p.native_dispatching || !p.callback.empty())
+        bad("NATIVE_ACTIVITY_BINDING", "Native lifecycle binding requires initial owner setup before Activity construction");
+    p.native_activity_observer = std::move(observer);
+}
+void ActivitySession::set_native_activity_pointer_observer(NativeActivityPointerObserver observer) {
+    auto &p = *impl_;
+    if (!p.attached || p.activity || p.native_dispatching || !p.callback.empty())
+        bad("NATIVE_ACTIVITY_BINDING", "Native input binding requires initial owner setup before Activity construction");
+    p.native_pointer_observer = std::move(observer);
+}
+void ActivitySession::set_native_activity_key_observer(NativeActivityKeyObserver observer) {
+    auto &p = *impl_;
+    if (!p.attached || p.activity || p.native_dispatching || !p.callback.empty())
+        bad("NATIVE_ACTIVITY_BINDING", "Native key binding requires initial owner setup");
+    p.native_key_observer = std::move(observer);
+}
+void ActivitySession::set_key_completion_observer(NativeKeyCompletionObserver observer) {
+    auto &p = *impl_;
+    if (!p.attached || p.activity || p.native_dispatching || !p.callback.empty())
+        bad("NATIVE_ACTIVITY_BINDING", "Native key completion binding requires initial owner setup");
+    p.key_completion_observer = std::move(observer);
+}
+std::unique_ptr<dex::ManagedMainEntry> ActivitySession::make_native_pointer_completion(
+    const NativeActivityInputCompletion &completion) {
+    auto &p = *impl_;
+    p.check_text_edit_observer_idle();
+    if (completion.key) {
+        auto *pending = p.pending_native_key(completion.key->request);
+        if (!pending) return {};
+        if (!completion.queue || !completion.event || completion.key->activity != pending->input.activity ||
+            completion.key->stage != pending->input.stage ||
+            !Impl::same_key_capture(completion.key->sample, pending->input.sample))
+            bad("NATIVE_KEY_COMPLETION", "Native completion differs from its reserved key capture");
+        if (!p.native_completion_target->owner || !p.native_key_completion_live(completion)) {
+            p.settle_native_key(completion.key->request, KeyDispatchOutcome::cancelled);
+            return {};
+        }
+        return std::make_unique<Impl::NativeCompletionEntry>(p.native_completion_target, completion);
+    }
+    if (!p.native_completion_target->owner || !p.native_completion_live(completion)) return {};
+    if (!completion.queue || !completion.event)
+        bad("NATIVE_INPUT_COMPLETION", "Native completion requires its exact queue and event identity");
+    return std::make_unique<Impl::NativeCompletionEntry>(p.native_completion_target, completion);
+}
+std::shared_ptr<NativeWindows> ActivitySession::native_windows() const { return impl_->native_window_registry; }
+std::unique_ptr<dex::ManagedMainEntry> ActivitySession::make_native_activity_work(const NativeActivityHostWork &work) {
+    auto &p = *impl_;
+    p.check_text_edit_observer_idle();
+    if (!p.native_completion_target->owner || !p.native_activity_work_live(work)) return {};
+    const auto scope = work.scope.lock();
+    if (!work.serial || !scope || work.credit_slot >= scope->credits.size() ||
+        scope->credits[work.credit_slot].serial != work.serial || scope->credits[work.credit_slot].posted)
+        bad("NATIVE_ACTIVITY_WORK", "Native host work has no exact unposted queue credit");
+    return std::make_unique<Impl::NativeHostWorkEntry>(p.native_completion_target, work);
+}
+bool ActivitySession::finishing() const noexcept { return impl_->finishing; }
+std::optional<ActivityFinishRequest> ActivitySession::pending_finish_request() const {
+    impl_->check_text_edit_observer_idle();
+    return impl_->finish_request;
+}
+void ActivitySession::acknowledge_finish_request(std::uint64_t ordinal) {
+    auto &p = *impl_;
+    p.check_text_edit_observer_idle();
+    if (!ordinal || !p.finish_request || p.finish_request->ordinal != ordinal)
+        bad("ACTIVITY_FINISH_RECEIPT", "Finish acknowledgement does not match the pending request");
+    p.finish_request.reset(); // The finishing latch survives acknowledgement and onDestroy.
+}
+std::shared_ptr<NativeWindowProducer> ActivitySession::surface_producer(ObjectId object) const {
+    const auto &p = *impl_;
+    if (!p.attached || !object || !p.active_surface || p.active_surface->surface != object) return {};
+    const auto *state = dynamic_cast<const SurfaceObjectState *>(p.runtime.host_state(object));
+    return state && state->owner == &p ? state->producer : std::shared_ptr<NativeWindowProducer>{};
+}
+void ActivitySession::set_native_surface_observer(std::function<NativeSurfaceAdmission(const NativeSurfaceRequest &)> observer) {
+    auto &p = *impl_;
+    if (p.reconciling_surface) bad("SURFACE_REENTRANT", "Cannot replace an active surface observer");
+    p.native_surface_observer = std::move(observer);
+}
+void ActivitySession::reconcile_native_surface() {
+    impl_->check_text_edit_observer_idle();
+    try { impl_->reconcile_surface(); }
+    catch (...) { impl_->state = Lifecycle::failed; throw; }
+}
 std::uint64_t ActivitySession::begin_view_activation(ObjectId object) const noexcept {
     const auto found = impl_->views.find(object);
     return found != impl_->views.end() && found->second.kind != ViewKind::checkbox
@@ -4374,6 +14407,10 @@ void ActivitySession::collection_selection_policy_write(dex::ManagedRuntime &run
 void ActivitySession::check_view_activations() const { impl_->check_view_activations(); }
 void ActivitySession::prepare_terminal_cleanup() noexcept {
     impl_->terminal_cleanup = true;
+    try { impl_->cancel_native_keys(); }
+    catch (...) { if (!impl_->key_completion_failure) impl_->key_completion_failure = std::current_exception(); }
+    impl_->native_completion_target->owner = nullptr;
+    impl_->abandon_touch_input();
     impl_->text_edit_observer = nullptr;
     impl_->soft_input_observer = nullptr;
 }
@@ -4807,6 +14844,10 @@ void ActivitySession::initialize_application(std::string_view descriptor, std::s
             if (!p.application_attached)
                 bad("APPLICATION_CONTEXT", "Application override did not attach its base Context");
         } else p.application_attached = true;
+        if (p.runtime.host_state(p.base_context))
+            p.update_context_impl(p.base_context, [&p](ContextImplState &next) {
+                next.references[ContextImplState::outer_slot] = Value::reference(p.application);
+            });
         p.application_published = true;
         p.application_stage = Impl::ApplicationStage::creating;
         if (const auto method = p.override_method(descriptor, "onCreate", "()V"))
@@ -4848,6 +14889,9 @@ void ActivitySession::launch_impl(std::string_view descriptor, const apk::Intent
             bad("ACTIVITY_INTENT", "Delivered Intent component disagrees with the independently selected declaration");
     }
     p.orientation_request = requested_orientation;
+    if ((p.bound_target_sdk && *p.bound_target_sdk != target_sdk) ||
+        (!p.bound_target_sdk && p.base_theme && p.target_sdk != target_sdk))
+        bad("THEME_BINDING", "Launch target SDK differs from the bound or initialized Context theme profile");
     p.target_sdk = target_sdk;
     // Before API13 these two dimensions were treated as handled implicitly.
     p.config_changes = config_changes | (target_sdk < 13 ? 0xc00u : 0u);
@@ -4871,6 +14915,8 @@ void ActivitySession::launch_impl(std::string_view descriptor, const apk::Intent
 }
 std::int32_t ActivitySession::requested_orientation() const noexcept { return impl_->orientation_request; }
 const DisplayConfiguration &ActivitySession::display_configuration() const noexcept { return impl_->configuration; }
+std::uint64_t ActivitySession::window_generation() const noexcept { return impl_->window_generation; }
+std::uint64_t ActivitySession::input_generation() const noexcept { return impl_->input_generation; }
 void ActivitySession::configure(const DisplayConfiguration &configuration, apk::ResourceTable resources) {
     impl_->check_text_edit_observer_idle();
     auto &p = *impl_;
@@ -4880,6 +14926,11 @@ void ActivitySession::configure(const DisplayConfiguration &configuration, apk::
         bad("CONFIGURATION_REENTRANT", "Configuration cannot interrupt a lifecycle or input callback");
     if (!resources.package_name().empty() && resources.package_name() != p.package)
         bad("PACKAGE", "Recomposed resources belong to another package");
+    if (p.launch_viewport && configuration != p.launch_viewport->configuration)
+        bad("CONFIGURATION_VIEWPORT_UNSUPPORTED", "Changing admitted viewport geometry requires an implemented display rebind");
+    p.validate_asset_sources(resources);
+    p.require_resources_update_profile();
+    p.surface_dirty = true;
     std::uint32_t changed = 0;
     if (configuration.orientation() != p.configuration.orientation()) changed |= 0x80u;
     if (configuration.screen_width_dp != p.configuration.screen_width_dp ||
@@ -4887,9 +14938,43 @@ void ActivitySession::configure(const DisplayConfiguration &configuration, apk::
     if (configuration.smallest_screen_width_dp != p.configuration.smallest_screen_width_dp) changed |= 0x800u;
     if (configuration.density_dpi != p.configuration.density_dpi) changed |= 0x1000u;
     // Prepare the guest storage before changing the selected resource table.
-    p.runtime.set_host_state(p.configuration_object, std::make_unique<ConfigurationState>(configuration));
+    const auto *previous = dynamic_cast<const ConfigurationState *>(p.runtime.host_state(p.configuration_object));
+    if (!previous) bad("CONFIGURATION_STATE", "Configuration has no actual retained value state");
+    const auto window_configuration = previous->references[0].bits;
+    const auto next_origin = p.next_configuration_origin();
+    if (window_configuration) {
+        const auto bounds = p.data_window_configuration(window_configuration).references[0].bits;
+        ManagedRoot bounds_root(p.runtime, bounds);
+        const auto source_bounds = p.resources_manager_state().baseline.max_bounds;
+        const auto bounds_admitted = p.runtime.host_state_capacity(bounds);
+        const auto &previous_bounds = p.surface_rect(bounds);
+        if (bounds_admitted < previous_bounds.bytes() || sizeof(SurfaceRectState) > bounds_admitted - previous_bounds.bytes())
+            bad("CONFIGURATION_LIMIT", "Admitted bounds refresh exceeds simultaneous managed admission");
+        auto rectangle = std::make_unique<SurfaceRectState>();
+        rectangle->left = source_bounds[0]; rectangle->top = source_bounds[1];
+        rectangle->right = source_bounds[2]; rectangle->bottom = source_bounds[3];
+        p.runtime.set_host_state(bounds, std::move(rectangle));
+        const auto admitted = p.runtime.host_state_capacity(window_configuration);
+        const auto &window_metadata = p.data_window_configuration(window_configuration);
+        if (admitted < window_metadata.bytes() || sizeof(WindowConfigurationState) > admitted - window_metadata.bytes())
+            bad("CONFIGURATION_LIMIT", "Window source refresh exceeds simultaneous managed admission");
+        auto refreshed = std::make_unique<WindowConfigurationState>(window_metadata);
+        refreshed->remainder_origin = next_origin;
+        p.runtime.set_host_state(window_configuration, std::move(refreshed));
+    }
+    const auto admitted_configuration = p.runtime.host_state_capacity(p.configuration_object);
+    const auto &prior_configuration = p.configuration_state(p.configuration_object);
+    if (admitted_configuration < prior_configuration.bytes() || sizeof(ConfigurationState) > admitted_configuration - prior_configuration.bytes())
+        bad("CONFIGURATION_LIMIT", "Configuration refresh exceeds simultaneous managed admission");
+    auto configuration_metadata = std::make_unique<ConfigurationState>(configuration, window_configuration);
+    configuration_metadata->owner = &p;
+    configuration_metadata->remainder_origin = next_origin;
+    if (p.launch_viewport) configuration_metadata->set(ConfigurationField::ui_mode, admitted_virtual_ui_mode);
+    p.runtime.set_host_state(p.configuration_object, std::move(configuration_metadata));
     p.configuration = configuration;
     p.resources = std::move(resources);
+    p.resource_source_origin = next_origin;
+    p.refresh_resources_manager_baseline(next_origin);
     if (!changed) return;
     p.cancel_input();
     ++p.metrics.view_revision;
@@ -4915,6 +15000,8 @@ void ActivitySession::signal(WindowSignal signal) {
     }
     if (p.state == Lifecycle::empty || p.state == Lifecycle::destroyed || p.state == Lifecycle::failed)
         bad("LIFECYCLE_STATE", "Window event cannot target an inactive activity");
+    if (signal == WindowSignal::minimize || signal == WindowSignal::restore ||
+        signal == WindowSignal::suspend || signal == WindowSignal::resume) p.surface_dirty = true;
     if (signal == WindowSignal::focus_lost || signal == WindowSignal::deactivate ||
         signal == WindowSignal::minimize || signal == WindowSignal::suspend || signal == WindowSignal::close) {
         p.clear_soft_input_requests();
@@ -5345,6 +15432,7 @@ void ActivitySession::place_views(std::span<const ViewPlacement> placements) {
             bad("LAYOUT", "Invalid view rectangle");
     }
     const bool scrolling = p.content && p.view(p.content).kind == ViewKind::scroll_view;
+    p.surface_dirty = true; // Explicit placement may acknowledge a changed physical extent with equal DP bounds.
     if (scrolling) {
         for (const auto &[id, node] : p.views) {
             (void)node;
@@ -5380,15 +15468,71 @@ bool ActivitySession::pointer(const PointerInput &event) {
     impl_->check_text_edit_observer_idle();
     if (static_cast<unsigned>(event.action) > 3 || !std::isfinite(event.x) || !std::isfinite(event.y) ||
         std::abs(event.x) > 65536 || std::abs(event.y) > 65536 || event.pointer > 65535 ||
-        (event.source != 0x2002 && event.source != 0x1002))
+        (event.source != 0x2002 && event.source != 0x1002) || !valid_pointer_context(event))
         bad("INPUT", "Invalid or unsupported pointer event");
-    return impl_->dispatch_input({event, {}});
+    auto &p = *impl_;
+    if (event.root) {
+        if (event.root != p.content) return false;
+        // Configuration carries Android's rounded logical density. The capture
+        // carries exact host DPI; retirement CANCEL must still reach old custody.
+        if (event.action != PointerAction::cancel &&
+            (static_cast<std::uint64_t>(event.capture_dpi) * 160 + 48) / 96 != p.configuration.density_dpi) return false;
+        if (p.active_surface) {
+            const auto &surface = *p.active_surface;
+            if (event.root != surface.request.root || event.native_producer != surface.admission.producer ||
+                event.native_width != surface.admission.width || event.native_height != surface.admission.height) return false;
+        } else if (event.native_producer) return false;
+    }
+    auto sample = event;
+    if (p.content && p.content == p.native_content_view) return p.native_pointer_input(sample);
+    if (!sample.root && !sample.time_known) {
+        if (const auto now = p.input_uptime()) {
+            if (sample.action == PointerAction::down) {
+                sample.time_known = true;
+                sample.down_time_ms = sample.event_time_ms = *now;
+            } else if (p.touch_gesture && p.touch_gesture->down_time_known && *now >= p.touch_gesture->down_time_ms) {
+                sample.time_known = true;
+                sample.down_time_ms = p.touch_gesture->down_time_ms;
+                sample.event_time_ms = *now;
+            }
+        }
+    }
+    return impl_->dispatch_input({sample, {}});
 }
 bool ActivitySession::key(const KeyInput &event) {
     impl_->check_text_edit_observer_idle();
     if (!valid_key_input(event))
         bad("INPUT", "Invalid or unsupported key event");
+    if (!key_capture_current(event)) return false;
     return impl_->dispatch_input({{}, event});
+}
+KeyDispatchOutcome ActivitySession::dispatch_key(const KeyInput &event, std::uint64_t request) {
+    auto &p = *impl_;
+    p.check_text_edit_observer_idle();
+    if (!valid_key_input(event)) bad("INPUT", "Invalid or unsupported key event");
+    if (!p.key_capture_current(event)) return KeyDispatchOutcome::cancelled;
+    if (!p.native_content_view || p.content != p.native_content_view)
+        return key(event) ? KeyDispatchOutcome::handled : KeyDispatchOutcome::unhandled;
+    if (!request || !event.root || !p.native_created || !p.native_queue_created ||
+        !p.native_key_observer || !p.key_completion_observer)
+        bad("NATIVE_KEY_ADMISSION", "Native key requires its actual queue and final-result owner");
+    if (p.pending_native_key(request)) bad("NATIVE_KEY_ADMISSION", "Native key request was already admitted");
+    auto slot = std::find_if(p.native_keys.begin(), p.native_keys.end(),
+        [](const auto &pending) { return !pending.input.request; });
+    if (slot == p.native_keys.end()) bad("NATIVE_KEY_LIMIT", "Native key request capacity exhausted");
+    NativeActivityKeyInput input;
+    input.activity = p.activity; input.sample = event; input.request = request;
+    input.stage = NativeKeyStage::pre_ime;
+    slot->input = input; // Reserve the bounded final-result owner before publication.
+    try {
+        if (!p.native_key_observer(input))
+            bad("NATIVE_KEY_ADMISSION", "Native input queue refused an authenticated key capture");
+    } catch (...) { *slot = {}; throw; }
+    ++p.metrics.key_events;
+    return KeyDispatchOutcome::deferred; // A real queue lease and final-result owner now exist.
+}
+bool ActivitySession::key_capture_current(const KeyInput &event) const noexcept {
+    return impl_->key_capture_current(event);
 }
 void ActivitySession::close() {
     impl_->check_text_edit_observer_idle();
@@ -5401,14 +15545,18 @@ void ActivitySession::close() {
         bad("INPUT_REENTRANT", "Cannot close during input dispatch");
     p.clear_soft_input_requests();
     p.retire_ime(true);
-    p.runtime.close_tasks();
-    p.runtime.close_main_callbacks();
+    const bool native_activity = p.activity && p.runtime.assignable(p.activity, native_activity_type);
+    if (!native_activity) {
+        p.runtime.close_tasks();
+        p.runtime.close_main_callbacks();
+    }
     p.cancel_input();
     try {
         if (p.state == Lifecycle::resumed)
             p.deliver("onPause", Lifecycle::paused);
         if (p.state == Lifecycle::paused || p.state == Lifecycle::started)
             p.deliver("onStop", Lifecycle::stopped);
+        p.retire_native_surface(true);
         if (p.state == Lifecycle::stopped || p.state == Lifecycle::created)
             p.deliver("onDestroy", Lifecycle::destroyed);
     } catch (...) {
@@ -5422,6 +15570,7 @@ void ActivitySession::close() {
 Lifecycle ActivitySession::state() const noexcept { return impl_->state; }
 ObjectId ActivitySession::activity() const noexcept { return impl_->activity; }
 ObjectId ActivitySession::content_view() const noexcept { return impl_->content; }
+std::uint64_t ActivitySession::attachment_revision() const noexcept { return impl_->attachment_revision; }
 const std::map<ObjectId, ViewState> &ActivitySession::views() const noexcept { return impl_->views; }
 std::map<ObjectId, ViewState> ActivitySession::snapshot_views() const {
     impl_->check_text_edit_observer_idle();
@@ -5429,6 +15578,9 @@ std::map<ObjectId, ViewState> ActivitySession::snapshot_views() const {
     // guest callback runs while preparing a host publication. Recheck mutable
     // StringBuilders before copying any description text.
     impl_->check_descriptions();
+    for (const auto &[id, node] : impl_->views)
+        if (node.kind == ViewKind::view && impl_->in_tree(id))
+            bad("VIEW_RENDER_UNSUPPORTED", "Generic View measurement, layout, drawing and attachment lifecycle are not implemented");
     auto result = impl_->views;
     const bool metadata_current = impl_->accessibility_cache_current();
     for (auto &[id, node] : result) {
@@ -5486,14 +15638,119 @@ bool ActivitySession::write_standard_output(dex::ManagedRuntime &runtime,bool er
 }
 const FrameworkMetrics &ActivitySession::metrics() const noexcept { return impl_->metrics; }
 const apk::ResourceTable &ActivitySession::resources() const noexcept { return impl_->resources; }
+bool ActivitySession::owns_asset_manager(dex::ObjectId object) const noexcept {
+    return impl_->attached && object && object == impl_->asset_manager;
+}
+void ActivitySession::prepare_native_asset_manager_sources() {
+    auto &p = *impl_;
+    if (!p.attached || !p.asset_manager)
+        bad("ASSET_SOURCES", "Native manager preparation requires an attached session");
+    if (p.asset_manager > native_asset_manager_identity_mask)
+        bad("ASSET_IDENTITY_LIMIT", "AssetManager identity exceeds the native token representation");
+    p.bind_asset_sources();
+    const auto *sources = dynamic_cast<const AssetSourcesState *>(p.runtime.find_host_state(p.asset_manager));
+    if (!sources || sources->owner != &p || !sources->sdk_data || !sources->sdk_size || sources->bindings.empty())
+        bad("ASSET_SOURCES", "Native manager preparation has no authenticated immutable sources");
+    sources->native_prepared = true;
+}
+std::uint64_t ActivitySession::publish_native_asset_manager(dex::ObjectId object) const noexcept {
+    const auto issuance = impl_->native_manager_issuance(object);
+    if (!issuance) return 0;
+    const auto token = native_asset_manager_identity_tag | object;
+    if (*issuance && *issuance != token) return 0;
+    *issuance = token;
+    return token;
+}
+bool ActivitySession::owns_native_asset_manager(std::uint64_t token) const noexcept {
+    if ((token & ~native_asset_manager_identity_mask) != native_asset_manager_identity_tag) return false;
+    const auto object = token & native_asset_manager_identity_mask;
+    const auto issuance = impl_->native_manager_issuance(object);
+    return issuance && *issuance == token;
+}
 std::optional<dex::HostClass> ActivitySession::class_info(std::string_view descriptor) const {
     return class_metadata(descriptor);
+}
+void ActivitySession::initialize_class(dex::ManagedRuntime &runtime, std::string_view type) {
+    auto &p = *impl_;
+    if (&runtime != &p.runtime || !p.attached)
+        bad("CLASS_INITIALIZATION_STATE", "Hosted class initialization belongs to another or closed runtime");
+    runtime.charge_provider_work(1);
+    if (array_map_class(type)) {
+        ArrayMapContext context{runtime, &p, p.array_map_class_space};
+        initialize_array_map_class(context, type);
+        return;
+    }
+    if (type == accessibility_my_callback_type)
+        return; // Source-proven empty own body; Handler.Callback contains only its abstract method.
+    if (type == accessibility_client_stub_type) {
+        // Runtime already initializes the real superclass before this hook. The
+        // explicit idempotent join also prevents a direct trusted hook call from
+        // bypassing Binder's source-bound static initialization.
+        runtime.initialize(binder_type);
+        // The complete IAccessibilityManagerClient/IInterface contracts contain
+        // abstract methods only, so no default-method interface init is required.
+        return; // Attested Stub has no own class initializer body.
+    }
+    if (type == accessibility_client_type) {
+        runtime.initialize(accessibility_client_stub_type);
+        return; // Attested anonymous class has no own body or direct interfaces.
+    }
+    if (type == window_binder_type) {
+        // Complete IBinder source declares a default method but only constant
+        // primitive fields, with no own allocation-bearing initializer body.
+        return;
+    }
+    if (type == binder_warn_supplier_type || type == binder_work_source_type)
+        return; // These explicitly Aether-owned carriers have no own static effects/default interfaces.
+    if (type == binder_type) {
+        p.initialize_binder_static_fields();
+        return;
+    }
+    if (type == accessibility_manager_type) {
+        p.initialize_accessibility_manager_statics();
+        return;
+    }
+    bad("CLASS_INITIALIZATION_UNSUPPORTED", "Hosted class initializer has no source-complete implementation");
+}
+dex::HostBootstrapClassPresence ActivitySession::bootstrap_class_presence(dex::ManagedRuntime &runtime,
+    std::string_view descriptor) const {
+    if (&runtime != &impl_->runtime)
+        bad("STATE", "Bootstrap class metadata belongs to another runtime");
+    // This is source-bound bootstrap metadata, not an implemented class or
+    // Activity/lifecycle authority. Unknown scopes retain the normal refusal.
+    return api35_bootstrap_class_presence(descriptor, &runtime, [](void *context, std::uint64_t count) {
+        static_cast<dex::ManagedRuntime *>(context)->charge_provider_work(count);
+    });
 }
 std::optional<Value> ActivitySession::static_field(dex::ManagedRuntime &runtime, dex::Index index) {
     auto &p = *impl_;
     if (&runtime != &p.runtime || !p.attached)
         bad("STATE", "Framework field belongs to another or closed runtime");
     const auto &field = runtime.image().fields.at(index);
+    if (array_map_class(runtime.image().types.at(field.owner))) {
+        // Raw external sget reaches this provider without Java access metadata.
+        // Export only the source-public ArrayMap field; the module's internal
+        // cache locks, heads/counts and immutable-array marker remain private.
+        const auto owner = std::string_view(runtime.image().types.at(field.owner));
+        if (owner == array_map_class_space_type ||
+            (owner == array_map_type && (field.name != "EMPTY" || runtime.image().types.at(field.type) != array_map_type)))
+            bad("ARRAY_MAP_FIELD_ACCESS_UNSUPPORTED", "ArrayMap private class/cache storage has no external field frontend");
+        // EmptyArray's exact public field/type matching stays in its module.
+        std::optional<Value> result;
+        const auto read = [&] {
+            ArrayMapContext context{runtime, &p, p.array_map_class_space};
+            result = array_map_static_field(context, runtime.image().types.at(field.owner), field.name,
+                                           runtime.image().types.at(field.type));
+        };
+        if (runtime.has_provider_work_context()) read();
+        else runtime.run_host_callback(read); // One actual idle field query, with the same existing ledger otherwise.
+        return result;
+    }
+    if (runtime.image().types.at(field.owner) == build_type && field.name == "FINGERPRINT" &&
+        runtime.image().types.at(field.type) == "Ljava/lang/String;")
+        return Value::reference(p.fingerprint_string());
+    if (runtime.image().types.at(field.type) == "I")
+        if (const auto value = layout_constant(runtime.image().types.at(field.owner), field.name)) return Value::word(*value);
     if (runtime.image().types.at(field.owner) == clip_description_type &&
         runtime.image().types.at(field.type) == "Ljava/lang/String;" && field.name == "MIMETYPE_TEXT_PLAIN") {
         if (!p.plain_text_mime) p.plain_text_mime = p.own(runtime.new_string(u"text/plain"));
@@ -5513,6 +15770,8 @@ std::optional<Value> ActivitySession::static_field(dex::ManagedRuntime &runtime,
         if (!p.input_method_name) p.input_method_name = p.own(runtime.new_string(u"input_method"));
         return Value::reference(p.input_method_name);
     }
+    if (runtime.image().types.at(field.owner) == porter_duff_mode_type && runtime.image().types.at(field.type) == porter_duff_mode_type)
+        if (const auto mode = porter_duff_mode_index(field.name)) return Value::reference(p.porter_duff_mode(*mode));
     if (runtime.image().types.at(field.owner) == buffer_mode_type && runtime.image().types.at(field.type) == buffer_mode_type) {
         if (field.name == "NORMAL") return Value::reference(p.mode_object(0));
         if (field.name == "SPANNABLE") return Value::reference(p.mode_object(1));
@@ -5530,9 +15789,10 @@ std::optional<dex::HostMethod> ActivitySession::public_method(
     std::string_view owner, std::string_view name, std::span<const std::string> parameters) const {
     std::string current_owner(owner);
     for (unsigned depth = 0; depth < 256; ++depth) {
-        owner = component_method_owner(preferences_owner(current_owner), name);
+        owner = layout_factory_method_owner(component_method_owner(preferences_owner(current_owner), name), name, parameters.size());
         for (const auto &api : api_registry()) {
-            if (api.owner != owner || api.name != name || !public_api(api)) continue;
+            if ((api.owner != owner && !(owner == xml_resource_parser_type &&
+                 (api.owner == xml_pull_type || api.owner == attribute_set_type))) || api.name != name || !public_api(api)) continue;
             const auto expected = api_parameters(api.signature);
             if (expected.size() != parameters.size() ||
                 !std::equal(expected.begin(), expected.end(), parameters.begin())) continue;
@@ -5544,10 +15804,15 @@ std::optional<dex::HostMethod> ActivitySession::public_method(
                                            (api.owner==input_connection_type && api.name!="setImeConsumesInput") ||
                                            api.owner==editable_type || api.owner==watcher_type || api.owner=="Ljava/lang/CharSequence;" || api.owner=="Landroid/text/GetChars;" ||
                                            api.owner==checkable_type || api.owner==checked_listener_type ||
-                                           api.owner==key_callback_type || api.owner==key_listener_type || api.owner==drag_listener_type ||
+                                           api.owner==key_callback_type || api.owner==key_listener_type || api.owner==touch_listener_type ||
+                                           api.owner=="Landroid/view/ViewParent;" || api.owner==drag_listener_type ||
                                          api.owner==component_callbacks_type || api.owner==component_callbacks2_type ||
                                          api.owner=="Landroid/os/Parcelable;" ||
-                                         (api.owner==lifecycle_type && !api.name.starts_with("onActivityPre") && !api.name.starts_with("onActivityPost")))?0x401u:
+                                         (api.owner==lifecycle_type && !api.name.starts_with("onActivityPre") && !api.name.starts_with("onActivityPost")) ||
+                                         (api.owner=="Landroid/content/pm/PackageManager;" && api.name=="getPackageInfo"))?0x401u:
+                                          (api.owner=="Landroid/content/Context;" && api.name=="obtainStyledAttributes") ||
+                                          (api.owner=="Landroid/view/View;" && api.name=="getContext") ||
+                                          (api.owner==bitmap_type && (api.name=="getWidth" || api.name=="getHeight" || api.name=="isRecycled")) ||
                                           (api.owner=="Landroid/view/KeyEvent;" && api.name=="dispatch") ||
                                           (api.owner=="Landroid/widget/TextView;" && api.name=="setText" &&
                                             (api.signature=="(Ljava/lang/CharSequence;)V" || api.signature=="(I)V")) ? 0x11u : 1u))};
@@ -5563,11 +15828,65 @@ std::optional<dex::HostMethod> ActivitySession::public_method(
     bad("CLASS_LIMIT", "Reflected framework hierarchy exceeds limit");
 }
 std::optional<dex::HostField> ActivitySession::public_field(std::string_view owner, std::string_view name) const {
+    if (owner == frame_params_type || owner == margin_params_type || owner == linear_params_type) {
+        if (name == "width" || name == "height" || layout_constant(owner, name))
+            return declared_field(layout_params_type, name);
+        if ((owner == frame_params_type || owner == linear_params_type) && (name == "leftMargin" || name == "topMargin" ||
+            name == "rightMargin" || name == "bottomMargin")) return declared_field(margin_params_type, name);
+    }
+    if ((owner == activity_info_type || owner == component_info_type || owner == application_info_type) && name == "metaData")
+        return declared_field(package_item_type, name);
     if (owner == application_info_type && name == "packageName")
         return declared_field(package_item_type, name);
     return declared_field(owner, name);
 }
 std::optional<dex::HostField> ActivitySession::declared_field(std::string_view owner, std::string_view name) const {
+    if (array_map_class(owner))
+        bad("ARRAY_MAP_FIELD_REFLECTION_UNSUPPORTED", "ArrayMap native class storage has no Java field-reflection frontend");
+    if (owner == accessibility_my_callback_type)
+        bad("ACCESSIBILITY_CALLBACK_REFLECTION_UNSUPPORTED", "Private callback storage has no Java field-reflection frontend");
+    if (owner == binder_warn_supplier_type || owner == binder_work_source_type)
+        bad("BINDER_FUNCTIONAL_REFLECTION_UNSUPPORTED", "Translated Binder static/functional storage has no Java field-reflection frontend");
+    if (owner == display_metrics_type) {
+        if (name == "widthPixels" || name == "heightPixels" || name == "densityDpi")
+            return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+        if (name == "density") return dex::HostField{std::string(owner), std::string(name), "F", 1, true};
+    }
+    if (owner == configuration_type && name == "windowConfiguration")
+        return dex::HostField{std::string(owner), std::string(name), std::string(window_configuration_type), 0x11u, true};
+    if (owner == activity_info_type && name == "configChanges")
+        return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+    if (owner == package_item_type && name == "metaData")
+        return dex::HostField{std::string(owner), std::string(name), std::string(bundle_type), 1, true};
+    if (owner == application_info_type && name == "targetSdkVersion")
+        return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+    if (owner == linear_params_type && name == "weight")
+        return dex::HostField{std::string(owner), std::string(name), "F", 1, true};
+    if (owner == typed_value_type) {
+        if (typed_value_field_index(name))
+            return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+        if (name == "string")
+            return dex::HostField{std::string(owner), std::string(name), "Ljava/lang/CharSequence;", 1, true};
+    }
+    if (owner == porter_duff_mode_type && porter_duff_mode_index(name))
+        return dex::HostField{std::string(owner), std::string(name), std::string(owner), 0x4019u, true};
+    if (owner == build_type && name == "FINGERPRINT")
+        return dex::HostField{std::string(owner), std::string(name), "Ljava/lang/String;", 0x19u, true};
+    if (owner == package_info_type) {
+        if (name == "versionCode" || name == "versionCodeMajor")
+            return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+        if (name == "packageName" || name == "versionName")
+            return dex::HostField{std::string(owner), std::string(name), "Ljava/lang/String;", 1, true};
+    }
+    if (owner == layout_params_type && layout_constant(owner, name))
+        return dex::HostField{std::string(owner), std::string(name), "I", 0x19u, true};
+    if ((owner == layout_params_type && (name == "width" || name == "height")) ||
+        (owner == margin_params_type && (name == "leftMargin" || name == "topMargin" ||
+            name == "rightMargin" || name == "bottomMargin")) ||
+        ((owner == frame_params_type || owner == linear_params_type) && name == "gravity"))
+        return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+    if (owner == rect_type && (name == "left" || name == "top" || name == "right" || name == "bottom"))
+        return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
     if (accessibility_constant(owner, name))
         return dex::HostField{std::string(owner), std::string(name), "I", 0x19u, true};
     if (owner == clip_description_type && name == "MIMETYPE_TEXT_PLAIN")
@@ -5579,7 +15898,7 @@ std::optional<dex::HostField> ActivitySession::declared_field(std::string_view o
     if (owner == "Landroid/content/Context;" && name == "INPUT_METHOD_SERVICE")
         return dex::HostField{std::string(owner), std::string(name), "Ljava/lang/String;", 0x19u, true};
     if (owner == editor_info_type) {
-        if (name == "inputType" || name == "imeOptions" || name == "initialSelStart" || name == "initialSelEnd" ||
+        if (name == "inputType" || name == "imeOptions" || name == "actionId" || name == "initialSelStart" || name == "initialSelEnd" ||
             name == "initialCapsMode" || name == "fieldId")
             return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
         if (name == "packageName") return dex::HostField{std::string(owner), std::string(name), "Ljava/lang/String;", 1, true};
@@ -5589,10 +15908,8 @@ std::optional<dex::HostField> ActivitySession::declared_field(std::string_view o
     if (owner == buffer_mode_type && (name == "NORMAL" || name == "SPANNABLE" || name == "EDITABLE"))
         return dex::HostField{std::string(owner), std::string(name), std::string(owner), 0x19u, true};
     // Exact Android 15 declarations; this is a deliberately partial schema.
-    if (owner == configuration_type &&
-        (name == "orientation" || name == "screenWidthDp" || name == "screenHeightDp" ||
-         name == "smallestScreenWidthDp" || name == "densityDpi"))
-        return dex::HostField{std::string(owner), std::string(name), "I", 1, true};
+    if (owner == configuration_type && configuration_field_index(name))
+        return dex::HostField{std::string(owner), std::string(name), name == "fontScale" ? "F" : "I", 1, true};
     if (owner == activity_thread_type && name == "mBoundApplication")
         return dex::HostField{std::string(owner), std::string(name), std::string(app_bind_type), 0, true};
     if (owner == app_bind_type && name == "appInfo")
@@ -5617,6 +15934,48 @@ Value ActivitySession::read_reflected_field(dex::ManagedRuntime &runtime, const 
     if (!known || known->type != field.type || known->flags != field.flags ||
         known->declaring_class_public != field.declaring_class_public)
         bad("FIELD_METADATA", "Reflected field does not match the framework declaration");
+    if (field.owner == activity_info_type && field.name == "configChanges")
+        return Value::word(p.activity_info_state(receiver).config_changes);
+    if (field.owner == package_item_type && field.name == "metaData")
+        return p.activity_info_state(receiver).references[0];
+    if (field.owner == display_metrics_type) {
+        if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+        const auto &facts = p.current_display();
+        const auto *metadata = dynamic_cast<const DisplayMetricsState *>(runtime.host_state(receiver));
+        if (!metadata || metadata->owner != &p ||
+            metadata->source.geometry_revision != facts.geometry_revision || metadata->source.configuration != facts.configuration)
+            bad("DISPLAY_METRICS_STATE", "DisplayMetrics is not the current authenticated resource binding");
+        if (field.name == "widthPixels") return Value::word(metadata->source.width_px);
+        if (field.name == "heightPixels") return Value::word(metadata->source.height_px);
+        if (field.name == "densityDpi") return Value::word(metadata->source.configuration.density_dpi);
+        return Value::word(metadata->density_bits);
+    }
+    if (field.owner == typed_value_type) {
+        const auto &metadata = p.typed_value_state(receiver);
+        if (const auto member = typed_value_field_index(field.name)) return Value::word(metadata.numbers[*member]);
+        return metadata.references[0];
+    }
+    if (field.owner == porter_duff_mode_type)
+        if (const auto mode = porter_duff_mode_index(field.name)) return Value::reference(p.porter_duff_mode(*mode));
+    if (field.owner == build_type && field.name == "FINGERPRINT")
+        return Value::reference(p.fingerprint_string());
+    if (const auto value = layout_constant(field.owner, field.name)) return Value::word(*value);
+    if (field.owner == layout_params_type || field.owner == margin_params_type || field.owner == frame_params_type ||
+        field.owner == linear_params_type) {
+        if (!runtime.assignable(receiver, field.owner)) runtime.raise("Ljava/lang/IllegalArgumentException;");
+        const auto &metadata = p.layout_params(receiver);
+        if (field.name == "weight") return Value::word(metadata.weight_bits);
+        const auto value = field.name == "width" ? metadata.width : field.name == "height" ? metadata.height :
+            field.name == "leftMargin" ? metadata.left : field.name == "topMargin" ? metadata.top :
+            field.name == "rightMargin" ? metadata.right : field.name == "bottomMargin" ? metadata.bottom : metadata.gravity;
+        return Value::word(std::bit_cast<std::uint32_t>(value));
+    }
+    if (field.owner == rect_type) {
+        const auto &state = p.surface_rect(receiver);
+        const auto value = field.name == "left" ? state.left : field.name == "top" ? state.top :
+            field.name == "right" ? state.right : state.bottom;
+        return Value::word(std::bit_cast<std::uint32_t>(value));
+    }
     if (field.owner == clip_description_type && field.name == "MIMETYPE_TEXT_PLAIN") {
         if (!p.plain_text_mime) p.plain_text_mime = p.own(runtime.new_string(u"text/plain"));
         return Value::reference(p.plain_text_mime);
@@ -5631,10 +15990,17 @@ Value ActivitySession::read_reflected_field(dex::ManagedRuntime &runtime, const 
         if (!p.input_method_name) p.input_method_name = p.own(runtime.new_string(u"input_method"));
         return Value::reference(p.input_method_name);
     }
+    if (field.owner == package_info_type) {
+        const auto &metadata = p.package_info_state(receiver);
+        if (field.name == "versionCode") return Value::word(metadata.version_code);
+        if (field.name == "versionCodeMajor") return Value::word(metadata.version_code_major);
+        return metadata.references[field.name == "packageName" ? 0 : 1];
+    }
     if (field.owner == editor_info_type) {
         const auto &state = p.editor_state(receiver);
         if (field.name == "inputType") return Value::word(std::bit_cast<std::uint32_t>(state.input_type));
         if (field.name == "imeOptions") return Value::word(std::bit_cast<std::uint32_t>(state.ime_options));
+        if (field.name == "actionId") return Value::word(std::bit_cast<std::uint32_t>(state.action_id));
         if (field.name == "initialSelStart") return Value::word(std::bit_cast<std::uint32_t>(state.initial_start));
         if (field.name == "initialSelEnd") return Value::word(std::bit_cast<std::uint32_t>(state.initial_end));
         if (field.name == "initialCapsMode") return Value::word(std::bit_cast<std::uint32_t>(state.initial_caps));
@@ -5644,21 +16010,26 @@ Value ActivitySession::read_reflected_field(dex::ManagedRuntime &runtime, const 
     if (field.owner == buffer_mode_type)
         return Value::reference(p.mode_object(field.name == "NORMAL" ? 0 : field.name == "SPANNABLE" ? 1 : 2));
     if (field.owner == configuration_type) {
-        if (receiver != p.configuration_object)
-            bad("CONFIGURATION_RECEIVER", "Configuration is not this session's current Resources binding");
-        const auto *state = dynamic_cast<const ConfigurationState *>(runtime.host_state(receiver));
-        if (!state) bad("CONFIGURATION_STATE", "Configuration storage is unavailable");
-        if (field.name == "orientation") return Value::word(state->value.orientation());
-        if (field.name == "screenWidthDp") return Value::word(state->value.screen_width_dp);
-        if (field.name == "screenHeightDp") return Value::word(state->value.screen_height_dp);
-        if (field.name == "smallestScreenWidthDp") return Value::word(state->value.smallest_screen_width_dp);
-        if (field.name == "densityDpi") return Value::word(state->value.density_dpi);
+        ManagedRoot configuration_root(runtime, receiver);
+        if (field.name == "windowConfiguration") return Value::reference(p.configuration_window(receiver));
+        const auto &metadata = p.configuration_state(receiver);
+        if (const auto index = configuration_field_index(field.name)) {
+            if (metadata.known[*index] != UINT32_MAX)
+                bad("CONFIGURATION_UNSUPPORTED", "Configuration field has no complete authentic value");
+            return Value::word(metadata.numbers[*index]);
+        }
     }
     if (field.owner == activity_thread_type && receiver == p.activity_thread)
         return Value::reference(p.bound_application);
     if (field.owner == app_bind_type && receiver == p.bound_application)
         return Value::reference(field.name == "appInfo" ? p.app_info() : p.loaded_package);
-    if (field.owner == package_item_type && p.application_info && receiver == p.application_info)
+    if (field.owner == application_info_type && field.name == "targetSdkVersion") {
+        const auto &metadata = p.application_info_state(receiver);
+        if (!metadata.target_known)
+            bad("APPLICATION_INFO_UNSUPPORTED", "Application target SDK has no actual selected-package binding");
+        return Value::word(metadata.target_sdk);
+    }
+    if (field.owner == package_item_type && field.name == "packageName" && p.application_info && receiver == p.application_info)
         return Value::reference(p.package_string());
     if ((field.owner == loaded_apk_type && receiver == p.loaded_package) ||
         (field.owner == application_info_type && p.application_info && receiver == p.application_info)) {
@@ -5675,8 +16046,127 @@ void ActivitySession::write_reflected_field(dex::ManagedRuntime &runtime, const 
     if (&runtime != &p.runtime || !p.attached) bad("STATE", "Framework field belongs to another or closed runtime");
     const auto known = declared_field(field.owner, field.name);
     if (!known || known->owner != field.owner || known->type != field.type || known->flags != field.flags ||
-        known->declaring_class_public != field.declaring_class_public || field.owner != editor_info_type)
-        bad("FIELD_WRITE_UNSUPPORTED", "Only declared mutable EditorInfo fields are supported");
+        known->declaring_class_public != field.declaring_class_public)
+        bad("FIELD_WRITE_UNSUPPORTED", "Mutable field does not match its framework declaration");
+    if (field.owner == activity_info_type && field.name == "configChanges") {
+        if (value.kind != dex::ValueKind::word) bad("FIELD_ARGUMENT", "ActivityInfo.configChanges requires integer bits");
+        p.update_activity_info(receiver, [value](ActivityInfoState &next) { next.config_changes = static_cast<std::uint32_t>(value.bits); });
+        return;
+    }
+    if (field.owner == package_item_type && field.name == "metaData") {
+        if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+            bad("FIELD_ARGUMENT", "ActivityInfo metadata requires a nullable Bundle reference");
+        ManagedRoot receiver_root(runtime, receiver), value_root(runtime, value.bits);
+        if (value.bits && !runtime.assignable(value.bits, bundle_type))
+            bad("FIELD_ARGUMENT", "ActivityInfo metadata value is not a Bundle");
+        p.update_activity_info(receiver, [value](ActivityInfoState &next) { next.references[0] = Value::reference(value.bits); });
+        return;
+    }
+    if (field.owner == display_metrics_type)
+        runtime.raise("Ljava/lang/UnsupportedOperationException;", u"DisplayMetrics writes require a shared mutable metrics implementation across consumers");
+    if (field.owner == configuration_type) {
+        const auto index = configuration_field_index(field.name);
+        if (!index || value.kind != dex::ValueKind::word)
+            bad("FIELD_WRITE_UNSUPPORTED", "Configuration requires a declared mutable scalar field");
+        runtime.charge_provider_work(configuration_field_count * 2);
+        p.update_configuration(receiver, [index, value](ConfigurationState &next) {
+            next.numbers[*index] = static_cast<std::uint32_t>(value.bits);
+            next.known[*index] = UINT32_MAX;
+        });
+        return;
+    }
+    if (field.owner == application_info_type && field.name == "targetSdkVersion") {
+        if (value.kind != dex::ValueKind::word)
+            bad("FIELD_ARGUMENT", "ApplicationInfo.targetSdkVersion requires actual int bits");
+        ManagedRoot receiver_root(runtime, receiver);
+        (void)p.application_info_state(receiver);
+        const auto admitted = runtime.host_state_capacity(receiver);
+        const auto &previous = p.application_info_state(receiver);
+        if (admitted < previous.bytes() || sizeof(ApplicationInfoState) > admitted - previous.bytes())
+            bad("APPLICATION_INFO_LIMIT", "ApplicationInfo replacement exceeds simultaneous managed admission");
+        auto next = std::make_unique<ApplicationInfoState>(previous);
+        next->target_sdk = static_cast<std::uint32_t>(value.bits);
+        next->target_known = true;
+        runtime.set_host_state(receiver, std::move(next));
+        return;
+    }
+    if (field.owner == typed_value_type) {
+        ManagedRoot receiver_root(runtime, receiver);
+        std::unique_ptr<ManagedRoot> value_root;
+        if (field.type == "Ljava/lang/CharSequence;") {
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("FIELD_ARGUMENT", "TypedValue.string requires a nullable CharSequence reference");
+            value_root = std::make_unique<ManagedRoot>(runtime, value.bits);
+            if (value.bits && !runtime.assignable(value.bits, "Ljava/lang/CharSequence;"))
+                runtime.raise("Ljava/lang/IllegalArgumentException;", u"TypedValue.string is not a CharSequence");
+        } else if (value.kind != dex::ValueKind::word)
+            bad("FIELD_ARGUMENT", "TypedValue integer field requires int bits");
+        auto next = std::make_unique<TypedValueState>(p.typed_value_state(receiver));
+        if (const auto member = typed_value_field_index(field.name)) next->numbers[*member] = static_cast<std::uint32_t>(value.bits);
+        else next->references[0] = Value::reference(value.bits);
+        runtime.set_host_state(receiver, std::move(next));
+        return;
+    }
+    if (field.owner == layout_params_type || field.owner == margin_params_type || field.owner == frame_params_type ||
+        field.owner == linear_params_type) {
+        if (field.flags != 1 || value.kind != dex::ValueKind::word || !runtime.assignable(receiver, field.owner))
+            bad("LAYOUT_PARAMS", "Mutable layout fields require their actual integer or float bits");
+        for (const auto &[id, node] : p.views) {
+            if (p.view_state(id).references[7].bits == receiver &&
+                ((node.parent && p.view(node.parent).kind != ViewKind::frame_layout) ||
+                 (id == p.content && node.kind != ViewKind::frame_layout && node.kind != ViewKind::surface_view)))
+                bad("LAYOUT_UNSUPPORTED", "Mutable layout fields on attached non-FrameLayout views are unsupported");
+        }
+        const auto number = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value.bits));
+        p.update_layout_params(receiver, [&](LayoutParamsState &next) {
+            if (field.name == "weight") next.weight_bits = static_cast<std::uint32_t>(value.bits);
+            else if (field.name == "width") next.width = number;
+            else if (field.name == "height") next.height = number;
+            else if (field.name == "leftMargin") next.left = number;
+            else if (field.name == "topMargin") next.top = number;
+            else if (field.name == "rightMargin") next.right = number;
+            else if (field.name == "bottomMargin") next.bottom = number;
+            else next.gravity = number;
+        });
+        for (const auto &[id, node] : p.views) {
+            if (p.view_state(id).references[7].bits != receiver) continue;
+            (void)node;
+            p.surface_dirty = true;
+            ++p.metrics.view_revision;
+        }
+        return;
+    }
+    if (field.owner == rect_type) {
+        if (value.kind != dex::ValueKind::word) bad("FIELD_ARGUMENT", "Rect int field requires int bits");
+        auto next = std::make_unique<SurfaceRectState>(p.surface_rect(receiver));
+        const auto number = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value.bits));
+        if (field.name == "left") next->left = number;
+        else if (field.name == "top") next->top = number;
+        else if (field.name == "right") next->right = number;
+        else next->bottom = number;
+        runtime.set_host_state(receiver, std::move(next));
+        return;
+    }
+    if (field.owner == package_info_type) {
+        ManagedRoot receiver_root(runtime, receiver);
+        std::unique_ptr<ManagedRoot> value_root;
+        if (field.type == "Ljava/lang/String;") {
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("FIELD_ARGUMENT", "PackageInfo String field requires a nullable String reference");
+            value_root = std::make_unique<ManagedRoot>(runtime, value.bits);
+            if (value.bits && !runtime.assignable(value.bits, "Ljava/lang/String;"))
+                runtime.raise("Ljava/lang/IllegalArgumentException;");
+        } else if (value.kind != dex::ValueKind::word)
+            bad("FIELD_ARGUMENT", "PackageInfo int field requires int bits");
+        auto next = std::make_unique<PackageInfoState>(p.package_info_state(receiver));
+        if (field.name == "versionCode") next->version_code = static_cast<std::uint32_t>(value.bits);
+        else if (field.name == "versionCodeMajor") next->version_code_major = static_cast<std::uint32_t>(value.bits);
+        else next->references[field.name == "packageName" ? 0 : 1] = Value::reference(value.bits);
+        runtime.set_host_state(receiver, std::move(next));
+        return;
+    }
+    if (field.owner != editor_info_type)
+        bad("FIELD_WRITE_UNSUPPORTED", "Only declared mutable EditorInfo and Rect fields are supported");
     ManagedRoot receiver_root(runtime, receiver);
     auto next = std::make_unique<EditorInfoState>(p.editor_state(receiver));
     std::unique_ptr<ManagedRoot> value_root;
@@ -5685,6 +16175,7 @@ void ActivitySession::write_reflected_field(dex::ManagedRuntime &runtime, const 
         const auto number = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(value.bits));
         if (field.name == "inputType") next->input_type = number;
         else if (field.name == "imeOptions") next->ime_options = number;
+        else if (field.name == "actionId") next->action_id = number;
         else if (field.name == "initialSelStart") next->initial_start = number;
         else if (field.name == "initialSelEnd") next->initial_end = number;
         else if (field.name == "initialCapsMode") next->initial_caps = number;
@@ -5772,7 +16263,434 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
     auto &p = *impl_;
     if (&runtime != &p.runtime || !p.attached)
         bad("STATE", "Framework call belongs to another or closed runtime");
+    if (p.resource_read_active) bad("BITMAP_STATE", "Packaged image reader cannot reenter framework calls");
     ++p.metrics.api_calls;
+    if (api_static(api)) return invoke_static_api_body(runtime, api, args);
+    return invoke_api_body(runtime, api, args);
+}
+Value ActivitySession::invoke_static_api_body(dex::ManagedRuntime &runtime, const ApiSupport &api,
+                                            std::span<const Value> args) {
+    // An idle trusted SDK call is one real host event. Active and retained work
+    // continue under their existing owner; no argument work is charged before it.
+    if (!runtime.has_provider_work_context()) {
+        Value result;
+        runtime.run_host_callback([&] { result = invoke_static_api_body(runtime, api, args); });
+        return result;
+    }
+    // DEX invoke argument registers are represented by an unsigned byte. This
+    // stack storage is protocol-bounded, not a new allocation/resource allowance.
+    if (args.size() > 255) bad("API_ARGUMENTS", "Static SDK arguments exceed the existing invoke protocol");
+    struct ArgumentRoots {
+        dex::ManagedRuntime &runtime;
+        std::array<ObjectId, 255> references; // Only the retained prefix is initialized/read.
+        std::size_t count = 0;
+        explicit ArgumentRoots(dex::ManagedRuntime &owner_runtime) : runtime(owner_runtime) {}
+        ~ArgumentRoots() { while (count) runtime.release(references[--count]); }
+    } roots{runtime};
+    for (const auto value : args) {
+        runtime.charge_provider_work(1);
+        if (value.kind == dex::ValueKind::reference && value.bits) {
+            runtime.charge_provider_work(1);
+            runtime.retain(value.bits);
+            roots.references[roots.count++] = value.bits;
+        }
+    }
+    // Validate the actual value/slot shape before running any initializer. The
+    // source-fixed signature is read in place; no unrooted vector is allocated.
+    if (api.signature.empty() || api.signature.front() != '(')
+        bad("API_METADATA", "Static SDK signature is malformed");
+    std::size_t at = 1, argument = 0, slots = 0;
+    while (at < api.signature.size() && api.signature[at] != ')') {
+        if (argument == args.size()) bad("API_ARGUMENTS", "Static SDK call has too few arguments");
+        runtime.charge_provider_work(1);
+        auto type = api.signature[at++];
+        bool reference = false;
+        if (type == '[') {
+            reference = true;
+            while (at < api.signature.size() && api.signature[at] == '[') {
+                runtime.charge_provider_work(1); ++at;
+            }
+            if (at == api.signature.size()) bad("API_METADATA", "Static SDK array signature is malformed");
+            runtime.charge_provider_work(1);
+            type = api.signature[at++];
+        }
+        if (type == 'L') {
+            reference = true;
+            while (at < api.signature.size() && api.signature[at] != ';') {
+                runtime.charge_provider_work(1); ++at;
+            }
+            if (at == api.signature.size()) bad("API_METADATA", "Static SDK reference signature is malformed");
+            runtime.charge_provider_work(1); ++at;
+        } else if (type != 'Z' && type != 'B' && type != 'C' && type != 'S' && type != 'I' &&
+                   type != 'F' && type != 'J' && type != 'D')
+            bad("API_METADATA", "Static SDK primitive signature is malformed");
+        const auto value = args[argument++];
+        const bool wide = !reference && (type == 'J' || type == 'D');
+        slots += wide ? 2 : 1;
+        if (slots > 255) bad("API_ARGUMENTS", "Static SDK argument register count exceeds the existing invoke protocol");
+        if (reference ? value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits)
+                      : value.kind != (wide ? dex::ValueKind::wide : dex::ValueKind::word))
+            bad("API_ARGUMENTS", "Static SDK argument kinds disagree with the actual descriptor");
+    }
+    if (at == api.signature.size() || argument != args.size())
+        bad("API_ARGUMENTS", "Static SDK argument count disagrees with its descriptor");
+    // SDK-internal canonical dispatch has no APK method ID, but follows the
+    // same initialization lifecycle. Every incoming reference stays rooted
+    // through that allocation/reentry and the subsequent original SDK body.
+    runtime.initialize(api.owner);
+    return invoke_api_body(runtime, api, args);
+}
+Value ActivitySession::invoke_api_body(dex::ManagedRuntime &runtime, const ApiSupport &api,
+                                     std::span<const Value> args) {
+    auto &p = *impl_;
+    if (array_map_class(api.owner)) {
+        ArrayMapContext context{runtime, &p, p.array_map_class_space};
+        return invoke_array_map(context, api.owner, api.name, api.signature, args);
+    }
+    if (api.owner == accessibility_manager_type)
+        bad("ACCESSIBILITY_MANAGER_CONSTRUCTOR_UNSUPPORTED", "Manager instance construction/query requires the complete source resource/service dependency chain");
+    if (api.owner == accessibility_my_callback_type)
+        bad("ACCESSIBILITY_CALLBACK_UNSUPPORTED", "Private Manager callback requires its actual Message/state consumer");
+    if (api.owner == binder_warn_supplier_type || api.owner == binder_work_source_type ||
+        (api.owner == binder_type && api.name == "setWarnOnBlocking"))
+        return p.binder_static_function_api(*this, api, args);
+    if (api.owner == binder_work_source_interface_type)
+        bad("BINDER_WORK_SOURCE_ABSTRACT", "WorkSourceProvider declares an abstract callback contract");
+    if (api.owner == accessibility_client_stub_type) return p.accessibility_stub_api(*this, api, args);
+    if (api.owner == accessibility_client_type)
+        bad("ACCESSIBILITY_CLIENT_CALLBACK_UNSUPPORTED", "SDK client callback requires its actual enclosing-manager/message consumer");
+    if (api.owner == accessibility_client_interface_type)
+        bad("ACCESSIBILITY_CLIENT_INTERFACE_ABSTRACT", "IAccessibilityManagerClient declares abstract callback contracts");
+    if (api.owner == binder_type && (api.name == "<init>" || api.name == "attachInterface"))
+        return p.binder_api(*this, api, args);
+    if (api.owner == binder_interface_type) {
+        if (api.name == "asBinder" && !args.empty() && args[0].kind == dex::ValueKind::reference && args[0].bits &&
+            runtime.assignable(args[0].bits, accessibility_client_stub_type)) {
+            const ApiSupport actual{accessibility_client_stub_type, "asBinder", "()Landroid/os/IBinder;", ApiStatus::partial, "Actual inherited SDK Stub identity body"};
+            return p.accessibility_stub_api(*this, actual, args);
+        }
+        bad("BINDER_INTERFACE_ABSTRACT", "IInterface has no concrete asBinder base body");
+    }
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getColor") return p.resource_color_api(api, args);
+    if ((api.owner == binder_type && (api.name == "getCallingUid" || api.name == "getCallingPid")) ||
+        (api.owner == process_type && (api.name == "myUid" || api.name == "myPid")) ||
+        (api.owner == user_handle_type && (api.name == "myUserId" || api.name == "getUserId")))
+        return p.process_identity_api(*this, api, args);
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type) &&
+        (api.name == "getUserId" || api.name == "getMainLooper" || api.name == "checkCallingOrSelfPermission" ||
+         (api.name == "checkPermission" && api.signature == "(Ljava/lang/String;II)I")))
+        return p.context_identity_prerequisite(*this, api, args);
+    if (api.owner == "Landroid/content/res/Resources;" && !args.empty() && args[0].kind == dex::ValueKind::reference &&
+        args[0].bits && args[0].bits != p.resource_object) {
+        const auto *metadata = dynamic_cast<const ResourcesObjectState *>(runtime.host_state(args[0].bits));
+        if (metadata && metadata->owner == &p) {
+            if (api.name == "getConfiguration") return p.configured_resources_configuration(args);
+            const auto impl = p.resources_impl(args[0].bits);
+            if (!p.resources_impl_state(impl).table_compatible)
+                bad("CONFIGURED_RESOURCES_UNSUPPORTED", "This configuration has no implemented selected-resource query source");
+            const auto name = api.name;
+            if (name != "getAssets" && name != "getDisplayMetrics" && name != "newTheme" && name != "getValue" &&
+                name != "getBoolean" && name != "getInteger" && name != "getDimension" &&
+                name != "getDimensionPixelOffset" && name != "getDimensionPixelSize" && name != "getLayout" &&
+                name != "getDrawable" && name != "getString" && name != "getText" && name != "getIdentifier")
+                bad("CONFIGURED_RESOURCES_UNSUPPORTED", "Configured Resources operation has no implemented owner-aware body");
+        }
+    }
+    if (api.name == "createConfigurationContext" &&
+        (api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type))
+        return p.create_configuration_context(api, args);
+    if (api.name == "getResources" && (api.owner == "Landroid/content/Context;" || api.owner == context_impl_type || api.owner == theme_wrapper_type))
+        return p.context_resources(api, args);
+    if (api.owner == "Landroid/content/Context;" && api.name == "getAssets")
+        bad("CONTEXT_ABSTRACT", "Context.getAssets has no concrete base body");
+    if (api.owner == theme_wrapper_type && api.name == "getAssets") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_WRAPPER_ARGUMENT", "getAssets requires its actual wrapper receiver");
+        ManagedRoot wrapper_root(runtime, args[0].bits);
+        // ContextThemeWrapper calls its private resource helper, rather than
+        // the receiver's virtual getResources override, then actual Assets.
+        const ApiSupport resource_api{theme_wrapper_type, "getResources", "()Landroid/content/res/Resources;",
+            ApiStatus::partial, "Private wrapper resource cache"};
+        const auto resource = p.context_resources(resource_api, args);
+        ManagedRoot resource_root(runtime, resource.bits);
+        return runtime.invoke_virtual_named(resource.bits, "getAssets", "()Landroid/content/res/AssetManager;");
+    }
+    if (api.owner == context_impl_type && api.name == "getAssets") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_RESOURCES_ARGUMENT", "getAssets requires its actual Context receiver");
+        ManagedRoot context_root(runtime, args[0].bits);
+        const auto resource = runtime.invoke_virtual_named(args[0].bits, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot resource_root(runtime, resource.bits);
+        return runtime.invoke_virtual_named(resource.bits, "getAssets", "()Landroid/content/res/AssetManager;");
+    }
+    if (api.owner == log_type) {
+        if (api.name != "d" || api.signature != "(Ljava/lang/String;Ljava/lang/String;)I")
+            bad("LOG_UNSUPPORTED", "Android logging overload is outside the implemented profile");
+        if (args.size() != 2) bad("LOG_ARGUMENT", "Log.d requires its two original String arguments");
+        for (const auto value : args)
+            if (value.kind != dex::ValueKind::reference && !(value.kind == dex::ValueKind::word && !value.bits))
+                bad("LOG_ARGUMENT", "Log.d requires nullable reference arguments");
+        ManagedRoot tag_root(runtime, args[0].bits), message_root(runtime, args[1].bits);
+        const auto result = write_managed_debug_log(runtime, args);
+        ++p.metrics.android_log_attempts;
+        if (result.transport_dropped) ++p.metrics.android_log_transport_drops;
+        return Value::word(std::bit_cast<std::uint32_t>(result.return_value));
+    }
+    if ((api.name == "getDataDir" || api.name == "getFilesDir" || api.name == "getExternalFilesDir" ||
+         api.name == "getExternalFilesDirs" || api.name == "getObbDir" || api.name == "getObbDirs") &&
+        (api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type))
+        return p.context_directory(api, args);
+    if (api.name == "getPackageManager" && (api.owner == "Landroid/content/Context;" ||
+        api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type))
+        return p.context_package_manager(api, args);
+    // Wrapper lineage authenticates custody, not the old global Context
+    // shortcuts. A wrapped Activity must also execute actual stored-base
+    // delegation before these inherited methods can be admitted.
+    if (api.owner == "Landroid/content/Context;" && !args.empty() && args[0].bits) {
+        const auto *state_metadata = runtime.host_state(args[0].bits);
+        const auto *activity_metadata = dynamic_cast<const ActivityIntentState *>(state_metadata);
+        const auto base = activity_metadata && activity_metadata->owner == &p && activity_metadata->base_attached
+            ? activity_metadata->references[ActivityIntentState::base_slot].bits : ObjectId{0};
+        const bool wrapped_activity = base && runtime.object_type(base) != context_impl_type;
+        const bool wrapper = dynamic_cast<const ContextWrapperState *>(state_metadata) != nullptr;
+        if ((wrapper || wrapped_activity) &&
+            api.name != "getDrawable" && api.name != "obtainStyledAttributes" && api.name != "getString" && api.name != "getText" &&
+            api.name != "getContentCaptureOptions" && api.name != "setContentCaptureOptions" &&
+            api.name != "getAutofillClient" && api.name != "setAutofillClient" &&
+            api.name != "getAutofillOptions" && api.name != "setAutofillOptions" && api.name != "isAutofillCompatibilityEnabled")
+            bad("CONTEXT_WRAPPER_UNSUPPORTED", "This Context operation requires its actual wrapper delegation");
+    }
+    if (api.owner == theme_wrapper_type && api.name == "<init>") return p.context_theme_wrapper_constructor(api, args);
+    if (api.owner == theme_wrapper_type && (api.name == "applyOverrideConfiguration" || api.name == "getOverrideConfiguration")) {
+        if (args.empty() || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_WRAPPER_ARGUMENT", "Override configuration requires its actual wrapper receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        if (!p.generic_theme_wrapper(args[0].bits))
+            bad("ACTIVITY_OVERRIDE_UNSUPPORTED", "Activity override configuration requires its distinct actual Activity carrier");
+        return p.theme_wrapper_configuration(api, args);
+    }
+    if (api.owner == theme_wrapper_type && api.name == "getThemeResId") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_WRAPPER_ARGUMENT", "Theme resource query requires its actual wrapper receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        if (p.generic_theme_wrapper(args[0].bits)) return Value::word(p.wrapper_state(args[0].bits, true).theme_resource);
+        if (args[0].bits != p.activity) bad("THEME_WRAPPER_UNSUPPORTED", "Theme resource query has no authenticated current wrapper storage");
+        (void)p.activity_window(args[0].bits);
+        return Value::word(p.activity_theme_resource);
+    }
+    if (api.owner == "Landroid/content/ContextWrapper;" && api.name == "<init>") return p.context_wrapper_constructor(args);
+    if (api.owner == "Landroid/content/ContextWrapper;" &&
+        (api.name == "getResources" || api.name == "getAssets" || api.name == "getApplicationContext" || api.name == "getApplicationInfo" || api.name == "getPackageName"))
+        return p.delegate_wrapper(api, args);
+    if (api.name == "getPackageName" && (api.owner == "Landroid/content/Context;" || api.owner == context_impl_type)) {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("CONTEXT_ARGUMENT", "getPackageName requires its actual Context receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        if (api.owner == "Landroid/content/Context;")
+            bad("CONTEXT_ABSTRACT", "Context.getPackageName has no executable base body");
+        p.ensure_primary_context_state(args[0].bits);
+        return Value::reference(p.package_string(true)); // Issued app Contexts share their held LoadedApk package String.
+    }
+    if (api.owner == layout_inflater_type && api.name == "inflate") return p.inflater_inflate(*this, api, args);
+    if ((api.owner == layout_inflater_type || api.owner == phone_inflater_type) && api.name == "onCreateView")
+        return p.inflater_on_create_view(*this, api, args);
+    if (api.owner == layout_inflater_type && api.name == "createView") return p.inflater_create_view(*this, args);
+    if (api.owner == layout_inflater_type || api.owner == phone_inflater_type) return p.inflater_api(api, args);
+    if (api.owner == inflater_factory_merger_type) {
+        if (args.empty()) bad("INFLATER_ARGUMENT", "FactoryMerger requires its actual receiver");
+        return Value::reference(invoke_inflater_factory_merger(runtime, args[0].bits, args.subspan(1), args.size() == 5));
+    }
+    if (api.owner == layout_factory_type || api.owner == layout_factory2_type || api.owner == layout_filter_type)
+        bad("INFLATER_ABSTRACT", "Inflater callback interface has no concrete base body");
+    if (api.name == "getSystemService" && api.signature == "(Ljava/lang/String;)Ljava/lang/Object;" &&
+        (api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" ||
+         api.owner == theme_wrapper_type || api.owner == context_impl_type)) return p.context_service(api, args);
+    if (api.owner == "Landroid/app/Activity;" && api.name == "onCreateView") return p.activity_factory(api, args);
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getLayoutInflater") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("INFLATER_ARGUMENT", "Activity.getLayoutInflater requires its receiver");
+        ManagedRoot activity_root(runtime, args[0].bits);
+        const auto window = runtime.invoke_virtual_named(args[0].bits, "getWindow", "()Landroid/view/Window;");
+        ManagedRoot window_root(runtime, window.bits);
+        return runtime.invoke_virtual_named(window.bits, "getLayoutInflater", "()Landroid/view/LayoutInflater;");
+    }
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type) &&
+        (api.name == "getContentCaptureOptions" || api.name == "setContentCaptureOptions")) return p.context_capture_options(api, args);
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type) &&
+        (api.name == "getAutofillOptions" || api.name == "setAutofillOptions" || api.name == "isAutofillCompatibilityEnabled"))
+        return p.context_autofill_options(api, args);
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getAutofillClient") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("AUTOFILL_CLIENT_ARGUMENT", "Activity.getAutofillClient requires its actual receiver");
+        return p.activity_autofill_client(args[0].bits);
+    }
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" || api.owner == context_impl_type) &&
+        (api.name == "getAutofillClient" || api.name == "setAutofillClient")) return p.context_autofill_client(api, args);
+    if ((api.owner == "Landroid/app/Activity;" || api.owner == theme_wrapper_type) && api.name == "attachBaseContext") {
+        if (api.owner == theme_wrapper_type && !args.empty() && p.generic_theme_wrapper(args[0].bits)) return p.attach_wrapper_base(args);
+        return p.attach_activity_base(api, args);
+    }
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getApplication") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("ACTIVITY_ARGUMENT", "getApplication requires its actual Activity receiver");
+        (void)p.activity_window(args[0].bits);
+        const auto *metadata = dynamic_cast<const ActivityIntentState *>(runtime.host_state(args[0].bits));
+        if (!metadata) bad("ACTIVITY_STATE", "Activity has no actual Application field storage");
+        return metadata->references[ActivityIntentState::application_slot];
+    }
+    if ((api.owner == "Landroid/view/View;" || api.owner == "Landroid/view/ViewGroup;") &&
+        (api.name == "resolveLayoutParams" || api.name == "getAnimation" || api.name == "hasTransientState" ||
+         api.name == "isFocusedByDefault" || api.name == "getLayoutDirection" || api.name == "getRawLayoutDirection" ||
+         api.name == "isLayoutDirectionInherited" || api.name == "resetRtlProperties" ||
+         api.name == "resetResolvedLayoutDirection" || api.name == "resetResolvedTextDirection" ||
+         api.name == "resetResolvedTextAlignment" || api.name == "resetResolvedPadding" || api.name == "resetResolvedDrawables"))
+        return p.topology_view_query(api, args);
+    if (api.owner == "Landroid/view/ViewGroup;" &&
+        (api.name == "indexOfChild" || api.name == "removeViewInLayout" ||
+         (api.name == "addView" &&
+          (api.signature == "(Landroid/view/View;I)V" || api.signature == "(Landroid/view/View;ILandroid/view/ViewGroup$LayoutParams;)V" ||
+           (!args.empty() && p.views.contains(args[0].bits) && p.view_state(args[0].bits).group_constructor)))))
+        return p.topology_group_api(api, args);
+    if ((api.owner == "Landroid/view/View;" || api.owner == "Landroid/view/ViewGroup;") &&
+        api.name == "notifySubtreeAccessibilityStateChangedIfNeeded") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_ARGUMENT", "Subtree notification requires its actual View receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)p.view(args[0].bits);
+        // Both actual SDK base bodies obtain AccessibilityManager before the
+        // AttachInfo check. Do not skip initialization or recurse into an override.
+        bad("VIEW_ACCESSIBILITY_MANAGER_UNSUPPORTED", "Subtree notification requires actual AccessibilityManager initialization");
+    }
+    if (api.owner == view_stub_type) return p.stub_api(api, args);
+    if (api.owner == stub_listener_type)
+        bad("VIEW_STUB_CALLBACK_ABSTRACT", "ViewStub.OnInflateListener has no concrete interface body");
+    if ((api.owner == "Landroid/view/ViewGroup;" || api.owner == frame_layout_type || api.owner == "Landroid/widget/LinearLayout;") &&
+        (api.name == "checkLayoutParams" || api.name == "generateDefaultLayoutParams" || api.name == "onSetLayoutParams" ||
+         (api.name == "generateLayoutParams" && api.signature.starts_with("(Landroid/view/ViewGroup$LayoutParams;)"))))
+        return p.layout_parameter_policy(api, args);
+    if (api.name == "generateLayoutParams" && api.signature.starts_with("(Landroid/util/AttributeSet;)") &&
+        (api.owner == "Landroid/view/ViewGroup;" || api.owner == frame_layout_type || api.owner == "Landroid/widget/LinearLayout;"))
+        return p.generate_xml_layout_params(api, args);
+    if (api.owner == "Landroid/view/View;" && api.name == "onFinishInflate" && api.signature == "()V") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("VIEW_ARGUMENT", "onFinishInflate requires its actual View receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        (void)p.view(args[0].bits);
+        return Value::nothing();
+    }
+    if (api.name == "<init>" && (api.owner == "Landroid/view/ViewGroup;" ||
+        api.owner == frame_layout_type || api.owner == "Landroid/widget/LinearLayout;"))
+        return p.widget_constructor(api, args);
+    if (api.owner == view_configuration_type) return p.view_configuration_api(api, args);
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" ||
+         api.owner == context_impl_type) && api.name == "getDisplayId") return p.context_display_id(api, args);
+    if (api.owner == configuration_type && api.name == "isLayoutSizeAtLeast") return p.configuration_size(args);
+    if (api.owner == configuration_type) return p.configuration_api(api, args);
+    if (api.owner == window_configuration_type && api.name == "getMaxBounds") return p.maximum_window_bounds(args);
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getDisplayMetrics") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("DISPLAY_METRICS_ARGUMENT", "Resources.getDisplayMetrics requires its actual receiver");
+        if (!args[0].bits) runtime.raise("Ljava/lang/NullPointerException;");
+        ManagedRoot resources_root(runtime, args[0].bits);
+        return Value::reference(p.resource_metrics(args[0].bits));
+    }
+    if (api.owner == application_info_type && api.name == "hasRtlSupport") return p.application_info_rtl(args);
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getLayout") {
+        try { return p.resource_get_layout(args); }
+        catch (const DeferredResourceFailure &failure) { p.resource_failure(failure.cause); }
+    }
+    if (api.owner == xml_parser_type || api.owner == xml_pull_type || api.owner == attribute_set_type ||
+        api.owner == xml_resource_parser_type) return p.xml_parser_api(api, args);
+    if (api.owner == xml_utility_type && api.name == "asAttributeSet") {
+        if (args.size() != 1 || (args[0].kind != dex::ValueKind::reference &&
+            !(args[0].kind == dex::ValueKind::word && !args[0].bits)))
+            bad("XML_PARSER_ARGUMENT", "Xml.asAttributeSet requires a nullable parser reference");
+        if (!args[0].bits)
+            bad("XML_ATTRIBUTE_SET_UNSUPPORTED", "Null pull parsers require the actual XmlPullAttributes adapter");
+        ManagedRoot parser_root(runtime, args[0].bits);
+        if (!runtime.assignable(args[0].bits, xml_pull_type))
+            bad("XML_PARSER_ARGUMENT", "Xml.asAttributeSet argument is not an XmlPullParser");
+        if (runtime.assignable(args[0].bits, attribute_set_type)) return Value::reference(args[0].bits);
+        bad("XML_ATTRIBUTE_SET_UNSUPPORTED", "External pull parsers require an implemented XmlPullAttributes adapter");
+    }
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getTitle") return p.activity_title(args);
+    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" ||
+         api.owner == context_impl_type) && api.name == "getClassLoader") return p.context_class_loader(api, args);
+    if (api.signature == "()V" &&
+        (api.name == "onContentChanged" || api.name == "onAttachedToWindow" || api.name == "onDetachedFromWindow")) {
+        if (api.owner == "Landroid/app/Activity;") return p.activity_window_base_hook(args);
+        if (api.owner == window_callback_type)
+            bad("WINDOW_CALLBACK_ABSTRACT", "Window.Callback method has no concrete interface body");
+    }
+    if (api.owner == typed_value_type) {
+        if (api.name == "<init>" && api.signature == "()V") return p.typed_value_constructor(args);
+        if (api.name == "getFloat" && api.signature == "()F") {
+            if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+                bad("TYPED_VALUE_ARGUMENT", "TypedValue.getFloat requires its actual receiver");
+            ManagedRoot value_root(runtime, args[0].bits);
+            return Value::word(p.typed_value_state(args[0].bits).numbers[1]);
+        }
+        bad("TYPED_VALUE_UNSUPPORTED", "TypedValue operation has no implemented value conversion");
+    }
+    if (api.owner == window_type || api.owner == session_window_type) return p.window_api(api, args);
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getWindow") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("WINDOW_ARGUMENT", "Activity.getWindow requires its actual receiver");
+        return p.activity_window(args[0].bits);
+    }
+    if (api.owner == "Landroid/app/Activity;" && api.name == "getOnBackInvokedDispatcher")
+        return p.activity_back_dispatcher(args);
+    if (api.owner == "Landroid/app/Activity;" && api.name == "setTheme") return p.activity_set_theme(api, args);
+    if (api.owner == theme_type) return p.theme_api(api, args);
+    if ((api.name == "getTheme" || api.name == "setTheme" || api.name == "onApplyThemeResource") &&
+        (api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/ContextWrapper;" ||
+         api.owner == context_impl_type || api.owner == theme_wrapper_type)) return p.context_theme_api(api, args);
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "newTheme") {
+        if (args.size() != 1 || args[0].kind != dex::ValueKind::reference)
+            bad("THEME_ARGUMENT", "Resources.newTheme requires its actual receiver");
+        return Value::reference(p.new_theme(args[0].bits));
+    }
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getValue") return p.resource_get_value(args);
+    if (api.owner == "Landroid/content/res/Resources;" &&
+        (api.name == "getBoolean" || api.name == "getInteger" || api.name == "getDimension" ||
+         api.name == "getDimensionPixelOffset" || api.name == "getDimensionPixelSize")) return p.resource_numeric_api(api, args);
+    if (api.owner == "Landroid/content/Context;" && api.name == "getDrawable") return p.context_get_drawable(args);
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getDrawable") {
+        if (api.signature == "(I)Landroid/graphics/drawable/Drawable;") {
+            if (args.size() != 2 || args[0].kind != dex::ValueKind::reference || args[1].kind != dex::ValueKind::word)
+                bad("DRAWABLE_ARGUMENT", "Resources.getDrawable requires its receiver and integer ID");
+            ManagedRoot root(runtime, args[0].bits);
+            const std::array parameters{args[1], Value::reference(0)};
+            return runtime.invoke_virtual_named(args[0].bits, "getDrawable",
+                "(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;", parameters);
+        }
+        try { return p.resource_get_drawable(args); }
+        catch (const DeferredResourceFailure &failure) { p.resource_failure(failure.cause); }
+    }
+    if (api.owner == typed_array_type) return p.typed_array_api(api, args);
+    if (api.owner == "Landroid/content/Context;" && api.name == "obtainStyledAttributes")
+        return p.obtain_styled_attributes(api, args);
+    if (api.owner == bitmap_factory_type || api.owner == bitmap_type) return p.bitmap_api(api, args);
+    if ((api.owner == "Landroid/content/pm/PackageManager;" || api.owner == session_package_manager_type ||
+         api.owner == application_package_manager_type) && api.name == "getActivityInfo")
+        return p.activity_info(args);
+    if ((api.owner == "Landroid/content/pm/PackageManager;" || api.owner == session_package_manager_type ||
+         api.owner == application_package_manager_type) && api.name == "getServiceInfo")
+        return p.service_info(args);
+    if (api.owner == package_info_type) return p.package_info_api(api, args);
+    if (api.owner == porter_duff_mode_type) return p.porter_duff_api(api, args);
+    if (api.owner == motion_event_type || (api.owner == "Landroid/view/InputEvent;" && !args.empty() &&
+        args[0].bits && runtime.assignable(args[0].bits, motion_event_type))) return p.motion_api(api, args);
+    if (api.owner == key_event_type || (api.owner == "Landroid/view/InputEvent;" && !args.empty() &&
+        args[0].bits && runtime.assignable(args[0].bits, key_event_type))) return p.key_api(api, args);
+    if (api.owner == layout_params_type || api.owner == margin_params_type || api.owner == frame_params_type ||
+        api.owner == linear_params_type)
+        return p.layout_params_api(api, args);
+    if (api.owner == surface_holder_type || api.owner == surface_holder_impl_type || api.owner == surface_type ||
+        api.owner == surface_callback_type || api.owner == rect_type)
+        return p.surface_api(api, args);
+    if (api.owner == broadcast_receiver_type && api.name == "<init>" && api.signature == "()V")
+        return Value::nothing(); // Genuine empty SDK base constructor; broadcast delivery remains unsupported.
     if (api.owner == accessibility_provider_type && api.name == "<init>")
         return Value::nothing(); // Abstract SDK base constructor only; provider methods remain unsupported.
     if (api.owner == accessibility_node_type || api.owner == accessibility_collection_type || api.owner == accessibility_item_type ||
@@ -5815,8 +16733,7 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             bad("CONTENT_ARGUMENT","getContentResolver requires its Context receiver");
         if(!args[0].bits)runtime.raise("Ljava/lang/NullPointerException;");
         p.context(args[0].bits);
-        if(api.owner=="Landroid/content/ContextWrapper;")
-            return runtime.invoke_virtual_named(p.base_context,"getContentResolver","()Landroid/content/ContentResolver;");
+        if(api.owner=="Landroid/content/ContextWrapper;") return p.delegate_wrapper(api, args);
         return Value::reference(p.resolver_service());
     }
     if (api.owner == "Landroid/app/Activity;" && (api.name == "getIntent" || api.name == "setIntent")) {
@@ -5832,7 +16749,11 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         if (!set) return current->references[0];
         if (args[1].bits && !runtime.assignable(args[1].bits, intent_type))
             bad("ACTIVITY_INTENT", "Activity Intent value is not an Intent");
-        runtime.set_host_state(receiver, std::make_unique<ActivityIntentState>(args[1].bits));
+        const auto *latest = dynamic_cast<const ActivityIntentState *>(runtime.host_state(receiver));
+        if (!latest) bad("ACTIVITY_INTENT", "Activity instance storage changed during Intent validation");
+        auto next = std::make_unique<ActivityIntentState>(*latest);
+        next->references[0] = Value::reference(args[1].bits);
+        runtime.set_host_state(receiver, std::move(next));
         return Value::nothing();
     }
     if (api.owner == buffer_type || api.owner == editable_type || api.owner == "Landroid/text/Selection;" ||
@@ -5874,11 +16795,7 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         p.dispatch_components(p.application,args[1].bits);
         return Value::nothing();
     }
-    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getConfiguration") {
-        if (args.size() != 1 || args[0].bits != p.resource_object)
-            bad("CONFIGURATION_RECEIVER", "getConfiguration requires this session's Resources");
-        return Value::reference(p.configuration_object);
-    }
+    if (api.owner == "Landroid/content/res/Resources;" && api.name == "getConfiguration") return p.configured_resources_configuration(args);
     if (api.owner == "Landroid/app/Activity;" &&
         (api.name == "getRequestedOrientation" || api.name == "setRequestedOrientation")) {
         const bool set = api.name == "setRequestedOrientation";
@@ -5898,6 +16815,7 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         if (requested != p.orientation_request) {
             p.cancel_input();
             p.orientation_request = requested;
+            p.surface_dirty = true;
             ++p.metrics.view_revision;
         }
         return Value::nothing();
@@ -6063,13 +16981,12 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
     if (api.owner == "Landroid/content/ContextWrapper;") {
         const auto receiver = args[0].bits;
         if (api.name == "getBaseContext") {
-            if (receiver == p.application && p.application)
-                return Value::reference(p.application_attached ? p.base_context : 0);
-            if (receiver == p.activity && p.activity)
-                return Value::reference(p.activity_attached ? p.base_context : 0);
-            bad("CONTEXT", "ContextWrapper is not bound to this session");
+            if (!receiver) runtime.raise("Ljava/lang/NullPointerException;");
+            return p.wrapper_base_context(receiver);
         }
         if (api.name == "attachBaseContext") {
+            if (dynamic_cast<const ContextWrapperState *>(runtime.host_state(receiver))) return p.attach_wrapper_base(args);
+            if (receiver == p.activity && p.activity) return p.attach_activity_base(api, args);
             if (receiver != p.application || !p.application)
                 bad("CONTEXT", "Application is not bound to this session");
             if (p.application_attached)
@@ -6144,7 +17061,7 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
                     bad("FILE_PATH_UNSUPPORTED", "Private-file metadata exceeds its 1024-unit path bound");
                 parent = supplied;
             }
-            if (parent == data_root && child == u"files" && api.signature == "(Ljava/lang/String;Ljava/lang/String;)V") {
+            if (parent == data_root && child == u"files") {
                 runtime.set_host_state(receiver, std::make_unique<PrivateFileState>(
                     root, "", p.base_context, PrivateFileKind::root_alias));
                 return Value::nothing();
@@ -6187,8 +17104,8 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         if (api.name == "isAbsolute")
             return Value::word(!state->path.empty() && state->path.front() == u'/');
         if(api.name=="mkdir") {
-            if(state->kind!=PrivateFileKind::canonical_root && state->kind!=PrivateFileKind::root_alias)
-                bad("FILE_PATH_UNSUPPORTED","Directory creation outside the verified existing private root is not implemented");
+            if(state->kind!=PrivateFileKind::canonical_root && state->kind!=PrivateFileKind::root_alias && state->kind!=PrivateFileKind::data_root)
+                bad("FILE_PATH_UNSUPPORTED","Directory creation outside verified existing app-data roots is not implemented");
             p.require_private_root();
             return Value::word(0); // The verified directory already exists; nothing was created.
         }
@@ -6238,10 +17155,6 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         return invoke_bundle(runtime, api.owner, api.name, api.signature, args);
     if (api.owner == looper_type && (api.name == "getMainLooper" || api.name == "myLooper"))
         return Value::reference(api.name == "myLooper" && !runtime.is_main_thread() ? 0 : p.main_loop());
-    if (api.owner == "Landroid/content/Context;" && api.name == "getMainLooper") {
-        p.context(args[0].bits);
-        return Value::reference(p.main_loop());
-    }
     if (api.owner == looper_type && (api.name == "isCurrentThread" || api.name == "getThread")) {
         if (!p.main_looper || args[0].bits != p.main_looper)
             bad("LOOPER_STATE", "Looper is not attached to this runtime's main event loop");
@@ -6249,27 +17162,9 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             return Value::reference(runtime.main_thread());
         return Value::word(runtime.is_main_thread() ? 1 : 0);
     }
-    if (api.owner == handler_type) {
-        const auto receiver = args[0].bits;
-        if (api.name == "<init>") {
-            if (runtime.host_state(receiver))
-                bad("HANDLER_STATE", "Handler constructor invoked twice");
-            if (api.signature == "()V" && !runtime.is_main_thread())
-                runtime.raise("Ljava/lang/RuntimeException;");
-            const auto looper = api.signature == "()V" ? p.main_loop() : args[1].bits;
-            if (!looper)
-                runtime.raise("Ljava/lang/NullPointerException;");
-            if (looper != p.main_looper)
-                bad("HANDLER_LOOPER", "Handler requires this runtime's attached main Looper");
-            runtime.set_host_state(receiver, std::make_unique<HandlerState>(looper));
-            return Value::nothing();
-        }
-        const auto *state = dynamic_cast<const HandlerState *>(runtime.host_state(receiver));
-        if (!state || !p.main_looper || state->looper() != p.main_looper)
-            bad("HANDLER_STATE", "Handler is not initialized for this runtime's main event loop");
-        if (api.name == "getLooper")
-            return Value::reference(state->looper());
-    }
+    if (api.owner == handler_type) return p.handler_api(*this, api, args);
+    if (api.owner == handler_callback_type)
+        bad("HANDLER_CALLBACK_ABSTRACT", "Handler.Callback has no concrete interface body");
     const bool process_start=api.owner=="Landroid/os/Process;" && api.name=="getStartUptimeMillis";
     if (api.owner == "Landroid/os/SystemClock;" || process_start) {
         if (!args.empty())
@@ -6296,23 +17191,41 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
     }
     const auto receiver = args[0].bits;
     const auto name = api.name;
+    if (api.owner == native_activity_type) {
+        if (receiver != p.activity) bad("ACTIVITY", "NativeActivity is not attached to this session");
+        if (name == "<init>") { p.native_constructor(receiver); return Value::nothing(); }
+        const bool has_argument = name == "onCreate" || name == "onSaveInstanceState" ||
+            name == "onConfigurationChanged" || name == "onWindowFocusChanged";
+        p.native_lifecycle(name, has_argument ? std::optional<Value>{args[1]} : std::optional<Value>{});
+        return Value::nothing();
+    }
     if (api.owner == "Landroid/app/Activity;") {
         if (receiver != p.activity)
             bad("ACTIVITY", "Activity is not attached to this application");
         if (name == "<init>")
             return Value::nothing();
+        if (name == "getActionBar") return p.action_bar();
         if (name == "isChangingConfigurations") return Value::word(p.changing_configuration != 0);
+        if (name == "isFinishing") return Value::word(p.finishing);
         if (name == "getChangingConfigurations") return Value::word(p.changing_configuration);
         if (name == "dispatchTouchEvent" || name == "dispatchKeyEvent") {
+            if (name == "dispatchTouchEvent") {
+                (void)p.touch_event(args[1].bits);
+                return Value::word(p.default_pointer(args[1].bits));
+            }
+            (void)p.key_event(args[1].bits); // Captured dispatch authority is distinct from retained values.
             const auto found = p.input_events.find(args[1].bits);
             if (found == p.input_events.end())
                 bad("INPUT", "Input event has expired or belongs to another session");
-            if (name == "dispatchTouchEvent" && found->second.pointer)
-                return Value::word(p.default_pointer(*found->second.pointer));
             if (name == "dispatchKeyEvent" && found->second.key)
                 return Value::word(p.default_key(args[1].bits));
             bad("INPUT", "Input event type does not match dispatch method");
         }
+        if (name == "onTouchEvent") {
+            (void)p.touch_event(args[1].bits);
+            return Value::word(0); // Window outside-touch close policy is not implemented.
+        }
+        if (name == "onUserInteraction") return Value::nothing(); // Actual SDK base hook.
         if (name == "onKeyDown" || name == "onKeyUp") {
             (void)p.key_event(args[2].bits);
             if (args[1].bits == 4)
@@ -6330,12 +17243,27 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         if (name == "getApplication")
             return Value::reference(p.activity_attached ? p.application : 0);
         if (name == "setContentView") {
-            auto &view = p.view(args[1].bits);
-            if (view.parent)
+            if (p.native_content_view && p.content == p.native_content_view && args[1].bits != p.native_content_view)
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"NativeActivity supports its exact full-window native content only");
+            if (p.assigning_content) bad("CONTENT_REENTRANT", "Cannot replace content recursively during its layout setter");
+            p.assigning_content = true;
+            struct Reset { bool &active; ~Reset() { active = false; } } reset{p.assigning_content};
+            const auto object = args[1].bits;
+            ManagedRoot root(runtime, object);
+            if (p.view(object).parent)
                 runtime.raise("Ljava/lang/IllegalStateException;", u"Content view already has a parent");
+            p.require_renderable_subtree(object);
+            p.preflight_content_commit();
             p.cancel_input();
             p.focus(0);
-            p.content = view.object;
+            const auto params = p.new_frame_params(); // PhoneWindow's one-argument attachment supplies fill params.
+            p.dispatch_set_layout_params(object, params);
+            if (p.view(object).parent)
+                bad("CONTENT_REENTRANT", "Layout setter attached the requested content to another parent");
+            p.require_renderable_subtree(object);
+            p.commit_content_root(object);
+            p.surface_recreate = p.active_surface.has_value();
+            p.surface_dirty = true;
             p.unscrolled_bounds.clear();
             p.apply_scroll_layout();
             ++p.metrics.view_revision;
@@ -6357,51 +17285,10 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             return Value::reference(0);
         }
     }
-    if (api.owner == "Landroid/view/InputEvent;" || api.owner == "Landroid/view/MotionEvent;" ||
-        api.owner == "Landroid/view/KeyEvent;") {
-        const auto found = p.input_events.find(receiver);
-        if (found == p.input_events.end())
-            bad("INPUT", "Input event has expired or belongs to another session");
-        const auto &event = found->second;
-        if (name == "dispatch" && event.key)
-            return Value::word(p.key_callback(args[1].bits, receiver));
-        if (name == "getSource")
-            return Value::word(event.pointer ? event.pointer->source : 0x101u);
-        if (event.pointer) {
-            const auto &motion = *event.pointer;
-            if (name == "getX")
-                return Value::word(std::bit_cast<std::uint32_t>(motion.x));
-            if (name == "getY")
-                return Value::word(std::bit_cast<std::uint32_t>(motion.y));
-            if (name == "getAction" || name == "getActionMasked")
-                return Value::word(static_cast<std::uint32_t>(motion.action));
-            if (name == "getPointerCount")
-                return Value::word(1);
-            if (name == "getPointerId") {
-                if (args[1].bits)
-                    runtime.raise("Ljava/lang/IllegalArgumentException;",
-                                  u"Only pointer index zero is present");
-                return Value::word(0);
-            }
-        } else {
-            if (name == "getAction")
-                return Value::word(event.key->up ? 1u : 0u);
-            if (name == "getKeyCode")
-                return Value::word(event.key->code);
-            if (name == "getMetaState")
-                return Value::word(event.key->meta);
-            if (name == "getRepeatCount")
-                return Value::word(event.key->repeat);
-            if (name == "getUnicodeChar") {
-                const auto input = *event.key;
-                if (input.character_status == KeyCharacterStatus::unsupported ||
-                    (args.size() == 2 && static_cast<std::uint32_t>(args[1].bits) != input.meta))
-                    runtime.raise("Ljava/lang/UnsupportedOperationException;",
-                                  u"Unicode mapping supports only the captured ordinary BMP key and modifier state");
-                return Value::word(input.unicode);
-            }
-        }
-        bad("INPUT", "Input getter does not match the event type");
+    if (api.owner == "Landroid/view/InputEvent;") {
+        if (name == "recycle")
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Only owned MotionEvent copies support recycling");
+        bad("INPUT", "InputEvent has no supported initialized value family");
     }
     if (api.owner == "Landroid/content/Context;") {
         p.context(receiver);
@@ -6431,26 +17318,26 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             return Value::reference(p.resource_object);
         if (name == "getPackageManager")
             return Value::reference(p.package_manager);
-        if (name == "checkSelfPermission" || name == "checkCallingOrSelfPermission") {
+        if (name == "checkSelfPermission") {
             if (runtime.string(args[1].bits) == u"android.permission.POST_NOTIFICATIONS" &&
                 p.notification_permission())
                 return Value::word(0);
             ++p.metrics.denied_permissions;
             return Value::word(0xffffffffu);
         }
-        if (name == "getSystemService") {
-            const auto service = std::u16string(runtime.string(args[1].bits));
-            if (service == u"clipboard") return Value::reference(p.clipboard_service());
-            if (service == u"notification") return Value::reference(p.notification_service());
-            if (service == u"input_method") return Value::reference(p.input_method_service());
-            ++p.metrics.unsupported_services;
-            runtime.raise("Ljava/lang/UnsupportedOperationException;",
-                          u"Android system service is unsupported: " + service);
-        }
     }
-    if (api.owner == "Landroid/content/pm/PackageManager;") {
-        if (receiver != p.package_manager)
-            bad("PACKAGE_MANAGER", "PackageManager is not attached");
+    if (api.owner == "Landroid/content/pm/PackageManager;" || api.owner == session_package_manager_type ||
+        api.owner == application_package_manager_type) {
+        p.authenticate_package_manager(receiver);
+        if (name == "getPackageInfo") {
+            if (args.size() != 3 || args[2].kind != dex::ValueKind::word)
+                bad("PACKAGE_INFO_ARGUMENT", "Package query requires a package String and int flags");
+            if (args[2].bits) bad("PACKAGE_INFO_UNSUPPORTED", "PackageInfo supports flags zero only");
+            if (!args[1].bits) runtime.raise("Ljava/lang/NullPointerException;");
+            if (runtime.string(args[1].bits) != unicode(p.package))
+                runtime.raise(package_missing_type, u"Package is outside this session's visible package namespace");
+            return Value::reference(p.package_info_snapshot());
+        }
         (void)runtime.string(args[1].bits);
         if (name == "hasSystemFeature")
             return Value::word(0);
@@ -6463,10 +17350,16 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             return Value::word(0xffffffffu);
         }
     }
-    if (api.owner == "Landroid/content/res/Resources;" && receiver != p.resource_object)
-        bad("RESOURCES", "Resources object is not attached");
-    if ((api.owner == "Landroid/content/Context;" || api.owner == "Landroid/content/res/Resources;") &&
-        (name == "getString" || name == "getText"))
+    if (api.owner == "Landroid/content/res/Resources;") (void)p.compatible_resource_impl(receiver);
+    if (api.owner == "Landroid/content/res/Resources;" && name == "getAssets")
+        return Value::reference(p.resource_assets(receiver));
+    if (api.owner == "Landroid/content/Context;" && (name == "getString" || name == "getText")) {
+        ManagedRoot context_root(runtime, receiver);
+        const auto resource = runtime.invoke_virtual_named(receiver, "getResources", "()Landroid/content/res/Resources;");
+        ManagedRoot resource_root(runtime, resource.bits);
+        return runtime.invoke_virtual_named(resource.bits, name, api.signature, args.subspan(1));
+    }
+    if (api.owner == "Landroid/content/res/Resources;" && (name == "getString" || name == "getText"))
         return Value::reference(runtime.new_string(
             p.resource_text(static_cast<std::uint32_t>(args[1].bits), name == "getString")));
     if (api.owner == "Landroid/content/res/Resources;" && name == "getIdentifier") {
@@ -6476,33 +17369,56 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         return Value::word(p.resources.identifier(text(1), text(2), text(3)));
     }
     if (name == "<init>" &&
-        (api.owner == "Landroid/widget/LinearLayout;" || api.owner == "Landroid/widget/TextView;" ||
+        (api.owner == "Landroid/view/View;" || api.owner == "Landroid/widget/TextView;" ||
          api.owner == "Landroid/widget/Button;" || api.owner == compound_button_type || api.owner == checkbox_type ||
-         api.owner == scroll_view_type || api.owner == edit_text_type)) {
-        p.context(args[1].bits);
+         api.owner == scroll_view_type || api.owner == edit_text_type || api.owner == surface_view_type)) {
+        if ((api.owner != "Landroid/view/View;" && api.owner != surface_view_type) || args[1].bits) p.context(args[1].bits);
+        if (api.owner == surface_view_type && args.size() > 2 && args[2].bits)
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"SurfaceView XML attributes are unsupported");
         if (p.views.contains(receiver))
             bad("VIEW", "View constructor called twice");
         if (p.views.size() >= 256)
             bad("VIEW_LIMIT", "Application view quota exceeded");
         ViewState view;
         view.object = receiver;
-        view.kind = runtime.assignable(receiver, edit_text_type) ? ViewKind::edit_text
+        view.kind = runtime.assignable(receiver, surface_view_type) ? ViewKind::surface_view
+                    : runtime.assignable(receiver, edit_text_type) ? ViewKind::edit_text
                     : runtime.assignable(receiver, scroll_view_type) ? ViewKind::scroll_view
                     : runtime.assignable(receiver, compound_button_type) ? ViewKind::checkbox
                     : runtime.assignable(receiver, "Landroid/widget/LinearLayout;") ? ViewKind::linear_layout
                     : runtime.assignable(receiver, "Landroid/widget/Button;")     ? ViewKind::button
-                                                                                  : ViewKind::text;
+                    : runtime.assignable(receiver, frame_layout_type) ? ViewKind::frame_layout
+                    : runtime.assignable(receiver, "Landroid/widget/TextView;") ? ViewKind::text : ViewKind::view;
         view.clickable = view.kind == ViewKind::checkbox;
         view.text_buffer_revision = view.kind == ViewKind::edit_text ? 1 : 0;
         auto metadata = std::make_unique<ViewObjectState>();
+        // Plain SDK View first exposes Java's zero mViewFlags to its original
+        // Context callback, then installs FOCUSABLE_AUTO after that returns.
+        if (api.owner == "Landroid/view/View;" || api.owner == surface_view_type) metadata->focusable_mode = 0;
+        metadata->surface_constructor = api.owner == surface_view_type;
+        metadata->view_context_constructor = api.owner == "Landroid/view/View;" || api.owner == surface_view_type;
+        metadata->references[9] = args[1];
         metadata->mode = view.kind == ViewKind::edit_text ? 2 : 0;
         if (runtime.assignable(receiver, "Landroid/widget/TextView;"))
             metadata->references[2] = Value::reference(view.kind == ViewKind::edit_text
                 ? p.new_editable({}, receiver, true) : runtime.new_string({}));
+
         runtime.set_host_state(receiver, std::move(metadata));
         p.own(receiver);
         p.views.emplace(receiver, std::move(view));
         ++p.metrics.view_revision;
+        if (api.owner == "Landroid/view/View;" || api.owner == surface_view_type)
+            p.initialize_view_context(receiver, args[1].bits);
+        if (api.owner == surface_view_type) {
+            const std::array base_args{Value::reference(receiver), args[1],
+                args.size() >= 3 ? args[2] : Value::reference(0),
+                args.size() >= 4 ? args[3] : Value::word(0), args.size() == 5 ? args[4] : Value::word(0)};
+            p.apply_view_xml_constructor(receiver, base_args);
+            const auto holder = p.initialize_surface_view(receiver);
+            ManagedRoot holder_root(runtime, holder);
+            p.update_view_constructor_state(receiver, [holder](ViewObjectState &next) { next.references[6] = Value::reference(holder); });
+            p.dispatch_will_not_draw(receiver, true);
+        }
         if (p.view(receiver).kind == ViewKind::edit_text) {
             Impl::EditCall call(p);
             const auto current = p.view_state(receiver).references[2].bits;
@@ -6512,12 +17428,177 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
             p.selection_changed(current);
             p.text_phase(receiver, current, 1, 0, 0, 0);
         }
+        if (api.owner == "Landroid/view/View;" && args.size() >= 3)
+            p.apply_view_xml_constructor(receiver, args);
         return Value::nothing();
     }
     if (api.owner == "Landroid/view/View$OnClickListener;" || api.owner == checked_listener_type || api.owner == watcher_type ||
-        api.owner == key_listener_type || api.owner == key_callback_type || api.owner == drag_listener_type)
+        api.owner == key_listener_type || api.owner == key_callback_type || api.owner == touch_listener_type || api.owner == drag_listener_type)
         bad("LISTENER", "Abstract listener or key callback method cannot execute directly");
+    if (api.owner == surface_view_type && name == "setVisibility" && api.signature == "(I)V") {
+        if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+            bad("SURFACE_ARGUMENT", "SurfaceView visibility requires its actual receiver and integer flags");
+        (void)p.view(receiver);
+        runtime.raise("Ljava/lang/UnsupportedOperationException;",
+            u"SurfaceView visibility bookkeeping and Surface update semantics are not implemented");
+    }
+    if (api.owner == "Landroid/view/View;" && name == "getRootView" && api.signature == "()Landroid/view/View;") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "getRootView requires its actual receiver");
+        return p.base_view_root(receiver);
+    }
+    if (api.owner == "Landroid/view/View;" && name == "getViewRootImpl" && api.signature == "()Landroid/view/ViewRootImpl;") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "getViewRootImpl requires its actual receiver");
+        return p.base_view_root_impl(receiver);
+    }
+    if ((api.owner == "Landroid/view/View;" || api.owner == "Landroid/view/ViewGroup;") && name == "hasFocus" && api.signature == "()Z") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "hasFocus requires its actual receiver");
+        return Value::word(p.base_view_has_focus(receiver, api.owner == "Landroid/view/ViewGroup;"));
+    }
+    if (api.owner == "Landroid/view/View;" && name == "clearAccessibilityFocus" && api.signature == "()V") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "clearAccessibilityFocus requires its actual receiver");
+        p.clear_unattached_accessibility_focus(receiver);
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/View;" && name == "setVisibility" && api.signature == "(I)V") {
+        if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+            bad("VIEW_ARGUMENT", "setVisibility requires its actual receiver and integer flags");
+        p.set_view_visibility_flags(receiver, static_cast<std::uint32_t>(args[1].bits));
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/View;" && name == "isOpaque" && api.signature == "()Z") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "isOpaque requires its actual receiver");
+        return Value::word(p.base_view_is_opaque(receiver));
+    }
+    if (api.owner == "Landroid/view/View;" && name == "invalidate" && api.signature == "(Z)V") {
+        if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+            bad("VIEW_ARGUMENT", "invalidate requires its actual receiver and cache Boolean");
+        p.invalidate_view(receiver, args[1].bits != 0);
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/View;" && name == "setWillNotDraw" && api.signature == "(Z)V") {
+        if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+            bad("VIEW_ARGUMENT", "setWillNotDraw requires its actual receiver and Boolean");
+        (void)p.view(receiver);
+        p.set_will_not_draw(receiver, args[1].bits != 0);
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/View;" && name == "requestLayout" && api.signature == "()V") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "requestLayout requires its actual receiver");
+        p.request_view_layout(receiver);
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/View;" && name == "isLayoutRequested" && api.signature == "()Z") {
+        if (args.size() != 1) bad("VIEW_ARGUMENT", "isLayoutRequested requires its actual receiver");
+        (void)p.view(receiver);
+        if (!p.view_state(receiver).view_context_constructor)
+            bad("VIEW_LAYOUT_REQUEST_UNSUPPORTED", "Layout request query requires actual implemented View state");
+        return Value::word(p.view_state(receiver).layout_requested);
+    }
+    if ((api.owner == "Landroid/view/ViewGroup;" || api.owner == frame_layout_type ||
+         api.owner == "Landroid/widget/LinearLayout;") && name.starts_with("set") &&
+        (name == "setOrientation" || name == "setGravity" || name == "setBaselineAligned" ||
+         name == "setDividerDrawable" || name == "setMeasureAllChildren" || name == "setDescendantFocusability" ||
+         name == "setClipChildren" || name == "setClipToPadding" || name == "setAnimationCacheEnabled" ||
+         name == "setPersistentDrawingCache" || name == "setAddStatesFromChildren" ||
+         name == "setAlwaysDrawnWithCacheEnabled" || name == "setMotionEventSplittingEnabled" ||
+         name == "setLayoutMode" || name == "setTransitionGroup" || name == "setTouchscreenBlocksFocus")) {
+        if (args.size() != 2 || (name == "setDividerDrawable"
+            ? (args[1].kind != dex::ValueKind::reference && !(args[1].kind == dex::ValueKind::word && !args[1].bits))
+            : args[1].kind != dex::ValueKind::word))
+            bad("WIDGET_SETTER_ARGUMENT", "Widget setter arguments do not match the canonical descriptor");
+        (void)p.view(receiver);
+        return p.widget_setter_base(receiver, name, args[1]);
+    }
     auto &view = p.view(receiver);
+    if (name == "dispatchTouchEvent")
+        return Value::word(p.view_touch_dispatch_base(receiver, args[1].bits, api.owner == "Landroid/view/ViewGroup;"));
+    if (name == "onTouchEvent") return Value::word(p.view_touch_base(receiver, args[1].bits));
+    if (name == "onInterceptTouchEvent") { (void)p.touch_event(args[1].bits); return Value::word(0); }
+    if (name == "requestDisallowInterceptTouchEvent") {
+        p.disallow_touch_intercept(receiver, args[1].bits != 0);
+        return Value::nothing();
+    }
+    if (name == "setOverScrollMode" && api.signature == "(I)V") {
+        if (args.size() != 2 || args[1].kind != dex::ValueKind::word)
+            bad("VIEW_ARGUMENT", "Over-scroll mode requires an integer mode");
+        return p.set_view_over_scroll_mode(receiver,
+            std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits)));
+    }
+    if (name == "getContext") return p.view_state(receiver).references[9];
+    if (name == "getParent") return Value::reference(view.parent);
+    if (name == "setOnTouchListener") {
+        if (args[1].bits && !runtime.assignable(args[1].bits, touch_listener_type))
+            runtime.raise("Ljava/lang/IllegalArgumentException;", u"Listener must implement View.OnTouchListener");
+        auto next = std::make_unique<ViewObjectState>(p.view_state(receiver));
+        next->references[8] = args[1];
+        runtime.set_host_state(receiver, std::move(next));
+        return Value::nothing();
+    }
+    if (api.owner == "Landroid/view/ViewGroup;" && (name == "onViewAdded" || name == "onViewRemoved"))
+        return Value::nothing(); // Actual public SDK base hooks; managed overrides execute virtually.
+    if (name == "getLayoutParams") return p.view_state(receiver).references[7];
+    if (name == "setLayoutParams") {
+        if ((!p.view_state(receiver).view_context_constructor || p.in_tree(receiver)) &&
+            ((view.parent && p.view(view.parent).kind != ViewKind::frame_layout) ||
+             (receiver == p.content && view.kind != ViewKind::frame_layout && view.kind != ViewKind::surface_view &&
+                 view.kind != ViewKind::native_content)))
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Attached LayoutParams changes require the FrameLayout fill profile");
+        p.set_layout_params(receiver, args[1].bits);
+        ++p.metrics.view_revision;
+        return Value::nothing();
+    }
+    if (name == "getChildCount") return Value::word(static_cast<std::uint32_t>(view.children.size()));
+    if (name == "getChildAt") {
+        const auto offset = std::bit_cast<std::int32_t>(static_cast<std::uint32_t>(args[1].bits));
+        return Value::reference(offset >= 0 && static_cast<std::size_t>(offset) < view.children.size()
+            ? view.children[static_cast<std::size_t>(offset)] : 0);
+    }
+    if (name == "removeView" || name == "removeAllViews") {
+        const auto removed = name == "removeView" ? args[1].bits : ObjectId{0};
+        if (name == "removeView" && std::find(view.children.begin(), view.children.end(), removed) == view.children.end())
+            return Value::nothing();
+        if (view.children.empty()) return Value::nothing();
+        p.cancel_input(); p.focus(0);
+        ManagedRoot parent_root(runtime, receiver);
+        struct RemovedChildren {
+            dex::ManagedRuntime &runtime;
+            std::array<ObjectId, 256> values{};
+            std::size_t count = 0;
+            ~RemovedChildren() { for (std::size_t n = 0; n < count; ++n) runtime.release(values[n]); }
+        } snapshot{runtime};
+        for (const auto child : p.view(receiver).children) {
+            if (removed && child != removed) continue;
+            runtime.retain(child); snapshot.values[snapshot.count++] = child;
+        }
+        if (!snapshot.count) return Value::nothing();
+        if (p.active_surface) {
+            auto object = p.active_surface->view;
+            for (unsigned depth = 0; object && depth < 256; ++depth) {
+                if ((removed && object == removed) || (!removed && p.view(object).parent == receiver)) {
+                    p.surface_recreate = true; break;
+                }
+                object = p.view(object).parent;
+            }
+        }
+        auto &children = p.view(receiver).children;
+        for (std::size_t index = 0; index < children.size();) {
+            if (!removed || children[index] == removed) {
+                const auto detached = erase_view_child(runtime, children, index);
+                p.view(detached).parent = 0;
+            } else ++index;
+        }
+        p.unscrolled_bounds.clear(); p.apply_scroll_layout();
+        p.surface_dirty = true; ++p.metrics.view_revision;
+        // Android's bulk removal notifies from the last child backwards. The
+        // committed detached set is pinned; later hook mutations are retained.
+        for (auto n = snapshot.count; n > 0; --n)
+            p.dispatch_hierarchy_hook(receiver, snapshot.values[n - 1], false);
+        return Value::nothing();
+    }
+    if (api.owner == surface_view_type && name == "getHolder") {
+        if (view.kind != ViewKind::surface_view) bad("SURFACE_IDENTITY", "Receiver is not an initialized SurfaceView");
+        return p.view_state(receiver).references[6];
+    }
     if (name == "getAccessibilityNodeProvider") return Value::reference(0);
     if (name == "createAccessibilityNodeInfo")
         return Value::reference(p.create_accessibility_node_info_base(receiver));
@@ -6613,6 +17694,9 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
     }
     if (name == "dispatchKeyEvent")
         return Value::word(p.view_key_dispatch_base(receiver, args[1].bits, api.owner == "Landroid/view/ViewGroup;"));
+    if (name == "dispatchKeyEventPreIme")
+        return Value::word(p.view_key_pre_ime(receiver, args[1].bits, api.owner == "Landroid/view/ViewGroup;"));
+    if (name == "onKeyPreIme") { (void)p.key_event(args[2].bits); return Value::word(0); }
     if (name == "onKeyDown" || name == "onKeyUp")
         return Value::word(p.view_key_base(receiver, static_cast<std::uint32_t>(args[1].bits), args[2].bits,
                                           api.owner == "Landroid/widget/TextView;", name == "onKeyUp"));
@@ -6695,7 +17779,18 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
                           u"Orientation must be HORIZONTAL or VERTICAL");
         view.orientation = static_cast<std::int32_t>(args[1].bits);
     } else if (name == "addView") {
+        if (p.view_state(receiver).group_constructor && !p.view_state(receiver).group_children_initialized)
+            runtime.raise("Ljava/lang/NullPointerException;", u"ViewGroup child storage is not initialized");
         auto &child = p.view(args[1].bits);
+        if (p.in_tree(receiver)) p.require_renderable_subtree(child.object);
+        if (view.kind == ViewKind::frame_layout) {
+            if (!view.children.empty() || (child.kind != ViewKind::frame_layout && child.kind != ViewKind::surface_view))
+                runtime.raise("Ljava/lang/UnsupportedOperationException;", u"FrameLayout supports only a single fill FrameLayout/SurfaceView child");
+        } else if (child.kind == ViewKind::surface_view)
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"Nested SurfaceView requires a fill FrameLayout parent");
+        const auto supplied = args.size() == 3 ? args[2].bits : p.view_state(child.object).references[7].bits;
+        if (view.kind != ViewKind::frame_layout && (args.size() == 3 || supplied))
+            runtime.raise("Ljava/lang/UnsupportedOperationException;", u"LayoutParams under non-FrameLayout parents are unsupported");
         if (child.kind == ViewKind::scroll_view)
             runtime.raise("Ljava/lang/UnsupportedOperationException;", u"ScrollView is supported only as the Activity content root");
         if (view.kind == ViewKind::scroll_view && !view.children.empty())
@@ -6705,8 +17800,30 @@ Value ActivitySession::invoke_api(dex::ManagedRuntime &runtime, const ApiSupport
         for (auto parent = receiver; parent; parent = p.view(parent).parent)
             if (parent == child.object)
                 runtime.raise("Ljava/lang/IllegalStateException;", u"View tree would contain a cycle");
-        view.children.push_back(child.object);
-        child.parent = receiver;
+        const auto child_id = child.object;
+        ManagedRoot parent_root(runtime, receiver), child_root(runtime, child_id);
+        if (view.kind == ViewKind::frame_layout) {
+            if (args.size() == 3 && !supplied) runtime.raise("Ljava/lang/NullPointerException;");
+            const auto parent_type = runtime.object_type(receiver);
+            if (p.override_method(parent_type, "checkLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Z") ||
+                (!supplied && (p.override_method(parent_type, "generateDefaultLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;") ||
+                    p.override_method(parent_type, "generateDefaultLayoutParams", "()Landroid/widget/FrameLayout$LayoutParams;"))) ||
+                (supplied && !runtime.assignable(supplied, frame_params_type) &&
+                    (p.override_method(parent_type, "generateLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Landroid/view/ViewGroup$LayoutParams;") ||
+                     p.override_method(parent_type, "generateLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Landroid/widget/FrameLayout$LayoutParams;"))))
+                bad("LAYOUT_UNSUPPORTED", "Custom FrameLayout parameter policy requires executed layout semantics");
+            const auto params = supplied && runtime.assignable(supplied, frame_params_type) ? supplied : p.new_frame_params(supplied);
+            p.dispatch_set_layout_params(child_id, params);
+        }
+        // The real setter may reenter and attach Views or fill the parent.
+        // Read fresh storage before committing; never overwrite those effects.
+        p.validate_child_attachment(receiver, child_id);
+        insert_view_child(runtime, p.view(receiver).children, p.view(receiver).children.size(), child_id);
+        p.view(child_id).parent = receiver;
+        p.surface_dirty = true;
+        ++p.metrics.view_revision;
+        p.dispatch_hierarchy_hook(receiver, child_id, true);
+        return Value::nothing();
     } else if (name == "setText") {
         if (args.size() == 3) p.set_text_base(receiver, args[1].bits,
             view.kind == ViewKind::edit_text ? 2 : p.mode_value(args[2].bits));

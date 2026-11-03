@@ -208,6 +208,16 @@ std::int32_t requested_orientation(const ManifestInfo &manifest, std::size_t sel
     return orientation;
 }
 
+ManifestInteger activity_theme(const ManifestInfo &manifest, std::size_t selected_activity) {
+    const auto target = activity_target(manifest, selected_activity,
+                                       "AETHER_ACTIVITY_THEME_INVALID", "activity-theme");
+    // Activity aliases inherit the target ActivityInfo theme, not alias attrs.
+    const auto &theme = manifest.activities[target].theme;
+    const bool no_resource = theme.type == manifest_absent_type || theme.type == 0 ||
+        ((theme.type == 1 || theme.type == 0x10 || theme.type == 0x11) && !theme.data);
+    return no_resource ? manifest.application_theme : theme;
+}
+
 std::uint32_t handled_configuration_changes(const ManifestInfo &manifest, std::size_t selected_activity) {
     if (!manifest.activity_config_changes.empty() &&
         manifest.activity_config_changes.size() != manifest.activities.size())
@@ -228,6 +238,46 @@ std::uint32_t handled_configuration_changes(const ManifestInfo &manifest, std::s
         throw InspectError("AETHER_ACTIVITY_CONFIG_CHANGES_UNSUPPORTED", "activity-configuration",
                            "Activity configChanges contains unsupported Android flag bits");
     return value.data;
+}
+
+SelectedNativeEntry selected_native_entry(const ManifestInfo &manifest, std::size_t selected_activity) {
+    if (!manifest.activity_native_entries.empty() &&
+        manifest.activity_native_entries.size() != manifest.activities.size())
+        throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_INVALID", "native-activity",
+                           "NativeActivity entry metadata is not aligned with the Activity inventory");
+    (void)activity_target(manifest, selected_activity,
+                          "AETHER_NATIVE_ACTIVITY_METADATA_INVALID", "native-activity");
+    const ManifestNativeEntry absent;
+    const auto &entry = manifest.activity_native_entries.empty() ? absent : manifest.activity_native_entries[selected_activity];
+    return decode_native_entry(entry);
+}
+SelectedNativeEntry decode_native_entry(const ManifestNativeEntry &entry) {
+    if (entry.unresolved_name)
+        throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_UNSUPPORTED", "native-activity",
+                           "NativeActivity entry defaults require literal direct meta-data names; a supplied name is missing or unresolved");
+    const auto literal = [](const ManifestNativeValue &metadata, const char *key, const char *fallback) {
+        if (metadata.value.type == manifest_absent_type && !metadata.resource_attribute)
+            return std::string(fallback);
+        if (metadata.resource_attribute || metadata.value.type != 3)
+            throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_UNSUPPORTED", "native-activity",
+                               std::string("NativeActivity ") + key + " requires a literal string; supplied resource or typed value is unsupported");
+        if (metadata.value.literal.empty() || metadata.value.literal.size() > 4096)
+            throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_UNSUPPORTED", "native-activity",
+                               std::string("NativeActivity ") + key + " must be a nonempty string of at most 4096 bytes");
+        return metadata.value.literal;
+    };
+    SelectedNativeEntry result{literal(entry.lib_name, "android.app.lib_name", "main"),
+                               literal(entry.func_name, "android.app.func_name", "ANativeActivity_onCreate")};
+    if (result.library.size() > 128 || !std::all_of(result.library.begin(), result.library.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                   c == '_' || c == '-' || c == '.' || c == '+';
+        }))
+        throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_UNSUPPORTED", "native-activity",
+                           "NativeActivity android.app.lib_name must use the supported 1..128-byte ASCII library basename");
+    if (std::any_of(result.function.begin(), result.function.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+        throw InspectError("AETHER_NATIVE_ACTIVITY_METADATA_UNSUPPORTED", "native-activity",
+                           "NativeActivity android.app.func_name contains an embedded NUL or ASCII control character");
+    return result;
 }
 
 std::string_view launcher_status_name(LauncherStatus status) {

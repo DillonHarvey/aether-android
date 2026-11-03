@@ -13,6 +13,7 @@ inline constexpr std::size_t header_bytes = 32, maximum_payload = 4096;
 inline constexpr std::size_t maximum_worker_error = 512;
 inline constexpr std::uint32_t protocol_magic = 0x52544841;
 inline constexpr std::uint16_t protocol_version = 1;
+inline constexpr std::uint64_t monotonic_local_admission_version = 1;
 enum class Operation : std::uint16_t {
     boot = 1,
     monotonic_time = 2,
@@ -88,7 +89,20 @@ enum class Operation : std::uint16_t {
     drop_text_info = 76, // One reviewed selection's length and exact UTF-16LE digest.
     drop_text_read = 77, // Consecutive bounded UTF-16LE chunks; never clipboard authority.
     activity_activation_terminal = 78, // Activity-only terminal fact custody; never a broker service.
-    activity_activation_terminal_ack = 79 // Host custody receipt, never a final-state acknowledgement.
+    activity_activation_terminal_ack = 79, // Host custody receipt, never a final-state acknowledgement.
+    activity_surface_request = 80, // Activity-only root native-surface admission/abandonment; not a broker service.
+    activity_key_result = 82, // Final outcome for an enrolled historical key command.
+    activity_key_result_ack = 83, // Host custody receipt, never input handling.
+    activity_finish_request = 84, // Authenticated Activity-owned ordered close intent.
+    activity_finish_ack = 85, // Host custody only; no lifecycle execution.
+    file_path_metadata = 86, // Typed scoped/held-directory metadata; never opens a guest descriptor.
+    file_truncate = 87, // Owned private token + bounded size; shared position is unchanged.
+    file_read_at = 88, // Owned token + offset + count; bounded byte reply, no shared seek.
+    file_write_at = 89, // Owned token + offset + count + copied bytes; one attempt per chunk.
+    monotonic_local_admission = 90, // Audited session-local fresh QPC reader; existing monotonic consent.
+    activity_viewport_request = 91, // Activity-only immutable host geometry/configuration admission; no native surface token.
+    activity_viewport_ack = 92, // Exact geometry request/context echo, never completed rendering or visibility.
+    activity_surface_ack = 81 // Exact request/context receipt with admitted producer and actual geometry.
 };
 enum class Status : std::uint32_t { ok, denied, unsupported, invalid, quota };
 struct Header {

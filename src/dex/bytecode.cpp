@@ -57,6 +57,7 @@ const std::array<Opcode, 256> &opcode_registry() noexcept {
         one(0x23, "new-array", Format::f22c, 2);
         one(0x24, "filled-new-array", Format::f35c, 3);
         one(0x25, "filled-new-array/range", Format::f3rc, 3);
+        one(0x26, "fill-array-data", Format::f31t, 3);
         one(0x27, "throw", Format::f11x, 1);
         one(0x28, "goto", Format::f10t, 1);
         one(0x29, "goto/16", Format::f20t, 2);
@@ -79,6 +80,12 @@ const std::array<Opcode, 256> &opcode_registry() noexcept {
         one(0x76, "invoke-direct/range", Format::f3rc, 3);
         one(0x77, "invoke-static/range", Format::f3rc, 3);
         one(0x78, "invoke-interface/range", Format::f3rc, 3);
+        one(0x7b, "neg-int", Format::f12x, 1);
+        one(0x7c, "not-int", Format::f12x, 1);
+        one(0x7d, "neg-long", Format::f12x, 1);
+        one(0x7e, "not-long", Format::f12x, 1);
+        one(0x7f, "neg-float", Format::f12x, 1);
+        one(0x80, "neg-double", Format::f12x, 1);
         one(0x81, "int-to-long", Format::f12x, 1);
         one(0x82, "int-to-float", Format::f12x, 1);
         one(0x84, "long-to-int", Format::f12x, 1);
@@ -112,7 +119,8 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
     const auto &method = image.methods[method_index];
     const auto &code = *method.code;
     const auto &units = code.units;
-    if (units.empty() || units.size() > 65536 || code.registers > 256 || code.incoming > code.registers)
+    if (units.empty() || units.size() > 65536 || code.registers > 256 || code.outgoing > 256 ||
+        code.incoming > code.registers)
         invalid(method_index, 0, "Invalid code limits");
     VerifiedCode result;
     result.at.resize(units.size(), no_index);
@@ -127,7 +135,7 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
     for (std::uint32_t pc = 0; pc < units.size();) {
         const auto first = units[pc];
         if (!first && (pc & 1) && pc + 1 < units.size() &&
-            (units[pc + 1] == 0x0100 || units[pc + 1] == 0x0200)) {
+            (units[pc + 1] == 0x0100 || units[pc + 1] == 0x0200 || units[pc + 1] == 0x0300)) {
             // D8 aligns non-executable payloads with an unreachable nop.
             data_width[pc] = data_prefix[pc + 1] = 1;
             ++pc;
@@ -159,6 +167,22 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             data_width[pc] = width;
             std::fill(data_prefix.begin() + pc + 1, data_prefix.begin() + pc + width + 1, 1);
             pc += width;
+            continue;
+        }
+        if (first == 0x0300) {
+            if ((pc & 1) || units.size() - pc < 4)
+                invalid(method_index, pc, "Misaligned or truncated array-data payload");
+            const auto element_width = std::uint32_t(units[pc + 1]);
+            if (element_width != 1 && element_width != 2 && element_width != 4 && element_width != 8)
+                invalid(method_index, pc, "Invalid array-data element width");
+            const auto count = std::uint32_t(units[pc + 2]) | (std::uint32_t(units[pc + 3]) << 16);
+            const auto width = std::uint64_t{4} + (std::uint64_t(element_width) * count + 1) / 2;
+            if (width > units.size() - pc)
+                invalid(method_index, pc, "Truncated array-data elements");
+            const auto extent = static_cast<std::uint32_t>(width);
+            data_width[pc] = extent;
+            std::fill(data_prefix.begin() + pc + 1, data_prefix.begin() + pc + extent + 1, 1);
+            pc += extent;
             continue;
         }
         const auto op = static_cast<std::uint8_t>(first);
@@ -312,7 +336,7 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
         } else if (op == 0x20 || op == 0x21 || op == 0x23) {
             reg(pc, ins.a);
             reg(pc, ins.b);
-        } else if (op == 0x22 || op == 0x27 || op == 0x2b || op == 0x2c || (op >= 0x38 && op <= 0x3d)) {
+        } else if (op == 0x22 || op == 0x26 || op == 0x27 || op == 0x2b || op == 0x2c || (op >= 0x38 && op <= 0x3d)) {
             reg(pc, ins.a);
         } else if (op >= 0x2d && op <= 0x31) {
             reg(pc, ins.a);
@@ -329,6 +353,10 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             reg(pc, ins.a, (op - 0x52) % 7 == 1 ? 2 : 1);
             if (op < 0x60)
                 reg(pc, ins.b);
+        } else if (op >= 0x7b && op <= 0x80) {
+            const auto width = op == 0x7d || op == 0x7e || op == 0x80 ? 2u : 1u;
+            reg(pc, ins.a, width);
+            reg(pc, ins.b, width);
         } else if (op == 0x81 || op == 0x82 || op == 0x84 || op == 0x87 || (op >= 0x8d && op <= 0x8f)) {
             reg(pc, ins.a, op == 0x81 ? 2 : 1);
             reg(pc, ins.b, op == 0x84 ? 2 : 1);
@@ -447,6 +475,17 @@ VerifiedCode verify(const DexImage &image, Index method_index) {
             if (!ins.branch && op != 0x2a)
                 invalid(method_index, ins.pc, "Branch target is not a valid instruction boundary");
             (void)branch_target(ins.pc, ins.branch);
+        }
+        if (op == 0x26) {
+            const auto location = std::int64_t(ins.pc) + ins.branch;
+            if (location < 0 || location >= static_cast<std::int64_t>(units.size()) ||
+                data_width[static_cast<std::size_t>(location)] < 4 ||
+                units[static_cast<std::size_t>(location)] != 0x0300)
+                invalid(method_index, ins.pc, "fill-array-data does not reference a complete array-data payload");
+            const auto payload = static_cast<std::uint32_t>(location);
+            ins.b = units[payload + 1];
+            ins.c = std::uint32_t(units[payload + 2]) | (std::uint32_t(units[payload + 3]) << 16);
+            ins.index = payload + 4;
         }
         if (op == 0x2b || op == 0x2c) {
             const bool sparse = op == 0x2c;

@@ -12,6 +12,14 @@ namespace aether::elf {
 InitializerError::InitializerError(a64::Fault fault_, std::string message, InitializerContext context_)
     : ElfError("AETHER_ELF_INITIALIZER_FAILED", std::move(message)), fault(fault_), context(std::move(context_)) {}
 namespace {
+bool input_filename(std::string_view name) {
+    return !name.empty() && name.size() <= 127 && name.ends_with(".so") &&
+           name.find("..") == name.npos &&
+           std::all_of(name.begin(), name.end(), [](unsigned char c) {
+               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '+';
+           });
+}
 std::string initializer_message(a64::Fault fault, const InitializerContext &context, bool module_truncated) {
     std::string message = "Guest initializer/finalizer failed: " + std::string(a64::fault_name(fault));
     message += context.finalizer ? "; phase=fini; module=\"" : "; phase=init; module=\"";
@@ -70,6 +78,10 @@ struct GuestLoader::Impl {
     const ImportResolver &imports;
     std::vector<GuestModule> modules;
     std::vector<std::size_t> scope, init_order;
+    void *initialization_context=nullptr;
+    InitializationObserver initialization_observer=nullptr;
+    void *initializer_driver_context=nullptr;
+    InitializerDriver initializer_driver=nullptr;
     std::vector<Address> mappings;
     // Owned names survive resident module vector growth across appended graphs.
     // Each list retains breadth-first module order and dynamic symbol order.
@@ -106,7 +118,7 @@ struct GuestLoader::Impl {
     }
     std::optional<std::size_t> index(std::string_view name) const {
         for (std::size_t i = 0; i < modules.size(); ++i)
-            if (modules[i].image.soname == name)
+            if (modules[i].image.soname == name || modules[i].image.declared_soname == name)
                 return i;
         return std::nullopt;
     }
@@ -163,7 +175,7 @@ struct GuestLoader::Impl {
                 resolution_step();
                 const auto &m = modules[at];
                 const auto &candidate = m.image.symbols[symbol];
-                if ((s.version_library.empty() || s.defined || m.image.soname == s.version_library) &&
+                if ((s.version_library.empty() || s.defined || m.image.declared_soname == s.version_library) &&
                     (s.version.empty() ? !candidate.version_hidden : s.version == candidate.version))
                     return located(m, candidate);
             }
@@ -186,9 +198,28 @@ struct GuestLoader::Impl {
             return;
         if (address % 4 || !memory.accessible(address, 4, a64::Permission::execute))
             throw ElfError("AETHER_ELF_INITIALIZER", "Initializer/finalizer target is not guest executable");
+        if(initialization_observer)initialization_observer(initialization_context,
+            {finalizer?InitializationStage::finalizer_begin:InitializationStage::initializer_begin,module,address});
         constexpr std::array<std::uint64_t, 3> arguments{}; // argc, argv, envp for Android constructors.
-        const auto result = cpu.call(address, arguments, stack_top, 1'000'000, {}, thread_pointer);
-        if(result.fault==a64::Fault::process_exit){cpu.process_checkpoint();throw ProcessExit{static_cast<std::uint8_t>(result.detail)};}
+        const auto result = initializer_driver?
+            initializer_driver(initializer_driver_context,cpu,address,arguments,stack_top,thread_pointer):
+            cpu.call(address, arguments, stack_top, 1'000'000, {}, thread_pointer);
+        if(result.fault==a64::Fault::process_exit){
+            const auto annotate=[&](ProcessExit exit){
+                if(!exit.initializer){
+                    GuestInitializerContext context{};
+                    std::copy_n(module.data(),std::min(module.size(),context.module.size()-1),context.module.data());
+                    context.entry=address;
+                    context.finalizer=finalizer;
+                    exit.initializer=context;
+                }
+                cpu.retain_initializer_context(*exit.initializer);
+                return exit;
+            };
+            try{cpu.process_checkpoint();}
+            catch(const ProcessExit &exit){throw annotate(exit);}
+            throw annotate(ProcessExit{static_cast<std::uint8_t>(result.detail)});
+        }
         if(result.fault==a64::Fault::thread_exit)throw ThreadExit{result.registers[0]};
         if (!result.returned) {
             InitializerContext context{std::string(module.substr(0, 48)), address, result.fault_address, result.pc,
@@ -198,6 +229,8 @@ struct GuestLoader::Impl {
             auto message = initializer_message(fault, context, module.size() > context.module.size());
             throw InitializerError(fault, std::move(message), std::move(context));
         }
+        if(initialization_observer)initialization_observer(initialization_context,
+            {finalizer?InitializationStage::finalizer_end:InitializationStage::initializer_end,module,address});
     }
     Address read_pointer(Address address) const {
         std::array<std::uint8_t, 8> bytes{};
@@ -244,6 +277,8 @@ void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_vi
         const bool streaming =
             std::any_of(inputs.begin(), inputs.end(), [](const auto &input) { return bool(input.source); });
         for (const auto &input : inputs) {
+            if (!input_filename(input.name))
+                throw ElfError("AETHER_ELF_SONAME", "Input must have a safe library filename");
             if (input.source && !input.bytes.empty())
                 throw ElfError("AETHER_ELF_SOURCE", "Native input has two competing byte representations");
             if (!supplied.insert(input.name).second)
@@ -252,6 +287,8 @@ void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_vi
             if (size > streamed_native_bytes)
                 throw ElfError("AETHER_ELF_LIMIT", "Native input exceeds 128 MiB");
             if (const auto resident = p.index(input.name)) {
+                if (p.modules[*resident].image.soname != input.name)
+                    throw ElfError("AETHER_ELF_SONAME", "Input filename collides with a resident SONAME alias");
                 apk::Sha256 hash;
                 if (input.source) {
                     std::uint64_t consumed = 0;
@@ -288,9 +325,14 @@ void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_vi
                                    "Native dependency graph exceeds its mapped-image budget");
                 mapped_bytes += bytes;
             }
-            if (input.name != image.soname || p.index(input.name) || p.imports.has_library(input.name))
+            if (p.index(input.name) || p.imports.has_library(input.name) ||
+                (!image.declared_soname.empty() &&
+                 (p.index(image.declared_soname) || p.imports.has_library(image.declared_soname))))
                 throw ElfError("AETHER_ELF_SONAME",
-                               "Input identity differs from SONAME or shadows a registered module");
+                               "Input filename or declared SONAME shadows a registered module");
+            // Keep actual ELF naming separate from the authorized held input.
+            // Every mapping, hash and dlopen result retains its exact filename.
+            image.soname = input.name;
             const auto span = image.span;
             const auto advance = (span + 0xffff) & ~Address{0xffff};
             if (advance > 0x20000000 - next)
@@ -405,6 +447,10 @@ void GuestLoader::load_graph(std::span<const ModuleInput> inputs, std::string_vi
         p.input_bytes = total_bytes; p.mapped_bytes = mapped_bytes; p.next = next;
         p.loaded = true;
         p.initialization_started = false;
+        // Relocation resolution is complete. This private owning name index
+        // has no runtime readers; a later graph extension rebuilds its scope.
+        // Retain the actual symbol/relocation metadata for resident inspection.
+        p.exports.clear();
     } catch (...) {
         while (p.mappings.size() > old_mappings) {
             p.memory.unmap(p.mappings.back()); p.mappings.pop_back();
@@ -520,6 +566,12 @@ void GuestLoader::initialize(a64::GuestCpu &cpu, Address stack_top, std::optiona
         p.initialization_failed = true;
         throw;
     }
+}
+void GuestLoader::set_initialization_observer(void *context,InitializationObserver observer) noexcept {
+    impl_->initialization_context=context;impl_->initialization_observer=observer;
+}
+void GuestLoader::set_initializer_driver(void *context,InitializerDriver driver) noexcept {
+    impl_->initializer_driver_context=context;impl_->initializer_driver=driver;
 }
 void GuestLoader::finalize(a64::GuestCpu &cpu, Address stack_top) {
     auto &p = *impl_;

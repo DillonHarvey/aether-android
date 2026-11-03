@@ -14,6 +14,7 @@ struct ClassLoader::Impl {
     DexImage &image;
     std::shared_ptr<ClassSource> source;
     Linker linker;
+    Linker::ParentClass parent;
     std::array<bool, 64> loaded{};
     // Borrow immutable names in the stable target tables. The loader and its
     // index are destroyed before the caller-owned target.
@@ -21,8 +22,8 @@ struct ClassLoader::Impl {
     std::set<std::string, std::less<>> complete, active;
     bool failed = false;
     std::atomic<ClassLoadAllocationPhase> allocation_phase{ClassLoadAllocationPhase::none};
-    Impl(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits)
-        : image(target), source(std::move(source)), linker(target, limits) {
+    Impl(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits, Linker::ParentClass parent)
+        : image(target), source(std::move(source)), linker(target, limits), parent(std::move(parent)) {
         if (!this->source)
             bad("STATE", "A class loader requires an immutable class source");
     }
@@ -32,6 +33,8 @@ struct ClassLoader::Impl {
     }
     void resolve(std::string_view descriptor) {
         try {
+        if (parent && parent(descriptor))
+            return;
         if (complete.contains(descriptor))
             return;
         const auto file = source->source_for(descriptor);
@@ -56,7 +59,7 @@ struct ClassLoader::Impl {
                         catch(const std::bad_alloc &) {
                             detail::note_class_load_allocation(ClassLoadAllocationPhase::source);throw;
                         }
-                    }(), name);
+                    }(), name, parent);
                 }
                 catch(const std::bad_alloc &) {
                     detail::note_class_load_allocation(ClassLoadAllocationPhase::link_merge);throw;
@@ -107,15 +110,35 @@ struct ClassLoader::Impl {
             throw;
         }
     }
+    Index intern_provider_method(std::string_view owner, std::string_view name,
+                                 std::string_view descriptor) {
+        detail::ScopedClassLoadAllocation allocation(allocation_phase);
+        check();
+        try {
+            return linker.intern_provider_method(owner, name, descriptor);
+        } catch (const std::bad_alloc &) {
+            detail::note_class_load_allocation(ClassLoadAllocationPhase::link_merge);
+            failed = true;
+            throw;
+        } catch (...) {
+            failed = true;
+            throw;
+        }
+    }
 };
-ClassLoader::ClassLoader(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits)
-    : impl_(std::make_unique<Impl>(target, std::move(source), limits)) {}
+ClassLoader::ClassLoader(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits,
+                         Linker::ParentClass parent)
+    : impl_(std::make_unique<Impl>(target, std::move(source), limits, std::move(parent))) {}
 ClassLoader::~ClassLoader() = default;
 void ClassLoader::ensure(std::string_view descriptor) { impl_->ensure(descriptor); }
 const Class *ClassLoader::definition(std::string_view descriptor) {
     impl_->ensure(descriptor);
     const auto found = impl_->definitions.find(descriptor);
     return found == impl_->definitions.end() ? nullptr : &impl_->image.classes.at(found->second);
+}
+Index ClassLoader::intern_provider_method(std::string_view owner, std::string_view name,
+                                        std::string_view descriptor) {
+    return impl_->intern_provider_method(owner, name, descriptor);
 }
 void ClassLoader::check() const { impl_->check(); }
 ClassLoadAllocationPhase ClassLoader::allocation_failure_phase() const noexcept {

@@ -140,8 +140,9 @@ std::string troubleshooting_plan(TroubleshootingOptions options) {
            (options.audit_summaries ? "selected" : "not selected") +
            "\nAudit limit: 256 sessions, 16 MiB total, 1 MiB per file. Active or unsafe logs are reported as "
            "unavailable.\n"
-           "No host paths, usernames, process IDs, absolute timestamps, raw log records, private files, "
-           "environment or memory. Nothing is uploaded. Review the captured preview before sharing.\n";
+           "Retained fault messages include technical context, event times and build/package attribution. "
+           "Text is untrusted and redaction is best-effort. No private files, raw audit records, "
+           "environment or memory are collected. Nothing is uploaded. Review before sharing.\n";
 }
 std::string troubleshooting_preview(const InstalledApp &app, TroubleshootingOptions options) {
     return "{\"schemaVersion\":1,\"operation\":\"troubleshoot-preview\",\"appId\":" + json_quote(app.id) +
@@ -200,7 +201,7 @@ std::string TroubleshootingReport::json() const {
             out << (i ? "," : "") << json_quote(names[i]) << ':' << s.statuses[i];
         out << "}}";
     }
-    out << "]},\"excluded\":[\"host-paths\",\"usernames\",\"process-ids\",\"absolute-timestamps\","
+    out << "]},\"excluded\":["
            "\"raw-audit-records\",\"private-app-files\",\"environment\",\"memory\"],\"uploaded\":false}";
     return out.str();
 }

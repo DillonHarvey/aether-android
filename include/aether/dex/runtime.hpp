@@ -4,6 +4,7 @@
 #include "aether/host/file_service.hpp"
 #include "aether/host/thread_priority.hpp"
 #include "aether/common/process_exit.hpp"
+#include "aether/common/work_admission.hpp"
 #include "aether/common/thread_exit.hpp"
 #include <memory>
 #include <functional>
@@ -21,8 +22,9 @@ struct Value {
     static Value nothing() noexcept { return {ValueKind::void_value, 0}; }
     bool operator==(const Value &) const = default;
 };
-// Immutable provider-owned data attached to a managed object. The interpreter
-// accounts its storage and traces its Values without knowing Android types.
+// Provider-owned data attached to a managed object. Replacement is atomic; the
+// trusted shrink_host_state exception permits only nonallocating removal. The
+// interpreter accounts storage and traces Values without knowing Android types.
 class HostObjectState {
   public:
     virtual ~HostObjectState() = default;
@@ -120,6 +122,13 @@ struct HostClass {
     bool identity_object_methods = false;
     // Explicit provenance for Class.getClassLoader; class_info alone is partial.
     bool bootstrap_class = false;
+    // Complete method-inheritance fact, never inferred from partial class_info.
+    // The provider class/ancestors do not override Throwable.getMessage().
+    bool inherits_throwable_get_message = false;
+    // Explicit hosted initialization lifecycle, including a proven empty own
+    // body whose superclass still needs initialization. False retains partial/
+    // unknown metadata, never proof that arbitrary SDK effects are absent.
+    bool has_class_initializer = false;
 };
 struct HostField {
     std::string owner, name, type;
@@ -131,6 +140,7 @@ struct HostMethod {
     std::vector<std::string> parameters;
     std::uint32_t flags = 1;
 };
+enum class HostBootstrapClassPresence { unknown, known_present, proven_absent };
 // Metadata is owned by the provider and stays valid until it is detached.
 // An attached provider implements a bounded API surface, not arbitrary host calls.
 class HostInterface {
@@ -151,6 +161,21 @@ class HostInterface {
         throw DexError("AETHER_DEX_INPUT_STREAM_UNSUPPORTED","No input stream provider is attached for this path");
     }
     virtual std::optional<HostClass> class_info(std::string_view descriptor) const = 0;
+    // Invoked only for an explicitly declared hosted initializer, within the
+    // runtime's ordinary owner/reentrant/erroneous class lifecycle. The runtime
+    // initializes the superclass first. The provider must perform any proven
+    // default-interface initialization before its source-ordered static body;
+    // partial interface metadata cannot establish that no such work is needed.
+    virtual void initialize_class(ManagedRuntime &, std::string_view) {
+        throw DexError("AETHER_DEX_CLASS_INITIALIZATION_UNSUPPORTED",
+                       "Hosted class initializer has no implementation");
+    }
+    // Complete, explicitly bound platform metadata only. Partial implementation
+    // is never negative evidence. Work/admission exceptions must propagate.
+    virtual HostBootstrapClassPresence bootstrap_class_presence(ManagedRuntime &,
+                                                               std::string_view) const {
+        return HostBootstrapClassPresence::unknown;
+    }
     virtual bool method_is_static(const DexImage &, Index method) const = 0;
     // nullopt is unknown/partial metadata, never proof that a method is absent.
     virtual std::optional<HostMethod> public_method(std::string_view, std::string_view,
@@ -178,6 +203,8 @@ class NativeInterface {
   public:
     virtual ~NativeInterface() = default;
     virtual bool supports_background() const noexcept {return false;}
+    virtual bool pump_native_tasks(ManagedRuntime &) {return false;}
+    virtual std::optional<std::chrono::steady_clock::time_point> next_native_deadline() const {return {};}
     virtual std::uint64_t capture_signal_mask(ManagedRuntime &) {return 0;}
     // Fallible, same-context orderly termination; never called by a destructor.
     virtual void finish_logical_thread(ManagedRuntime &) {}
@@ -194,6 +221,9 @@ struct RuntimeMetrics {
     std::uint64_t instructions = 0, managed_calls = 0, native_calls = 0, core_calls = 0;
     std::uint64_t allocations = 0, collections = 0, reclaimed = 0, exceptions = 0;
     std::size_t maximum_frames = 0, live_objects = 0, heap_bytes = 0, pinned_references = 0;
+    // heap_bytes is charged quota; this component represents temporary provider
+    // storage reservations rather than managed-object committed storage.
+    std::size_t provider_storage_reserved_bytes = 0;
 };
 struct ViewActivationState;
 class ViewActivationScope final {
@@ -205,6 +235,14 @@ class ViewActivationScope final {
     void complete(bool activated) noexcept;
   private:
     std::unique_ptr<ViewActivationState> state_;
+};
+// Host-only identity of the existing native main-callback backend. This is not
+// a Java MessageQueue, native mPtr, posting permission, or ownership transfer.
+// The owner must outlive the borrower; closed admission does not erase identity.
+struct NativeMainQueueWitness {
+    const ManagedRuntime *owner = nullptr;
+    const void *identity = nullptr;
+    bool admission_closed = false;
 };
 // Original bounded interpreter with one Windows owner and a shared managed heap.
 // Loading does not authorize code execution.
@@ -218,6 +256,21 @@ class ManagedRuntime {
     ManagedRuntime &operator=(const ManagedRuntime &) = delete;
     void set_progress_sink(RuntimeProgressSink *sink);
     void set_native_interface(NativeInterface *interface);
+    // Trusted synchronous host-event entry while the managed main is idle.
+    // Establishes one actual invocation budget/provider barrier without making
+    // protected SDK methods publicly reflectable or granting a queued refill.
+    void run_host_callback(const std::function<void()> &entry);
+    // Trusted scoped Java monitor using the existing logical-thread/frame model.
+    // Reentrant same-owner calls are allowed; foreign-owner contention retains
+    // the existing precise diagnostic. Always releases on callback failure.
+    void run_host_monitor(ObjectId monitor, const std::function<void()> &entry);
+    // Observation of an existing execution context only; never grants work.
+    bool has_provider_work_context() const;
+    // Trusted owner-scoped temporary C++ storage against the SAME heap quota.
+    // Reserve before allocation/managed reentry; release after native storage
+    // is freed. These methods do not grant execution or change hard limits.
+    void reserve_provider_storage(std::size_t bytes);
+    void release_provider_storage(std::size_t bytes) noexcept;
     void set_host_interface(HostInterface *interface);
     const DexImage &image() const noexcept;
     // Resolve definitions through the demand loader. image() is a passive view
@@ -258,6 +311,16 @@ class ManagedRuntime {
     // fabricated. Retain the result before another managed allocation.
     ObjectId new_host_input_stream(std::unique_ptr<HostInputStream> source);
     ObjectId new_string(std::u16string_view value);
+    // Canonical core factory shared with ThreadLocal.withInitial; Supplier.get
+    // is deferred until the current logical thread has no binding.
+    ObjectId new_supplied_thread_local(ObjectId supplier);
+    // Reuses the ordinary Boolean.valueOf TRUE/FALSE identities and GC roots.
+    ObjectId boolean_value_of(bool value);
+    // Trusted provider conversion from stable native-owned text. live_native_bytes
+    // is additional storage not already charged through managed host state.
+    // Keeps that storage admitted throughout String allocation, including GC.
+    // The caller must keep the text alive independently of managed collection.
+    ObjectId new_host_string(std::u16string_view value, std::size_t live_native_bytes);
     // Trusted host construction of an ordinary initialized HashSet of strings.
     ObjectId new_string_set(std::span<const std::optional<std::u16string>> values);
     ObjectId class_object(std::string_view descriptor);
@@ -267,14 +330,41 @@ class ManagedRuntime {
     // guest Thread receiver after start(), on one Windows owner.
     // Synchronous owned native-worker boundary. Independent logical state and
     // GC roots share heap/frame/instruction quotas; scheduler suspension is barred.
-    void run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority={});
+    void run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority={},std::uint64_t allowance=UINT64_MAX);
     // Trusted once-only cleanup on the current background/native context. Keeps
     // its first exit value and remaining budget; callbacks cannot reset either.
     void run_thread_finalizers(const std::function<void()> &entry);
     // Trusted nonexecuting accounting also works after an owned exit latch.
     // Exact debit to zero succeeds; overrun fails without modifying allowances.
+    struct NativeInstructionBudget {
+        std::uint64_t retained=0,shared=UINT64_MAX;
+        // Hard remaining parent headroom captured for this running worker
+        // slice. This is not its requested cooperative scheduling quantum.
+        std::optional<std::uint64_t> slice;
+        // Scheduling only: real provider/managed/native work saturates this
+        // value, then the original continuation yields at a legal boundary.
+        // It never grants or increases the independent guest CPU tick lease.
+        std::optional<std::uint64_t> soft_quantum;
+    };
+    // Retained lifetime allowance and transient work grants are independent.
+    // A CPU fatal cap must never be reduced to a temporary slice allowance.
+    NativeInstructionBudget native_instruction_budget() const;
+    // Pure post-lease observation, never permission/admission or a checkpoint.
+    // Invalid/terminated/cancelled ownership returns zero dimensions; no active
+    // parent invocation/main callback returns no budget rather than a new grant.
+    std::optional<NativeInstructionBudget> native_progress_budget() const noexcept;
     std::uint64_t thread_instruction_budget() const;
+    std::uint64_t native_thread_admission_budget() const;
     void charge_thread_instructions(std::uint64_t instructions);
+    // Trusted host-provider work in the current admitted execution only. Debit
+    // each bounded processing chunk once, immediately before attempting it;
+    // later failure does not refund attempted work. Units describe real host
+    // processing (for example parsed bytes), not managed/native instructions.
+    // Checks process/cancellation and retained resource authority, never creates
+    // an allowance, yields, calls guests, or relaxes a provider barrier. Soft
+    // quantum exhaustion defers suspension to the next legal safepoint; a hard
+    // failure unwinds without replaying the provider operation.
+    void charge_provider_work(std::uint64_t actual_work);
     // One owned background/native logical thread; root main exit is unsupported.
     [[noreturn]] void exit_current_thread(std::uint64_t value);
     host::PriorityResult thread_priority(std::optional<std::int32_t> nice={});
@@ -297,6 +387,38 @@ class ManagedRuntime {
     // All tasks share heap/statics. Arguments/results/exceptions stay GC roots
     // until release_task. Pumping is nonblocking and main-context-only.
     using TaskId = Scheduler::TaskId;
+    // Trusted retained logical-main startup. The controller is borrowed through
+    // release/cancellation and retains the original host resource authority.
+    // An absent instruction limit is explicit resource-metered policy, never a
+    // fresh finite allowance. The entry must retain/pin any captured guest IDs.
+    struct MainWorkPolicy {
+        std::optional<std::uint64_t> instruction_limit;
+        WorkAdmission *admission = nullptr;
+    };
+    struct MainWorkBudget {
+        std::optional<std::uint64_t> retained;
+        std::uint64_t quantum_remaining = 0, actual_work = 0;
+    };
+    TaskId prepare_main_work(std::function<void()> entry, MainWorkPolicy policy,
+                             Scheduler::SwitchHooks hooks = {});
+    bool run_main_work(TaskId task, std::uint64_t quantum);
+    Scheduler::State main_work_state(TaskId task) const;
+    std::exception_ptr main_work_exception(TaskId task) const;
+    std::uint64_t main_work_actual_work(TaskId task) const;
+    void cancel_main_work(TaskId task);
+    bool release_main_work(TaskId task) noexcept;
+    // Only selected main work has a budget. The numeric legacy native-budget
+    // APIs cannot represent resource-metered admission and reject that path.
+    std::optional<MainWorkBudget> main_work_budget() const;
+    // Metadata admission for a dormant worker that may run after startup.
+    // Its finite worker policy is independent of the main scheduling quantum;
+    // this query neither grants peer execution nor consumes/renews main work.
+    std::uint64_t deferred_native_worker_budget() const;
+    // Called by an audited CPU boundary outside noexcept/generated execution.
+    // False can_yield checks authority without relaxing any provider barrier.
+    void main_work_checkpoint(bool can_yield);
+    void park_main_work(std::optional<std::chrono::steady_clock::time_point> deadline = {});
+    void wake_main_work(TaskId task);
     TaskId schedule(Index method, std::span<const Value> arguments = {}, bool virtual_dispatch = false);
     // Audited host admission from any owned logical context, including a running
     // task/provider. Never executes inline. Retained IDs still require explicit
@@ -307,6 +429,30 @@ class ManagedRuntime {
     // Each park attempt/checkpoint consumes one shared batch unit, even an
     // immediately satisfied park. Checkpoint yields; park preserves permit semantics.
     TaskId schedule_worker(std::unique_ptr<ManagedWorkerEntry> entry);
+    // Trusted two-phase host admission: roots/charge/fiber are retained but the
+    // entry cannot run until publication. This grants no native suspension.
+    TaskId prepare_worker(std::unique_ptr<ManagedWorkerEntry> entry, Scheduler::SwitchHooks hooks = {});
+    // Allocation-free, nonexecuting commits on an owned execution context.
+    // Valid prepared IDs publish without a process/loader/provider checkpoint.
+    // Unstarted rollback alone may discard from a background owner; started
+    // stacks still require cancellation/unwind and external-main release.
+    bool publish_worker(TaskId task) noexcept;
+    bool discard_prepared_worker(TaskId task) noexcept;
+    // Explicit native-factory tasks only; generic managed barriers stay unchanged.
+    TaskId prepare_native_worker(std::unique_ptr<ManagedWorkerEntry>,Scheduler::SwitchHooks);
+    // The hard slice grant includes managed/native/host work without refilling
+    // the worker's retained allowance. A suspended parent pays the same actual
+    // work after restoration; the shared task batch is charged only by child work.
+    bool run_native_worker(TaskId task,std::int32_t priority,std::uint64_t slice_runtime_grant=UINT64_MAX);
+    Scheduler::State native_worker_state(TaskId task) const;
+    std::exception_ptr native_worker_exception(TaskId task) const;
+    void native_worker_checkpoint();
+    // Only an actual typed native wait may park this otherwise non-suspendable
+    // native context. Wake is a nonexecuting commit by the owned scheduler root.
+    void native_worker_park(std::optional<std::chrono::steady_clock::time_point> deadline = {});
+    void wake_native_worker(TaskId task);
+    void cancel_native_worker(TaskId task);
+    bool release_native_worker(TaskId task) noexcept;
     void park_worker(std::optional<std::chrono::steady_clock::time_point> deadline = {});
     void unpark_worker(TaskId task);
     void worker_checkpoint();
@@ -327,6 +473,10 @@ class ManagedRuntime {
     void post_main(std::unique_ptr<ManagedMainEntry> entry);
     bool run_main_callback();
     bool has_main_callbacks() const;
+    // Passive owner-thread query: no allocation, collection, callback, context
+    // selection, work credit or queue-capacity change. A borrowed execution
+    // runtime has no deliverable native main queue and returns nullopt.
+    std::optional<NativeMainQueueWitness> native_main_queue_witness() const;
     void close_main_callbacks();
     ObjectId new_array(std::string_view descriptor, std::int32_t length);
     std::string_view object_type(ObjectId object) const;
@@ -337,10 +487,37 @@ class ManagedRuntime {
     std::size_t array_length(ObjectId object) const;
     Value array_get(ObjectId object, std::int32_t index) const;
     void array_set(ObjectId object, std::int32_t index, Value value);
+    // Trusted finally/unwind restoration only. Caller must have captured the
+    // previous reference while healthy and independently retained both it and
+    // the actual Object[] until this call. No allocation, collection, loading,
+    // guest execution or quota grant; broken custody invariants terminate.
+    void restore_host_array_reference(ObjectId array, std::int32_t index, ObjectId previous) noexcept;
+
     const HostObjectState *host_state(ObjectId object) const;
+    // Passive borrowed observation only: no allocation, GC, rooting, loader
+    // validation or execution authority. Null/collected IDs and foreign host
+    // threads return nullptr. The caller preserves existing admission/source
+    // checks and cannot retain this pointer across GC or host-state replacement.
+    const HostObjectState *find_host_state(ObjectId object) const noexcept;
     // Replacement is atomic with respect to allocation failure. The receiver
     // and proposed references remain rooted during any required collection.
+    // Trusted provider admission: collect dead objects, pin the live target,
+    // and report its maximum replacement-state bytes under the existing heap
+    // limit. This is a snapshot, not a reservation; set_host_state revalidates.
+    std::size_t host_state_capacity(ObjectId object);
     void set_host_state(ObjectId object, std::unique_ptr<HostObjectState> state);
+    // Trusted provider publication: caller roots the target and all children.
+    // Consumes already charged storage; never allocates or collects. Remaining
+    // reservation belongs to the caller until its other buffers are destroyed.
+    void set_host_state_with_storage(ObjectId object, std::unique_ptr<HostObjectState> state,
+                                     std::size_t &reservation_bytes);
+    // Trusted no-throw/no-allocation provider mutation. Callback may only remove
+    // references/storage; it must not reenter the runtime or guest. Violations
+    // of the non-growing storage contract terminate as an internal invariant.
+    void shrink_host_state(ObjectId object,
+        void (*shrink)(HostObjectState &, void *) noexcept, void *context);
+
+
     bool assignable(ObjectId object, std::string_view type) const;
     // JNI instance lookup initializes the supplied class, then resolves exact
     // owned instance declarations along its superclass chain. Access shares
@@ -393,7 +570,19 @@ class ManagedRuntime {
     void retain(ObjectId object);
     void release(ObjectId object);
     void collect();
+    // A default/null-data view means null detailMessage; a nonnull empty view
+    // means an actual empty message, materialized once if getMessage observes it.
     [[noreturn]] void raise(std::string_view type, std::u16string_view message = {});
+    // Same charged exception construction, retaining an actual Throwable cause
+    // across allocation/collection. Does not translate host admission failures.
+    [[noreturn]] void raise_with_cause(std::string_view type, std::u16string_view message, ObjectId cause);
+    // Preserve the original nullable Java detailMessage identity and actual cause.
+    // Both inputs stay rooted through target allocation/class initialization.
+    [[noreturn]] void raise_with_message_and_cause(std::string_view type, ObjectId message, ObjectId cause);
+    // Complete an already allocated fresh Throwable after original constructor
+    // argument callbacks. Preserves Java NEW-before-argument evaluation order.
+    [[noreturn]] void raise_existing_with_message_and_cause(ObjectId target, ObjectId message, ObjectId cause);
+
 
   private:
     Index lookup_jni_method_impl(std::string_view owner, std::string_view name,

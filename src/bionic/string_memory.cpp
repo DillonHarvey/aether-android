@@ -1,6 +1,7 @@
 #include "string_memory.hpp"
 #include <vector>
 #include <algorithm>
+#include <array>
 
 namespace aether::bionic {
 namespace {
@@ -25,10 +26,46 @@ void writable(a64::GuestMemory &memory, Address address, std::uint64_t count) {
                   !memory.accessible(address, static_cast<std::size_t>(count), a64::Permission::write)))
         fail(Fault::write, "native string/memory destination is outside writable guest memory");
 }
+// Scans have no guest callbacks or writes. Copy a small, readable mapping
+// fragment once rather than resolving the guest mapping for every byte. Never
+// read across a mapping or the caller's finite scan bound to fill the buffer.
+class ScanReader {
+  public:
+    ScanReader(a64::GuestMemory &memory, Address address, std::uint64_t count)
+        : memory_(memory), address_(address), count_(count) {}
+    std::uint8_t at(std::uint64_t offset) {
+        if (offset >= limit || offset >= count_)
+            fail(Fault::unsupported_service, "native string scan exceeds 1 MiB profile");
+        if (address_ >= a64::GuestMemory::address_limit ||
+            offset >= a64::GuestMemory::address_limit - address_)
+            fail(Fault::read, "native string/memory source is outside readable guest memory");
+        if (offset < begin_ || offset - begin_ >= size_) {
+            const auto current = address_ + offset;
+            const auto mapping = memory_.mapping(current);
+            if (!mapping)
+                fail(Fault::read, "native string/memory source is outside readable guest memory");
+            const auto available = mapping->size - static_cast<std::size_t>(current - mapping->address);
+            const auto count = (std::min)({bytes_.size(), available,
+                static_cast<std::size_t>((std::min)(count_ - offset, limit - offset))});
+            if (!memory_.read(current, std::span<std::uint8_t>{bytes_}.first(count)))
+                fail(Fault::read, "native string/memory source is outside readable guest memory");
+            begin_ = offset;
+            size_ = count;
+        }
+        return bytes_[static_cast<std::size_t>(offset - begin_)];
+    }
+  private:
+    a64::GuestMemory &memory_;
+    Address address_;
+    std::uint64_t count_, begin_ = 0;
+    std::size_t size_ = 0;
+    std::array<std::uint8_t, 256> bytes_{};
+};
 std::vector<std::uint8_t> string(a64::GuestMemory &memory, Address address) {
     std::vector<std::uint8_t> result;
+    ScanReader reader(memory, address, limit);
     for (std::uint64_t i = 0;; ++i) {
-        const auto byte = read_byte(memory, address, i);
+        const auto byte = reader.at(i);
         if (!byte) return result;
         result.push_back(byte);
     }
@@ -46,8 +83,9 @@ Address search(a64::GuestMemory &memory, Address haystack, std::uint64_t count,
                const std::vector<std::uint8_t> &needle, bool text) {
     if (needle.empty()) return haystack;
     const auto prefix = prefix_table(needle);
+    ScanReader reader(memory, haystack, text ? limit : count);
     for (std::uint64_t i = 0, matched = 0; text || i < count; ++i) {
-        const auto byte = read_byte(memory, haystack, i);
+        const auto byte = reader.at(i);
         if (text && !byte) return 0;
         while (matched && byte != needle[static_cast<std::size_t>(matched)])
             matched = prefix[static_cast<std::size_t>(matched - 1)];
@@ -64,6 +102,18 @@ Fault NativeStringMemory::invoke(StringMemoryOperation operation, std::array<std
         const auto first = r[0], second = r[1], count = r[2];
         using Op = StringMemoryOperation;
         switch (operation) {
+        case Op::compare_case: case Op::compare_case_n: {
+            const bool limited=operation==Op::compare_case_n;
+            if(limited)bounded(count);
+            ScanReader left(memory_,first,limited?count:limit),right(memory_,second,limited?count:limit);
+            const auto lower=[](unsigned value){return value>='A' && value<='Z'?value+('a'-'A'):value;};
+            for(std::uint64_t i=0;!limited || i<count;++i){
+                const auto a=lower(left.at(i)),b=lower(right.at(i));
+                if(a!=b || !a){r[0]=static_cast<std::uint64_t>(static_cast<std::int64_t>(a)-static_cast<std::int64_t>(b));return Fault::none;}
+            }
+            r[0]=0;return Fault::none;
+        }
+
         case Op::copy_end: {
             auto bytes = string(memory_, second);
             const auto length = static_cast<std::uint64_t>(bytes.size());

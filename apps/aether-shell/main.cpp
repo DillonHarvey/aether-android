@@ -31,15 +31,28 @@ using namespace aether::install;
 AppLaunchObserver failure_observer(bool json, bool &launch_failure_shown) {
     return [json, &launch_failure_shown](const AppLaunchFailure &failure) {
         if (json) return;
-        const auto message = std::wstring(L"This app session could not complete.\n\n") +
+        auto message = std::wstring(L"This app session could not complete.\n\n") +
             utf16(session_failure_code(failure.failure)) +
             L"\n\nReview local diagnostics for this app? No report is saved until you choose Save "
-            L"report and a new destination. Private app files, memory and raw logs are excluded. "
+            L"report and a new destination. Reports include retained diagnostic messages. Review before sharing. Private files and memory are excluded. "
             L"Nothing is uploaded. The app will not restart automatically.";
+        if (failure.diagnostic) {
+            auto detail = utf16(failure.diagnostic->code + ": " + failure.diagnostic->message);
+            if (detail.size() > 2000) {
+                detail.resize(2000);
+                if (detail.back() >= 0xd800 && detail.back() <= 0xdbff) detail.pop_back();
+                detail += L" [View diagnostics for retained detail.]";
+            }
+            message += L"\n\n" + detail;
+        }
+        if (!failure.retention_error.empty())
+            message += L"\n\nDiagnostic retention failed: " + utf16(failure.retention_error);
+        else
+            message += L"\n\nDiagnostic history is retained locally and is included in reports.";
         const auto choice = MessageBoxW(nullptr, message.c_str(), L"Aether - App session ended",
                                         MB_YESNO | MB_ICONERROR | MB_DEFBUTTON2);
         launch_failure_shown = choice != 0;
-        if (choice == IDYES) show_app_dialog(failure.store, failure.app_id, false, false, failure.failure);
+        if (choice == IDYES) show_app_dialog(failure.store, failure.app_id, false, false, failure.failure, failure.diagnostic, failure.retention_error);
     };
 }
 int run(const std::vector<std::string> &arguments, bool json, bool &launch_failure_shown) {

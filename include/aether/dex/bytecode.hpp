@@ -42,6 +42,9 @@ struct SwitchPayload {
     std::vector<std::uint32_t> targets;
 };
 struct Instruction {
+    // fill-array-data (0x26): a is the array register, b the element width,
+    // c the element count, and index the first data code-unit offset in the
+    // owning immutable Code.units (never a remapped DEX reference index).
     std::uint32_t pc = 0, next = 0, a = 0, b = 0, c = 0, index = 0;
     std::uint8_t opcode = 0;
     std::uint64_t literal = 0;

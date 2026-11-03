@@ -14,6 +14,7 @@ class ArchiveSource final : public ModuleSource {
                   std::shared_ptr<ArchiveScanBudget> budget);
     std::uint64_t size() const noexcept override;
     std::vector<std::uint8_t> read(std::uint64_t offset, std::size_t size) override;
+    std::vector<std::vector<std::uint8_t>> read_ranges(std::span<const ModuleRange> ranges) override;
     void stream(const std::function<void(std::uint64_t, Bytes)> &visitor) override;
 
   private:

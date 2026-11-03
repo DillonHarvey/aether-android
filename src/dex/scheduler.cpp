@@ -47,6 +47,8 @@ struct Scheduler::Impl {
         std::uint64_t cpu_ticks = 0, cpu_slice_start = 0;
         Clock::time_point deadline{};
         std::function<void()> callback;
+        SwitchHooks hooks;
+        bool target_only=false, logical_main=false;
         std::exception_ptr failure;
     };
     CpuClock cpu_clock;
@@ -96,6 +98,11 @@ struct Scheduler::Impl {
         if (!IsThreadAFiber() || GetCurrentFiber() != (running ? running->fiber : root))
             bad("AETHER_SCHEDULER_FIBER", "Scheduler entered from an unowned fiber");
     }
+    bool owns_current_context() const noexcept {
+        return GetCurrentThreadId()==owner_thread && IsThreadAFiber() &&
+            GetCurrentFiber()==(running?running->fiber:root) &&
+            active_task==(running?running->id:0);
+    }
     void external() const {
         check();
         if (running) bad("AETHER_SCHEDULER_STATE", "Operation requires the external owner main context");
@@ -103,6 +110,16 @@ struct Scheduler::Impl {
     Task &find(TaskId id) const {
         for (const auto &task : tasks) if (task && task->id == id) return *task;
         bad("AETHER_SCHEDULER_TASK", "Task identity is absent, released or belongs to another scheduler");
+    }
+    void cancel_prepared(Task &task) noexcept {
+        task.cancelled=true;
+        task.state=State::cancelled;
+        task.hooks={}; // Never entered: no borrowed hook context is needed again.
+        // Detach captures before their destruction. A trusted capture destructor
+        // may retire this terminal task; it must not destroy a callable member
+        // while that member's own destruction is still using the Task object.
+        std::function<void()> retired;
+        retired.swap(task.callback);
     }
     void checkpoint() {
         check();
@@ -150,27 +167,39 @@ struct Scheduler::Impl {
         SwitchToFiber(owner.root);
         std::terminate(); // Terminal fibers must only be deleted, never resumed.
     }
-    void resume(Task &task) {
+    void resume(Task &task,bool cleanup=false) {
+        if(cleanup && !task.cancelled)
+            bad("AETHER_SCHEDULER_STATE", "Cleanup resume requires a closed scheduler and cancelled task");
         const auto previous_priority = GetThreadPriority(GetCurrentThread());
         if(previous_priority == THREAD_PRIORITY_ERROR_RETURN)
             bad("AETHER_SCHEDULER_PRIORITY", "Cannot preserve owner priority before logical task execution");
         const auto target_priority = *host::priority_profile_target(initial_priority,task.priority);
         if(target_priority != previous_priority && !SetThreadPriority(GetCurrentThread(),target_priority))
             bad("AETHER_SCHEDULER_PRIORITY", "Cannot apply logical task priority to the Win32 owner");
+        // A trusted clock callback may inspect root state. Never call it while
+        // scheduler identity and the actual current fiber disagree.
+        const auto cpu_start=sample_cpu();
+        if(task.hooks.enter && !cpu_start && !cleanup) {
+            if((target_priority != previous_priority || priority_changed) &&
+               !SetThreadPriority(GetCurrentThread(),previous_priority))
+                bad("AETHER_SCHEDULER_PRIORITY", "Cannot restore owner priority after failed switch preparation");
+            bad("AETHER_SCHEDULER_CPU_UNAVAILABLE", "Hooked task requires a valid CPU slice clock before entry");
+        }
+        if(cpu_start)task.cpu_slice_start=*cpu_start;
         running = &task;
         active_task = task.id;
         task.state = State::running;
-        const auto cpu_start=sample_cpu();
-        if(cpu_start)task.cpu_slice_start=*cpu_start;
+        if(task.hooks.enter)task.hooks.enter(task.hooks.context,task.id);
         SwitchToFiber(task.fiber);
+        running = nullptr;
+        active_task = 0;
+        if(task.hooks.leave)task.hooks.leave(task.hooks.context,task.id);
         const auto cpu_end=sample_cpu();
         if(cpu_start && cpu_end) {
             const auto elapsed=*cpu_end-*cpu_start;
-            if(elapsed>UINT64_MAX-task.cpu_ticks || elapsed>UINT64_MAX-background_cpu_ticks)cpu_valid=false;
-            else {task.cpu_ticks+=elapsed;background_cpu_ticks+=elapsed;}
+            if(elapsed>UINT64_MAX-task.cpu_ticks || (!task.logical_main && elapsed>UINT64_MAX-background_cpu_ticks))cpu_valid=false;
+            else {task.cpu_ticks+=elapsed;if(!task.logical_main)background_cpu_ticks+=elapsed;}
         }
-        running = nullptr;
-        active_task = 0;
         if(target_priority != previous_priority || priority_changed) {
             if(!SetThreadPriority(GetCurrentThread(),previous_priority))
                 bad("AETHER_SCHEDULER_PRIORITY", "Cannot restore owner priority after logical task execution");
@@ -186,7 +215,7 @@ std::uint64_t Scheduler::logical_cpu_ticks(std::uint64_t raw) const {
     const auto &p=*impl_;p.check();
     if(!p.cpu_valid || !p.observe_cpu(raw))
         bad("AETHER_SCHEDULER_CPU_UNAVAILABLE","Logical-thread CPU accounting is unavailable");
-    if(p.running) {
+    if(p.running && !p.running->logical_main) {
         const auto elapsed=raw-p.running->cpu_slice_start;
         if(elapsed>UINT64_MAX-p.running->cpu_ticks) {
             p.cpu_valid=false;bad("AETHER_SCHEDULER_CPU_UNAVAILABLE","Logical-thread CPU accounting overflowed");
@@ -210,20 +239,76 @@ Scheduler::~Scheduler() {
     } catch (...) { std::terminate(); }
 }
 Scheduler::TaskId Scheduler::submit(std::function<void()> callback,std::optional<std::int32_t> inherited_priority) {
+    return submit(std::move(callback),inherited_priority,SwitchHooks{});
+}
+Scheduler::TaskId Scheduler::submit(std::function<void()> callback,std::optional<std::int32_t> inherited_priority,SwitchHooks hooks) {
+    return admit(std::move(callback),inherited_priority,hooks,false);
+}
+Scheduler::TaskId Scheduler::prepare(std::function<void()> callback,std::optional<std::int32_t> inherited_priority) {
+    return prepare(std::move(callback),inherited_priority,SwitchHooks{});
+}
+Scheduler::TaskId Scheduler::prepare(std::function<void()> callback,std::optional<std::int32_t> inherited_priority,SwitchHooks hooks) {
+    return admit(std::move(callback),inherited_priority,hooks,true);
+}
+Scheduler::TaskId Scheduler::admit(std::function<void()> callback,std::optional<std::int32_t> inherited_priority,SwitchHooks hooks,bool prepared,bool target_only,bool logical_main) {
     auto &p = *impl_;p.check();
     if(p.process)p.process->checkpoint();
     if (p.closed) bad("AETHER_SCHEDULER_CLOSED", "Submissions are closed");
+    if(logical_main) {
+        p.external();
+        for(const auto &task:p.tasks)if(task && task->logical_main)
+            bad("AETHER_SCHEDULER_STATE", "A retained logical-main context already exists");
+    }
     if (!callback) bad("AETHER_SCHEDULER_TASK", "Empty scheduler callback");
+    if(static_cast<bool>(hooks.enter)!=static_cast<bool>(hooks.leave) || (!hooks.enter && hooks.context))
+        bad("AETHER_SCHEDULER_SWITCH_HOOKS", "Switch callbacks must be paired and an unused context must be null");
     if(inherited_priority && !host::priority_profile_supported(*inherited_priority))bad("AETHER_SCHEDULER_PRIORITY_UNSUPPORTED","Unsupported inherited priority profile");
     std::size_t occupied = 0;std::unique_ptr<Impl::Task> *slot = nullptr;
     for (auto &task : p.tasks) { if (task) ++occupied; else if (!slot) slot = &task; }
     if (!slot || occupied == p.limits.contexts) bad("AETHER_SCHEDULER_CONTEXT_LIMIT", "Retained scheduler context bound exceeded");
     auto task = std::make_unique<Impl::Task>();task->owner=&p;task->callback=std::move(callback);
+    task->hooks=hooks;task->target_only=target_only;task->logical_main=logical_main;
+    task->state=prepared?State::prepared:State::runnable;
     task->priority = inherited_priority?*inherited_priority:(p.running ? p.running->priority : p.root_priority);
     task->id=identity();
     task->fiber=CreateFiberEx(p.limits.stack_commit,p.limits.stack_reserve,FIBER_FLAG_FLOAT_SWITCH,&Impl::entry,task.get());
     if (!task->fiber) bad("AETHER_SCHEDULER_STACK", "Cannot allocate bounded scheduler fiber stack");
     const auto id=task->id;*slot=std::move(task);return id;
+}
+Scheduler::TaskId Scheduler::prepare_targeted(std::function<void()> callback,std::optional<std::int32_t> priority,SwitchHooks hooks) {
+    return admit(std::move(callback),priority,hooks,true,true);
+}
+Scheduler::TaskId Scheduler::prepare_main(std::function<void()> callback,SwitchHooks hooks) {
+    return admit(std::move(callback),{},hooks,true,true,true);
+}
+bool Scheduler::run_main(TaskId id) {
+    auto &p=*impl_;p.external();
+    const auto &task=p.find(id);
+    if(!task.logical_main)bad("AETHER_SCHEDULER_STATE","Target is not the retained logical-main context");
+    return run_one(id,task.priority);
+}
+bool Scheduler::publish(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(!p.owns_current_context() || p.closed)return false;
+    for(auto &task:p.tasks)if(task && task->id==id){
+        if(task->state!=State::prepared || task->cancelled)return false;
+        task->state=State::runnable;
+        return true;
+    }
+    return false;
+}
+bool Scheduler::discard_prepared(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(!p.owns_current_context())return false;
+    for(auto &slot:p.tasks)if(slot && slot->id==id){
+        if(slot->state!=State::prepared)return false;
+        auto retired=std::move(slot);
+        // Only unentered fibers reach this path. In particular, a published
+        // runnable task must use cancellation even if its first slice is pending.
+        DeleteFiber(retired->fiber);
+        return true;
+    }
+    return false;
 }
 bool Scheduler::run_one() {
     auto &p=*impl_;p.external();
@@ -233,8 +318,36 @@ bool Scheduler::run_one() {
         (task->state==State::parked && task->park_timed)) && task->deadline<=now) task->state=State::runnable;
     for (std::size_t n=0;n<p.tasks.size();++n) {
         const auto index=(p.cursor+n)%p.tasks.size();auto &task=p.tasks[index];
-        if (!task || task->state!=State::runnable) continue;
+        if (!task || task->target_only || task->state!=State::runnable) continue;
         p.cursor=(index+1)%p.tasks.size();p.resume(*task);return true;
+    }
+    return false;
+}
+bool Scheduler::run_one(TaskId id,std::int32_t priority) {
+    auto &p=*impl_;p.external();
+    if(p.closed)return false;
+    if(!host::priority_profile_supported(priority))bad("AETHER_SCHEDULER_PRIORITY_UNSUPPORTED","Unsupported native slice priority");
+    auto &task=p.find(id);
+    if(task.state!=State::runnable)return false;
+    task.priority=priority;p.resume(task);return true;
+}
+void Scheduler::cancel_and_unwind(TaskId id) {
+    auto &p=*impl_;p.external();auto &task=p.find(id);
+    if(terminal(task.state))return;
+    if(task.state==State::prepared){p.cancel_prepared(task);return;}
+    task.cancelled=true;p.resume(task,true);
+    if(!terminal(task.state))std::terminate();
+}
+bool Scheduler::release_terminal(TaskId id) noexcept {
+    auto &p=*impl_;if(!p.owns_current_context())return false;
+    for(auto &slot:p.tasks)if(slot && slot->id==id){
+        if(p.running==slot.get() || !terminal(slot->state))return false;
+        if(slot->logical_main) {
+            const auto target=host::priority_profile_target(p.initial_priority,slot->priority);
+            if(!target || !SetThreadPriority(GetCurrentThread(),*target))return false;
+            p.root_priority=slot->priority;
+        }
+        auto retired=std::move(slot);DeleteFiber(retired->fiber);return true;
     }
     return false;
 }
@@ -253,13 +366,14 @@ void Scheduler::park() { impl_->park({}); }
 void Scheduler::park_until(std::chrono::steady_clock::time_point deadline) { impl_->park(deadline); }
 void Scheduler::unpark(TaskId id) {
     auto &p=*impl_;p.check();auto &task=p.find(id);
-    if (terminal(task.state)) return;
+    if (terminal(task.state) || task.state==State::prepared) return;
     task.park_permit = true;
     if (task.state==State::parked) task.state=State::runnable;
 }
 void Scheduler::cancel(TaskId id) {
     auto &p=*impl_;p.check();auto &task=p.find(id);
     if (terminal(task.state)) return;
+    if(task.state==State::prepared){p.cancel_prepared(task);return;}
     task.cancelled=true;
     if(task.state==State::sleeping || task.state==State::parked) task.state=State::runnable;
 }
@@ -276,16 +390,30 @@ std::optional<std::chrono::steady_clock::time_point> Scheduler::next_deadline() 
 }
 void Scheduler::release(TaskId id) {
     auto &p=*impl_;p.external();auto &task=p.find(id);
-    if(!terminal(task.state)) bad("AETHER_SCHEDULER_STATE", "Only terminal contexts may be released");
-    for(auto &slot:p.tasks) if(slot.get()==&task) {DeleteFiber(task.fiber);slot.reset();return;}
+    if(!terminal(task.state) && task.state!=State::prepared)
+        bad("AETHER_SCHEDULER_STATE", "Only prepared or terminal contexts may be released");
+    for(auto &slot:p.tasks) if(slot.get()==&task) {
+        // Remove the ID before dropping unstarted captures, permitting their
+        // trusted cleanup to reenter without deleting this Task twice.
+        auto retired=std::move(slot);
+        DeleteFiber(retired->fiber);
+        return;
+    }
 }
 void Scheduler::close() {
     auto &p=*impl_;p.external();if(p.close_complete)return;p.closed=true;
-    for(auto &task:p.tasks) if(task && !terminal(task->state)) task->cancelled=true;
+    for(auto &task:p.tasks) if(task && !terminal(task->state)) {
+        if(task->state==State::prepared)p.cancel_prepared(*task);
+        else task->cancelled=true;
+    }
     // At most one resume per retained context. Cooperative cancellation must unwind
     // directly to entry; a callback that never checkpoints requires the process watchdog.
     for(auto &task:p.tasks) if(task && !terminal(task->state)) {
-        p.resume(*task);
+        // Cancellation checkpoints run before guest work on both first entry
+        // and return from a suspension. Permit only this unwind when CPU
+        // accounting is unavailable; cpu_valid stays false and no elapsed
+        // value is manufactured, so logical CPU queries still fail explicitly.
+        p.resume(*task,true);
         if(!terminal(task->state)) std::terminate();
     }
     if(p.priority_changed && !SetThreadPriority(GetCurrentThread(),p.initial_priority))

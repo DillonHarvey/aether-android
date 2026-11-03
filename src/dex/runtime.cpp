@@ -118,7 +118,14 @@ std::uint32_t string_hash(std::u16string_view text) noexcept {
         hash = 31 * hash + character;
     return hash;
 }
+inline constexpr std::string_view executors_type="Ljava/util/concurrent/Executors;";
+bool fixed_pool_factory(std::string_view name,std::string_view signature) noexcept {
+    return name=="newFixedThreadPool" &&
+        (signature=="(I)Ljava/util/concurrent/ExecutorService;" ||
+         signature=="(ILjava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;");
+}
 std::string_view core_super(std::string_view type) {
+    if(type==executors_type)return "Ljava/lang/Object;";
     if(const auto stream=stream_class(type))return stream->superclass;
     if(type=="Landroid/text/TextUtils;")return "Ljava/lang/Object;";
     if (const auto info=async_task_class(type))return info->superclass;
@@ -211,7 +218,7 @@ std::string_view core_super(std::string_view type) {
         return "Ljava/lang/LinkageError;";
     if (type == "Ljava/lang/NoSuchMethodError;")
         return "Ljava/lang/IncompatibleClassChangeError;";
-    if (type == "Ljava/lang/NoSuchFieldError;")
+    if (type == "Ljava/lang/NoSuchFieldError;" || type == "Ljava/lang/IllegalAccessError;")
         return "Ljava/lang/IncompatibleClassChangeError;";
     if (type == "Ljava/lang/IncompatibleClassChangeError;")
         return "Ljava/lang/LinkageError;";
@@ -251,11 +258,41 @@ class CountDownLatchState final : public HostObjectState {
 };
 struct ThreadState {
     enum class Lifecycle { fresh, started, terminated };
-    ObjectId name = 0, target = 0, group = 0, pool_worker = 0, uncaught_handler = 0;
+    ObjectId name = 0, target = 0, group = 0, pool_worker = 0, uncaught_handler = 0,
+             context_loader = 0;
     Lifecycle lifecycle = Lifecycle::fresh;
     std::uint64_t inherited_signal_mask = 0;
     bool initialized = false, daemon = false, synthetic = false;
 };
+// This catalog names implemented core operations, not arbitrary JNI requests or
+// a complete Java declaration inventory. The loader interns references only.
+std::optional<std::string_view> core_loader_method_owner(std::string_view owner,
+                                                        std::string_view name,
+                                                        std::string_view signature) {
+    if (owner == "Ljava/lang/Thread;" &&
+        ((name == "getContextClassLoader" && signature == "()Ljava/lang/ClassLoader;") ||
+         (name == "setContextClassLoader" && signature == "(Ljava/lang/ClassLoader;)V")))
+        return "Ljava/lang/Thread;";
+    if (owner == "Ljava/lang/Class;" &&
+        ((name == "getClassLoader" && signature == "()Ljava/lang/ClassLoader;") ||
+         (name == "getSimpleName" && signature == "()Ljava/lang/String;")))
+        return "Ljava/lang/Class;";
+    if ((owner == "Ljava/lang/ClassLoader;" || owner == "Laether/dex/RuntimeClassLoader;") &&
+        name == "loadClass" && signature == "(Ljava/lang/String;)Ljava/lang/Class;")
+        return "Ljava/lang/ClassLoader;";
+    return {};
+}
+bool abstract_collection_base(std::string_view type) noexcept {
+    return type == "Ljava/util/AbstractCollection;" || type == "Ljava/util/AbstractList;" ||
+           type == "Ljava/util/AbstractSet;" || type == "Ljava/util/AbstractSequentialList;";
+}
+bool abstract_collection_default(std::string_view name,std::string_view signature) noexcept {
+    return (name=="iterator" && signature=="()Ljava/util/Iterator;") ||
+        (name=="listIterator" && (signature=="()Ljava/util/ListIterator;" || signature=="(I)Ljava/util/ListIterator;")) ||
+        (name=="isEmpty" && signature=="()Z") || (name=="remove" && signature=="(I)Ljava/lang/Object;") ||
+        (name=="set" && signature=="(ILjava/lang/Object;)Ljava/lang/Object;") ||
+        (name=="add" && signature=="(ILjava/lang/Object;)V");
+}
 struct PoolWorker {
     std::array<Value,5> roots{}; // pool, actual factory Thread, first job, current job, throwable
     bool entered=false,exited=false,active=false,idle=false,abrupt=false,counted=false;
@@ -266,10 +303,14 @@ struct PoolWorker {
     ObjectId thread()const noexcept{return roots[1].bits;}
 };
 struct DefaultFactory {ObjectId group=0;std::uint64_t sequence=0;};
+enum class ThrowableMessageKind { null_message, inline_text, string_reference, unavailable };
 struct Object {
     std::string type, represented;
     std::u16string text;
     std::map<Index, Value> fields;
+    // One actual AbstractList declaration, shared by inherited symbolic field
+    // references. Managed subclasses keep their own element storage and fields.
+    std::uint32_t abstract_list_mod_count = 0;
     std::vector<Value> elements;
     std::unique_ptr<ThreadPoolState> pool;
     std::unique_ptr<FutureState> future;
@@ -287,6 +328,7 @@ struct Object {
     std::unique_ptr<DequeIterator> deque_iterator;
     std::unique_ptr<SnapshotIterator> iterator;
     std::unique_ptr<LiveListIterator> live_iterator;
+    std::unique_ptr<VirtualListIterator> virtual_list_iterator;
     std::unique_ptr<AtomicReference> atomic;
     std::unique_ptr<AtomicInteger> atomic_integer;
     std::unique_ptr<AtomicLong> atomic_long;
@@ -321,6 +363,8 @@ struct Object {
     std::unique_ptr<ReferenceQueue> queue;
     std::unique_ptr<ReferenceFieldUpdater> updater;
     ObjectId cause = 0;
+    ObjectId throwable_message = 0;
+    ThrowableMessageKind throwable_message_kind = ThrowableMessageKind::null_message;
     std::size_t bytes = 0;
     bool marked = false;
     // Weak canonical membership: ordinary roots retain interned Strings, while
@@ -444,6 +488,8 @@ struct TaskContext {
     std::size_t worker_bytes = 0;
     std::size_t charged = 0;
     bool java_owned = false;
+    bool prepared_worker = false, native_worker = false;
+    std::optional<std::uint64_t> slice_headroom, slice_quantum;
     ObjectId maintenance_pool = 0;
     bool maintenance_abrupt = false, missing_worker = false;
     std::span<const Value> checked_worker_roots() const {
@@ -466,10 +512,16 @@ struct ManagedRuntime::Impl {
     std::unique_ptr<ClassLoader> loader;
     RuntimeLimits limits;
     RuntimeMetrics metrics;
+    // Actual work is monotonic across independent execution contexts. Transfers
+    // between their allowances never count as fresh work. The native witness
+    // advances only in charge_thread_instructions, after successful admission.
+    std::uint64_t actual_work = 0, native_charge_counter = 0;
     NativeInterface *native = nullptr;
     std::shared_ptr<ProcessState> process=std::make_shared<ProcessState>();
     bool process_bound=false;
     HostInterface *host = nullptr;
+    bool bootstrap_provider_bound = false;
+    bool host_initializers_used = false;
     std::uint64_t host_generation=1;
     std::thread::id owner = std::this_thread::get_id();
     const std::uint64_t execution_owner = Scheduler::execution_token();
@@ -509,12 +561,34 @@ struct ManagedRuntime::Impl {
     mutable ExecutionContext main_context;
     std::array<ExecutionContext*,16> native_contexts{};
     std::array<std::uint64_t,16> native_context_tokens{};
+    // Compact registry of all live native stacks, including future parked
+    // scheduler owners. Entries are ordered by admission, not by current fiber.
     std::size_t native_context_depth=0;
+    ExecutionContext *selected_native_context() const noexcept {
+        const auto token=Scheduler::execution_token();
+        for(std::size_t n=native_context_depth;n;--n)
+            if(native_context_tokens[n-1]==token)return native_contexts[n-1];
+        return nullptr;
+    }
+    void remove_native_context(ExecutionContext &context) noexcept {
+        for(std::size_t n=0;n<native_context_depth;++n)if(native_contexts[n]==&context){
+            if(native_context_tokens[n]!=Scheduler::execution_token())std::terminate();
+            for(std::size_t i=n+1;i<native_context_depth;++i){
+                native_contexts[i-1]=native_contexts[i];
+                native_context_tokens[i-1]=native_context_tokens[i];
+            }
+            --native_context_depth;native_contexts[native_context_depth]=nullptr;
+            native_context_tokens[native_context_depth]=0;return;
+        }
+        // A live stack may only unregister its own admitted entry once.
+        std::terminate();
+    }
     bool native_cpu_unattributed=false;
     const std::optional<int> owner_priority_baseline=host::current_thread_priority();
     ObjectId thread_group_object = 0;
     ObjectId default_uncaught_handler = 0;
     ObjectId java_version_property = 0;
+    ObjectId null_string_literal = 0; // Strong core constant; shared with the ordinary intern namespace.
     ObjectId empty_list = 0;
     std::array<ObjectId,3> empty_map_objects{};
     ObjectId runtime_object = 0, vm_runtime_object = 0, math_random_object = 0;
@@ -526,6 +600,31 @@ struct ManagedRuntime::Impl {
     // reuse validation for a new range until that entire range has passed.
     mutable std::size_t sealed_loader_checked_classes = 0;
     std::unique_ptr<Scheduler> scheduler;
+    struct MainWork {
+        Scheduler::TaskId id = 0;
+        MainWorkPolicy policy;
+        std::optional<std::uint64_t> retained;
+        std::uint64_t quantum_remaining = 0, work_start = 0;
+    };
+    std::unique_ptr<MainWork> main_work;
+    bool main_work_selected() const noexcept {
+        return main_work && main_work->id && Scheduler::execution_token()==main_work->id;
+    }
+    std::uint64_t main_work_actual() const noexcept {
+        if(!main_work || actual_work<main_work->work_start)std::terminate();
+        return actual_work-main_work->work_start;
+    }
+    void check_main_work() const {
+        if(!main_work || !main_work->policy.admission)fail("MAIN_WORK_POLICY","Retained main work has no resource controller");
+        const auto stopped=main_work->policy.admission->check(main_work_actual());
+        if(stopped!=WorkStopReason::none)
+            throw DexError(std::string(work_stop_name(stopped)),"Retained main work exhausted its host resource admission");
+    }
+    void main_work_root(Scheduler::TaskId id) const {
+        if(owner!=std::this_thread::get_id() || execution_owner || !scheduler ||
+           scheduler->current()!=0 || !main_work || main_work->id!=id)
+            fail("MAIN_WORK_STATE","Retained main control requires its owning external scheduler root");
+    }
     std::array<std::unique_ptr<TaskContext>, 16> tasks;
     std::uint64_t task_work_remaining = 0;
     std::array<std::unique_ptr<MainCallback>, 16> main_callbacks;
@@ -549,9 +648,9 @@ struct ManagedRuntime::Impl {
     // this lookup cannot construct a diagnostic or allocate when binding is absent.
     const ExecutionContext *allocation_context() const noexcept {
         const auto token=Scheduler::execution_token();
-        if(native_context_depth)
-            return token==native_context_tokens[native_context_depth-1] ? native_contexts[native_context_depth-1] : nullptr;
-        if(token==execution_owner)return &main_context;
+        if(const auto context=selected_native_context())return context;
+        if(main_work_selected())return &main_context;
+        if(token==execution_owner && !main_work)return &main_context;
         // Task identities are process-unique; do not call Scheduler::current(),
         // whose validation could allocate an error while already out of memory.
         if(scheduler)
@@ -629,12 +728,12 @@ struct ManagedRuntime::Impl {
         }
     }
     ExecutionContext &current_context() const {
-        if(native_context_depth){
-            if(Scheduler::execution_token()!=native_context_tokens[native_context_depth-1])fail("EXECUTION_CONTEXT","Native worker belongs to another scheduler context");
-            return *native_contexts[native_context_depth-1];
-        }
+        if(const auto context=selected_native_context())return *context;
         const auto token = Scheduler::execution_token();
-        if (token == execution_owner) return main_context;
+        if(main_work_selected())return main_context;
+        if (token == execution_owner && !main_work) return main_context;
+        if(token==execution_owner && main_work)
+            fail("MAIN_WORK_STATE","Retained main work owns the managed main context until release");
         if (scheduler && scheduler->current() == token)
             for (const auto &task : tasks)
                 if (task && task->id == token) return task->context;
@@ -658,6 +757,7 @@ struct ManagedRuntime::Impl {
     }
     template<class F> decltype(auto) provider_call(F &&call) const {
         execution_checkpoint();
+        if(main_work_selected())check_main_work();
         NonYielding barrier(current_context());
         try {
             if constexpr(std::is_void_v<std::invoke_result_t<F&>>) {
@@ -670,8 +770,38 @@ struct ManagedRuntime::Impl {
             allocation_failure_checkpoint();throw;
         } catch(...) {failure_checkpoint();throw;}
     }
-    bool scheduled_task() const {return Scheduler::execution_token()!=execution_owner;}
-    bool background() const { return native_context_depth || Scheduler::execution_token() != execution_owner; }
+    bool scheduled_task() const {return !main_work_selected() && Scheduler::execution_token()!=execution_owner;}
+    std::uint64_t *native_slice_remaining() const noexcept {
+        const auto token=Scheduler::execution_token();
+        for(const auto &task:tasks)
+            if(task && task->native_worker && task->id==token && task->slice_headroom)
+                return &*task->slice_headroom;
+        return nullptr;
+    }
+    std::uint64_t *native_slice_quantum() const noexcept {
+        const auto token=Scheduler::execution_token();
+        for(const auto &task:tasks)
+            if(task && task->native_worker && task->id==token && task->slice_quantum)
+                return &*task->slice_quantum;
+        return nullptr;
+    }
+    void charge_context_work(ExecutionContext &context,std::uint64_t count,const char *message) {
+        auto *slice=native_slice_remaining();
+        if(main_work_selected()) {
+            if(main_work->retained && count>*main_work->retained)fail("BUDGET",message);
+        } else if(count>context.remaining || (slice && count>*slice))fail("BUDGET",message);
+        if(count>UINT64_MAX-actual_work)fail("BUDGET","Runtime actual-work counter exhausted");
+        if(main_work_selected()) {
+            if(main_work->retained)*main_work->retained-=count;
+            main_work->quantum_remaining-=std::min(count,main_work->quantum_remaining);
+        } else {
+            context.remaining-=count;
+            if(slice)*slice-=count;
+            if(auto *quantum=native_slice_quantum())*quantum-=std::min(count,*quantum);
+        }
+        actual_work+=count;
+    }
+    bool background() const { return selected_native_context() || (!main_work_selected() && Scheduler::execution_token() != execution_owner); }
     bool owned_thread(ObjectId id) const {
         const auto found = heap.find(id);
         return found != heap.end() && bool(found->second.thread);
@@ -690,13 +820,44 @@ struct ManagedRuntime::Impl {
         }
         return thread_group_object;
     }
+    void validate_context_loader(ObjectId id) {
+        if (id && !subtype(object(id).type, "Ljava/lang/ClassLoader;"))
+            fail("VALUE_TYPE", "Thread context loader is not a managed ClassLoader");
+    }
+    ObjectId inherited_context_loader(ObjectId parent) {
+        (void)thread_state(parent);
+        // Android inherits the actual virtual getter at construction, including
+        // app overrides. No provider barrier is dropped for this callback.
+        if (const auto method = object_override(parent, "getContextClassLoader",
+                                                 "()Ljava/lang/ClassLoader;")) {
+            const std::array<Value, 1> args{Value::reference(parent)};
+            const auto result = reference(runtime.invoke_virtual(*method, args));
+            ThreadRoot result_root(runtime, result);
+            validate_context_loader(result);
+            return result;
+        }
+        return thread_state(parent).context_loader;
+    }
+    struct ThreadRoot {
+        ManagedRuntime &runtime;
+        ObjectId id;
+        ThreadRoot(ManagedRuntime &runtime, ObjectId id) : runtime(runtime), id(id) { runtime.retain(id); }
+        ~ThreadRoot() { runtime.release(id); }
+        ThreadRoot(const ThreadRoot &) = delete;
+        ThreadRoot &operator=(const ThreadRoot &) = delete;
+    };
     ObjectId synthetic_thread(ExecutionContext &context, std::u16string_view name) {
         if (context.thread_object) return context.thread_object;
+        // The app's primordial Thread has the held application loader. A fresh
+        // native attachment starts with the bootstrap (null) context instead.
+        const auto context_loader = &context == &main_context ? runtime.class_loader() : ObjectId{0};
+        ThreadRoot loader_root(runtime, context_loader);
         Object value; value.type = "Ljava/lang/Thread;";
         value.text = name; // Immutable, accounted fallback; materialize a String only on getName.
         value.thread = std::make_unique<ThreadState>();
         value.thread->synthetic = value.thread->initialized = true;
         value.thread->lifecycle = ThreadState::Lifecycle::started;
+        value.thread->context_loader = context_loader;
         const auto id = allocate(std::move(value));
         if (id > static_cast<ObjectId>(std::numeric_limits<std::int64_t>::max()))
             fail("IDENTITY_LIMIT", "Managed Thread ID exceeds positive long range");
@@ -811,12 +972,21 @@ struct ManagedRuntime::Impl {
         }
         check_interruption(context);
     }
+    void mark_task_cancellation(Scheduler::TaskId id) noexcept {
+        if(!id)return; // Zero is the external root, never a cancellable task.
+        for(auto &entry:tasks)if(entry && entry->id==id)entry->context.cancellation_requested=true;
+        // Every live nested native stack of this task must preserve the private
+        // scheduler cancellation while unwinding, not replace it with sticky exit.
+        for(std::size_t n=0;n<native_context_depth;++n)
+            if(native_context_tokens[n]==id)native_contexts[n]->cancellation_requested=true;
+    }
     TaskContext &task(Scheduler::TaskId id) const {
         for (const auto &entry : tasks) if (entry && entry->id == id) return *entry;
         fail("TASK", "Managed task is absent, released or belongs to another runtime");
     }
     Scheduler::TaskId submit_task(Index method, std::span<const Value> arguments, bool virtual_dispatch,
-                                  std::unique_ptr<ManagedWorkerEntry> worker = {}, ObjectId java_thread = 0) {
+                                  std::unique_ptr<ManagedWorkerEntry> worker = {}, ObjectId java_thread = 0,
+                                  bool dormant = false, Scheduler::SwitchHooks hooks = {}, bool native_worker = false) {
         check_thread();
         execution_checkpoint();
         if (execution_owner != 0)
@@ -836,6 +1006,8 @@ struct ManagedRuntime::Impl {
         }
         if (!slot) fail("TASK_LIMIT", "Managed task context bound of 16 is exhausted");
         auto entry = std::make_unique<TaskContext>();
+        entry->prepared_worker=dormant;
+        entry->native_worker=native_worker;
         if (java_thread) {
             (void)thread_state(java_thread);
             entry->java_owned = true;
@@ -863,7 +1035,7 @@ struct ManagedRuntime::Impl {
             fail("HEAP_LIMIT", "Managed task entry exceeds the shared heap quota");
         entry->charged = base_charge + entry->worker_bytes;
         std::optional<std::int32_t> inherited_priority;
-        if(native_context_depth){const auto inherited=priority({});if(inherited.error)fail("SCHEDULER_PRIORITY_UNSUPPORTED","Cannot inherit native worker priority");inherited_priority=inherited.nice;}
+        if(selected_native_context()){const auto inherited=priority({});if(inherited.error)fail("SCHEDULER_PRIORITY_UNSUPPORTED","Cannot inherit native worker priority");inherited_priority=inherited.nice;}
         ensure_scheduler();
         // Publish entry arguments as roots before collection. No managed allocation
         // or callback can occur between copying arguments and this publication.
@@ -876,7 +1048,7 @@ struct ManagedRuntime::Impl {
         } catch (...) { slot->reset(); throw; }
         metrics.heap_bytes += task->charged;
         try {
-            task->id = scheduler->submit([this, task, method, virtual_dispatch] {
+            auto execute = [this, task, method, virtual_dispatch] {
                 background_executed = true;
                 if (progress_sink && !progress_sink->prepare_native_stack())
                     fail("PROGRESS_STACK", "Cannot prepare bounded native fault diagnostics on task stack");
@@ -911,8 +1083,11 @@ struct ManagedRuntime::Impl {
                 }
                 // Only orderly completion or this context's recognized exit can
                 // reach fallible cleanup. Failure/cancellation only retire state.
-                if(native)runtime.run_thread_finalizers([&]{native->finish_logical_thread(runtime);});
-            },inherited_priority);
+                if(native && !task->native_worker)runtime.run_thread_finalizers([&]{native->finish_logical_thread(runtime);});
+            };
+            task->id = dormant ? (native_worker ? scheduler->prepare_targeted(std::move(execute),inherited_priority,hooks)
+                                                : scheduler->prepare(std::move(execute),inherited_priority,hooks))
+                               : scheduler->submit(std::move(execute),inherited_priority,hooks);
         } catch (...) {
             metrics.heap_bytes -= task->charged;
             slot->reset();
@@ -936,6 +1111,55 @@ struct ManagedRuntime::Impl {
         return value;
     }
     Object &pool_queue(ObjectId id) {return validate_pool_queue(pool_state(id).queue());}
+    void initialize_pool(ObjectId receiver,std::int32_t core_size,std::int32_t maximum,
+                         std::int64_t keep_alive,ObjectId unit_id,ObjectId queue_id,
+                         ObjectId factory_id,ObjectId handler_id,bool custom_factory,bool custom_handler) {
+        if(!object(receiver).pool)fail("STATE","ThreadPoolExecutor has no authenticated state");
+        if(object(receiver).pool->initialized())fail("STATE","ThreadPoolExecutor constructor invoked twice");
+        // The final Java constructor validates sizing before nullable strategy
+        // arguments, including when both nThreads and a supplied factory fail.
+        if(core_size<0 || maximum<=0 || maximum<core_size || keep_alive<0)
+            runtime.raise("Ljava/lang/IllegalArgumentException;");
+        if(!queue_id || (custom_factory && !factory_id) || (custom_handler && !handler_id))
+            runtime.raise("Ljava/lang/NullPointerException;");
+        const auto &unit=object(unit_id);
+        if(unit.type!=time_unit_type || !unit.enumeration)fail("ENUM_STATE","Invalid executor TimeUnit");
+        const auto nanos=convert_time_unit(keep_alive,unit.enumeration->ordinal(),0);
+        (void)validate_pool_queue(queue_id);
+        if(!factory_id) {
+            const auto creator=runtime.current_thread();
+            Object value;value.type=default_thread_factory_type;value.factory=std::make_unique<DefaultFactory>();
+            value.factory->group=thread_state(creator).group?thread_state(creator).group:thread_group();
+            factory_id=allocate(std::move(value));
+        }
+        ThreadRoot factory_root(runtime,factory_id);
+        if(!handler_id) {
+            Object value;value.type=abort_policy_type;value.abort_policy=std::make_unique<AbortPolicy>();
+            (void)value.abort_policy->invoke(runtime,abort_policy_type,"<init>","()V");
+            handler_id=allocate(std::move(value));
+        }
+        object(receiver).pool->initialize(static_cast<std::uint32_t>(core_size),
+            static_cast<std::uint32_t>(maximum),nanos,queue_id,factory_id,handler_id);
+    }
+    Value create_fixed_pool(std::span<const Value> args,bool custom_factory) {
+        if(args.size()!=(custom_factory?2u:1u))fail("SIGNATURE","Fixed thread pool factory argument count mismatch");
+        const auto count=std::bit_cast<std::int32_t>(word(args[0]));
+        const auto pool=runtime.new_object(thread_pool_type);
+        ThreadRoot pool_root(runtime,pool);
+        const auto unit=time_unit(2); // Actual MILLISECONDS constant, as specified by Executors.
+        const auto queue=runtime.new_object(blocking_queue_type);
+        ThreadRoot queue_root(runtime,queue);
+        const std::array<Value,1> queue_args{Value::reference(queue)};
+        auto &backing=object(queue);
+        if(!backing.fifo || !backing.fifo->invoke(runtime,blocking_queue_type,"<init>","()V",queue_args,
+            {backing.bytes,metrics.heap_bytes,limits.heap_bytes,limits.array_length}))
+            fail("STATE","Fixed thread pool requires its actual initialized LinkedBlockingQueue");
+        initialize_pool(pool,count,count,0,unit,queue,custom_factory?reference(args[1]):ObjectId{0},0,
+                        custom_factory,false);
+        // No worker or callback is started here. The retained factory is used
+        // by the existing add_pool_worker path only when actual work arrives.
+        return Value::reference(pool);
+    }
     bool native_pool_queue(ObjectId id) {
         const auto &queue=pool_queue(id);
         return queue.fifo && (queue.type==blocking_queue_type || queue.type==synchronous_queue_type);
@@ -1083,10 +1307,12 @@ struct ManagedRuntime::Impl {
         }
     }
     ObjectId default_factory_thread(ObjectId factory,ObjectId target) {
-        auto &value=object(factory);
-        if(!value.factory) fail("THREAD_FACTORY_UNSUPPORTED", "Default factory lacks authenticated state");
+        if(!object(factory).factory) fail("THREAD_FACTORY_UNSUPPORTED", "Default factory lacks authenticated state");
+        const auto context_loader=inherited_context_loader(runtime.current_thread());
+        ThreadRoot loader_root(runtime,context_loader);
         Object thread;thread.type="Ljava/lang/Thread;";thread.thread=std::make_unique<ThreadState>();
-        thread.thread->target=target;thread.thread->group=value.factory->group;
+        thread.thread->target=target;thread.thread->group=object(factory).factory->group;
+        thread.thread->context_loader=context_loader;
         thread.thread->initialized=true;thread.thread->daemon=false;
         const auto id=allocate(std::move(thread));
         runtime.retain(id);
@@ -1094,8 +1320,9 @@ struct ManagedRuntime::Impl {
         std::u16string name=u"pool-";
         for(auto c:std::to_string(factory))name.push_back(c);
         name+=u"-thread-";
-        for(auto c:std::to_string(++value.factory->sequence))name.push_back(c);
-        thread_state(id).name=runtime.new_string(name);
+        for(auto c:std::to_string(++object(factory).factory->sequence))name.push_back(c);
+        const auto name_id=runtime.new_string(name);
+        thread_state(id).name=name_id;
         return id;
     }
     bool pool_worker_admissible(ObjectId id,ObjectId first) {
@@ -1505,6 +1732,9 @@ struct ManagedRuntime::Impl {
         if(state.state==FutureState::State::cancelled)runtime.raise(cancellation_type);
         if(state.state==FutureState::State::failed) {
             Object error;error.type=execution_exception_type;error.cause=state.roots[3].bits;
+            // The existing cause-only shortcut has not executed cause.toString().
+            // Do not invent its Java detailMessage when it becomes observable.
+            error.throwable_message_kind=ThrowableMessageKind::unavailable;
             const auto id=allocate(std::move(error));++metrics.exceptions;current_context().last_exception=id;
             throw JavaException(id);
         }
@@ -1516,8 +1746,7 @@ struct ManagedRuntime::Impl {
     }
     void charge_future_wait() {
         auto &context=current_context();
-        if(!context.remaining)fail("BUDGET", "Future wait instruction allowance exhausted");
-        --context.remaining;
+        charge_context_work(context,1,"Future wait instruction allowance exhausted");
         if(scheduled_task()) {
             if(!task_work_remaining)fail("BUDGET", "Future wait batch allowance exhausted");
             --task_work_remaining;
@@ -1673,7 +1902,7 @@ struct ManagedRuntime::Impl {
     }
     host::PriorityResult priority(std::optional<std::int32_t> nice) {
         if(nice && !host::priority_profile_supported(*nice))return {95};
-        if(native_context_depth){const auto service=current_context().native_priority;if(!service || !*service)return {95};return (*service)(nice);}
+        if(selected_native_context()){const auto service=current_context().native_priority;if(!service || !*service)return {95};return (*service)(nice);}
         if(!scheduler && !nice)return {};
         try {ensure_scheduler();if(nice)scheduler->set_current_priority(*nice);return {0,scheduler->current_priority()};}catch(...){return {5};}
     }
@@ -1715,6 +1944,7 @@ struct ManagedRuntime::Impl {
         if(state.state==FutureState::State::failed) {
             Object error;error.type="Ljava/lang/RuntimeException;";error.cause=state.roots[3].bits;
             error.text=u"An error occurred while executing doInBackground()";
+            error.throwable_message_kind=ThrowableMessageKind::inline_text;
             const auto id=allocate(std::move(error));++metrics.exceptions;current_context().last_exception=id;throw JavaException(id);
         }
         if(!async_state(task).invoked)
@@ -1751,14 +1981,19 @@ struct ManagedRuntime::Impl {
         if(state.kind==AsyncSdkState::Kind::factory && name=="newThread" && signature=="(Ljava/lang/Runnable;)Ljava/lang/Thread;") {
             if(state.sequence==UINT64_MAX)fail("ASYNC_LIMIT", "AsyncTask thread-name counter exhausted");
             const auto creator=runtime.current_thread();
+            const auto context_loader=inherited_context_loader(creator);
+            ThreadRoot loader_root(runtime,context_loader);
+            if(object(receiver).async_sdk->sequence==UINT64_MAX)fail("ASYNC_LIMIT", "AsyncTask thread-name counter exhausted");
             Object thread;thread.type="Ljava/lang/Thread;";thread.thread=std::make_unique<ThreadState>();
             thread.thread->initialized=true;thread.thread->target=reference(args[1]);
             thread.thread->daemon=thread_state(creator).daemon;
             thread.thread->group=thread_state(creator).group?thread_state(creator).group:thread_group();
+            thread.thread->context_loader=context_loader;
             const auto id=allocate(std::move(thread));runtime.retain(id);
             struct Release {ManagedRuntime &runtime;ObjectId id;~Release(){runtime.release(id);}} release{runtime,id};
-            std::u16string text=u"AsyncTask #";for(const auto c:std::to_string(++state.sequence))text.push_back(c);
-            thread_state(id).name=runtime.new_string(text);return Value::reference(id);
+            std::u16string text=u"AsyncTask #";for(const auto c:std::to_string(++object(receiver).async_sdk->sequence))text.push_back(c);
+            const auto name_id=runtime.new_string(text);
+            thread_state(id).name=name_id;return Value::reference(id);
         }
         if(state.kind==AsyncSdkState::Kind::backup_policy && name=="rejectedExecution" && signature=="(Ljava/lang/Runnable;Ljava/util/concurrent/ThreadPoolExecutor;)V") {
             require_suspendable();SuspendCoreBarrier allow(current_context());
@@ -1857,8 +2092,7 @@ struct ManagedRuntime::Impl {
     void stream_work() {
         // Native reader loops participate in the same persistent work budgets.
         auto &context=current_context();
-        if(!context.remaining)fail("BUDGET","Stream operation instruction allowance exhausted");
-        --context.remaining;
+        charge_context_work(context,1,"Stream operation instruction allowance exhausted");
         if(scheduled_task()) {
             if(!task_work_remaining)fail("BUDGET","Stream task batch allowance exhausted");
             --task_work_remaining;
@@ -2180,8 +2414,7 @@ struct ManagedRuntime::Impl {
         struct IteratorRoot {ManagedRuntime &runtime;ObjectId id;~IteratorRoot(){runtime.release(id);}} root{runtime,iterator};
         bool modified=false;
         while(word(call_virtual_named(iterator,"hasNext","()Z"))) {
-            if(!context.remaining)fail("BUDGET","Collection traversal instruction allowance exhausted");
-            --context.remaining;
+            charge_context_work(context,1,"Collection traversal instruction allowance exhausted");
             if(scheduled_task()) {
                 if(!task_work_remaining)fail("BUDGET","Collection traversal batch allowance exhausted");
                 --task_work_remaining;
@@ -2211,8 +2444,7 @@ struct ManagedRuntime::Impl {
         struct Root {ManagedRuntime &runtime;ObjectId id;~Root(){runtime.release(id);}} held{runtime,iterator};
         bool modified=false;
         while(word(call_virtual_named(iterator,"hasNext","()Z"))) {
-            if(!context.remaining)fail("BUDGET","Collection traversal instruction allowance exhausted");
-            --context.remaining;
+            charge_context_work(context,1,"Collection traversal instruction allowance exhausted");
             if(scheduled_task()) {
                 if(!task_work_remaining)fail("BUDGET","Collection traversal batch allowance exhausted");
                 --task_work_remaining;
@@ -2664,7 +2896,7 @@ struct ManagedRuntime::Impl {
         return {};
     }
     void random_work() {
-        auto &context=current_context();if(!context.remaining)fail("BUDGET","Random instruction allowance exhausted");--context.remaining;
+        auto &context=current_context();charge_context_work(context,1,"Random instruction allowance exhausted");
         if(scheduled_task()){if(!task_work_remaining)fail("BUDGET","Random batch allowance exhausted");--task_work_remaining;}
         else if(main_callback_inflight){if(!main_callback_work_remaining)fail("BUDGET","Random main-callback allowance exhausted");--main_callback_work_remaining;}
     }
@@ -2712,22 +2944,84 @@ struct ManagedRuntime::Impl {
         const auto bytes=sizeof(ThreadLocalTable)+value.thread_locals->bytes();
         value.thread_locals.reset();value.bytes-=bytes;metrics.heap_bytes-=bytes;
     }
-    void set_thread_local(ObjectId thread,ObjectId key,ObjectId binding) {
-        auto &value=object(thread);
-        if(!value.thread)fail("THREAD_STATE","ThreadLocal storage requires authenticated Thread identity");
-        if(!value.thread_locals) {
-            const auto charge=sizeof(ThreadLocalTable);
-            if(charge>limits.heap_bytes-metrics.heap_bytes)collect();
-            if(charge>limits.heap_bytes-metrics.heap_bytes)fail("HEAP_LIMIT","ThreadLocal table exceeds managed heap quota");
-            auto table=std::make_unique<ThreadLocalTable>();
-            std::size_t staged_bytes=0;metrics.heap_bytes+=charge;
-            try {table->set(runtime,key,binding,{staged_bytes,metrics.heap_bytes,limits.heap_bytes,limits.array_length});}
-            catch(...) {metrics.heap_bytes-=charge+staged_bytes;throw;}
-            value.thread_locals=std::move(table);value.bytes+=charge+staged_bytes;return;
-        }
-        value.thread_locals->set(runtime,key,binding,{value.bytes,metrics.heap_bytes,limits.heap_bytes,limits.array_length});
+    struct ThreadLocalCommitContext {
+        Impl &owner;
+        Object &thread;
+        ThreadLocalTable &table;
+        std::size_t &owner_bytes;
+        std::size_t old_capacity_bytes;
+        bool pending;
+    };
+    static void adopt_thread_local_storage(void *opaque, std::size_t old_bytes,
+                                          std::size_t new_bytes, std::size_t &reservation) noexcept {
+        auto &context = *static_cast<ThreadLocalCommitContext *>(opaque);
+        auto &p = context.owner;
+        // All fallible ownership checks preceded mutation. These are trusted
+        // no-throw commit invariants after the actual old buffer was freed.
+        if (!context.thread.thread || old_bytes != context.old_capacity_bytes ||
+            context.table.bytes() != new_bytes || reservation != new_bytes ||
+            (context.pending ? bool(context.thread.thread_locals) : context.thread.thread_locals.get() != &context.table) ||
+            old_bytes > context.owner_bytes || p.metrics.provider_storage_reserved_bytes > p.metrics.heap_bytes ||
+            new_bytes > p.metrics.provider_storage_reserved_bytes ||
+            old_bytes > p.metrics.heap_bytes - p.metrics.provider_storage_reserved_bytes ||
+            context.owner_bytes - old_bytes > p.limits.heap_bytes ||
+            new_bytes > p.limits.heap_bytes - (context.owner_bytes - old_bytes))
+            std::terminate();
+        context.owner_bytes = context.owner_bytes - old_bytes + new_bytes;
+        p.metrics.heap_bytes -= old_bytes;
+        p.metrics.provider_storage_reserved_bytes -= new_bytes;
+        reservation = 0; // Fresh storage remains charged, now owned by the core object.
     }
-    std::optional<Value> invoke_thread_local(ObjectId receiver,std::string_view name,std::string_view signature,std::span<const Value> args) {
+    void set_thread_local(ObjectId thread,ObjectId key,ObjectId binding) {
+        struct Root {
+            ManagedRuntime &runtime;
+            ObjectId object;
+            Root(ManagedRuntime &owner, ObjectId id) : runtime(owner), object(id) { runtime.retain(object); }
+            ~Root() { runtime.release(object); }
+        } thread_root{runtime, thread}, key_root{runtime, key}, binding_root{runtime, binding};
+        auto &value = object(thread);
+        if (!value.thread) fail("THREAD_STATE", "ThreadLocal storage requires authenticated Thread identity");
+        if (metrics.provider_storage_reserved_bytes > metrics.heap_bytes ||
+            value.bytes > metrics.heap_bytes - metrics.provider_storage_reserved_bytes ||
+            metrics.heap_bytes > limits.heap_bytes)
+            fail("HEAP_LIMIT", "ThreadLocal owner storage accounting is inconsistent");
+        if (!value.thread_locals) {
+            struct PendingTable {
+                Impl &owner;
+                std::size_t header_reserved = 0, staged_bytes = 0;
+                std::unique_ptr<ThreadLocalTable> table;
+                ~PendingTable() {
+                    table.reset(); // Free header/capacity before either accounting refund.
+                    owner.metrics.heap_bytes -= staged_bytes;
+                    owner.runtime.release_provider_storage(header_reserved);
+                }
+            } pending{*this};
+            runtime.reserve_provider_storage(sizeof(ThreadLocalTable));
+            pending.header_reserved = sizeof(ThreadLocalTable);
+            runtime.charge_provider_work(1);
+            pending.table = std::make_unique<ThreadLocalTable>();
+            ThreadLocalCommitContext commit{*this, value, *pending.table, pending.staged_bytes, 0, true};
+            pending.table->set(runtime, key, binding,
+                {pending.staged_bytes, metrics.heap_bytes, limits.heap_bytes, limits.array_length},
+                {&commit, adopt_thread_local_storage});
+            // No fallible operation remains after staged capacity adoption.
+            // Header reservation and capacity become this one Thread's storage.
+            value.thread_locals = std::move(pending.table);
+            value.bytes += sizeof(ThreadLocalTable) + pending.staged_bytes;
+            metrics.provider_storage_reserved_bytes -= pending.header_reserved;
+            pending.header_reserved = 0;
+            pending.staged_bytes = 0;
+            return;
+        }
+        auto &table = *value.thread_locals;
+        if (table.bytes() > value.bytes) fail("HEAP_LIMIT", "ThreadLocal capacity exceeds its owner charge");
+        ThreadLocalCommitContext commit{*this, value, table, value.bytes, table.bytes(), false};
+        table.set(runtime, key, binding,
+            {value.bytes, metrics.heap_bytes, limits.heap_bytes, limits.array_length},
+            {&commit, adopt_thread_local_storage});
+    }
+    std::optional<Value> invoke_thread_local(ObjectId receiver,std::string_view name,std::string_view signature,
+                                            std::span<const Value> args,bool supplied_override = false) {
         auto &key=object(receiver);
         if(!key.thread_local_key)fail("STATE","ThreadLocal lacks authenticated state");
         if(name=="<init>") {
@@ -2735,17 +3029,30 @@ struct ManagedRuntime::Impl {
             key.thread_local_key->initialized=true;return Value::nothing();
         }
         if(!key.thread_local_key->initialized)fail("STATE","ThreadLocal must be initialized before use");
-        if(name=="initialValue")return Value::reference(0);
+        if (name == "initialValue") {
+            if (!supplied_override) return Value::reference(0); // Exact base body for a nonvirtual super call.
+            if (!key.thread_local_key->supplied) fail("STATE", "SuppliedThreadLocal has no authentic supplier storage");
+            const auto supplier = key.thread_local_key->supplier;
+            if (!supplier) runtime.raise("Ljava/lang/NullPointerException;");
+            runtime.retain(supplier);
+            struct SupplierRoot {ManagedRuntime &runtime;ObjectId object;~SupplierRoot(){runtime.release(object);}} root{runtime,supplier};
+            if (!current_context().barriers) fail("THREAD_LOCAL_STATE", "Supplier callback requires its exact core boundary");
+            SuspendCoreBarrier allow(current_context());
+            return runtime.invoke_virtual_named(supplier, "get", "()Ljava/lang/Object;");
+        }
         const auto thread=runtime.current_thread();
         auto &thread_value=object(thread);
-        if(thread_value.thread_locals)thread_value.thread_locals->expunge();
         if(name=="set") {set_thread_local(thread,receiver,reference(args[1]));return Value::nothing();}
         if(name=="remove") {
-            if(thread_value.thread_locals)if(auto *slot=thread_value.thread_locals->find(receiver))*slot={};
+            if(thread_value.thread_locals)thread_value.thread_locals->erase(runtime,receiver);
             return Value::nothing();
         }
         if(name=="get") {
-            if(thread_value.thread_locals)if(const auto *slot=thread_value.thread_locals->find(receiver))return Value::reference(slot->value);
+            if (thread_value.thread_locals) {
+                thread_value.thread_locals->expunge(runtime);
+                if (const auto *slot = thread_value.thread_locals->find(runtime, receiver))
+                    return Value::reference(slot->value);
+            }
             if(!current_context().barriers)fail("THREAD_LOCAL_STATE","ThreadLocal initializer requires its exact core boundary");
             Value result;
             {SuspendCoreBarrier allow(current_context());result=runtime.invoke_virtual_named(receiver,"initialValue","()Ljava/lang/Object;");}
@@ -2773,6 +3080,9 @@ struct ManagedRuntime::Impl {
         const auto desc=runtime.new_string(std::u16string(description.begin(),description.end()));runtime.retain(desc);
         struct Root {ManagedRuntime &runtime;ObjectId id;~Root(){runtime.release(id);}} root{runtime,desc};
         Object value;value.type=pattern_syntax_type;value.regex_syntax=std::make_unique<PatternSyntax>();
+        // PatternSyntaxException overrides getMessage; its formatted diagnostic
+        // is not proof that the inherited Throwable detailMessage is known.
+        value.throwable_message_kind=ThrowableMessageKind::unavailable;
         *value.regex_syntax={source,desc,error.index};value.text=runtime.string(desc);
         if(error.index>=0) {
             const auto number=std::to_string(error.index);value.text+=u" near index ";value.text.append(number.begin(),number.end());
@@ -2966,9 +3276,32 @@ struct ManagedRuntime::Impl {
         }
         return value.character->invoke(runtime, name, signature, args, other);
     }
+    void preflight_object_storage(std::size_t bytes) {
+        check_thread();
+        const auto fits = [&] {
+            return heap.size() < limits.objects && metrics.heap_bytes <= limits.heap_bytes &&
+                bytes <= limits.heap_bytes - metrics.heap_bytes;
+        };
+        if (!fits()) collect();
+        if (!fits()) fail("HEAP_LIMIT", "Managed object storage exhausted before native allocation");
+    }
+    void make_thread_local_key(Object &pending, bool supplied = false) {
+        if (pending.thread_local_key) fail("STATE", "ThreadLocal storage constructed twice");
+        constexpr auto field_bytes = sizeof(Value) + 64;
+        constexpr auto header_bytes = sizeof(Object) + sizeof(ManagedThreadLocal);
+        if (pending.type.size() > limits.heap_bytes || header_bytes > limits.heap_bytes - pending.type.size())
+            fail("HEAP_LIMIT", "ThreadLocal native header exceeds the managed heap quota");
+        const auto fixed = header_bytes + pending.type.size();
+        if (pending.fields.size() > (limits.heap_bytes - fixed) / field_bytes)
+            fail("HEAP_LIMIT", "ThreadLocal header and owned fields exceed the managed heap quota");
+        preflight_object_storage(fixed + pending.fields.size() * field_bytes);
+        pending.thread_local_key = std::make_unique<ManagedThreadLocal>();
+        pending.thread_local_key->supplied = supplied;
+    }
     ObjectId box_boolean(bool value) {
         auto &cached=boolean_cache[value?1:0];
         if(!cached) {
+            preflight_object_storage(sizeof(Object) + boolean_type.size() + sizeof(ManagedBoolean));
             Object boxed;boxed.type=boolean_type;boxed.boolean=std::make_unique<ManagedBoolean>();
             boxed.boolean->initialize(value);cached=allocate(std::move(boxed));
         }
@@ -2984,10 +3317,9 @@ struct ManagedRuntime::Impl {
         }
         return value.boolean->invoke(runtime,name,signature,args,other);
     }
-    std::optional<Value> hosted_virtual(ObjectId receiver, std::string_view name,
-                                        std::span<const std::string> parameters,
-                                        std::string_view result_type, std::span<const Value> args,
-                                        bool activation_delegation = false) {
+    std::optional<HostMethod> hosted_virtual_declaration(ObjectId receiver, std::string_view name,
+                                                        std::span<const std::string> parameters,
+                                                        std::string_view result_type, bool class_only = false) const {
         if (!host || name == "<init>" || name == "<clinit>") return {};
         const auto actual_type = std::string(object(receiver).type);
         auto boundary = actual_type;
@@ -3001,16 +3333,41 @@ struct ManagedRuntime::Impl {
         if (core_type(boundary) || boundary.starts_with('[') ||
             !provider_call([&] { return host->class_info(boundary); })) return {};
         const auto method = provider_call([&] { return host->public_method(boundary, name, parameters); });
-        if (!method) return {};
+        if (!method) return {}; // Partial provider metadata is not proof of Java absence.
+        if (class_only) {
+            // Only an actual class declaration can preempt owned interfaces.
+            // An interface-owned public declaration leaves the existing default
+            // search unchanged, including its conflict/abstract checks.
+            auto current = boundary;
+            bool found = false;
+            for (unsigned depth = 0;; ++depth) {
+                if (depth == 256) fail("CLASS_LIMIT", "Provider declaring-class hierarchy exceeds limit");
+                if (core_type(current) || current.starts_with('[') || resolve_class(current)) break;
+                const auto metadata = provider_call([&] { return host->class_info(current); });
+                if (!metadata || metadata->is_interface) break;
+                if (current == method->owner) { found = true; break; }
+                if (metadata->superclass.empty()) break;
+                current = metadata->superclass;
+            }
+            if (!found) return {};
+        }
         const bool compatible_result = method->return_type == result_type ||
             (reference_type(method->return_type) && reference_type(result_type) &&
              subtype(method->return_type, result_type));
         if (method->name != name || !compatible_result ||
             method->parameters.size() != parameters.size() ||
             !std::equal(method->parameters.begin(), method->parameters.end(), parameters.begin()) ||
-            !(method->flags & 1u) || (method->flags & (8u | 0x400u)) ||
+            (method->flags & 7u) != 1u || (method->flags & (8u | 0x400u)) ||
             !subtype(actual_type, method->owner))
             fail("METHOD_METADATA", "Provider virtual declaration does not match the requested public method");
+        return method;
+    }
+    std::optional<Value> hosted_virtual(ObjectId receiver, std::string_view name,
+                                        std::span<const std::string> parameters,
+                                        std::string_view result_type, std::span<const Value> args,
+                                        bool activation_delegation = false) {
+        const auto method = hosted_virtual_declaration(receiver, name, parameters, result_type);
+        if (!method) return {};
         if (args.size() != parameters.size() + 1 || reference(args[0]) != receiver)
             fail("SIGNATURE", "Provider virtual arguments do not match their receiver and declaration");
         std::optional<ViewActivationScope> activation;
@@ -3065,6 +3422,45 @@ struct ManagedRuntime::Impl {
         // resolve metadata, so root it before that work can collect anything.
         RegexRoot result_root(runtime, result.kind == ValueKind::reference ? result.bits : ObjectId{0});
         return typed(result, result_type);
+    }
+    // Shared authenticated backend for DEX invocation and trusted named SDK
+    // calls. Caller frames retain receiver/name across class-space resolution;
+    // this loads metadata only and never initializes the selected class.
+    Value throwable_get_message(ObjectId receiver) {
+        const auto kind=object(receiver).throwable_message_kind;
+        if(kind==ThrowableMessageKind::unavailable)
+            fail("API_UNSUPPORTED", "Throwable detailMessage is not materialized by this exception producer");
+        if(kind==ThrowableMessageKind::null_message)return Value::reference(0);
+        if(const auto message=object(receiver).throwable_message)return Value::reference(message);
+        // The current invoke frame roots the receiver. String allocation may
+        // collect, so reacquire its Object after allocation before publication.
+        runtime.charge_provider_work(object(receiver).text.size());
+        const auto message=runtime.new_string(object(receiver).text);
+        object(receiver).throwable_message=message;
+        return Value::reference(message);
+    }
+    Value held_loader_load_class(ObjectId receiver, ObjectId name_object) {
+        if(receiver!=loader_object || !loader_object)
+            fail("CLASS_LOADER_UNSUPPORTED", "Class loading requires this runtime's canonical held class space");
+        const auto name=runtime.string(name_object);
+        const auto descriptor=binary_descriptor(name);
+        if(!descriptor || descriptor->starts_with('[')) runtime.raise("Ljava/lang/ClassNotFoundException;",name);
+        if(!resolve_class(*descriptor) && !core_type(*descriptor)) {
+            const auto metadata=host ? provider_call([&] { return host->class_info(*descriptor); }) : std::nullopt;
+            if(!metadata) {
+                const auto presence = host ? provider_call([&] {
+                    return host->bootstrap_class_presence(runtime, *descriptor);
+                }) : HostBootstrapClassPresence::unknown;
+                if(presence == HostBootstrapClassPresence::proven_absent)
+                    runtime.raise("Ljava/lang/ClassNotFoundException;",name);
+                if(descriptor->starts_with("Ljava/") || descriptor->starts_with("Ljavax/") ||
+                   descriptor->starts_with("Landroid/") || descriptor->starts_with("Ldalvik/"))
+                    fail("CLASS_UNSUPPORTED", "Platform class is not implemented: "+*descriptor);
+                runtime.raise("Ljava/lang/ClassNotFoundException;",name);
+            }
+            if(!metadata->bootstrap_class) fail("CLASS_LOADER_UNSUPPORTED", "Native class loader provenance is incomplete");
+        }
+        return Value::reference(runtime.class_object(*descriptor)); // Loading never initializes the class.
     }
     Value call_virtual_named(ObjectId receiver, std::string_view name, std::string_view signature,
                              std::span<const Value> arguments = {}, bool allow_thread_base = false) {
@@ -3214,6 +3610,18 @@ struct ManagedRuntime::Impl {
                 return string_split(receiver,reference(frame.arguments[1]),
                     limited?std::bit_cast<std::int32_t>(word(frame.arguments[2])):0);
             }
+            if (core_type(type) && subtype(type, "Ljava/lang/Throwable;") &&
+                name == "getMessage" && signature == "()Ljava/lang/String;") {
+                authenticate_named(frame, signature, arguments);
+                NonYielding barrier(current_context());
+                return throwable_get_message(receiver);
+            }
+            if ((type == "Ljava/lang/ClassLoader;" || type == "Laether/dex/RuntimeClassLoader;") &&
+                name == "loadClass" && signature == "(Ljava/lang/String;)Ljava/lang/Class;") {
+                authenticate_named(frame, signature, arguments);
+                NonYielding barrier(current_context());
+                return held_loader_load_class(receiver, reference(frame.arguments[1]));
+            }
             if (type == "Ljava/lang/Class;" && (name == "getConstructor" || name == "getDeclaredConstructor") &&
                 signature == "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;") {
                 authenticate_named(frame, signature, arguments);
@@ -3314,12 +3722,14 @@ struct ManagedRuntime::Impl {
                     if(const auto result=invoke_uuid(receiver,name,signature,frame.arguments))return *result;
                 }
             }
-            if(type==thread_local_type && name!="<init>" && thread_local_method(name,signature)) {
+            if ((type == thread_local_type || type == supplied_thread_local_type) && name != "<init>" &&
+                thread_local_method(type, name, signature) && !thread_local_static_method(type, name, signature)) {
                 const bool one=name=="set";
                 if(arguments.size()!=(one?1U:0U))fail("SIGNATURE","Wrong named ThreadLocal argument count");
                 if(one)frame.arguments[1]=typed(arguments[0],"Ljava/lang/Object;");
                 NonYielding barrier(current_context());
-                if(const auto result=invoke_thread_local(receiver,name,signature,frame.arguments))return *result;
+                if(const auto result=invoke_thread_local(receiver,name,signature,frame.arguments,
+                        type == supplied_thread_local_type))return *result;
             }
             if(regex_method(type,name,signature)) {
                 const bool one=signature[1]!=')';
@@ -3514,6 +3924,20 @@ struct ManagedRuntime::Impl {
             }
             const auto *definition = resolve_class(type);
             if (!definition) {
+                if((type==virtual_list_iterator_type || type==virtual_list_list_iterator_type) &&
+                   virtual_list_iterator_method(name,signature,type==virtual_list_list_iterator_type)) {
+                    authenticate_named(frame,signature,arguments);
+                    NonYielding barrier(current_context());
+                    if(const auto result=virtual_iterator_call(receiver,name,signature,frame.arguments))return *result;
+                    fail("STATE","Virtual list iterator has no owned helper");
+                }
+                if((abstract_collection_base(type) || type=="Ljava/util/List;" ||
+                    type=="Ljava/util/Collection;" || type=="Ljava/lang/Iterable;") &&
+                   abstract_collection_default(name,signature)) {
+                    authenticate_named(frame,signature,arguments);
+                    NonYielding barrier(current_context());
+                    if(const auto result=abstract_collection_call(receiver,type,name,signature,frame.arguments,true))return *result;
+                }
                 // Managed overrides were searched first. Invoke an actual
                 // public provider declaration without inventing a DEX ID.
                 if (const auto result = hosted_char_sequence(receiver, name, signature, frame.arguments))
@@ -3545,6 +3969,15 @@ struct ManagedRuntime::Impl {
                     authenticate_named(frame, signature, arguments);
                     if (const auto result = hosted_virtual(receiver, name, parameters, result_type, frame.arguments))
                         return *result;
+                    if (name == "getMessage" && signature == "()Ljava/lang/String;") {
+                        const auto metadata=provider_call([&] { return host->class_info(type); });
+                        if (metadata && metadata->inherits_throwable_get_message) {
+                            if (!subtype(type,"Ljava/lang/Throwable;"))
+                                fail("METHOD_METADATA","Inherited Throwable method requires Throwable provenance");
+                            NonYielding barrier(current_context());
+                            return throwable_get_message(receiver);
+                        }
+                    }
                 }
                 break;
             }
@@ -3762,6 +4195,12 @@ struct ManagedRuntime::Impl {
         }
     }
     bool pump_task() {
+        if(main_work_selected()) {
+            // This logical main stack is already on a scheduler fiber. It may
+            // return only itself to root; it cannot recursively run a peer.
+            runtime.main_work_checkpoint(true);
+            return false;
+        }
         execution_checkpoint();
         // Every caller is the owned main fiber, including managed safepoints and
         // audited main sleep/yield. Host-owned retained task IDs are untouched.
@@ -3849,11 +4288,21 @@ struct ManagedRuntime::Impl {
     void check_monitor_available(ObjectId id) const {
         const auto &active=current_context();
         const auto check=[&](const ExecutionContext &context){
+            runtime.charge_provider_work(1);
             if(&context==&active)return;
-            for(const auto *frame:context.frames)for(std::size_t n=0;n<frame->monitor_count;++n)
-                if(frame->monitors[n]==id)fail("THREAD_BLOCKING_UNSUPPORTED","Monitor is owned by another logical thread");
+            for(const auto *frame:context.frames) {
+                runtime.charge_provider_work(1);
+                for(std::size_t n=0;n<frame->monitor_count;++n) {
+                    runtime.charge_provider_work(1);
+                    if(frame->monitors[n]==id)fail("THREAD_BLOCKING_UNSUPPORTED","Monitor is owned by another logical thread");
+                }
+            }
         };
-        check(main_context);for(const auto &task:tasks)if(task)check(task->context);
+        check(main_context);
+        for(const auto &task:tasks) {
+            runtime.charge_provider_work(1);
+            if(task)check(task->context);
+        }
         for(std::size_t n=0;n<native_context_depth;++n)check(*native_contexts[n]);
     }
     std::size_t frame_count() const {
@@ -3865,8 +4314,18 @@ struct ManagedRuntime::Impl {
     void safepoint() {
         execution_checkpoint();
         auto &context = current_context();
+        if(main_work_selected() && !main_work->quantum_remaining && !context.barriers) {
+            bool held=false;for(const auto *frame:context.frames)held=held || frame->monitor_count;
+            if(!held){runtime.main_work_checkpoint(true);return;}
+        }
         if (context.quantum) { --context.quantum; return; }
         context.quantum = 127;
+        if(main_work_selected()) {
+            check_main_work();
+            // Nested/provider/monitor ancestry merely defers soft preemption.
+            // It never renews an aggregate authority or loses actual work.
+            return;
+        }
         if (!scheduler || context.barriers) return;
         for (const auto *frame : context.frames) if (frame->monitor_count) return;
         if (background()) scheduler->yield();
@@ -3878,7 +4337,12 @@ struct ManagedRuntime::Impl {
         if (scheduler) {
             try {
                 tasks_closing=true;
-                for(auto &task:tasks)if(task)task->context.cancellation_requested=true;
+                if(main_work) {
+                    main_context.cancellation_requested=true;
+                    for(std::size_t n=0;n<native_context_depth;++n)
+                        if(native_context_tokens[n]==main_work->id)native_contexts[n]->cancellation_requested=true;
+                }
+                for(auto &task:tasks)if(task)mark_task_cancellation(task->id);
                 scheduler->close();
                 for(auto &task:tasks)if(task)finish_task_context(task->context);
                 reap_java_threads(false);
@@ -3893,7 +4357,19 @@ struct ManagedRuntime::Impl {
             limits.heap_bytes > 64 * 1024 * 1024 || !limits.array_length || limits.array_length > 1'048'576)
             fail("LIMIT", "Invalid managed runtime limits");
         if (source)
-            loader = std::make_unique<ClassLoader>(image, std::move(source));
+            loader = std::make_unique<ClassLoader>(image, std::move(source), LinkLimits{},
+                [this](std::string_view descriptor) {
+                    // Detachment is teardown, not a new app-definition policy.
+                    if (!host && bootstrap_provider_bound)
+                        fail("STATE", "Cannot link app classes after bootstrap provider detachment");
+                    // Preserve the existing sealed-loader collision refusal.
+                    if (descriptor == "Ljava/lang/ClassLoader;" || descriptor == "Laether/dex/RuntimeClassLoader;")
+                        return false;
+                    if (core_type(descriptor)) return true;
+                    if (!host) return false;
+                    const auto metadata = provider_call([&] { return host->class_info(descriptor); });
+                    return metadata && metadata->bootstrap_class;
+                });
         for (const auto &p : image.prototypes) {
             if (p.return_type >= image.types.size())
                 fail("INDEX", "Invalid return type");
@@ -4202,6 +4678,7 @@ struct ManagedRuntime::Impl {
         mark(thread_group_object, todo);
         mark(default_uncaught_handler, todo);
         mark(java_version_property, todo);
+        mark(null_string_literal, todo);
         mark(empty_list, todo);
         for(const auto id:empty_map_objects)mark(id,todo);
         mark(runtime_object, todo);
@@ -4213,6 +4690,7 @@ struct ManagedRuntime::Impl {
             todo.pop_back();
             const auto &o = heap.at(id);
             mark(o.cause, todo);
+            mark(o.throwable_message, todo);
             if(o.stream)for(const auto root:o.stream->roots)value(root);
             if (o.thread) {
                 mark(o.thread->name, todo);
@@ -4220,6 +4698,7 @@ struct ManagedRuntime::Impl {
                 mark(o.thread->group, todo);
                 mark(o.thread->pool_worker, todo);
                 mark(o.thread->uncaught_handler, todo);
+                mark(o.thread->context_loader, todo);
             }
             for (const auto &[field, v] : o.fields) {
                 (void)field;
@@ -4247,6 +4726,8 @@ struct ManagedRuntime::Impl {
                     value(v);
             if (o.live_iterator)
                 mark(o.live_iterator->backing(), todo);
+            if (o.virtual_list_iterator)
+                mark(o.virtual_list_iterator->backing(), todo);
             if (o.iterator)
                 for (auto v : o.iterator->references())
                     value(v);
@@ -4280,6 +4761,7 @@ struct ManagedRuntime::Impl {
                 mark(o.map_entry->map, todo);
             if (o.map_values)
                 mark(o.map_values->map, todo);
+            if (o.thread_local_key) mark(o.thread_local_key->supplier, todo);
             if(o.thread_locals)for(const auto &slot:o.thread_locals->slots)if(slot.occupied)mark(slot.value,todo);
             if(o.regex_pattern)mark(o.regex_pattern->source,todo);
             if(o.regex_matcher){mark(o.regex_matcher->pattern,todo);mark(o.regex_matcher->original,todo);mark(o.regex_matcher->snapshot,todo);}
@@ -4322,9 +4804,12 @@ struct ManagedRuntime::Impl {
                 fail("STREAM_STATE","Input adapter byte accounting changed during collection");
             if (!it->second.marked) {
                 if(it->second.stream)(void)provider_call([&]{return it->second.stream->close_source();});
-                metrics.heap_bytes -= it->second.bytes;
-                ++metrics.reclaimed;
+                const auto reclaimed_bytes = it->second.bytes;
+                // Native resources owned by HostObjectState remain charged
+                // until their noexcept destruction has actually released them.
                 it = heap.erase(it);
+                metrics.heap_bytes -= reclaimed_bytes;
+                ++metrics.reclaimed;
             } else
                 ++it;
         }
@@ -4359,6 +4844,8 @@ struct ManagedRuntime::Impl {
             value.bytes += sizeof(ManagedList) + value.list->bytes();
         if (value.live_iterator)
             value.bytes += sizeof(LiveListIterator);
+        if (value.virtual_list_iterator)
+            value.bytes += sizeof(VirtualListIterator);
         if (value.iterator)
             value.bytes += sizeof(SnapshotIterator) + value.iterator->bytes();
         if (value.atomic)
@@ -4434,8 +4921,20 @@ struct ManagedRuntime::Impl {
     ObjectId canonical_string(std::u16string_view text) const {
         // Scan the existing bounded heap instead of maintaining an uncharged
         // second text table. GC removes dead weak members with their Objects.
-        for(const auto &[id,value]:heap)
-            if(value.interned_string && value.type=="Ljava/lang/String;" && value.text==text)return id;
+        for (const auto &[id, value] : heap) {
+            runtime.charge_provider_work(1); // The actual next bounded heap visit.
+            if (!value.interned_string || value.type != "Ljava/lang/String;" || value.text.size() != text.size())
+                continue;
+            bool equal = true;
+            for (std::size_t index = 0; index < text.size(); ++index) {
+                runtime.charge_provider_work(1); // Only characters actually compared.
+                if (value.text[index] != text[index]) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return id;
+        }
         return 0;
     }
     Value string_intern(ObjectId receiver) {
@@ -4445,13 +4944,32 @@ struct ManagedRuntime::Impl {
         return Value::reference(receiver);
     }
     void initialize(std::string_view type) {
+        // A direct idle-owner initialization is one genuine host execution event,
+        // including encoded static values before <clinit>. Nested, native,
+        // retained, scheduled and queued work always keeps its existing ledger.
+        if (!runtime.has_provider_work_context()) {
+            runtime.run_host_callback([&] { initialize(type); });
+            return;
+        }
         execution_checkpoint();
         check_thread();
         NonYielding barrier(current_context());
         known(type);
         const auto *definition = resolve_class(type);
-        if (!definition)
-            return;
+        auto *const initializer_host = host;
+        std::optional<HostClass> hosted;
+        if (!definition) {
+            // Primitive/array/core initialization remains owned by the core.
+            // Unknown provider metadata never invents an initializer body.
+            if (core_type(type) || type.size() == 1 || type.front() == '[' || !initializer_host)
+                return;
+            hosted = provider_call([&] { return initializer_host->class_info(type); });
+            if (!hosted || !hosted->has_class_initializer)
+                return;
+            // These class states and SDK static roots belong to this provider
+            // for the remaining lifetime of this closed runtime class space.
+            host_initializers_used = true;
+        }
         auto &state = class_state[std::string(type)];
         if(state==1) {
             if(class_initializers.at(std::string(type))!=&current_context())fail("CLASS_INITIALIZATION_WAIT_UNSUPPORTED","Class initialization is owned by another logical thread");
@@ -4464,6 +4982,19 @@ struct ManagedRuntime::Impl {
         struct InitializerEnd {Impl &p;const std::string &key;~InitializerEnd(){p.class_initializers.erase(key);}} initializer_end{*this,initializer_key};
         state = 1;
         try {
+            if (!definition) {
+                if (!hosted->is_interface && !hosted->superclass.empty())
+                    initialize(hosted->superclass);
+                if (host != initializer_host)
+                    fail("HOST_STATE", "Hosted initializer provider changed during superclass initialization");
+                // The same lifecycle above handles recursive same-owner entry,
+                // completion and failure; no provider-local restart or replay.
+                provider_call([&] { initializer_host->initialize_class(runtime, type); });
+                if (host != initializer_host)
+                    fail("HOST_STATE", "Hosted initializer provider changed during its static body");
+                state = 2;
+                return;
+            }
             for (const auto index : definition->static_fields)
                 statics.try_emplace(index, default_value(image.types.at(image.fields.at(index).type)));
             for (std::size_t i = 0; i < definition->static_values.size(); ++i) {
@@ -4544,7 +5075,7 @@ struct ManagedRuntime::Impl {
             state = 3;
             if (subtype(object(error.object).type, "Ljava/lang/Error;"))
                 throw;
-            runtime.raise("Ljava/lang/ExceptionInInitializerError;");
+            runtime.raise_with_cause("Ljava/lang/ExceptionInInitializerError;", {}, error.object);
         } catch (...) {
             state = 3;
             throw;
@@ -4579,6 +5110,69 @@ struct ManagedRuntime::Impl {
         if(name=="println")emit(u"\n");
         return Value::nothing();
     }
+    std::optional<Index> owned_method_declaration(Index index) const {
+        if(index>=image.methods.size())fail("METHOD_METADATA","Method reference is outside the held table");
+        const auto &reference_method=image.methods.at(index);
+        if(reference_method.declared)return index;
+        // Constructors and class initializers are never inherited. This search
+        // loads metadata only and returns an existing canonical declaration ID.
+        if(reference_method.name=="<init>" || reference_method.name=="<clinit>")return {};
+        const auto &signature=image.prototypes.at(reference_method.prototype).descriptor;
+        auto current=std::string_view(image.types.at(reference_method.owner));
+        if(core_type(current))return {}; // Avoid even empty-set host allocation for exact core ownership.
+        std::set<std::string_view> visited;
+        std::size_t work=0;
+        for(unsigned depth=0;depth<256;++depth) {
+            // The sealed bootstrap owns core classes. Preserve their existing
+            // dispatch without a redundant source lookup/progress transition.
+            if(core_type(current))return {};
+            if(!visited.insert(current).second)fail("CLASS_LIMIT","Cyclic symbolic method superclass hierarchy");
+            const auto *definition=resolve_class(current);
+            if(!definition)return {}; // Unknown provider inventories are not guessed.
+            const std::array inventories{&definition->direct_methods,&definition->virtual_methods};
+            for(std::size_t kind=0;kind<inventories.size();++kind)
+                for(const auto candidate:*inventories[kind]) {
+                    if(++work>262144)fail("METHOD_LIMIT","Symbolic method resolution exceeds its work budget");
+                    if(candidate>=image.methods.size())fail("METHOD_METADATA","Invalid declared method index");
+                    const auto &method=image.methods.at(candidate);
+                    if(!method.declared || method.owner!=definition->type || method.direct!=(kind==0) ||
+                       method.prototype>=image.prototypes.size() || std::popcount(method.flags&7u)>1)
+                        fail("METHOD_METADATA","Invalid method declaration in symbolic superclass lookup");
+                    if(method.name==reference_method.name && image.prototypes.at(method.prototype).descriptor==signature)
+                        return candidate; // Do not skip a first nonstatic or inaccessible match.
+                }
+            // Interface static methods belong only to their own declaration;
+            // neither superinterfaces nor Object supply an inherited static.
+            if((definition->flags&0x200u) || definition->superclass==no_index)return {};
+            current=image.types.at(definition->superclass);
+        }
+        fail("CLASS_LIMIT","Symbolic method superclass hierarchy exceeds 256 levels");
+    }
+    Index static_target(Index symbolic,Index caller_index) {
+        const auto declaration=owned_method_declaration(symbolic);
+        if(!declaration)return symbolic; // Preserve exact existing core/provider dispatch.
+        const auto &method=image.methods.at(*declaration);
+        if(!(method.flags&8u))
+            runtime.raise("Ljava/lang/IncompatibleClassChangeError;",u"Static invocation resolved to an instance method");
+        const auto &symbolic_type=image.types.at(image.methods.at(symbolic).owner);
+        const auto &declaring_type=image.types.at(method.owner);
+        const auto &caller=image.types.at(image.methods.at(caller_index).owner);
+        const auto *symbolic_class=resolve_class(symbolic_type);
+        if(!symbolic_class)fail("METHOD_METADATA","Owned static reference has no symbolic class metadata");
+        if(!(symbolic_class->flags&1u) && caller!=symbolic_type &&
+           java_package(caller)!=java_package(symbolic_type))
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Static reference class is inaccessible to caller");
+        // Accessibility is checked against the symbolic class and the resolved
+        // member separately. A public facade may legally expose a public static
+        // member declared by its package-private superclass.
+        const bool same_class=caller==declaring_type;
+        const bool same_package=java_package(caller)==java_package(declaring_type);
+        const bool accessible=(method.flags&1u) || same_class ||
+            (!(method.flags&2u) && (same_package || ((method.flags&4u) && subtype(caller,declaring_type))));
+        if(!accessible)
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Static method is inaccessible to caller");
+        return *declaration;
+    }
     bool method_is_static(Index index) const {
         if (loader) {
             provider_call([&] { ensure_class(image.types.at(image.methods.at(index).owner)); });
@@ -4587,7 +5181,13 @@ struct ManagedRuntime::Impl {
         const auto &method = image.methods.at(index);
         if (method.declared)
             return bool(method.flags & 8);
+        if(const auto declaration=owned_method_declaration(index))
+            return bool(image.methods.at(*declaration).flags&8u);
         const auto &owner_type = image.types.at(method.owner);
+        if(owner_type==executors_type) {
+            if(fixed_pool_factory(method.name,image.prototypes.at(method.prototype).descriptor))return true;
+            fail("API_UNSUPPORTED","Executors operation is outside the implemented factory profile");
+        }
         if (owner_type == "Ljava/lang/Runnable;") {
             if (method.name == "run" && image.prototypes.at(method.prototype).descriptor == "()V")
                 return false;
@@ -4595,7 +5195,14 @@ struct ManagedRuntime::Impl {
                                         image.prototypes.at(method.prototype).descriptor +
                                         " is not implemented");
         }
-        if(owner_type==android_process_type || owner_type==android_binder_type)return method.name!="<init>";
+        if (owner_type == android_process_type) return method.name != "<init>";
+        if (owner_type == android_binder_type) {
+            if (method.name == "flushPendingCommands" && image.prototypes.at(method.prototype).descriptor == "()V")
+                return true; // Exact core-owned Binder static operation.
+            if (host) return provider_call([&] { return host->method_is_static(image, index); });
+            fail("API_UNSUPPORTED", owner_type + "." + method.name + image.prototypes.at(method.prototype).descriptor +
+                                    " has no Binder method provider");
+        }
         if(owner_type==async_status_type)return method.name=="values" || method.name=="valueOf";
         if(owner_type==async_task_type)return method.name=="execute" && image.prototypes.at(method.prototype).descriptor=="(Ljava/lang/Runnable;)V";
         if(owner_type=="Landroid/text/TextUtils;") {
@@ -4607,7 +5214,12 @@ struct ManagedRuntime::Impl {
         }
         if(owner_type==uuid_type)return method.name=="randomUUID" || method.name=="fromString" || method.name=="nameUUIDFromBytes";
         if(owner_type==random_type)return false;
-        if(owner_type==thread_local_type)return method.name=="withInitial";
+        if (owner_type == thread_local_type || owner_type == supplied_thread_local_type) {
+            const auto &signature = image.prototypes.at(method.prototype).descriptor;
+            if (thread_local_static_method(owner_type, method.name, signature)) return true;
+            if (thread_local_method(owner_type, method.name, signature)) return false;
+            fail("API_UNSUPPORTED", owner_type + "." + method.name + signature + " is outside the ThreadLocal profile");
+        }
         if(owner_type==pattern_type)return method.name=="compile" || method.name=="quote" || method.name=="matches";
         if(owner_type==long_type || owner_type==short_type) {
             const auto &signature=image.prototypes.at(method.prototype).descriptor;
@@ -5455,6 +6067,201 @@ struct ManagedRuntime::Impl {
         if(slot==object(receiver).fields.end()) fail("FIELD_METADATA", "Receiver has no declared field slot");
         return typed(slot->second,field.type);
     }
+    static std::string_view java_package(std::string_view type) noexcept {
+        const auto slash=type.rfind('/');
+        return type.substr(0,slash==std::string_view::npos?0:slash);
+    }
+    struct ListField {
+        Index owned=no_index;
+        std::string_view declaring;
+        std::uint32_t flags=4u | 0x80u; // AbstractList.modCount: protected transient int.
+    };
+    std::optional<ListField> resolve_list_mod_count(Index index) {
+        const auto &reference_field=image.fields.at(index);
+        if(reference_field.declared || reference_field.name!="modCount" ||
+           image.types.at(reference_field.type)!="I")return {};
+        const auto &symbolic_owner=image.types.at(reference_field.owner);
+        if(!subtype(symbolic_owner,"Ljava/util/AbstractList;"))return {};
+        std::set<std::string_view> visited;
+        std::size_t work=0;
+        const auto find=[&](auto &&self,std::string_view current,unsigned depth)->std::optional<ListField> {
+            if(depth>256)fail("CLASS_LIMIT","AbstractList field hierarchy exceeds 256 levels");
+            if(++work>262144)fail("FIELD_LIMIT","AbstractList field resolution exceeds its work budget");
+            if(!visited.insert(current).second)return {};
+            if(current=="Ljava/util/AbstractList;")return ListField{no_index,current,4u | 0x80u};
+            if(const auto *definition=resolve_class(current)) {
+                // JVM field resolution matches name AND descriptor, then visits
+                // superinterfaces before the superclass. Staticness is checked
+                // only after this actual declaration has been selected.
+                for(const auto *inventory:{&definition->instance_fields,&definition->static_fields})
+                    for(const auto candidate:*inventory) {
+                        if(++work>262144)fail("FIELD_LIMIT","AbstractList field resolution exceeds its work budget");
+                        const auto &field=image.fields.at(candidate);
+                        if(!field.declared || field.owner!=definition->type)
+                            fail("FIELD_METADATA","Invalid declared field ownership in AbstractList ancestry");
+                        if(field.name=="modCount" && image.types.at(field.type)=="I")
+                            return ListField{candidate,image.types.at(field.owner),field.flags};
+                    }
+                for(const auto interface_type:definition->interfaces)
+                    if(const auto found=self(self,image.types.at(interface_type),depth+1))return found;
+                if(definition->superclass!=no_index)
+                    return self(self,image.types.at(definition->superclass),depth+1);
+                return {};
+            }
+            if(current=="Ljava/lang/Object;")return {};
+            // These exact standard interfaces declare no modCount:I field.
+            // Unknown provider interfaces are not treated as an empty inventory.
+            if(current=="Ljava/util/List;" || current=="Ljava/util/Collection;" ||
+               current=="Ljava/lang/Iterable;" || current=="Ljava/util/RandomAccess;" ||
+               current=="Ljava/lang/Cloneable;" || current=="Ljava/io/Serializable;")return {};
+            if(is_interface(current))
+                fail("FIELD_UNSUPPORTED","Interface field inventory is incomplete during AbstractList resolution");
+            if(core_type(current))return self(self,core_super(current),depth+1);
+            fail("FIELD_UNSUPPORTED","Provider field inventory is incomplete during AbstractList resolution");
+        };
+        const auto result=find(find,symbolic_owner,0);
+        if(!result)fail("FIELD_UNSUPPORTED","AbstractList field declaration could not be resolved");
+        return result;
+    }
+    std::uint32_t list_mod_count(ObjectId receiver) {
+        if(!subtype(object(receiver).type,"Ljava/util/AbstractList;"))
+            fail("FIELD_METADATA","Modification count requires an actual AbstractList receiver");
+        if(object(receiver).list || !resolve_class(object(receiver).type))
+            fail("FIELD_UNSUPPORTED","Modification count for modeled provider list storage is unsupported");
+        return object(receiver).abstract_list_mod_count;
+    }
+    std::optional<Value> virtual_iterator_call(ObjectId receiver,std::string_view name,
+                                               std::string_view signature,std::span<const Value> args) {
+        auto *const iterator=object(receiver).virtual_list_iterator.get();
+        if(!iterator)return {};
+        return iterator->invoke(runtime,name,signature,args,[this](ObjectId backing) {
+            // Factory admission authenticated the canonical base field. The
+            // backing is rooted by the iterator and by the callback helper.
+            return object(backing).abstract_list_mod_count;
+        });
+    }
+    std::optional<Value> abstract_collection_call(ObjectId receiver,std::string_view declaring_type,
+                                                  std::string_view name,std::string_view signature,
+                                                  std::span<const Value> args,bool virtual_dispatch) {
+        const bool base=abstract_collection_base(declaring_type);
+        const bool list_owner=declaring_type=="Ljava/util/AbstractList;" || declaring_type=="Ljava/util/AbstractSequentialList;" ||
+                              (virtual_dispatch && declaring_type=="Ljava/util/List;");
+        const bool iterator=name=="iterator" && signature=="()Ljava/util/Iterator;";
+        const bool list_iterator=name=="listIterator" &&
+            (signature=="()Ljava/util/ListIterator;" || signature=="(I)Ljava/util/ListIterator;");
+        const bool empty=name=="isEmpty" && signature=="()Z";
+        const bool unsupported_mutator=(name=="remove" && signature=="(I)Ljava/lang/Object;") ||
+            (name=="set" && signature=="(ILjava/lang/Object;)Ljava/lang/Object;") ||
+            (name=="add" && signature=="(ILjava/lang/Object;)V");
+        const bool collection_owner=base || (virtual_dispatch &&
+            (declaring_type=="Ljava/util/Collection;" || declaring_type=="Ljava/util/List;" ||
+             (declaring_type=="Ljava/lang/Iterable;" && iterator)));
+        if(!collection_owner || !(iterator || list_iterator || empty || unsupported_mutator))return {};
+        // Existing provider collections retain their own storage and iterator
+        // algorithms. This path supplies defaults only to real managed classes.
+        if(!resolve_class(object(receiver).type) || object(receiver).list || object(receiver).set ||
+           object(receiver).fifo || object(receiver).deque || object(receiver).map)return {};
+        if(empty) {
+            if(args.size()!=1)fail("SIGNATURE","AbstractCollection.isEmpty requires its receiver");
+            if(!subtype(object(receiver).type,"Ljava/util/AbstractCollection;"))return {};
+            const auto size=runtime.invoke_virtual_named(receiver,"size","()I");
+            return Value::word(word(size)==0);
+        }
+        if(!subtype(object(receiver).type,"Ljava/util/AbstractList;"))return {};
+        if(unsupported_mutator) {
+            if(!list_owner)return {};
+            const bool sequential=declaring_type=="Ljava/util/AbstractSequentialList;" ||
+                (virtual_dispatch && subtype(object(receiver).type,"Ljava/util/AbstractSequentialList;"));
+            if(sequential)return {}; // Sequential defaults use actual listIterator overrides.
+            runtime.raise("Ljava/lang/UnsupportedOperationException;");
+        }
+        if(list_iterator && !list_owner)return {};
+        if(iterator && !virtual_dispatch && !list_owner)return {};
+        const bool sequential=declaring_type=="Ljava/util/AbstractSequentialList;" ||
+            (virtual_dispatch && subtype(object(receiver).type,"Ljava/util/AbstractSequentialList;"));
+        if(iterator && sequential)
+            return runtime.invoke_virtual_named(receiver,"listIterator","()Ljava/util/ListIterator;");
+        if(list_iterator && signature=="()Ljava/util/ListIterator;") {
+            const std::array<Value,1> parameters{Value::word(0)};
+            return runtime.invoke_virtual_named(receiver,"listIterator","(I)Ljava/util/ListIterator;",parameters);
+        }
+        if(sequential)return {}; // The indexed SequentialList declaration is abstract.
+        std::uint32_t cursor=0;
+        if(list_iterator) {
+            if(args.size()!=2)fail("SIGNATURE","Indexed listIterator requires an int index");
+            cursor=word(args[1]);
+            const auto size=word(runtime.invoke_virtual_named(receiver,"size","()I"));
+            if(size>static_cast<std::uint32_t>(INT32_MAX))fail("COLLECTION_STATE","Managed list size is negative");
+            if(cursor>size)runtime.raise("Ljava/lang/IndexOutOfBoundsException;");
+        } else if(args.size()!=1)fail("SIGNATURE","Iterator requires its list receiver");
+        const auto expected=list_mod_count(receiver);
+        ThreadRoot backing_root(runtime,receiver);
+        Object result;
+        result.type=list_iterator?virtual_list_list_iterator_type:virtual_list_iterator_type;
+        result.virtual_list_iterator=std::make_unique<VirtualListIterator>(receiver,cursor,expected,list_iterator);
+        return Value::reference(allocate(std::move(result)));
+    }
+    void check_list_field_access(const ListField &field,const Frame &frame,ObjectId receiver,
+                                 bool write,bool stat,std::string_view symbolic_owner) {
+        const auto &caller_method=image.methods.at(frame.method);
+        const auto &caller=image.types.at(caller_method.owner);
+        if(const auto *definition=resolve_class(symbolic_owner);definition && !(definition->flags&1u) &&
+           caller!=symbolic_owner && java_package(caller)!=java_package(symbolic_owner))
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Field reference class is inaccessible");
+        const bool same_class=caller==field.declaring;
+        const bool same_package=java_package(caller)==java_package(field.declaring);
+        const bool protected_subclass=(field.flags&4u) && subtype(caller,field.declaring);
+        const bool accessible=(field.flags&1u) || same_class ||
+            (!(field.flags&2u) && (same_package || protected_subclass));
+        if(!accessible)
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"List field is inaccessible to caller");
+        if(!stat && protected_subclass && !same_class && !same_package &&
+           !subtype(object(receiver).type,caller))
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Protected list field receiver is outside caller ancestry");
+        if(write && (field.flags&16u) &&
+           (!same_class || caller_method.name!=(stat?"<clinit>":"<init>")))
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Final field write is outside its declaring initializer");
+    }
+    Value access_list_field(const ListField &field,Index reference_index,const Frame &frame,
+                             std::uint32_t receiver_register,std::uint8_t op,Value input) {
+        const bool stat=op>=0x60,write=stat?op>=0x67:op>=0x59;
+        if(bool(field.flags&8u)!=stat)
+            runtime.raise("Ljava/lang/IncompatibleClassChangeError;",u"List field staticness disagrees with opcode");
+        if(op!=0x52 && op!=0x59 && op!=0x60 && op!=0x67)
+            fail("VALUE_TYPE","List modification-count field requires an int opcode");
+        const auto &symbolic_owner=image.types.at(image.fields.at(reference_index).owner);
+        const auto receiver=stat?ObjectId{0}:reference(frame.get(receiver_register));
+        if(!stat) {
+            if(!receiver)runtime.raise("Ljava/lang/NullPointerException;");
+            if(!subtype(object(receiver).type,symbolic_owner))
+                fail("FIELD_METADATA","List field receiver is incompatible with its reference class");
+        }
+        check_list_field_access(field,frame,receiver,write,stat,symbolic_owner);
+        if(field.owned!=no_index) {
+            if(stat) {
+                if(write){runtime.set_static(field.owned,input);return Value::nothing();}
+                return runtime.get_static(field.owned);
+            }
+            auto &slots=object(receiver).fields;
+            const auto slot=slots.find(field.owned);
+            if(slot==slots.end())fail("FIELD_METADATA","Resolved list field has no owned receiver slot");
+            if(write){slot->second=Value::word(word(input));return Value::nothing();}
+            return slot->second;
+        }
+        const auto current=list_mod_count(receiver);
+        if(write){object(receiver).abstract_list_mod_count=word(input);return Value::nothing();}
+        return Value::word(current);
+    }
+    void check_collection_constructor(const Frame &frame,std::string_view declaring,ObjectId receiver) {
+        const auto &caller_method=image.methods.at(frame.method);
+        const auto &caller=image.types.at(caller_method.owner);
+        if(java_package(caller)==java_package(declaring))return;
+        const auto *definition=resolve_class(caller);
+        if(!definition || definition->superclass==no_index ||
+           image.types.at(definition->superclass)!=declaring || caller_method.name!="<init>" ||
+           frame.arguments.empty() || reference(frame.arguments[0])!=receiver)
+            runtime.raise("Ljava/lang/IllegalAccessError;",u"Protected collection constructor requires the actual superclass call");
+    }
     Value read_public_provider_field(Index index, const Frame &frame, std::uint32_t receiver_register, bool object_field) {
         const auto &reference_field=image.fields.at(index);
         const auto &declaring_type=image.types.at(reference_field.owner);
@@ -5510,6 +6317,9 @@ struct ManagedRuntime::Impl {
             const auto wrapper = runtime.new_object("Ljava/lang/RuntimeException;");
             object(wrapper).cause = cause.object;
             replace_text(wrapper, std::u16string(message));
+            // AtomicReferenceFieldUpdater wraps with RuntimeException(cause):
+            // its detailMessage needs cause.toString(), not this diagnostic.
+            object(wrapper).throwable_message_kind=ThrowableMessageKind::unavailable;
             ++metrics.exceptions;
             current_context().last_exception = wrapper;
             throw JavaException(wrapper);
@@ -5714,8 +6524,7 @@ struct ManagedRuntime::Impl {
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(50);
         const auto work=[&] {
             auto &context=current_context();
-            if(!context.remaining)fail("BUDGET","String split instruction allowance exhausted");
-            --context.remaining;
+            charge_context_work(context,1,"String split instruction allowance exhausted");
             if(scheduled_task()) {
                 if(!task_work_remaining)fail("BUDGET","String split task batch allowance exhausted");
                 --task_work_remaining;
@@ -6013,10 +6822,10 @@ struct ManagedRuntime::Impl {
         // Charge bounded native work before mutation. No allocation, callback
         // or scheduling checkpoint is introduced in a bulk primitive/self copy.
         auto &context = current_context();
-        if (count > context.remaining || (scheduled_task() && count > task_work_remaining) ||
+        if ((!main_work_selected() && count > context.remaining) || (scheduled_task() && count > task_work_remaining) ||
             (!scheduled_task() && main_callback_inflight && count > main_callback_work_remaining))
             fail("BUDGET", "System.arraycopy work allowance exhausted");
-        context.remaining -= count;
+        charge_context_work(context,count,"System.arraycopy work allowance exhausted");
         if (scheduled_task()) task_work_remaining -= count;
         else if (main_callback_inflight) main_callback_work_remaining -= count;
         const auto first = static_cast<std::size_t>(source_position);
@@ -6067,6 +6876,28 @@ struct ManagedRuntime::Impl {
         const auto &type = image.types.at(method.owner);
         const auto &signature = image.prototypes.at(method.prototype).descriptor;
         ++metrics.core_calls;
+        if(type==executors_type && fixed_pool_factory(method.name,signature))
+            return create_fixed_pool(args,signature=="(ILjava/util/concurrent/ThreadFactory;)Ljava/util/concurrent/ExecutorService;");
+        if(abstract_collection_base(type) && method.name=="<init>" && signature=="()V") {
+            const auto receiver=reference(args[0]);
+            if(object(receiver).type==type)
+                fail("ALLOCATION_UNSUPPORTED","An abstract collection base cannot be instantiated directly");
+            // These protected constructors perform only their real base chain.
+            // AbstractList's field initializer runs on every constructor call.
+            if(type=="Ljava/util/AbstractList;" || type=="Ljava/util/AbstractSequentialList;")
+                object(receiver).abstract_list_mod_count=0;
+            return Value::nothing();
+        }
+        if(!args.empty() &&
+           ((type==virtual_list_iterator_type || type==virtual_list_list_iterator_type) ||
+            (virtual_dispatch && (type=="Ljava/util/Iterator;" || type=="Ljava/util/ListIterator;"))) &&
+           object(reference(args[0])).virtual_list_iterator &&
+           virtual_list_iterator_method(method.name,signature,
+               object(reference(args[0])).type==virtual_list_list_iterator_type)) {
+            if(const auto result=virtual_iterator_call(reference(args[0]),method.name,signature,args))return *result;
+        }
+        if(!args.empty() && abstract_collection_default(method.name,signature))
+            if(const auto result=abstract_collection_call(reference(args[0]),type,method.name,signature,args,virtual_dispatch))return *result;
         if (virtual_dispatch && !args.empty() &&
             (type == "Ljava/lang/CharSequence;" || type == "Ljava/lang/Object;"))
             if (const auto result = hosted_char_sequence(reference(args[0]), method.name, signature, args))
@@ -6110,8 +6941,16 @@ struct ManagedRuntime::Impl {
                (unmodifiable_iterator_class(actual_type) && unmodifiable_iterator_method(method.name,signature,actual_type==unmodifiable_list_iterator_type)))
                 return invoke_unmodifiable(receiver,method.name,signature,args);
         }
-        if(type==thread_local_type && thread_local_method(method.name,signature))
-            if(const auto result=invoke_thread_local(reference(args[0]),method.name,signature,args))return *result;
+        if (type == thread_local_type && thread_local_static_method(type, method.name, signature))
+            return Value::reference(runtime.new_supplied_thread_local(reference(args[0])));
+        if (type == supplied_thread_local_type && method.name == "<init>")
+            fail("API_UNSUPPORTED", "SuppliedThreadLocal construction is private to ThreadLocal.withInitial");
+        if ((type == thread_local_type || type == supplied_thread_local_type) && thread_local_method(type, method.name, signature)) {
+            const auto receiver = reference(args[0]);
+            const bool supplied_override = type == supplied_thread_local_type ||
+                (virtual_dispatch && object(receiver).type == supplied_thread_local_type);
+            if (const auto result = invoke_thread_local(receiver, method.name, signature, args, supplied_override)) return *result;
+        }
         if(type==pattern_type) {
             if(method.name=="compile" && (signature=="(Ljava/lang/String;)Ljava/util/regex/Pattern;" ||
                 signature=="(Ljava/lang/String;I)Ljava/util/regex/Pattern;"))
@@ -6209,7 +7048,6 @@ struct ManagedRuntime::Impl {
         if (!args.empty() && thread_pool_class(type)) {
             auto &receiver = object(reference(args[0]));
             if (receiver.pool) {
-                auto &pool = *receiver.pool;
                 if (type == thread_pool_type && method.name == "<init>") {
                     const std::string prefix="(IIJLjava/util/concurrent/TimeUnit;Ljava/util/concurrent/BlockingQueue;";
                     const bool base=signature==prefix+")V";
@@ -6217,34 +7055,12 @@ struct ManagedRuntime::Impl {
                     const bool handler=signature==prefix+"Ljava/util/concurrent/RejectedExecutionHandler;)V";
                     const bool both=signature==prefix+"Ljava/util/concurrent/ThreadFactory;Ljava/util/concurrent/RejectedExecutionHandler;)V";
                     if (base||factory||handler||both) {
-                        if (pool.initialized()) fail("STATE","ThreadPoolExecutor constructor invoked twice");
-                        const auto core=std::bit_cast<std::int32_t>(word(args[1]));
-                        const auto maximum=std::bit_cast<std::int32_t>(word(args[2]));
-                        const auto keep=std::bit_cast<std::int64_t>(wide(args[3]));
-                        if (core<0||maximum<=0||maximum<core||keep<0)runtime.raise("Ljava/lang/IllegalArgumentException;");
-                        const auto &unit=object(reference(args[4]));
-                        if (unit.type!=time_unit_type||!unit.enumeration)fail("ENUM_STATE","Invalid executor TimeUnit");
-                        const auto nanos=convert_time_unit(keep,unit.enumeration->ordinal(),0);
-                        const auto queue=reference(args[5]);
-                        (void)validate_pool_queue(queue);
-                        ObjectId factory_id=(factory||both)?reference(args[6]):0;
-                        ObjectId handler_id=(handler||both)?reference(args[both?7:6]):0;
-                        if ((factory||both)&&!factory_id)runtime.raise("Ljava/lang/NullPointerException;");
-                        if ((handler||both)&&!handler_id)runtime.raise("Ljava/lang/NullPointerException;");
-                        if (!factory_id) {
-                            const auto creator=runtime.current_thread();
-                            Object value;value.type=default_thread_factory_type;value.factory=std::make_unique<DefaultFactory>();
-                            value.factory->group=thread_state(creator).group?thread_state(creator).group:thread_group();
-                            factory_id=allocate(std::move(value));
-                        }
-                        runtime.retain(factory_id);
-                        struct Release { ManagedRuntime &runtime;ObjectId id;~Release(){runtime.release(id);} } release{runtime,factory_id};
-                        if (!handler_id) {
-                            Object value;value.type=abort_policy_type;value.abort_policy=std::make_unique<AbortPolicy>();
-                            (void)value.abort_policy->invoke(runtime,abort_policy_type,"<init>","()V");
-                            handler_id=allocate(std::move(value));
-                        }
-                        pool.initialize(static_cast<std::uint32_t>(core),static_cast<std::uint32_t>(maximum),nanos,queue,factory_id,handler_id);
+                        initialize_pool(reference(args[0]),
+                            std::bit_cast<std::int32_t>(word(args[1])),
+                            std::bit_cast<std::int32_t>(word(args[2])),
+                            std::bit_cast<std::int64_t>(wide(args[3])),reference(args[4]),reference(args[5]),
+                            (factory||both)?reference(args[6]):ObjectId{0},
+                            (handler||both)?reference(args[both?7:6]):ObjectId{0},factory||both,handler||both);
                         return Value::nothing();
                     }
                 } else {
@@ -6349,6 +7165,15 @@ struct ManagedRuntime::Impl {
                     return *result;
         }
         if (type == "Ljava/lang/Thread;") {
+            if(method.name=="getContextClassLoader" && signature=="()Ljava/lang/ClassLoader;")
+                return Value::reference(thread_state(reference(args[0])).context_loader);
+            if(method.name=="setContextClassLoader" && signature=="(Ljava/lang/ClassLoader;)V") {
+                const auto receiver=reference(args[0]), context_loader_id=reference(args[1]);
+                (void)thread_state(receiver);
+                validate_context_loader(context_loader_id);
+                thread_state(receiver).context_loader=context_loader_id;
+                return Value::nothing();
+            }
             if(method.name=="getDefaultUncaughtExceptionHandler" && signature=="()Ljava/lang/Thread$UncaughtExceptionHandler;")
                 return Value::reference(default_uncaught_handler);
             if(method.name=="setDefaultUncaughtExceptionHandler" && signature=="(Ljava/lang/Thread$UncaughtExceptionHandler;)V") {
@@ -6364,8 +7189,7 @@ struct ManagedRuntime::Impl {
                 (signature == "()V" || signature == "(Ljava/lang/Runnable;)V" ||
                  signature == "(Ljava/lang/String;)V" || signature == "(Ljava/lang/Runnable;Ljava/lang/String;)V")) {
                 const auto receiver = reference(args[0]);
-                auto &state = thread_state(receiver, false);
-                if (state.initialized) fail("THREAD_STATE", "Thread constructor invoked more than once");
+                if (thread_state(receiver, false).initialized) fail("THREAD_STATE", "Thread constructor invoked more than once");
                 const bool has_target = signature == "(Ljava/lang/Runnable;)V" ||
                     signature == "(Ljava/lang/Runnable;Ljava/lang/String;)V";
                 const bool has_name = signature == "(Ljava/lang/String;)V" ||
@@ -6373,16 +7197,24 @@ struct ManagedRuntime::Impl {
                 const auto name = has_name ? reference(args[has_target ? 2 : 1]) : ObjectId{0};
                 if (has_name) (void)runtime.string(name); // Null name is a real Java NPE.
                 const auto parent = runtime.current_thread();
-                const auto &parent_state = thread_state(parent);
-                if (has_name) state.name = name;
-                else {
+                const auto context_loader=inherited_context_loader(parent);
+                ThreadRoot loader_root(runtime,context_loader);
+                auto name_id=name;
+                if (!has_name) {
                     std::u16string generated = u"Thread-";
                     for (const auto c : std::to_string(receiver)) generated.push_back(c);
-                    state.name = runtime.new_string(generated);
+                    name_id = runtime.new_string(generated);
                 }
-                state.group = parent_state.group ? parent_state.group : thread_group();
-                state.daemon = parent_state.daemon;
+                ThreadRoot name_root(runtime,name_id);
+                const auto group = thread_state(parent).group ? thread_state(parent).group : thread_group();
+                const auto daemon = thread_state(parent).daemon;
+                auto &state = thread_state(receiver, false);
+                if (state.initialized) fail("THREAD_STATE", "Thread constructor completed during inherited loader callback");
+                state.name = name_id;
+                state.group = group;
+                state.daemon = daemon;
                 state.target = has_target ? reference(args[1]) : ObjectId{0};
+                state.context_loader = context_loader;
                 state.initialized = true;
                 return Value::nothing();
             }
@@ -7020,24 +7852,9 @@ struct ManagedRuntime::Impl {
         if (type == "Ljava/lang/Object;" && method.name == "getClass" && signature == "()Ljava/lang/Class;")
             return Value::reference(runtime.class_object(object(reference(args[0])).type));
         if ((type == "Ljava/lang/ClassLoader;" || type == "Laether/dex/RuntimeClassLoader;") &&
-            method.name == "loadClass" && signature == "(Ljava/lang/String;)Ljava/lang/Class;") {
-            if(reference(args[0])!=loader_object || !loader_object)
-                fail("CLASS_LOADER_UNSUPPORTED", "Class loading requires this runtime's canonical held class space");
-            const auto name=runtime.string(reference(args[1]));
-            const auto descriptor=binary_descriptor(name);
-            if(!descriptor || descriptor->starts_with('[')) runtime.raise("Ljava/lang/ClassNotFoundException;",name);
-            if(!resolve_class(*descriptor) && !core_type(*descriptor)) {
-                const auto metadata=host ? provider_call([&] { return host->class_info(*descriptor); }) : std::nullopt;
-                if(!metadata) {
-                    if(descriptor->starts_with("Ljava/") || descriptor->starts_with("Ljavax/") ||
-                       descriptor->starts_with("Landroid/") || descriptor->starts_with("Ldalvik/"))
-                        fail("CLASS_UNSUPPORTED", "Platform class is not implemented: "+*descriptor);
-                    runtime.raise("Ljava/lang/ClassNotFoundException;",name);
-                }
-                if(!metadata->bootstrap_class) fail("CLASS_LOADER_UNSUPPORTED", "Native class loader provenance is incomplete");
-            }
-            return Value::reference(runtime.class_object(*descriptor)); // Loading never initializes the class.
-        }
+            method.name == "loadClass" && signature == "(Ljava/lang/String;)Ljava/lang/Class;")
+            return held_loader_load_class(reference(args[0]), reference(args[1]));
+
         if(type=="Ljava/lang/Class;" && method.name=="getClassLoader" && signature=="()Ljava/lang/ClassLoader;") {
             auto represented=runtime.represented_class(reference(args[0]));
             while(represented.starts_with('[')) represented.remove_prefix(1);
@@ -7112,6 +7929,16 @@ struct ManagedRuntime::Impl {
         if (type == "Ljava/lang/Class;" && method.name == "getName" && signature == "()Ljava/lang/String;")
             return Value::reference(
                 runtime.new_string(binary_name(runtime.represented_class(reference(args[0])))));
+        if (type == "Ljava/lang/Class;" && method.name == "getSimpleName" && signature == "()Ljava/lang/String;") {
+            const auto descriptor = runtime.represented_class(reference(args[0]));
+            auto component = descriptor;
+            while (component.starts_with('[')) component.remove_prefix(1);
+            // Reflection loads held metadata only; it never initializes the
+            // component or any enclosing class to compute a name.
+            const auto *definition = component.starts_with('L') ? resolve_class(component) : nullptr;
+            const auto name = simple_name(descriptor, definition, image.strings);
+            return Value::reference(runtime.new_string(name));
+        }
         if (type == "Ljava/lang/Class;" && method.name == "forName" &&
             signature == "(Ljava/lang/String;)Ljava/lang/Class;") {
             const auto name = runtime.string(reference(args[0]));
@@ -7403,15 +8230,40 @@ struct ManagedRuntime::Impl {
         }
         if (type == "Ljava/lang/Object;" && method.name == "<init>" && signature == "()V")
             return Value::nothing();
+        if (core_type(type) && subtype(type, "Ljava/lang/Throwable;") && method.name == "getMessage" &&
+            signature == "()Ljava/lang/String;")
+            return throwable_get_message(reference(args[0]));
         if (core_type(type) && subtype(type, "Ljava/lang/Throwable;") && method.name == "getCause" &&
             signature == "()Ljava/lang/Throwable;")
             return Value::reference(object(reference(args[0])).cause);
         if (core_type(type) && subtype(type, "Ljava/lang/Throwable;") && method.name == "<init>" &&
             signature == "()V") {
             replace_text(reference(args[0]), {});
+            object(reference(args[0])).throwable_message=0;
+            object(reference(args[0])).throwable_message_kind=ThrowableMessageKind::null_message;
             return Value::nothing();
         }
         if(type=="Ljava/lang/String;" && method.name=="valueOf") {
+            if(signature=="(Ljava/lang/Object;)Ljava/lang/String;") {
+                const auto value=reference(args[0]);
+                if(!value) {
+                    if(!null_string_literal) {
+                        null_string_literal=canonical_string(u"null");
+                        if(!null_string_literal) {
+                            const auto literal=runtime.new_string(u"null");
+                            object(literal).interned_string=true;
+                            null_string_literal=literal;
+                        }
+                    }
+                    return Value::reference(null_string_literal);
+                }
+                // The invocation frame roots the input. Drop only this core
+                // operation's barrier for its one actual virtual callback;
+                // preserve a nullable toString result instead of coercing it.
+                if(!current_context().barriers)fail("STATE","String.valueOf lacks its core barrier");
+                SuspendCoreBarrier allow(current_context());
+                return Value::reference(reference(runtime.invoke_virtual_named(value,"toString","()Ljava/lang/String;")));
+            }
             if(signature=="(I)Ljava/lang/String;") {
                 const auto decimal=std::to_string(std::bit_cast<std::int32_t>(word(args[0])));
                 return Value::reference(runtime.new_string(std::u16string(decimal.begin(),decimal.end())));
@@ -7586,7 +8438,7 @@ struct ManagedRuntime::Impl {
             signature == "(Ljava/lang/String;)V") {
             if (!native)
                 fail("NATIVE_UNAVAILABLE", "System.loadLibrary requires an attached native interface");
-            if(background() && (native_context_depth || !native->supports_background()))fail("TASK_NATIVE_UNSUPPORTED","Background native loading requires per-context JNI/CPU state");
+            if(background() && (selected_native_context() || !native->supports_background()))fail("TASK_NATIVE_UNSUPPORTED","Background native loading requires per-context JNI/CPU state");
             NonYielding native_barrier(current_context());
             report_progress(RuntimeProgressStage::native_enter,index);
             ProgressEnd native_progress{*this,RuntimeProgressStage::native_exit,index,0};
@@ -7689,6 +8541,38 @@ struct ManagedRuntime::Impl {
             if (definition->superclass == no_index)
                 break;
             type = image.types.at(definition->superclass);
+        }
+        // Owned class declarations above already won. Before searching their
+        // interfaces, retain the same precedence for an authenticated concrete
+        // provider class declaration at the unowned superclass boundary.
+        if (host) {
+            const auto &prototype = image.prototypes.at(method.prototype);
+            std::vector<std::string> parameters;
+            parameters.reserve(prototype.parameters.size());
+            for (const auto parameter : prototype.parameters) parameters.push_back(image.types.at(parameter));
+            if (const auto declaration = hosted_virtual_declaration(receiver, method.name, parameters,
+                    image.types.at(prototype.return_type), true)) {
+                std::string signature = "(";
+                for (const auto &parameter : declaration->parameters) signature += parameter;
+                signature += ")" + declaration->return_type;
+                if (!method.declared && !method.direct && image.types.at(method.owner) == declaration->owner &&
+                    prototype.descriptor == signature) return index;
+                Index selected = no_index;
+                try { selected = image.method(declaration->owner, declaration->name, signature); }
+                catch (const DexError &error) {
+                    if (error.code != "AETHER_DEX_METHOD_NOT_FOUND") throw;
+                    if (!loader)
+                        fail("METHOD_UNSUPPORTED", "Concrete provider class method has no symbolic reference or owning live linker");
+                    // Admit only this exact authenticated executable provider
+                    // tuple. The linker adds a charged symbolic reference, not
+                    // a class source, declaration flags, or a guest method body.
+                    selected = loader->intern_provider_method(declaration->owner, declaration->name, signature);
+                }
+                const auto &canonical = image.methods.at(selected);
+                if (canonical.declared || canonical.direct || method_is_static(selected))
+                    fail("METHOD_METADATA", "Concrete provider method reference is not a symbolic instance declaration");
+                return selected;
+            }
         }
         if (const auto target = default_target(index, {object(receiver).type}))
             return *target;
@@ -7893,9 +8777,8 @@ struct ManagedRuntime::Impl {
                 if (!task_work_remaining) fail("BUDGET", "Managed task batch instruction budget exhausted");
                 --task_work_remaining;
             }
-            if (!current_context().remaining)
-                fail("BUDGET", "Managed instruction budget exhausted");
-            --current_context().remaining;
+            if(metrics.instructions==UINT64_MAX)fail("BUDGET","Managed instruction counter exhausted");
+            charge_context_work(current_context(),1,"Managed instruction budget exhausted");
             ++metrics.instructions;
             if((metrics.instructions&1023U)==0)report_progress(RuntimeProgressStage::managed_sample,frame.method,frame.pc);
             if (frame.pc >= code.at.size() || code.at[frame.pc] == no_index)
@@ -7978,6 +8861,63 @@ struct ManagedRuntime::Impl {
                     frame.result = Value::reference(id);
                     for (std::size_t n = 0; n < ins.arguments.size(); ++n)
                         runtime.array_set(id, static_cast<std::int32_t>(n), get(ins.arguments[n]));
+                } else if (op == 0x26) {
+                    const auto id = reference(get(ins.a));
+                    if (!id) runtime.raise("Ljava/lang/NullPointerException;");
+                    char component = 0;
+                    {
+                        const auto &array = object(id);
+                        if (array.type.size() != 2 || array.type[0] != '[')
+                            fail("VALUE_TYPE", "fill-array-data requires a primitive array");
+                        component = array.type[1];
+                        unsigned width = 0;
+                        switch (component) {
+                        case 'Z': case 'B': width = 1; break;
+                        case 'S': case 'C': width = 2; break;
+                        case 'I': case 'F': width = 4; break;
+                        case 'J': case 'D': width = 8; break;
+                        default: fail("VALUE_TYPE", "fill-array-data requires a primitive component");
+                        }
+                        if (ins.b != width) fail("VALUE_TYPE", "Array-data width disagrees with its primitive component");
+                        if (ins.c > array.elements.size()) runtime.raise("Ljava/lang/ArrayIndexOutOfBoundsException;");
+                    }
+                    if (!method.code) fail("VERIFY", "Array-data has no owning immutable code");
+                    const auto &units = method.code->units;
+                    const auto bytes = std::uint64_t(ins.b) * ins.c;
+                    const auto data_units = (bytes + 1) / 2;
+                    if (ins.index > units.size() || data_units > units.size() - ins.index)
+                        fail("VERIFY", "Verified array-data extent exceeds its owning code");
+                    const auto count = static_cast<std::size_t>(ins.c);
+                    // The opcode itself was charged above. Charge all elements
+                    // once before mutation; soft scheduling expiry is handled
+                    // after this bounded, callback-free instruction commits.
+                    auto &context = current_context();
+                    if ((!main_work_selected() && count > context.remaining) ||
+                        (scheduled_task() && count > task_work_remaining) ||
+                        (!scheduled_task() && main_callback_inflight && count > main_callback_work_remaining))
+                        fail("BUDGET", "fill-array-data work allowance exhausted");
+                    charge_context_work(context, count, "fill-array-data work allowance exhausted");
+                    if (scheduled_task()) task_work_remaining -= count;
+                    else if (main_callback_inflight) main_callback_work_remaining -= count;
+                    auto &elements = object(id).elements;
+                    for (std::size_t index = 0; index < count; ++index) {
+                        std::uint64_t bits = 0;
+                        for (unsigned byte = 0; byte < ins.b; ++byte) {
+                            const auto offset = std::uint64_t(index) * ins.b + byte;
+                            const auto unit = units[ins.index + static_cast<std::size_t>(offset / 2)];
+                            bits |= std::uint64_t((unit >> ((offset & 1u) * 8)) & 0xffu) << (byte * 8);
+                        }
+                        if (component == 'J' || component == 'D') elements[index] = Value::wide(bits);
+                        else if (component == 'B')
+                            elements[index] = Value::word(static_cast<std::uint32_t>(static_cast<std::int32_t>(
+                                std::bit_cast<std::int8_t>(static_cast<std::uint8_t>(bits)))));
+                        else if (component == 'S')
+                            elements[index] = Value::word(static_cast<std::uint32_t>(static_cast<std::int32_t>(
+                                std::bit_cast<std::int16_t>(static_cast<std::uint16_t>(bits)))));
+                        else elements[index] = Value::word(static_cast<std::uint32_t>(bits));
+                        // Z preserves the raw ART byte; do not normalize with &1.
+                        // C is unsigned; I/F and J/D preserve every payload bit.
+                    }
                 } else if (op == 0x27) {
                     const auto id = reference(get(ins.a));
                     if (!id)
@@ -8070,6 +9010,14 @@ struct ManagedRuntime::Impl {
                     const auto &field = image.fields.at(ins.index);
                     if (loader)
                         provider_call([&] { ensure_class(image.types.at(field.owner)); });
+                    if(const auto resolved=resolve_list_mod_count(ins.index)) {
+                        const bool write=op<0x60?op>=0x59:op>=0x67;
+                        const auto value=access_list_field(*resolved,ins.index,frame,ins.b,op,
+                                                          write?get(ins.a):Value::nothing());
+                        if(!write)put(value);
+                        frame.pc=next;
+                        continue;
+                    }
                     const bool time_constant = op == 0x62 && image.types.at(field.owner) == time_unit_type &&
                         image.types.at(field.type) == time_unit_type && time_unit_index(field.name).has_value();
                     const auto field_name = image.types.at(field.owner) + "." + field.name + ":" + image.types.at(field.type);
@@ -8113,6 +9061,7 @@ struct ManagedRuntime::Impl {
                     }
                 } else if ((op >= 0x6e && op <= 0x72) || (op >= 0x74 && op <= 0x78)) {
                     const auto stat = op == 0x71 || op == 0x77;
+                    auto dispatch=stat?static_target(ins.index,frame.method):ins.index;
                     const auto &target = image.methods.at(ins.index);
                     const auto &proto = image.prototypes.at(target.prototype);
                     std::vector<Value> args;
@@ -8126,8 +9075,14 @@ struct ManagedRuntime::Impl {
                         args.push_back(typed(argument,image.types.at(type)));
                         at += type_words(image.types[type]);
                     }
-                    if (method_is_static(ins.index) != stat)
+                    if (method_is_static(dispatch) != stat)
                         fail("INVOKE_KIND", "Invoke opcode disagrees with method staticness");
+                    if(abstract_collection_base(image.types.at(target.owner)) && target.name=="<init>" &&
+                       proto.descriptor=="()V") {
+                        if(op!=0x70 && op!=0x76)
+                            fail("INVOKE_KIND","Collection base constructor requires invoke-direct");
+                        check_collection_constructor(frame,image.types.at(target.owner),reference(args[0]));
+                    }
                     const bool interface_call = op == 0x72 || op == 0x78;
                     const bool virtual_call = op == 0x6e || op == 0x74;
                     if ((interface_call || virtual_call) &&
@@ -8135,7 +9090,6 @@ struct ManagedRuntime::Impl {
                         fail("INVOKE_KIND", "Invoke opcode disagrees with class/interface method owner");
                     if ((op == 0x70 || op == 0x76) && target.declared && !target.direct)
                         fail("INVOKE_KIND", "invoke-direct requires a direct method");
-                    auto dispatch = ins.index;
                     if (op == 0x6e || op == 0x74 || op == 0x72 || op == 0x78)
                         dispatch = virtual_target(ins.index, reference(args[0]));
                     else if (op == 0x6f || op == 0x75)
@@ -8149,6 +9103,23 @@ struct ManagedRuntime::Impl {
                             reference(frame.arguments[0]) == reference(args[0]);
                     }
                     frame.result = runtime.invoke_resolved(dispatch, args, virtual_call || interface_call, activation_delegation);
+                } else if (op >= 0x7b && op <= 0x80) {
+                    // Capture the complete source before writing: wide operands
+                    // may overlap the destination by either register half.
+                    const auto source = get(ins.b);
+                    if (op == 0x7d || op == 0x7e || op == 0x80) {
+                        const auto bits = wide(source);
+                        if (op == 0x7d) put(Value::wide(std::uint64_t{0} - bits));
+                        else if (op == 0x7e) put(Value::wide(~bits));
+                        else put(Value::wide(bits ^ 0x8000000000000000ULL));
+                    } else {
+                        const auto bits = word(source);
+                        if (op == 0x7b) put(Value::word(std::uint32_t{0} - bits));
+                        else if (op == 0x7c) put(Value::word(~bits));
+                        else put(Value::word(bits ^ 0x80000000u));
+                    }
+                    // Floating negation flips only the sign bit, preserving
+                    // signed zero and NaN payloads without host FP state.
                 } else if (op >= 0x8d && op <= 0x8f) {
                     // Narrow the low bits, then explicitly extend the signed
                     // byte/short or unsigned Java char back to a full DEX word.
@@ -8224,6 +9195,10 @@ struct ManagedRuntime::Impl {
             fail("METHOD_NOT_FOUND", "Method index outside DEX table");
         if (frame_count() >= limits.frames)
             fail("CALL_DEPTH", "Shared managed frame limit exceeded");
+        if(!virtual_dispatch)
+            if(const auto declaration=owned_method_declaration(index);
+               declaration && (image.methods.at(*declaration).flags&8u))
+                index=*declaration;
         const auto &method = image.methods[index];
         const auto &prototype = image.prototypes[method.prototype];
         const auto &type = image.types[method.owner];
@@ -8282,7 +9257,7 @@ struct ManagedRuntime::Impl {
             result = provided ? *provided : core(index, frame.arguments, virtual_dispatch);
         } else if (method.flags & 0x100) {
             allocation_phase=RuntimeAllocationPhase::native;
-            if(background() && (native_context_depth || !native || !native->supports_background()))fail("TASK_NATIVE_UNSUPPORTED","Background managed native calls require per-context JNI/CPU state");
+            if(background() && (selected_native_context() || !native || !native->supports_background()))fail("TASK_NATIVE_UNSUPPORTED","Background managed native calls require per-context JNI/CPU state");
             NonYielding barrier(current_context());
             if (!native)
                 fail("NATIVE_UNAVAILABLE", "Native method requires an attached native interface");
@@ -8380,13 +9355,122 @@ void ManagedRuntime::set_native_interface(NativeInterface *interface) {
         fail("STATE", "Cannot replace native interface while execution or managed tasks are active");
     impl_->native = interface;
 }
+void ManagedRuntime::run_host_callback(const std::function<void()> &entry) {
+    auto &p=*impl_;p.check_thread(true);p.execution_checkpoint();p.check_thread();
+    auto &context=p.current_context();
+    if(!entry || p.background() || context.invocations || !context.frames.empty() || context.barriers ||
+       context.cancellation_requested || p.tasks_closing)
+        fail("HOST_CALLBACK_STATE","Host callback requires the idle live managed main owner");
+    if(!p.main_work_selected())context.remaining=p.limits.instructions;
+    context.last_result={};context.last_exception=0;
+    ++context.invocations;
+    struct End {ExecutionContext &context;~End(){--context.invocations;}} end{context};
+    NonYielding barrier(context);
+    try {entry();p.execution_checkpoint();}
+    catch(const JavaException &error){p.execution_checkpoint();context.last_exception=error.object;throw;}
+    catch(...){p.failure_checkpoint();throw;}
+}
+void ManagedRuntime::run_host_monitor(ObjectId monitor, const std::function<void()> &entry) {
+    if (!entry) fail("HOST_MONITOR_STATE", "Scoped host monitor requires its actual callback");
+    if (!has_provider_work_context()) {
+        run_host_callback([&] { run_host_monitor(monitor, entry); });
+        return;
+    }
+    auto &p = *impl_;
+    p.check_thread();
+    if (!monitor) raise("Ljava/lang/NullPointerException;");
+    retain(monitor);
+    struct Root {ManagedRuntime &runtime;ObjectId object;~Root(){runtime.release(object);}} root{*this,monitor};
+    auto &context = p.current_context();
+    std::optional<Frame> synthetic;
+    Frame *frame = nullptr;
+    if (context.frames.empty()) {
+        if (p.frame_count() >= p.limits.frames) fail("CALL_DEPTH", "Shared managed frame limit exceeded");
+        // Fixed monitor-cell construction and frame preparation/cleanup;
+        // no unused heap root table or new frame allowance is introduced.
+        charge_provider_work(std::tuple_size_v<decltype(Frame::monitors)> + 2);
+        synthetic.emplace();
+        synthetic->method = no_index; // Trusted host frame, never an APK instruction witness.
+        frame = &*synthetic;
+        context.frames.push_back(frame);
+        p.metrics.maximum_frames = std::max(p.metrics.maximum_frames, p.frame_count());
+    } else frame = context.frames.back();
+    struct Pop {
+        ExecutionContext &context;
+        Frame *frame;
+        bool active;
+        ~Pop() noexcept {
+            if (active) {
+                if (context.frames.empty() || context.frames.back() != frame) std::terminate();
+                context.frames.pop_back();
+            }
+        }
+    } pop{context, frame, bool(synthetic)};
+    const auto previous = frame->monitor_count;
+    if (previous == frame->monitors.size()) fail("MONITOR_LIMIT", "Monitor nesting exceeds 32 acquisitions per invocation");
+    charge_provider_work(1);
+    p.check_monitor_available(monitor);
+    // Fixed acquire/release writes cannot throw once their work is admitted.
+    charge_provider_work(2);
+    frame->monitors[frame->monitor_count++] = monitor;
+    struct Unlock {
+        Frame &frame;
+        ObjectId monitor;
+        std::size_t previous;
+        ~Unlock() noexcept {
+            if (frame.monitor_count != previous + 1 || frame.monitors[previous] != monitor) std::terminate();
+            frame.monitors[previous] = 0;
+            frame.monitor_count = previous;
+        }
+    } unlock{*frame, monitor, previous};
+    entry();
+}
+bool ManagedRuntime::has_provider_work_context() const {
+    const auto &p = *impl_;
+    p.check_thread();
+    return p.main_work_selected() || p.current_context().invocations ||
+           p.scheduled_task() || p.main_callback_inflight;
+}
+void ManagedRuntime::reserve_provider_storage(std::size_t bytes) {
+    auto &p = *impl_;
+    p.check_thread();
+    p.execution_checkpoint();
+    if (p.metrics.heap_bytes > p.limits.heap_bytes ||
+        p.metrics.provider_storage_reserved_bytes > p.metrics.heap_bytes)
+        fail("HEAP_LIMIT", "Provider storage found inconsistent shared heap accounting");
+    if (bytes > p.limits.heap_bytes - p.metrics.heap_bytes) p.collect();
+    if (bytes > p.limits.heap_bytes - p.metrics.heap_bytes)
+        fail("HEAP_LIMIT", "Provider temporary storage exhausts the shared heap quota");
+    p.metrics.heap_bytes += bytes;
+    p.metrics.provider_storage_reserved_bytes += bytes;
+}
+void ManagedRuntime::release_provider_storage(std::size_t bytes) noexcept {
+    auto &p = *impl_;
+    if (p.owner != std::this_thread::get_id() || bytes > p.metrics.provider_storage_reserved_bytes ||
+        bytes > p.metrics.heap_bytes)
+        std::terminate(); // Trusted reservation lifetime/accounting invariant.
+    p.metrics.provider_storage_reserved_bytes -= bytes;
+    p.metrics.heap_bytes -= bytes;
+}
 void ManagedRuntime::set_host_interface(HostInterface *interface) {
     impl_->check_thread(interface == nullptr);
     if (!impl_->current_context().frames.empty() || impl_->active_tasks())
         fail("STATE", "Cannot replace host interface while execution or managed tasks are active");
+    if (interface && interface != impl_->host && impl_->host_initializers_used)
+        fail("STATE", "Cannot change bootstrap providers after hosted class initialization");
+    if (interface && interface != impl_->host && impl_->loader && !impl_->image.sources.empty())
+        fail("STATE", "Cannot change bootstrap providers after app class linking");
+    if (interface && !impl_->loader)
+        for (const auto &definition : impl_->image.classes) {
+            const auto &descriptor = impl_->image.types.at(definition.type);
+            const auto metadata = impl_->provider_call([&] { return interface->class_info(descriptor); });
+            if (core_type(descriptor) || (metadata && metadata->bootstrap_class))
+                fail("CLASS_LOADER_UNSUPPORTED", "Eager app image collides with a bootstrap class: " + descriptor);
+        }
     if(impl_->host_generation==std::numeric_limits<std::uint64_t>::max())fail("STATE","Host provider binding generation exhausted");
     ++impl_->host_generation;
     impl_->host = interface;
+    if (interface) impl_->bootstrap_provider_bound = true;
 }
 const DexImage &ManagedRuntime::image() const noexcept { return impl_->image; }
 const Class *ManagedRuntime::class_definition(std::string_view descriptor) const {
@@ -8408,7 +9492,7 @@ Value ManagedRuntime::invoke_resolved(Index method, std::span<const Value> argum
     p.check_thread();
     const bool outer = !p.current_context().invocations;
     if (outer) {
-        p.current_context().remaining = p.limits.instructions;
+        if(!p.main_work_selected())p.current_context().remaining = p.limits.instructions;
         p.current_context().last_result = {};
         p.current_context().last_exception = 0;
     }
@@ -8448,7 +9532,7 @@ Value ManagedRuntime::invoke_virtual_named(ObjectId receiver, std::string_view n
     auto &context = p.current_context();
     const bool outer = !context.invocations;
     if (outer) {
-        context.remaining = p.limits.instructions;
+        if(!p.main_work_selected())context.remaining = p.limits.instructions;
         context.last_result = {};
         context.last_exception = 0;
     }
@@ -8572,15 +9656,36 @@ Index ManagedRuntime::lookup_jni_method_impl(std::string_view owner, std::string
             fail("CLASS_LIMIT", "Native method hierarchy exceeds 65536 classes");
         const auto *definition = p.resolve_class(current);
         if (!definition) {
+            const auto implemented_owner=core_loader_method_owner(current,name,signature);
+            // The concrete held loader implements this exact inherited method
+            // as ClassLoader. Do not skip arbitrary unknown provider parents.
+            const auto lookup_owner=implemented_owner?*implemented_owner:std::string_view(current);
             // Exact core/provider symbolic dispatch remains the existing
             // fallback, not a complete inherited declaration inventory. An
             // Object miss must not prevent the owned interface search below.
-            try { return lookup(current, name, signature, is_static); }
+            try { return lookup(lookup_owner, name, signature, is_static); }
             catch (const DexError &error) {
                 if (error.code != "AETHER_DEX_METHOD_NOT_FOUND")
                     throw;
+                if(implemented_owner && p.loader) {
+                    if(is_static)
+                        fail("SIGNATURE", "Implemented core loader method requires an instance");
+                    // Only a supported core tuple reaches the charged, stable
+                    // linker catalog. No class source or method body is added.
+                    (void)p.loader->intern_provider_method(*implemented_owner,name,signature);
+                    return lookup(*implemented_owner,name,signature,is_static);
+                }
+                if(implemented_owner && current!=lookup_owner) {
+                    // An eager image is immutable and may already contain the
+                    // concrete alias reference. Preserve that existing route;
+                    // never append metadata without the owning live linker.
+                    try { return lookup(current,name,signature,is_static); }
+                    catch(const DexError &alias_error) {
+                        if(alias_error.code!="AETHER_DEX_METHOD_NOT_FOUND")throw;
+                    }
+                }
                 if (current != "Ljava/lang/Object;")
-                    fail("METHOD_UNSUPPORTED", "Native superclass provider method inventory is incomplete");
+                    fail("METHOD_UNSUPPORTED", "Native provider inventory incomplete: " + current + "." + std::string(name) + std::string(signature) + (is_static ? " static" : " instance"));
                 if (current != "Ljava/lang/Object;" || class_path.empty())
                     throw;
             }
@@ -8649,7 +9754,7 @@ Index ManagedRuntime::lookup_jni_method_impl(std::string_view owner, std::string
         const auto &descriptor = p.image.types.at(type);
         const auto *definition = p.resolve_class(descriptor);
         if (!definition)
-            fail("METHOD_UNSUPPORTED", "Native interface provider method inventory is incomplete");
+            fail("METHOD_UNSUPPORTED", "Native interface inventory incomplete: " + descriptor + "; requested " + std::string(owner) + "." + std::string(name) + std::string(signature) + (is_static ? " static" : " instance"));
         if (!(definition->flags & 0x200))
             fail("METHOD_METADATA", "Native interface inventory names an ordinary class");
         const auto method = declared(*definition, descriptor, true);
@@ -8841,12 +9946,16 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
             fail("ALLOCATION_UNSUPPORTED","BitSet class metadata is available; BitSet storage and methods are not implemented");
         if(type=="Ljava/lang/Void;")
             fail("ALLOCATION_UNSUPPORTED","Void is a final non-instantiable primitive Class holder");
+        if (type == supplied_thread_local_type)
+            fail("ALLOCATION_UNSUPPORTED", "SuppliedThreadLocal is final/private and requires ThreadLocal.withInitial");
         if (type == pool_worker_type || type == queue_iterator_type || async_internal_type(type) ||
-            type==async_status_type || type==android_process_type || type==android_binder_type || type=="Landroid/text/TextUtils;")
+            type==async_status_type || type==android_process_type || type=="Landroid/text/TextUtils;")
             fail("ALLOCATION_UNSUPPORTED", "Internal/static SDK ancestry cannot be constructed by guest code");
         if(type==async_task_type)result.async_task=std::make_unique<AsyncTaskState>();
         if (type == "Ljava/lang/Math;")
             fail("ALLOCATION_UNSUPPORTED", "Math is a static utility class");
+        if (type == executors_type)
+            fail("ALLOCATION_UNSUPPORTED", "Executors construction is outside the supported utility profile");
         if (type == "Ljava/lang/Runtime;" || type == "Ldalvik/system/VMRuntime;")
             fail("ALLOCATION_UNSUPPORTED", "Runtime objects require getRuntime");
         if (type == "Ljava/lang/Thread;")
@@ -8870,7 +9979,8 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
             fail("ALLOCATION_UNSUPPORTED", "Concurrent map views and iterators require a map factory");
         if(type==deque_iterator_type)fail("ALLOCATION_UNSUPPORTED","Deque iterators require a factory");
         if(type==array_deque_type)result.deque=std::make_unique<ManagedDeque>();
-        if (type == live_iterator_type || type == live_list_iterator_type)
+        if (type == live_iterator_type || type == live_list_iterator_type ||
+            type == virtual_list_iterator_type || type == virtual_list_list_iterator_type)
             fail("ALLOCATION_UNSUPPORTED", "Live list iterators require a backing-list factory");
         if(type=="Ljava/util/function/Supplier;")fail("ALLOCATION","Cannot instantiate Supplier interface");
         if(type=="Ljava/util/regex/MatchResult;")fail("ALLOCATION","Cannot instantiate regex interface");
@@ -8915,7 +10025,7 @@ ObjectId ManagedRuntime::new_object(std::string_view type) {
             result.uuid=std::make_unique<ManagedUuid>();
         }
         if(type==random_type)result.random=std::make_unique<ManagedRandom>();
-        if(type==thread_local_type)result.thread_local_key=std::make_unique<ManagedThreadLocal>();
+        if(type==thread_local_type)p.make_thread_local_key(result);
         if(type==long_type || type==short_type) {
             if(result.type!=type)fail("ALLOCATION_UNSUPPORTED","Integral wrappers are final and cannot be subclassed");
             result.integral=std::make_unique<ManagedIntegral>(type==long_type);
@@ -8995,12 +10105,13 @@ std::shared_ptr<ProcessState> ManagedRuntime::process_state() const {
     if(!context.thread_exit)context.thread_exit=value;
     throw ThreadExit{*context.thread_exit};
 }
-void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority) {
+void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const host::PriorityService &priority,std::uint64_t allowance) {
     auto &p=*impl_;p.check_thread();
     p.execution_checkpoint();
     if(!entry || p.native_context_depth==p.native_contexts.size())fail("NATIVE_THREAD_LIMIT","Native context nesting exhausted");
     auto &parent=p.current_context();ExecutionContext child;child.native_priority=priority?&priority:nullptr;
-    child.remaining=parent.invocations?parent.remaining:p.limits.instructions;
+    child.cancellation_requested=parent.cancellation_requested;
+    child.remaining=std::min(allowance,parent.invocations?parent.remaining:p.limits.instructions);
     child.invocations=1;child.barriers=1;const auto initial=child.remaining;
     p.native_cpu_unattributed=true;
     p.native_context_tokens[p.native_context_depth]=Scheduler::execution_token();
@@ -9010,7 +10121,7 @@ void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const 
         ~Restore(){
             p.discard_native_context(child);
             p.end_native_thread(child);
-            --p.native_context_depth;p.native_contexts[p.native_context_depth]=nullptr;
+            p.remove_native_context(child);
             if(parent.invocations){const auto spent=initial-child.remaining;parent.remaining=spent>=parent.remaining?0:parent.remaining-spent;}
         }
     } restore{p,parent,child,initial};
@@ -9019,6 +10130,9 @@ void ManagedRuntime::run_native_thread(const std::function<void()> &entry,const 
             // A cleanup failure outranks this child's already latched pthread exit.
             // Process termination remains authoritative; ordinary paths keep the
             // existing sticky-exit checkpoint and never resume the dying context.
+            // Private scheduler cancellation outranks this context's older
+            // exit/finalization state. Process termination remains authoritative.
+            if(child.cancellation_requested){p.process->checkpoint();throw;}
             if(child.native_finalization_failure) {
                 p.process->checkpoint();std::rethrow_exception(child.native_finalization_failure);
             }
@@ -9060,24 +10174,104 @@ void ManagedRuntime::run_thread_finalizers(const std::function<void()> &entry) {
         p.process->checkpoint();throw;
     }
 }
-std::uint64_t ManagedRuntime::thread_instruction_budget() const {
+ManagedRuntime::NativeInstructionBudget ManagedRuntime::native_instruction_budget() const {
     auto &p=*impl_;p.check_thread(true);p.process->checkpoint();
-    if(p.current_context().cancellation_requested)fail("TASK_CANCELLED","Cancelled context cannot admit native work");
-    auto remaining=p.current_context().remaining;
+    if(p.main_work_selected())fail("MAIN_WORK_BUDGET","Resource-metered main work requires its typed budget");
+    const auto &context=p.current_context();
+    if(context.cancellation_requested)fail("TASK_CANCELLED","Cancelled context cannot admit native work");
+    NativeInstructionBudget budget;
+    budget.retained=context.remaining;
+    if(p.scheduled_task())budget.shared=p.task_work_remaining;
+    else if(p.main_callback_inflight)budget.shared=p.main_callback_work_remaining;
+    if(const auto slice=p.native_slice_remaining())budget.slice=*slice;
+    if(const auto quantum=p.native_slice_quantum())budget.soft_quantum=*quantum;
+    return budget;
+}
+std::optional<ManagedRuntime::NativeInstructionBudget> ManagedRuntime::native_progress_budget() const noexcept {
+    const auto &p=*impl_;
+    const NativeInstructionBudget stopped{0,0,std::uint64_t{0}};
+    if(p.owner!=std::this_thread::get_id() || !p.process || p.process->exit_status())return stopped;
+    if(p.main_work_selected())return stopped; // No finite allowance can be invented for this legacy view.
+    // Resident observation cannot throw/allocate a context diagnostic while a
+    // lease destructor restores its parent during ordinary or exceptional exit.
+    const auto *context=p.allocation_context();
+    if(!context || context->cancellation_requested)return stopped;
+    if(!context->invocations && !p.main_callback_inflight)return {};
+    NativeInstructionBudget budget;
+    budget.retained=context->invocations?context->remaining:p.limits.instructions;
+    if(p.scheduled_task())budget.shared=p.task_work_remaining;
+    else if(p.main_callback_inflight)budget.shared=p.main_callback_work_remaining;
+    if(const auto slice=p.native_slice_remaining())budget.slice=*slice;
+    if(const auto quantum=p.native_slice_quantum())budget.soft_quantum=*quantum;
+    return budget;
+}
+std::uint64_t ManagedRuntime::thread_instruction_budget() const {
+    const auto budget=native_instruction_budget();
+    auto remaining=std::min(budget.retained,budget.shared);
+    if(budget.slice)remaining=std::min(remaining,*budget.slice);
+    return remaining;
+}
+std::uint64_t ManagedRuntime::native_thread_admission_budget() const {
+    const auto &p=*impl_;p.check_thread(true);p.process->checkpoint();
+    if(p.main_work_selected())fail("MAIN_WORK_BUDGET","Resource-metered main work requires typed native admission");
+    const auto &context=p.current_context();
+    if(context.cancellation_requested)fail("TASK_CANCELLED","Cancelled context cannot admit native work");
+    auto remaining=context.invocations?context.remaining:p.limits.instructions;
     if(p.scheduled_task())remaining=std::min(remaining,p.task_work_remaining);
     else if(p.main_callback_inflight)remaining=std::min(remaining,p.main_callback_work_remaining);
     return remaining;
 }
+void ManagedRuntime::charge_provider_work(std::uint64_t actual_work) {
+    auto &p=*impl_;p.check_thread();p.execution_checkpoint();
+    auto &context=p.current_context();
+    if(context.cancellation_requested || p.tasks_closing)
+        fail("TASK_CANCELLED","Cancelled execution cannot admit provider work");
+    if(p.main_work_selected()) {
+        p.check_main_work();
+        // The provider keeps its actual host stack and nonyielding barrier.
+        // charge_context_work saturates only the soft quantum, while preserving
+        // the cumulative ledger and any explicit retained instruction ceiling.
+        p.charge_context_work(context,actual_work,"Provider work exceeds its retained ceiling");
+        p.check_main_work();
+        return;
+    }
+    const bool scheduled=p.scheduled_task();
+    if(!context.invocations && !scheduled && !p.main_callback_inflight)
+        fail("PROVIDER_WORK_STATE","Provider work requires an active admitted execution");
+    if(actual_work>context.remaining ||
+       (scheduled && actual_work>p.task_work_remaining) ||
+       (!scheduled && p.main_callback_inflight && actual_work>p.main_callback_work_remaining))
+        fail("BUDGET","Provider work exceeds its remaining execution allowance");
+    p.charge_context_work(context,actual_work,"Provider work exceeds its remaining execution allowance");
+    if(scheduled)p.task_work_remaining-=actual_work;
+    else if(p.main_callback_inflight)p.main_callback_work_remaining-=actual_work;
+    // Host processing is neither a DEX instruction nor a guest CPU tick: do not
+    // change metrics.instructions or native_charge_counter/witness attribution.
+}
 void ManagedRuntime::charge_thread_instructions(std::uint64_t instructions) {
-    auto &p=*impl_;p.check_thread(true);p.process->checkpoint();
+    auto &p=*impl_;p.check_thread(true);
+    if(p.main_work_selected()) {
+        // These ticks have already executed. Settle them even during terminal
+        // unwind; a process/admission checkpoint before this debit would lose
+        // the native tail. The next regular boundary checks authority before
+        // any further guest effect. CPU admission enforces an optional ceiling.
+        if(instructions>UINT64_MAX-p.native_charge_counter)
+            fail("BUDGET","Native instruction charge counter exhausted");
+        p.charge_context_work(p.current_context(),instructions,"Native main work exceeded its retained ceiling");
+        p.native_charge_counter+=instructions;
+        return;
+    }
+    p.process->checkpoint();
     auto &context=p.current_context();
     if(instructions>thread_instruction_budget())fail("BUDGET","Native instructions exceed the remaining logical thread allowance");
-    context.remaining-=instructions;
+    if(instructions>UINT64_MAX-p.native_charge_counter)fail("BUDGET","Native instruction charge counter exhausted");
+    p.charge_context_work(context,instructions,"Native instructions exceed the remaining logical thread allowance");
+    p.native_charge_counter+=instructions;
     if(p.scheduled_task())p.task_work_remaining-=instructions;
     else if(p.main_callback_inflight)p.main_callback_work_remaining-=instructions;
 }
 bool ManagedRuntime::detach_native_thread() {
-    auto &p=*impl_;p.check_thread();if(!p.native_context_depth)return false;
+    auto &p=*impl_;p.check_thread();if(!p.selected_native_context())return false;
     auto &context=p.current_context();if(!context.frames.empty() || context.invocations!=1)return false;
     p.end_native_thread(context);
     context.last_result={};context.last_exception=0;context.interrupted=false;return true;
@@ -9103,7 +10297,7 @@ ObjectId ManagedRuntime::current_thread() {
     p.check_thread();
     if (!p.background()) return p.synthetic_thread(p.main_context, u"main");
     if (p.current_context().thread_object) return p.current_context().thread_object;
-    std::u16string name = p.native_context_depth?u"native-":u"task-";
+    std::u16string name = p.selected_native_context()?u"native-":u"task-";
     for (const auto character : std::to_string(Scheduler::execution_token())) name.push_back(character);
     return p.synthetic_thread(p.current_context(), name);
 }
@@ -9137,6 +10331,114 @@ ManagedRuntime::TaskId ManagedRuntime::schedule(Index method, std::span<const Va
     p.task_owner(); // Preserve the existing external-main-only host API.
     return p.submit_task(method, arguments, virtual_dispatch);
 }
+ManagedRuntime::TaskId ManagedRuntime::prepare_main_work(std::function<void()> entry,MainWorkPolicy policy,
+                                                        Scheduler::SwitchHooks hooks) {
+    auto &p=*impl_;p.check_thread();p.execution_checkpoint();
+    if(!entry || !policy.admission || (policy.instruction_limit && !*policy.instruction_limit) ||
+       p.execution_owner || p.background() || p.main_work || p.main_context.invocations ||
+       !p.main_context.frames.empty() || p.main_context.barriers || p.native_context_depth ||
+       p.active_tasks() || p.main_callback_inflight || p.tasks_closing)
+        fail("MAIN_WORK_STATE","Main work requires an idle owned runtime and an explicit resource controller");
+    if(p.scheduler && p.scheduler->current())fail("MAIN_WORK_STATE","Main work must be prepared by external root");
+    if(sizeof(Impl::MainWork)>p.limits.heap_bytes-p.metrics.heap_bytes)p.collect();
+    if(sizeof(Impl::MainWork)>p.limits.heap_bytes-p.metrics.heap_bytes)
+        fail("HEAP_LIMIT","Retained main metadata exceeds the managed heap quota");
+    auto work=std::make_unique<Impl::MainWork>();
+    work->policy=policy;work->retained=policy.instruction_limit;work->work_start=p.actual_work;
+    if(!p.scheduler){p.scheduler=std::make_unique<Scheduler>(p.priority_baseline());p.scheduler->bind_process_state(p.process);}
+    p.main_work=std::move(work);
+    try {
+        p.check_main_work();
+        const auto id=p.scheduler->prepare_main([&p,entry=std::move(entry)] {
+            if(!p.main_work_selected())fail("MAIN_WORK_STATE","Main entry has lost its selected identity");
+            p.check_main_work();
+            if(p.progress_sink && !p.progress_sink->prepare_native_stack())
+                fail("PROGRESS_STACK","Cannot prepare bounded native diagnostics on retained main stack");
+            entry();p.execution_checkpoint();p.check_main_work();
+        },hooks);
+        p.main_work->id=id;p.metrics.heap_bytes+=sizeof(Impl::MainWork);
+        return id;
+    } catch(...) {p.main_work.reset();throw;}
+}
+bool ManagedRuntime::run_main_work(TaskId id,std::uint64_t quantum) {
+    auto &p=*impl_;p.main_work_root(id);
+    if(!quantum || quantum>10'000'000)
+        fail("MAIN_WORK_GRANT","Main scheduling quantum is outside its bounded host range");
+    p.process->checkpoint();p.check_main_work();
+    auto state=p.scheduler->state(id);
+    if(state!=Scheduler::State::prepared && state!=Scheduler::State::runnable)return false;
+    p.main_work->quantum_remaining=quantum;
+    if(state==Scheduler::State::prepared && !p.scheduler->publish(id))
+        fail("MAIN_WORK_STATE","Cannot publish retained main entry");
+    const auto ran=p.scheduler->run_main(id);
+    // A terminal task's exact exception takes precedence over a later policy
+    // sample. Observe that exception through main_work_exception without entry.
+    state=p.scheduler->state(id);
+    if(state!=Scheduler::State::failed && state!=Scheduler::State::cancelled)p.check_main_work();
+    return ran;
+}
+Scheduler::State ManagedRuntime::main_work_state(TaskId id) const {
+    const auto &p=*impl_;p.main_work_root(id);return p.scheduler->state(id);
+}
+std::exception_ptr ManagedRuntime::main_work_exception(TaskId id) const {
+    const auto &p=*impl_;p.main_work_root(id);return p.scheduler->exception(id);
+}
+std::uint64_t ManagedRuntime::main_work_actual_work(TaskId id) const {
+    const auto &p=*impl_;p.main_work_root(id);return p.main_work_actual();
+}
+void ManagedRuntime::cancel_main_work(TaskId id) {
+    auto &p=*impl_;p.main_work_root(id);
+    p.main_context.cancellation_requested=true;
+    for(std::size_t n=0;n<p.native_context_depth;++n)
+        if(p.native_context_tokens[n]==id)p.native_contexts[n]->cancellation_requested=true;
+    p.scheduler->cancel_and_unwind(id);
+}
+bool ManagedRuntime::release_main_work(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(p.owner!=std::this_thread::get_id() || p.execution_owner || !p.scheduler ||
+       Scheduler::execution_token() || !p.main_work || p.main_work->id!=id ||
+       !p.main_context.frames.empty() || p.main_context.invocations || p.main_context.barriers || p.native_context_depth)
+        return false;
+    if(!p.scheduler->release_terminal(id))return false;
+    p.main_work.reset();p.metrics.heap_bytes-=sizeof(Impl::MainWork);
+    p.main_context.cancellation_requested=false;
+    return true;
+}
+std::optional<ManagedRuntime::MainWorkBudget> ManagedRuntime::main_work_budget() const {
+    const auto &p=*impl_;
+    if(p.owner!=std::this_thread::get_id())fail("THREAD","Managed runtime belongs to another thread");
+    if(!p.main_work_selected())return {};
+    return MainWorkBudget{p.main_work->retained,p.main_work->quantum_remaining,p.main_work_actual()};
+}
+std::uint64_t ManagedRuntime::deferred_native_worker_budget() const {
+    const auto &p=*impl_;p.check_thread(true);p.execution_checkpoint();
+    if(!p.main_work_selected())
+        fail("MAIN_WORK_STATE","Dormant worker admission requires the selected retained main entry");
+    p.check_main_work();
+    return p.limits.instructions;
+}
+void ManagedRuntime::main_work_checkpoint(bool can_yield) {
+    auto &p=*impl_;p.check_thread(true);p.execution_checkpoint();
+    if(!p.main_work_selected())fail("MAIN_WORK_STATE","Main checkpoint requires its selected retained entry");
+    p.check_main_work();
+    if(can_yield && !p.main_work->quantum_remaining) {
+        for(const auto *frame:p.current_context().frames)if(frame->monitor_count)return;
+        p.scheduler->yield();p.execution_checkpoint();p.check_main_work();
+    }
+}
+void ManagedRuntime::park_main_work(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    auto &p=*impl_;p.check_thread(true);p.execution_checkpoint();
+    if(!p.main_work_selected() || p.selected_native_context())
+        fail("MAIN_WORK_STATE","Main park requires its selected logical-main entry");
+    p.check_main_work();
+    for(const auto *frame:p.main_context.frames)if(frame->monitor_count)
+        fail("THREAD_BLOCKING_UNSUPPORTED","Main parking while holding a managed monitor is unsupported");
+    if(deadline)p.scheduler->park_until(*deadline);else p.scheduler->park();
+    p.execution_checkpoint();p.check_main_work();
+}
+void ManagedRuntime::wake_main_work(TaskId id) {
+    auto &p=*impl_;p.main_work_root(id);p.scheduler->wake(id);
+}
 ManagedRuntime::TaskId ManagedRuntime::schedule_owned(Index method, std::span<const Value> arguments, bool virtual_dispatch) {
     return impl_->submit_task(method, arguments, virtual_dispatch);
 }
@@ -9148,6 +10450,141 @@ ManagedRuntime::TaskId ManagedRuntime::schedule_worker(std::unique_ptr<ManagedWo
     if (p.scheduler) (void)p.scheduler->current();
     if (!entry) fail("WORKER_ENTRY", "Persistent worker entry is null");
     return p.submit_task(no_index, {}, false, std::move(entry));
+}
+ManagedRuntime::TaskId ManagedRuntime::prepare_worker(std::unique_ptr<ManagedWorkerEntry> entry,Scheduler::SwitchHooks hooks) {
+    if(!entry)fail("WORKER_ENTRY","Prepared worker entry is null");
+    return impl_->submit_task(no_index,{},false,std::move(entry),0,true,hooks);
+}
+bool ManagedRuntime::publish_worker(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(p.owner!=std::this_thread::get_id() || p.execution_owner || !p.scheduler)return false;
+    for(auto &entry:p.tasks)if(entry && entry->id==id){
+        if(!entry->prepared_worker || !entry->worker)return false;
+        if(!p.scheduler->publish(id))return false;
+        entry->prepared_worker=false;return true;
+    }
+    return false;
+}
+bool ManagedRuntime::discard_prepared_worker(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(p.owner!=std::this_thread::get_id() || p.execution_owner || !p.scheduler)return false;
+    for(auto &entry:p.tasks)if(entry && entry->id==id){
+        if(!entry->prepared_worker || !entry->worker || !entry->context.frames.empty() || entry->context.invocations)return false;
+        if(!p.scheduler->discard_prepared(id))return false;
+        // No task stack has started, so no finalizers or owner callbacks run.
+        // Detach the slot before destroying its trusted nonreentrant entry.
+        auto discarded=std::move(entry);
+        p.metrics.heap_bytes-=discarded->charged;
+        return true;
+    }
+    return false;
+}
+ManagedRuntime::TaskId ManagedRuntime::prepare_native_worker(std::unique_ptr<ManagedWorkerEntry> entry,Scheduler::SwitchHooks hooks) {
+    if(!entry || !hooks.enter || !hooks.leave)fail("WORKER_ENTRY","Native worker requires owned entry and paired hooks");
+    return impl_->submit_task(no_index,{},false,std::move(entry),0,true,hooks,true);
+}
+bool ManagedRuntime::run_native_worker(TaskId id,std::int32_t priority,std::uint64_t slice_runtime_grant) {
+    auto &p=*impl_;p.check_thread();
+    if(p.execution_owner || !p.scheduler || p.scheduler->current()!=0 || p.tasks_closing)
+        fail("TASK_STATE","Native slice requires its external scheduler root");
+    auto &task=p.task(id);auto &parent=p.current_context();
+    if(!task.native_worker || task.prepared_worker || parent.barriers>1 || parent.native_finalizing || !p.class_initializers.empty())
+        fail("TASK_STATE","Native slice crosses an unaudited execution boundary");
+    for(const auto frame:parent.frames)if(frame->monitor_count)
+        fail("THREAD_BLOCKING_UNSUPPORTED","Native slice while holding a managed monitor is unsupported");
+    if(task.slice_headroom || task.slice_quantum)fail("TASK_STATE","Native slice already has a live work grant");
+    // Capture actual hard parent authority separately from the requested soft
+    // scheduling quantum. Synchronous provider/managed processing may defer a
+    // yield, but cannot consume beyond this hard headroom or its own context.
+    auto headroom=p.task_work_remaining;
+    if(parent.invocations)headroom=std::min(headroom,parent.remaining);
+    if(p.main_callback_inflight)headroom=std::min(headroom,p.main_callback_work_remaining);
+    const auto quantum=std::min(slice_runtime_grant,headroom);
+    if(!quantum)fail("BUDGET","Native slice runtime work grant exhausted");
+    task.slice_headroom=headroom;task.slice_quantum=quantum;
+    struct SliceEnd {
+        Impl &p;TaskContext &task;ExecutionContext &parent;
+        std::uint64_t token,start,headroom,quantum;
+        bool parent_invocation,main_callback;
+        ~SliceEnd() noexcept {
+            // Hooks have restored the exact root before run_one can return or
+            // throw. Accounting also runs during process/cancellation unwind,
+            // without a checked/provider call that could replace that unwind.
+            if(Scheduler::execution_token()!=token || p.allocation_context()!=&parent ||
+               !task.slice_headroom || !task.slice_quantum || p.actual_work<start)std::terminate();
+            const auto spent=p.actual_work-start;
+            if(*task.slice_headroom>headroom || spent!=headroom-*task.slice_headroom ||
+               *task.slice_quantum!=quantum-std::min(spent,quantum))std::terminate();
+            task.slice_headroom.reset();task.slice_quantum.reset();
+            if(parent_invocation){
+                if(spent>parent.remaining)std::terminate();
+                parent.remaining-=spent;
+            }
+            if(main_callback){
+                if(spent>p.main_callback_work_remaining)std::terminate();
+                p.main_callback_work_remaining-=spent;
+            }
+        }
+    } end{p,task,parent,Scheduler::execution_token(),p.actual_work,headroom,quantum,bool(parent.invocations),bool(p.main_callback_inflight)};
+    return p.scheduler->run_one(id,priority);
+}
+Scheduler::State ManagedRuntime::native_worker_state(TaskId id) const {
+    const auto &p=*impl_;p.check_thread(true);
+    if(!p.scheduler || !p.task(id).native_worker)fail("TASK_STATE","Unknown native worker");
+    return p.scheduler->state(id);
+}
+std::exception_ptr ManagedRuntime::native_worker_exception(TaskId id) const {
+    const auto &p=*impl_;p.check_thread(true);
+    if(!p.scheduler || !p.task(id).native_worker)fail("TASK_STATE","Unknown native worker");
+    return p.scheduler->exception(id);
+}
+void ManagedRuntime::native_worker_checkpoint() {
+    auto &p=*impl_;p.check_thread();p.process->checkpoint();
+    if(!p.scheduler || !p.scheduler->current())fail("TASK_STATE","Native checkpoint requires its task");
+    auto &task=p.task(p.scheduler->current());auto &context=p.current_context();
+    if(!task.native_worker || !p.selected_native_context() || !context.frames.empty() || context.invocations!=1 || context.barriers!=1 || context.native_finalizing)
+        fail("TASK_STATE","Native checkpoint crosses a callback or finalization boundary");
+    if(!p.task_work_remaining)fail("BUDGET","Native structural scheduling allowance exhausted");
+    // The admitted scheduling step is actual work, including on cancellation
+    // unwind after suspension. Settle it through the same slice/parent ledger.
+    p.charge_context_work(context,1,"Native structural scheduling allowance exhausted");
+    --p.task_work_remaining;p.scheduler->yield();p.execution_checkpoint();
+}
+void ManagedRuntime::native_worker_park(std::optional<std::chrono::steady_clock::time_point> deadline) {
+    auto &p=*impl_;p.check_thread();p.process->checkpoint();
+    if(!p.scheduler || !p.scheduler->current())fail("TASK_STATE","Native park requires its task");
+    auto &task=p.task(p.scheduler->current());auto &context=p.current_context();
+    if(!task.native_worker || !p.selected_native_context() || !context.frames.empty() || context.invocations!=1 || context.barriers!=1 || context.native_finalizing)
+        fail("TASK_STATE","Native park crosses a callback or finalization boundary");
+    if(!p.task_work_remaining)fail("BUDGET","Native structural scheduling allowance exhausted");
+    p.charge_context_work(context,1,"Native structural scheduling allowance exhausted");
+    --p.task_work_remaining;
+    if(deadline)p.scheduler->park_until(*deadline);else p.scheduler->park();
+    p.execution_checkpoint();
+}
+void ManagedRuntime::wake_native_worker(TaskId id) {
+    auto &p=*impl_;p.check_thread();
+    if(p.execution_owner || !p.scheduler || p.scheduler->current()!=0 || p.tasks_closing)
+        fail("TASK_STATE","Native wake requires its external scheduler root");
+    if(!p.task(id).native_worker)fail("TASK_STATE","Native wake target is not an admitted native task");
+    p.scheduler->unpark(id);
+}
+void ManagedRuntime::cancel_native_worker(TaskId id) {
+    auto &p=*impl_;p.check_thread(true);
+    if(p.execution_owner || !p.scheduler || p.scheduler->current()!=0 || !p.task(id).native_worker)
+        fail("TASK_STATE","Native cancellation requires its external scheduler root");
+    p.mark_task_cancellation(id);p.scheduler->cancel_and_unwind(id);
+}
+bool ManagedRuntime::release_native_worker(TaskId id) noexcept {
+    auto &p=*impl_;
+    if(p.owner!=std::this_thread::get_id() || !p.scheduler || p.execution_owner)return false;
+    for(auto &entry:p.tasks)if(entry && entry->id==id){
+        if(!entry->native_worker || !entry->context.frames.empty() || entry->context.invocations)return false;
+        if(!p.scheduler->release_terminal(id))return false;
+        auto retired=std::move(entry);p.finish_task_context(retired->context);
+        p.metrics.heap_bytes-=retired->charged;return true;
+    }
+    return false;
 }
 void ManagedRuntime::park_worker(std::optional<std::chrono::steady_clock::time_point> deadline) {
     auto &p = *impl_;
@@ -9182,12 +10619,19 @@ void ManagedRuntime::worker_checkpoint() {
 bool ManagedRuntime::run_task() {
     auto &p = *impl_;
     p.task_owner(true);
-    return p.pump_task();
+    const bool managed=p.pump_task();
+    const bool native=p.native && p.native->pump_native_tasks(*this);
+    return managed || native;
 }
 std::optional<std::chrono::steady_clock::time_point> ManagedRuntime::next_task_deadline() const {
     const auto &p = *impl_;
     p.task_owner(true);
-    return p.scheduler ? p.scheduler->next_deadline() : std::nullopt;
+    auto deadline=p.scheduler ? p.scheduler->next_deadline() : std::nullopt;
+    if(p.native){
+        const auto native_deadline=p.native->next_native_deadline();
+        if(native_deadline && (!deadline || *native_deadline<*deadline))deadline=native_deadline;
+    }
+    return deadline;
 }
 Scheduler::State ManagedRuntime::task_state(TaskId id) const {
     auto &p = *impl_;
@@ -9209,8 +10653,8 @@ std::exception_ptr ManagedRuntime::task_exception(TaskId id) const {
 }
 void ManagedRuntime::cancel_task(TaskId id) {
     auto &p = *impl_;
-    p.task_owner();auto &task=p.task(id);
-    p.scheduler->cancel(id);task.context.cancellation_requested=true;
+    p.task_owner();(void)p.task(id);
+    p.scheduler->cancel(id);p.mark_task_cancellation(id);
 }
 void ManagedRuntime::release_task(TaskId id) {
     auto &p = *impl_;
@@ -9230,7 +10674,7 @@ void ManagedRuntime::close_tasks() {
         fail("TASK_STATE", "Managed task shutdown requires an idle external main context");
     (void)p.scheduler->current();
     p.tasks_closing=true;
-    for(auto &task:p.tasks)if(task)task->context.cancellation_requested=true;
+    for(auto &task:p.tasks)if(task)p.mark_task_cancellation(task->id);
     p.scheduler->close();
     for(auto &task:p.tasks)if(task)p.finish_task_context(task->context);
     p.reap_java_threads();
@@ -9309,6 +10753,12 @@ bool ManagedRuntime::has_main_callbacks() const {
     impl_->check_thread();
     return impl_->main_callback_count != 0;
 }
+std::optional<NativeMainQueueWitness> ManagedRuntime::native_main_queue_witness() const {
+    auto &p=*impl_;
+    p.check_thread(true); // Passive metadata remains observable during teardown.
+    if(p.execution_owner)return std::nullopt;
+    return NativeMainQueueWitness{this, &p.main_callbacks, p.main_callbacks_closed};
+}
 void ManagedRuntime::close_main_callbacks() {
     auto &p = *impl_;
     p.check_thread(true);
@@ -9337,6 +10787,81 @@ ObjectId ManagedRuntime::new_string(std::u16string_view value) {
     result.type = "Ljava/lang/String;";
     result.text = value;
     return impl_->allocate(std::move(result));
+}
+ObjectId ManagedRuntime::new_supplied_thread_local(ObjectId supplier) {
+    if (!has_provider_work_context()) {
+        ObjectId result = 0;
+        run_host_callback([&] { result = new_supplied_thread_local(supplier); });
+        return result;
+    }
+    auto &p = *impl_;
+    p.check_thread();
+    NonYielding barrier(p.current_context());
+    retain(supplier);
+    struct Root {
+        ManagedRuntime &runtime;
+        ObjectId object;
+        ~Root() { runtime.release(object); }
+    } supplier_root{*this, supplier};
+    if (supplier && !assignable(supplier, "Ljava/util/function/Supplier;"))
+        fail("VALUE_TYPE", "ThreadLocal.withInitial requires its actual Supplier argument");
+    p.initialize(thread_local_type);
+    // Match allocate's ordinary charge before descriptor/key native allocation.
+    // No managed allocation or reentry occurs before the final allocate check.
+    charge_provider_work(1);
+    p.preflight_object_storage(sizeof(Object) + supplied_thread_local_type.size() + sizeof(ManagedThreadLocal));
+    Object pending;
+    pending.type = supplied_thread_local_type;
+    p.make_thread_local_key(pending, true);
+    const auto result = p.allocate(std::move(pending));
+    retain(result);
+    Root result_root{*this, result};
+    charge_provider_work(1);
+    p.object(result).thread_local_key->initialized = true; // Actual base construction precedes the supplier null check.
+    if (!supplier) raise("Ljava/lang/NullPointerException;");
+    charge_provider_work(1);
+    p.object(result).thread_local_key->supplier = supplier;
+    return result;
+}
+ObjectId ManagedRuntime::boolean_value_of(bool value) {
+    if (!has_provider_work_context()) {
+        ObjectId result = 0;
+        run_host_callback([&] { result = boolean_value_of(value); });
+        return result;
+    }
+    charge_provider_work(1);
+    return impl_->box_boolean(value);
+}
+ObjectId ManagedRuntime::new_host_string(std::u16string_view value, std::size_t live_native_bytes) {
+    auto &p = *impl_;
+    p.check_thread();
+    if (value.size() > p.limits.array_length)
+        fail("STRING_LIMIT", "Managed string exceeds length limit");
+    constexpr std::string_view type = "Ljava/lang/String;";
+    // Match allocate's String charge without exposing Object layout to providers.
+    const auto fixed = sizeof(Object) + type.size();
+    if (fixed > p.limits.heap_bytes ||
+        value.size() > (p.limits.heap_bytes - fixed) / sizeof(char16_t))
+        fail("HEAP_LIMIT", "Provider String exceeds the managed heap quota");
+    const auto managed_bytes = fixed + value.size() * sizeof(char16_t);
+    if (live_native_bytes > p.limits.heap_bytes - managed_bytes)
+        fail("HEAP_LIMIT", "Provider text and String exceed the managed heap quota");
+    const auto combined = live_native_bytes + managed_bytes;
+    const auto fits = [&] {
+        return p.metrics.heap_bytes <= p.limits.heap_bytes &&
+            combined <= p.limits.heap_bytes - p.metrics.heap_bytes &&
+            p.heap.size() < p.limits.objects;
+    };
+    if (!fits()) p.collect();
+    if (!fits())
+        fail("HEAP_LIMIT", "Provider text and String exceed available managed heap capacity");
+    struct NativeReservation {
+        std::size_t &heap;
+        std::size_t bytes;
+        ~NativeReservation() { heap -= bytes; }
+    } reservation{p.metrics.heap_bytes, live_native_bytes};
+    p.metrics.heap_bytes += live_native_bytes;
+    return new_string(value);
 }
 ObjectId ManagedRuntime::new_host_input_stream(std::unique_ptr<HostInputStream> source) {
     auto &p = *impl_;
@@ -9417,7 +10942,32 @@ ObjectId ManagedRuntime::class_loader() {
 }
 ObjectId ManagedRuntime::new_array(std::string_view descriptor, std::int32_t length) {
     auto &p = *impl_;
+    if (!has_provider_work_context()) {
+        // One genuine idle allocation event; existing executing callers keep
+        // their ledger. Preserve the data allocator's prior diagnostic roots.
+        auto &context = p.current_context();
+        const auto previous_result = context.last_result;
+        const auto previous_exception = context.last_exception;
+        struct Root {
+            ManagedRuntime &runtime; ObjectId object;
+            Root(ManagedRuntime &owner, ObjectId id) : runtime(owner), object(id) { runtime.retain(object); }
+            ~Root() { runtime.release(object); }
+        } result_root{*this, previous_result.kind == ValueKind::reference ? previous_result.bits : 0},
+          exception_root{*this, previous_exception};
+        struct Restore {
+            ExecutionContext &context; Value result; ObjectId exception; bool java_failure = false;
+            ~Restore() noexcept {
+                context.last_result = result;
+                if (!java_failure) context.last_exception = exception;
+            }
+        } restore{context, previous_result, previous_exception};
+        ObjectId result = 0;
+        try { run_host_callback([&] { result = new_array(descriptor, length); }); }
+        catch (const JavaException &) { restore.java_failure = true; throw; }
+        return result;
+    }
     p.check_thread();
+    NonYielding barrier(p.current_context()); // Keep the preflight valid through native backing publication.
     if (descriptor.size() < 2 || descriptor[0] != '[' || descriptor.substr(1) == "V")
         fail("ARRAY_TYPE", "Invalid array descriptor");
     p.known(descriptor);
@@ -9425,9 +10975,34 @@ ObjectId ManagedRuntime::new_array(std::string_view descriptor, std::int32_t len
         raise("Ljava/lang/NegativeArraySizeException;");
     if (static_cast<std::size_t>(length) > p.limits.array_length)
         fail("ARRAY_LIMIT", "Managed array exceeds length limit");
+    // Admit the ordinary array charge before constructing its native backing.
+    // Class validation is already complete; on the single runtime owner there
+    // is no managed allocation/reentry between this check and allocate's final
+    // admission. Collection therefore precedes, rather than follows, resize.
+    if (descriptor.size() > p.limits.heap_bytes ||
+        sizeof(Object) > p.limits.heap_bytes-descriptor.size())
+        fail("HEAP_LIMIT", "Managed array header exceeds heap quota");
+    const auto fixed=sizeof(Object)+descriptor.size();
+    if (static_cast<std::size_t>(length) > (p.limits.heap_bytes-fixed)/sizeof(Value))
+        fail("HEAP_LIMIT", "Managed array storage exceeds heap quota");
+    const auto bytes=fixed+static_cast<std::size_t>(length)*sizeof(Value);
+    const auto fits=[&] {
+        return p.heap.size()<p.limits.objects && p.metrics.heap_bytes<=p.limits.heap_bytes &&
+            bytes<=p.limits.heap_bytes-p.metrics.heap_bytes;
+    };
+    if (!fits())p.collect();
+    if (!fits())fail("HEAP_LIMIT", "Managed heap quota exhausted before array allocation");
+    charge_provider_work(1); // Actual header/backing allocation attempt.
     Object result;
     result.type = descriptor;
-    result.elements.resize(static_cast<std::size_t>(length), default_value(descriptor.substr(1)));
+    const auto count = static_cast<std::size_t>(length);
+    result.elements.reserve(count);
+    if (result.elements.capacity() != count)
+        fail("ARRAY_STORAGE_UNSUPPORTED", "Array allocation changed its admitted backing capacity");
+    // Native allocation succeeded. Admit exactly the typed initialization pass;
+    // resize cannot allocate or call guest code with this trivial Value payload.
+    charge_provider_work(count);
+    result.elements.resize(count, default_value(descriptor.substr(1)));
     return p.allocate(std::move(result));
 }
 std::string_view ManagedRuntime::object_type(ObjectId object) const { return impl_->object(object).type; }
@@ -9464,6 +11039,10 @@ std::u16string_view ManagedRuntime::exception_message(ObjectId object) const {
     const auto &o = impl_->object(object);
     if (!impl_->subtype(o.type, "Ljava/lang/Throwable;"))
         fail("VALUE_TYPE", "Expected a Throwable object");
+    // The Java constructor stores its actual String, not a second native copy.
+    // The exception's traced reference keeps this diagnostic view alive.
+    if(o.throwable_message_kind==ThrowableMessageKind::string_reference)
+        return impl_->object(o.throwable_message).text;
     return o.text;
 }
 std::size_t ManagedRuntime::array_length(ObjectId object) const {
@@ -9501,6 +11080,20 @@ void ManagedRuntime::array_set(ObjectId object, std::int32_t index, Value value)
         raise("Ljava/lang/ArrayStoreException;");
     o.elements[static_cast<std::size_t>(index)] = impl_->typed(value, component);
 }
+void ManagedRuntime::restore_host_array_reference(ObjectId array, std::int32_t index, ObjectId previous) noexcept {
+    auto &p = *impl_;
+    // Normal array_set performs loader/type admission for new execution. A
+    // direct SDK finally store must instead remain possible after loading has
+    // failed, without replacing that original failure with another exception.
+    if (p.owner != std::this_thread::get_id() || index < 0 || !p.pins.contains(array))
+        std::terminate();
+    const auto target = p.heap.find(array);
+    if (target == p.heap.end() || target->second.type != "[Ljava/lang/Object;" ||
+        static_cast<std::size_t>(index) >= target->second.elements.size() ||
+        (previous && (!p.pins.contains(previous) || !p.heap.contains(previous))))
+        std::terminate();
+    target->second.elements[static_cast<std::size_t>(index)] = Value::reference(previous);
+}
 bool ManagedRuntime::assignable(ObjectId object, std::string_view type) const {
     impl_->check_thread();
     return !object || impl_->subtype(impl_->object(object).type, type);
@@ -9508,6 +11101,29 @@ bool ManagedRuntime::assignable(ObjectId object, std::string_view type) const {
 const HostObjectState *ManagedRuntime::host_state(ObjectId id) const {
     impl_->check_thread();
     return impl_->object(id).host_state.get();
+}
+const HostObjectState *ManagedRuntime::find_host_state(ObjectId id) const noexcept {
+    const auto &p = *impl_;
+    if (!id || p.owner != std::this_thread::get_id()) return nullptr;
+    const auto found = p.heap.find(id);
+    return found == p.heap.end() ? nullptr : found->second.host_state.get();
+}
+std::size_t ManagedRuntime::host_state_capacity(ObjectId id) {
+    auto &p=*impl_;
+    p.check_thread();
+    const auto &target=p.object(id);
+    if(!p.host || core_type(target.type) || target.type.starts_with('['))
+        fail("HOST_STATE","Provider admission requires an attached framework object");
+    retain(id);
+    struct Release {
+        ManagedRuntime &runtime; ObjectId id;
+        ~Release(){runtime.release(id);}
+    } root{*this,id};
+    p.collect();
+    const auto old=p.object(id).host_bytes;
+    if(old>p.metrics.heap_bytes || p.metrics.heap_bytes>p.limits.heap_bytes)
+        fail("HEAP_LIMIT","Provider admission found inconsistent heap accounting");
+    return p.limits.heap_bytes-(p.metrics.heap_bytes-old);
 }
 void ManagedRuntime::set_host_state(ObjectId id, std::unique_ptr<HostObjectState> state) {
     auto &p = *impl_;
@@ -9521,8 +11137,12 @@ void ManagedRuntime::set_host_state(ObjectId id, std::unique_ptr<HostObjectState
         auto &target=found->second;
         if(core_type(target.type) || target.type.starts_with('['))
             fail("HOST_STATE","Provider state requires a noncore framework object");
-        target.bytes-=target.host_bytes;p.metrics.heap_bytes-=target.host_bytes;
-        target.host_bytes=0;target.host_state.reset();return;
+        const auto old = target.host_bytes;
+        target.host_state.reset(); // Free owned native storage before refunding it.
+        target.bytes -= old;
+        p.metrics.heap_bytes -= old;
+        target.host_bytes = 0;
+        return;
     }
     p.check_thread();
     const auto &object = p.object(id);
@@ -9559,10 +11179,71 @@ void ManagedRuntime::set_host_state(ObjectId id, std::unique_ptr<HostObjectState
     if (bytes > old && bytes - old > p.limits.heap_bytes - p.metrics.heap_bytes)
         fail("HEAP_LIMIT", "Provider state exhausts the managed heap budget");
     auto &target = p.object(id);
+    // unique_ptr replacement destroys the old native owner before its charge
+    // is refunded. State destruction cannot execute managed code.
+    target.host_state = std::move(state);
     target.bytes = target.bytes - old + bytes;
     p.metrics.heap_bytes = p.metrics.heap_bytes - old + bytes;
     target.host_bytes = bytes;
+}
+void ManagedRuntime::set_host_state_with_storage(ObjectId id,
+        std::unique_ptr<HostObjectState> state, std::size_t &reservation_bytes) {
+    auto &p = *impl_;
+    p.check_thread();
+    // No resolution, rooting, allocation, guest callback or collection below:
+    // the provider holds roots throughout construction and this commit.
+    const auto found = p.heap.find(id);
+    if (!state || found == p.heap.end())
+        fail("HOST_STATE", "Reserved provider publication requires a live target and state");
+    auto &target = found->second;
+    if (!p.host || core_type(target.type) || target.type.starts_with('['))
+        fail("HOST_STATE", "Reserved provider state requires an attached framework object");
+    const auto bytes = state->bytes();
+    const auto values = state->values();
+    if (bytes < sizeof(HostObjectState) || bytes > reservation_bytes ||
+        reservation_bytes > p.metrics.provider_storage_reserved_bytes ||
+        p.metrics.provider_storage_reserved_bytes > p.metrics.heap_bytes ||
+        p.metrics.heap_bytes > p.limits.heap_bytes ||
+        target.host_bytes > p.metrics.heap_bytes - p.metrics.provider_storage_reserved_bytes ||
+        values.size() > p.limits.array_length)
+        fail("HEAP_LIMIT", "Reserved provider publication exceeds its admitted storage");
+    for (const auto value : values) {
+        if (value.kind == ValueKind::reference) {
+            if (value.bits && p.heap.find(value.bits) == p.heap.end())
+                fail("REFERENCE", "Reserved provider state contains a dead managed reference");
+        } else if (value.kind != ValueKind::word && value.kind != ValueKind::wide) {
+            fail("VALUE_TYPE", "Reserved provider state contains an invalid managed value");
+        }
+    }
+    const auto old = target.host_bytes;
+    // Both old storage and the new reservation stay charged through native
+    // destruction. Publication and cleanup are noexcept and cannot reenter Java.
     target.host_state = std::move(state);
+    target.bytes = target.bytes - old + bytes;
+    target.host_bytes = bytes;
+    // New storage was already included in heap_bytes by the reservation.
+    p.metrics.heap_bytes -= old;
+    p.metrics.provider_storage_reserved_bytes -= bytes;
+    reservation_bytes -= bytes;
+}
+void ManagedRuntime::shrink_host_state(ObjectId id,
+        void (*shrink)(HostObjectState &, void *) noexcept, void *context) {
+    auto &p = *impl_;
+    p.check_thread();
+    auto &target = p.object(id);
+    if (!p.host || !shrink || !target.host_state || core_type(target.type) || target.type.starts_with('['))
+        fail("HOST_STATE", "Provider storage shrink requires attached existing framework state");
+    const auto old = target.host_bytes;
+    if (old > target.bytes || p.metrics.provider_storage_reserved_bytes > p.metrics.heap_bytes ||
+        old > p.metrics.heap_bytes - p.metrics.provider_storage_reserved_bytes)
+        fail("HEAP_LIMIT", "Provider storage shrink found inconsistent heap accounting");
+    shrink(*target.host_state, context);
+    const auto bytes = target.host_state->bytes();
+    if (bytes > old || bytes < sizeof(HostObjectState) || old > p.metrics.heap_bytes)
+        std::terminate(); // Trusted callback violated its non-growing contract.
+    target.bytes -= old - bytes;
+    target.host_bytes = bytes;
+    p.metrics.heap_bytes -= old - bytes;
 }
 Index ManagedRuntime::lookup_instance_field(std::string_view owner, std::string_view name,
                                            std::string_view descriptor) {
@@ -10061,8 +11742,19 @@ void ManagedRuntime::release(ObjectId id) {
 }
 void ManagedRuntime::collect() { impl_->collect(); }
 [[noreturn]] void ManagedRuntime::raise(std::string_view type, std::u16string_view message) {
+    raise_with_cause(type, message, 0);
+}
+[[noreturn]] void ManagedRuntime::raise_with_cause(std::string_view type, std::u16string_view message, ObjectId cause) {
     auto &p = *impl_;
     p.check_thread();
+    retain(cause);
+    struct CauseRoot {
+        ManagedRuntime &runtime;
+        ObjectId cause;
+        ~CauseRoot() { runtime.release(cause); }
+    } cause_root{*this, cause};
+    if (cause && !assignable(cause, "Ljava/lang/Throwable;"))
+        fail("EXCEPTION", "Exception cause does not derive from Throwable");
     if (!p.subtype(type, "Ljava/lang/Throwable;"))
         fail("EXCEPTION", "Exception type does not derive from Throwable");
     if (message.size() > p.limits.array_length)
@@ -10072,10 +11764,58 @@ void ManagedRuntime::collect() { impl_->collect(); }
         fail("HEAP_LIMIT", "Exception message exceeds heap limit");
     auto &o = p.object(id);
     o.text = message;
+    o.throwable_message_kind = message.data() ? ThrowableMessageKind::inline_text : ThrowableMessageKind::null_message;
+    o.cause = cause;
     o.bytes += message.size() * 2;
     p.metrics.heap_bytes += message.size() * 2;
     ++p.metrics.exceptions;
     p.current_context().last_exception = id;
+    throw JavaException(id);
+}
+[[noreturn]] void ManagedRuntime::raise_with_message_and_cause(std::string_view type, ObjectId message, ObjectId cause) {
+    auto &p=*impl_;
+    p.check_thread();
+    retain(message);
+    struct Root { ManagedRuntime &runtime; ObjectId id; ~Root(){runtime.release(id);} } message_root{*this,message};
+    retain(cause);
+    Root cause_root{*this,cause};
+    if(message)(void)string(message); // Actual nullable Java String identity.
+    if(cause && !assignable(cause,"Ljava/lang/Throwable;"))
+        fail("EXCEPTION","Exception cause does not derive from Throwable");
+    if(!p.subtype(type,"Ljava/lang/Throwable;"))
+        fail("EXCEPTION","Exception type does not derive from Throwable");
+    // Clinit/host admission failures propagate without becoming this wrapper.
+    const auto id=new_object(type);
+    raise_existing_with_message_and_cause(id,message,cause);
+}
+[[noreturn]] void ManagedRuntime::raise_existing_with_message_and_cause(ObjectId id, ObjectId message, ObjectId cause) {
+    auto &p=*impl_;
+    p.check_thread();
+    retain(id);
+    struct Root { ManagedRuntime &runtime; ObjectId id; ~Root(){runtime.release(id);} } target_root{*this,id};
+    retain(message);
+    Root message_root{*this,message};
+    retain(cause);
+    Root cause_root{*this,cause};
+    if(!id || !assignable(id,"Ljava/lang/Throwable;"))
+        fail("EXCEPTION","Exception target does not derive from Throwable");
+    if(message)(void)string(message);
+    if(cause && !assignable(cause,"Ljava/lang/Throwable;"))
+        fail("EXCEPTION","Exception cause does not derive from Throwable");
+    const auto &fresh=p.object(id);
+    if(fresh.cause || fresh.throwable_message || !fresh.text.empty() ||
+        fresh.throwable_message_kind!=ThrowableMessageKind::null_message)
+        fail("EXCEPTION","Exception construction requires fresh message/cause storage");
+    // Throwable(String,cause) stores references. A duplicate diagnostic buffer
+    // would introduce a new allocation/failure after argument callbacks which
+    // the original constructor does not perform. Diagnostics borrow the traced
+    // actual String through exception_message instead.
+    auto &value=p.object(id);
+    value.throwable_message=message;
+    value.throwable_message_kind=message ? ThrowableMessageKind::string_reference : ThrowableMessageKind::null_message;
+    value.cause=cause;
+    ++p.metrics.exceptions;
+    p.current_context().last_exception=id;
     throw JavaException(id);
 }
 } // namespace aether::dex

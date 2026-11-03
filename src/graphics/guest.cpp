@@ -1,4 +1,5 @@
 #include "aether/common/text.hpp"
+#include "aether/android/native_window.hpp"
 #include "guest_internal.hpp"
 #include <Windows.h>
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <dxgi.h>
 #include <format>
 #include <limits>
+#include <optional>
 #include <wrl/client.h>
 
 namespace aether::graphics {
@@ -73,6 +75,63 @@ constexpr std::array<ApiEntry, static_cast<std::size_t>(Operation::count)> entri
      {"libGLESv2.so", "glFinish"},
      {"libGLESv2.so", "glGetString"}}};
 static_assert(entries.size() == static_cast<std::size_t>(Operation::count));
+// Standard exported declarations whose bodies are not implemented yet. These
+// are intentionally NOT advertised by api_registry/eglGetProcAddress. Direct
+// ELF references may bind, but reaching one fails with its exact API name;
+// unused functions must not fabricate execution or report GL success.
+constexpr std::array deferred_entries{
+    ApiEntry{"libEGL.so", "eglGetConfigAttrib"},
+    ApiEntry{"libGLESv2.so", "glActiveTexture"},
+    ApiEntry{"libGLESv2.so", "glBindFramebuffer"},
+    ApiEntry{"libGLESv2.so", "glBindRenderbuffer"},
+    ApiEntry{"libGLESv2.so", "glBindTexture"},
+    ApiEntry{"libGLESv2.so", "glBlendFunc"},
+    ApiEntry{"libGLESv2.so", "glCheckFramebufferStatus"},
+    ApiEntry{"libGLESv2.so", "glClearDepthf"},
+    ApiEntry{"libGLESv2.so", "glClearStencil"},
+    ApiEntry{"libGLESv2.so", "glColorMask"},
+    ApiEntry{"libGLESv2.so", "glCompressedTexImage2D"},
+    ApiEntry{"libGLESv2.so", "glCompressedTexSubImage2D"},
+    ApiEntry{"libGLESv2.so", "glCullFace"},
+    ApiEntry{"libGLESv2.so", "glDeleteFramebuffers"},
+    ApiEntry{"libGLESv2.so", "glDeleteRenderbuffers"},
+    ApiEntry{"libGLESv2.so", "glDeleteTextures"},
+    ApiEntry{"libGLESv2.so", "glDepthFunc"},
+    ApiEntry{"libGLESv2.so", "glDepthMask"},
+    ApiEntry{"libGLESv2.so", "glDepthRangef"},
+    ApiEntry{"libGLESv2.so", "glDrawElements"},
+    ApiEntry{"libGLESv2.so", "glFramebufferRenderbuffer"},
+    ApiEntry{"libGLESv2.so", "glFramebufferTexture2D"},
+    ApiEntry{"libGLESv2.so", "glGenerateMipmap"},
+    ApiEntry{"libGLESv2.so", "glGenFramebuffers"},
+    ApiEntry{"libGLESv2.so", "glGenRenderbuffers"},
+    ApiEntry{"libGLESv2.so", "glGenTextures"},
+    ApiEntry{"libGLESv2.so", "glGetActiveUniform"},
+    ApiEntry{"libGLESv2.so", "glGetIntegerv"},
+    ApiEntry{"libGLESv2.so", "glRenderbufferStorage"},
+    ApiEntry{"libGLESv2.so", "glScissor"},
+    ApiEntry{"libGLESv2.so", "glStencilFunc"},
+    ApiEntry{"libGLESv2.so", "glStencilMask"},
+    ApiEntry{"libGLESv2.so", "glStencilOp"},
+    ApiEntry{"libGLESv2.so", "glTexImage2D"},
+    ApiEntry{"libGLESv2.so", "glTexParameteri"},
+    ApiEntry{"libGLESv2.so", "glTexSubImage2D"},
+    ApiEntry{"libGLESv2.so", "glUniform1fv"},
+    ApiEntry{"libGLESv2.so", "glUniform1i"},
+    ApiEntry{"libGLESv2.so", "glUniform1iv"},
+    ApiEntry{"libGLESv2.so", "glUniform2fv"},
+    ApiEntry{"libGLESv2.so", "glUniform2iv"},
+    ApiEntry{"libGLESv2.so", "glUniform3fv"},
+    ApiEntry{"libGLESv2.so", "glUniform3iv"},
+    ApiEntry{"libGLESv2.so", "glUniform4fv"},
+    ApiEntry{"libGLESv2.so", "glUniform4iv"},
+    ApiEntry{"libGLESv2.so", "glUniformMatrix4fv"},
+    ApiEntry{"libGLESv2.so", "glVertexAttrib1fv"},
+    ApiEntry{"libGLESv2.so", "glVertexAttrib2fv"},
+    ApiEntry{"libGLESv2.so", "glVertexAttrib3fv"},
+    ApiEntry{"libGLESv2.so", "glVertexAttrib4fv"}};
+static_assert((entries.size() + deferred_entries.size()) * 8 <= 4096);
+static_assert(entries.size() + deferred_entries.size() <= 0x100);
 std::atomic<std::uint64_t> next_identity{1};
 std::uint64_t identity() {
     auto value = next_identity.load();
@@ -747,12 +806,68 @@ std::uint64_t GuestGraphicsServices::Impl::dispatch_egl(Operation op, a64::Servi
     }
 }
 
+struct GuestGraphicsServices::NativeWindowBindings {
+    std::shared_ptr<android::NativeWindows> registry;
+    struct Surface {
+        std::uint64_t surface = 0, display = 0;
+        android::NativeWindowBinding binding;
+        bool deleted = false;
+    };
+    std::array<std::optional<Surface>, 4> surfaces;
+    std::uint64_t draw = 0, read = 0;
+    explicit NativeWindowBindings(std::shared_ptr<android::NativeWindows> value) : registry(std::move(value)) {}
+    bool live(const android::NativeWindowBinding &binding) const noexcept {
+        try { return registry->query_for_egl(binding).has_value(); } catch (...) { return false; }
+    }
+    Surface *find(std::uint64_t id) {
+        for (auto &entry : surfaces) if (entry && entry->surface == id) return &*entry;
+        return nullptr;
+    }
+    void collect() {
+        for (auto &entry : surfaces) {
+            // Abandonment is published only after the host has acknowledged
+            // consumer retirement. EGL deletion otherwise retains current pins.
+            if (entry && ((!live(entry->binding)) ||
+                (entry->deleted && entry->surface != draw && entry->surface != read))) entry.reset();
+        }
+    }
+    bool invalid(std::uint64_t id) const {
+        for (const auto &entry : surfaces)
+            if (entry && entry->surface == id) return !live(entry->binding);
+        return false;
+    }
+    void record(const GraphicsCommand &command, const GraphicsReply &reply,
+                const std::optional<android::NativeWindowBinding> &created) {
+        if (reply.fault != a64::Fault::none || !reply.value) return;
+        if (command.operation == Operation::create_window && created) {
+            if (find(reply.value))
+                throw Rejection{a64::Fault::windows_service, "Native EGL surface identity was reused"};
+            for (auto &entry : surfaces) if (!entry) {
+                entry = Surface{reply.value, command.scalars[0], *created, false};
+                return;
+            }
+            throw Rejection{a64::Fault::windows_service, "Native EGL surface pin capacity exhausted"};
+        }
+        if (command.operation == Operation::make_current) {
+            draw = command.scalars[1]; read = command.scalars[2];
+        } else if (command.operation == Operation::release_thread) {
+            draw = read = 0;
+        } else if (command.operation == Operation::destroy_surface) {
+            if (auto *entry = find(command.scalars[1])) entry->deleted = true;
+        } else if (command.operation == Operation::terminate) {
+            for (auto &entry : surfaces)
+                if (entry && entry->display == command.scalars[0]) entry->deleted = true;
+        }
+        collect();
+    }
+};
+
 GuestGraphicsServices::GuestGraphicsServices(a64::GuestMemory &memory, const a64::AppContext &app,
                                              GraphicsChannel *channel)
     : impl_(std::make_unique<Impl>(memory, app, channel)) {
     memory.map(trampoline_base, 4096, a64::read_write);
     impl_->trampoline_owned = true;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
+    for (std::size_t i = 0; i < entries.size() + deferred_entries.size(); ++i) {
         impl_->write(trampoline_base + i * 8, 0xd4000001u | ((first_service + i) << 5), 4);
         impl_->write(trampoline_base + i * 8 + 4, 0xd65f03c0u, 4);
     }
@@ -760,10 +875,10 @@ GuestGraphicsServices::GuestGraphicsServices(a64::GuestMemory &memory, const a64
 }
 GuestGraphicsServices::~GuestGraphicsServices() = default;
 bool GuestGraphicsServices::handles_service(std::uint32_t service) noexcept {
-    return service >= first_service && service - first_service < entries.size();
+    return service >= first_service && service - first_service < entries.size() + deferred_entries.size();
 }
 bool GuestGraphicsServices::has_library(std::string_view library) const noexcept {
-    return library == "libEGL.so" || library == "libGLESv2.so";
+    return library == "libEGL.so" || library == "libGLESv2.so" || library == "libGLESv3.so";
 }
 std::optional<elf::GuestSymbol> GuestGraphicsServices::resolve(std::string_view library,
                                                                std::string_view name,
@@ -772,9 +887,16 @@ std::optional<elf::GuestSymbol> GuestGraphicsServices::resolve(std::string_view 
     if (impl_->closed || (!version.empty() && version != expected_version))
         return std::nullopt;
     for (std::size_t i = 0; i < entries.size(); ++i)
-        if (entries[i].library == library && entries[i].name == name)
+        if ((entries[i].library == library ||
+             (library == "libGLESv3.so" && entries[i].library == "libGLESv2.so")) && entries[i].name == name)
             return elf::GuestSymbol{
                 std::string(name), std::string(library), std::string(version), trampoline_base + i * 8, 8, 2};
+    for (std::size_t i = 0; i < deferred_entries.size(); ++i)
+        if ((deferred_entries[i].library == library ||
+             (library == "libGLESv3.so" && deferred_entries[i].library == "libGLESv2.so")) &&
+            deferred_entries[i].name == name)
+            return elf::GuestSymbol{std::string(name), std::string(library), std::string(version),
+                                   trampoline_base + (entries.size() + i) * 8, 8, 2};
     return std::nullopt;
 }
 a64::Fault GuestGraphicsServices::invoke(std::uint32_t service, a64::Address instruction,
@@ -801,11 +923,40 @@ a64::Fault GuestGraphicsServices::invoke_frame(std::uint32_t service, a64::Addre
             unsupported("Graphics service trap is not at its live registered call site");
         if (!p.app.instance_id || !p.app.graphics_allowed)
             throw Rejection{a64::Fault::capability_denied, "This app has no graphics capability"};
+        if (service - first_service >= entries.size()) {
+            p.remote_error = "Graphics API not implemented: ";
+            p.remote_error += deferred_entries[service - first_service - entries.size()].name;
+            p.error = p.remote_error;
+            ++p.stats.rejected;
+            return a64::Fault::unsupported_service;
+        }
         const auto op = static_cast<Operation>(service - first_service);
         if (p.channel) {
-            const auto command =
+            auto command =
                 copy_command(op, state, p.memory, static_cast<std::uint32_t>(p.pack_alignment));
+            std::optional<android::NativeWindowBinding> created;
+            if (native_windows_) {
+                auto &bindings = *native_windows_;
+                if (op == Operation::create_window) {
+                    try { created = bindings.registry->resolve_for_egl(command.scalars[2]); }
+                    catch (...) { created.reset(); }
+                    command.scalars[2] = created ? created->backend_token : 0;
+                } else if (op == Operation::make_current) {
+                    // Nonzero surfaces with EGL_NO_CONTEXT must still reach
+                    // the renderer as nonzero arguments and fail EGL_BAD_MATCH;
+                    // rewriting both to zero would fabricate a successful unbind.
+                    if (command.scalars[3]) {
+                        if (bindings.invalid(command.scalars[1])) command.scalars[1] = 0;
+                        if (bindings.invalid(command.scalars[2])) command.scalars[2] = 0;
+                    }
+                } else if (op == Operation::query_surface || op == Operation::swap_buffers ||
+                           op == Operation::destroy_surface) {
+                    if (bindings.invalid(command.scalars[1])) command.scalars[1] = 0;
+                }
+                bindings.collect();
+            }
             auto result = p.channel->exchange(command);
+            if (native_windows_) native_windows_->record(command, result, created);
             apply_outputs(command, result, state, p.memory);
             p.stats = result.metrics;
             p.info = std::move(result.host);
@@ -892,6 +1043,36 @@ std::uint32_t GuestGraphicsServices::pack_alignment() const noexcept {
 const Metrics &GuestGraphicsServices::metrics() const noexcept { return impl_->stats; }
 const HostInfo &GuestGraphicsServices::host_info() const noexcept { return impl_->info; }
 std::string_view GuestGraphicsServices::last_error() const noexcept { return impl_->error; }
+void GuestGraphicsServices::set_native_windows(std::shared_ptr<android::NativeWindows> registry) {
+    auto &p = *impl_;
+    if (p.owner != std::this_thread::get_id() || p.closed || !p.channel || p.context_failed ||
+        !p.app.instance_id || !p.app.graphics_allowed || p.stats.calls || p.stats.rejected || native_windows_ ||
+        !registry || !registry->owned_by_current_thread())
+        throw a64::GuestError("AETHER_GRAPHICS_NATIVE_WINDOW_BINDING", "Native windows require an idle owned worker channel");
+    native_windows_ = std::make_unique<NativeWindowBindings>(std::move(registry));
+}
+void GuestGraphicsServices::prepare_native_surface_admission() {
+    auto &p = *impl_;
+    if (p.owner != std::this_thread::get_id() || p.closed || p.context_failed || !p.channel || !native_windows_)
+        throw a64::GuestError("AETHER_GRAPHICS_NATIVE_WINDOW", "Native admission cleanup requires a live channel owner");
+    auto &bindings = *native_windows_;
+    bindings.collect();
+    auto *current = bindings.find(bindings.draw);
+    if (!current || !current->deleted) current = bindings.find(bindings.read);
+    if (!current || !current->deleted) return;
+    GraphicsCommand command;
+    command.operation = Operation::make_current;
+    command.scalars[0] = current->display;
+    auto reply = p.channel->exchange(command);
+    if (reply.fault != a64::Fault::none || reply.value != 1)
+        throw a64::GuestError("AETHER_GRAPHICS_NATIVE_WINDOW", "Cannot unbind the deleted current surface before admission");
+    bindings.record(command, reply, {});
+    p.stats = reply.metrics;
+    p.info = std::move(reply.host);
+    p.remote_error = std::move(reply.error);
+    p.error = p.remote_error;
+    p.pack_alignment = static_cast<GLint>(reply.pack_alignment);
+}
 std::uint64_t GuestGraphicsServices::attach_window(std::unique_ptr<host::HostSurface> surface) {
     auto &p = *impl_;
     if (p.owner != std::this_thread::get_id() || p.closed || !p.app.instance_id || !p.app.graphics_allowed)
@@ -1007,5 +1188,6 @@ void GuestGraphicsServices::shutdown() {
     if (impl_->owner != std::this_thread::get_id())
         throw a64::GuestError("AETHER_GRAPHICS_THREAD", "Graphics shutdown requires its owner thread");
     impl_->close();
+    native_windows_.reset();
 }
 } // namespace aether::graphics

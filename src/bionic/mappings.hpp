@@ -3,7 +3,7 @@
 #include <map>
 
 namespace aether::bionic {
-enum class MappingOperation { map, unmap, protect };
+enum class MappingOperation { map, unmap, protect, remap };
 class NativeMappings {
   public:
     explicit NativeMappings(a64::GuestMemory &memory):memory_(memory){}

@@ -5,10 +5,11 @@
 #include "aether/host/windows/document_service.hpp"
 #include <functional>
 
-namespace aether::host { class ClipboardWindowContext; }
+namespace aether::host { class ClipboardWindowContext; class NativeWindowContext; }
 
 namespace aether::security {
 struct ActivityLaunch;
+struct StartupWorkPolicy;
 // Synchronous borrowed record on the I/O owner. Receipt must finish within the
 // already armed exchange deadline; the sink cannot extend transport authority.
 using ActivityTextEditSink =
@@ -41,17 +42,22 @@ class IsolatedActivity final {
                               const std::filesystem::path &developer_output_root = {}, ActivityTextEditSink observer = {},
                               ActivitySoftInputSink soft_input_observer = {},
                               std::shared_ptr<host::ClipboardWindowContext> clipboard_window = {},
-                              ActivityTerminalActivationSink terminal_activation_observer = {});
+                              ActivityTerminalActivationSink terminal_activation_observer = {},
+                              std::shared_ptr<host::NativeWindowContext> native_window = {});
     explicit IsolatedActivity(InstalledActivity application, ActivityTextEditSink observer = {},
                               ActivitySoftInputSink soft_input_observer = {},
                               std::shared_ptr<host::ClipboardWindowContext> clipboard_window = {},
-                              ActivityTerminalActivationSink terminal_activation_observer = {});
+                              ActivityTerminalActivationSink terminal_activation_observer = {},
+                              std::shared_ptr<host::NativeWindowContext> native_window = {});
     ~IsolatedActivity();
     IsolatedActivity(const IsolatedActivity &) = delete;
     IsolatedActivity &operator=(const IsolatedActivity &) = delete;
     void signal(android::WindowSignal signal);
     void place_views(std::span<const android::ViewPlacement> placements);
     bool pointer(const android::PointerInput &input);
+    // Immediate-result convenience. Deferred admission raises a precise
+    // unsupported diagnostic after admission (never resubmit that key);
+    // asynchronous callers use dispatch + take_key_results.
     bool key(const android::KeyInput &input);
     bool drop_file(const std::wstring &path); // Explicitly unsupported until real brokered document delivery exists
     void refresh();
@@ -60,6 +66,12 @@ class IsolatedActivity final {
     void drop_document(host::PreparedDocumentSource source, const ActivityCommand &command);
     void drop_text(std::u16string text, const ActivityCommand &command);
     bool service_background(); // Single I/O owner; no presentation command or publication.
+    // Authenticated final key custody; only exposed after its deferred ACK.
+    // Single I/O owner, including after successful close. Never calls UI code.
+    std::vector<ActivityKeyResult> take_key_results();
+    // One authenticated per-Activity finish notice. I/O-owner custody only;
+    // the consumer must arrange ordered close on its presentation owner.
+    std::optional<ActivityFinishRequest> take_finish_request();
     void cancel() noexcept; // Cross-thread abort only; never calls guest code or waits.
     const ActivityState &snapshot() const noexcept;
     const auto &views() const noexcept { return snapshot().views; }
@@ -68,6 +80,8 @@ class IsolatedActivity final {
     auto state() const noexcept { return snapshot().lifecycle; }
     std::uint32_t probe(std::string_view name) const;
     std::uint32_t process_id() const noexcept;
+    // Host-owned transport identity only; never copied into worker ActivityState.
+    std::uint64_t transport_session() const noexcept;
     std::uint64_t command_count() const noexcept;
     std::uint64_t broker_calls() const noexcept;
     bool exited() const noexcept;
@@ -85,5 +99,6 @@ std::uint8_t run_activity_worker(HANDLE reader, HANDLE writer, std::uint64_t ses
                            bool read_recovery_probe = false, bool installed = false,
                            std::span<const std::uint8_t> mapped_package = {},
                            WorkerProgressWriter *progress = nullptr, bool audio_playback = false,
-                           const ActivityLaunch *launch = nullptr);
+                           const ActivityLaunch *launch = nullptr,
+                           const StartupWorkPolicy *startup_work = nullptr);
 } // namespace aether::security

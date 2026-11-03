@@ -87,6 +87,10 @@ public:
     /// Empties the entire cache.
     virtual void ClearCache();
 
+    /// Clear through the most-derived emitter, then release empty hash storage.
+    /// Requires the owner's quiescent cache boundary, with no live code targets.
+    virtual void TrimCache();
+
     /// Invalidates a selection of basic blocks.
     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations);
 

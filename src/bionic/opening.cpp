@@ -1,5 +1,6 @@
 #include "opening.hpp"
 #include <array>
+#include <new>
 namespace aether::bionic {
 namespace {
 using host::FileError;using host::FileAccessScope;
@@ -33,8 +34,6 @@ a64::Fault NativeOpening::invoke(OpeningOperation operation,a64::Address error,s
             if(!byte[0])break;path+=static_cast<char>(byte[0]);
         }
         if(path.size()==1024)return fail(36);if(path.empty())return fail(2);
-        if(!access && ((flags&~unsigned{3|64|128|512|directory|nofollow|cloexec}) || (flags&3)==3))return fail(95);
-        if(!access && (flags&64) && static_cast<std::uint32_t>(r[at?3:2])!=0600)return fail(95);
         // Collapse slash and dot components, but never resolve a parent traversal.
         const bool absolute=path.front()=='/';
         bool directory_required=path.back()=='/';std::string clean=absolute?"/":"";
@@ -45,6 +44,18 @@ a64::Fault NativeOpening::invoke(OpeningOperation operation,a64::Address error,s
             if(!part.empty() && part!="."){if(!clean.empty() && clean.back()!='/')clean+='/';clean+=part;}
             if(end==std::string::npos)break;start=end+1;
         }
+        // This is an intrinsic guest device, never a Windows pathname or a
+        // provider-backed private file. Other /dev names retain path denial.
+        if(absolute && clean=="/dev/urandom"){
+            if(directory_required)return fail(20);
+            if(access){if(flags&3U)return fail(13);r[0]=0;return a64::Fault::none;}
+            const auto opened=descriptors_.entropy_device(flags);
+            if(opened.error!=FileError::none)return fail(code(opened.error));
+            if(opened.value<0 || opened.value>=256)return fail(5);
+            r[0]=static_cast<std::uint64_t>(opened.value);return a64::Fault::none;
+        }
+        if(!access && ((flags&~unsigned{3|64|128|512|directory|nofollow|cloexec}) || (flags&3)==3))return fail(95);
+        if(!access && (flags&64) && static_cast<std::uint32_t>(r[at?3:2])!=0600)return fail(95);
         // Unbound legacy first-party bridges retain their original flat ordinary-open
         // denial contract; installed packages use the authenticated nested namespace.
         if(operation==OpeningOperation::open && package_.empty() && !absolute && clean.find('/')!=std::string::npos)return fail(13);
@@ -68,6 +79,7 @@ a64::Fault NativeOpening::invoke(OpeningOperation operation,a64::Address error,s
             }
             if(selected.error!=FileError::none)return fail(code(selected.error));
             if(selected.value<0 || selected.value>=256)return fail(5);
+            descriptors_.record_open_status(static_cast<int>(selected.value),flags);
             descriptors_.set_close_on_exec(static_cast<int>(selected.value),(flags&cloexec)!=0);r[0]=static_cast<std::uint64_t>(selected.value);return a64::Fault::none;
         }
         FileAccessScope base=FileAccessScope::files_root;std::string_view name=clean;
@@ -103,8 +115,10 @@ a64::Fault NativeOpening::invoke(OpeningOperation operation,a64::Address error,s
         if(result.error!=FileError::none)return fail(code(result.error));
         if(!root && ((flags&directory) || directory_required) && ((flags&3) || (flags&(64|512)))){(void)descriptors_.close(static_cast<int>(result.value));return fail(21);}
         if(result.value<0 || result.value>=256)return fail(5);
+        descriptors_.record_open_status(static_cast<int>(result.value),flags);
         descriptors_.set_close_on_exec(static_cast<int>(result.value),(flags&cloexec)!=0);
         r[0]=static_cast<std::uint64_t>(result.value);return a64::Fault::none;
-    }catch(...){rejection_="native openat: host marshalling failed";return a64::Fault::unsupported_service;}
+    }catch(const std::bad_alloc &){return fail(12);}
+    catch(...){rejection_="native openat: host marshalling failed";return a64::Fault::unsupported_service;}
 }
 }

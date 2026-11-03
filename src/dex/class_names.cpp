@@ -91,4 +91,43 @@ std::u16string binary_name(std::string_view descriptor) {
     }
     return result;
 }
+std::u16string simple_name(std::string_view descriptor, const Class *definition,
+                          const StringTable &strings) {
+    std::size_t dimensions = 0;
+    while (descriptor.starts_with('[')) {
+        ++dimensions;
+        descriptor.remove_prefix(1);
+    }
+    if (dimensions > 255 || descriptor.empty())
+        throw DexError("AETHER_DEX_CLASS_NAME", "Invalid array Class identity");
+    const bool primitive = descriptor.size() == 1;
+    if (primitive) {
+        if (std::string_view("VZBSCIJFD").find(descriptor.front()) == std::string_view::npos ||
+            (dimensions && descriptor == "V"))
+            throw DexError("AETHER_DEX_CLASS_NAME", "Invalid primitive Class identity");
+    } else if (!descriptor.starts_with('L') || !descriptor.ends_with(';')) {
+        throw DexError("AETHER_DEX_CLASS_NAME", "Invalid reference Class identity");
+    }
+
+    std::u16string result;
+    if (!primitive && definition && definition->inner_class_present &&
+        definition->inner_class_name == no_index) {
+        // The actual InnerClass annotation uses null for an anonymous class.
+    } else if (!primitive && definition && definition->inner_class_present &&
+               (definition->enclosing_class != no_index || definition->enclosing_method != no_index)) {
+        if (definition->inner_class_name >= strings.size())
+            throw DexError("AETHER_DEX_CLASS_METADATA", "Inner Class name is outside the held string table");
+        result = strings[definition->inner_class_name];
+    } else {
+        if (!primitive && !definition && descriptor.find('$') != std::string_view::npos)
+            throw DexError("AETHER_DEX_CLASS_NAME_UNSUPPORTED",
+                           "Nested provider simple name requires trusted naming metadata");
+        result = binary_name(descriptor);
+        if (const auto dot = result.find_last_of(u'.'); dot != std::u16string::npos)
+            result.erase(0, dot + 1);
+    }
+    for (std::size_t n = 0; n < dimensions; ++n)
+        result += u"[]";
+    return result;
+}
 } // namespace aether::dex

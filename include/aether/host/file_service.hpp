@@ -45,6 +45,20 @@ inline bool valid_file_metadata(const FileMetadata &value) noexcept {
            value.access_nanoseconds < 1'000'000'000 && value.modified_nanoseconds < 1'000'000'000 &&
            value.changed_nanoseconds < 1'000'000'000 && value.links <= 1;
 }
+// Actual attributes of one contained pathname, including directories. The
+// existing descriptor metadata contract remains regular-file-only.
+struct FilePathMetadata {
+    FileMetadata file;
+    bool directory = false;
+};
+inline bool valid_file_path_metadata(const FilePathMetadata &value) noexcept {
+    const auto &file = value.file;
+    if (!file.identity || file.identity > 4096) return false;
+    if (!value.directory) return valid_file_metadata(file);
+    return file.size <= INT64_MAX && file.allocated_bytes <= INT64_MAX &&
+           file.access_nanoseconds < 1'000'000'000 && file.modified_nanoseconds < 1'000'000'000 &&
+           file.changed_nanoseconds < 1'000'000'000;
+}
 struct FileOpen {
     bool read = false, write = false, create = false, exclusive = false, truncate = false;
 };
@@ -166,12 +180,27 @@ class FileService {
     virtual FileResult rename_path(const FilePathRef&,const FilePathRef&,FileRenameInfo&) noexcept {return {-1,FileError::unsupported};}
     virtual FileResult read(int descriptor, std::span<std::uint8_t> output) noexcept = 0;
     virtual FileResult write(int descriptor, std::span<const std::uint8_t> input) noexcept = 0;
+    // Explicit-offset operations preserve the shared open-description cursor.
+    // A successful I/O returns its actual count, including a genuine short I/O.
+    // Failed reads preserve output; truncation succeeds with zero.
+    virtual FileResult truncate(int, std::uint64_t) noexcept { return {-1, FileError::unsupported}; }
+    virtual FileResult read_at(int, std::uint64_t, std::span<std::uint8_t>) noexcept {
+        return {-1, FileError::unsupported};
+    }
+    virtual FileResult write_at(int, std::uint64_t, std::span<const std::uint8_t>) noexcept {
+        return {-1, FileError::unsupported};
+    }
     virtual FileResult close(int descriptor) noexcept = 0;
     // Explicit durability barrier for a writable descriptor; never implied by close.
     virtual FileResult flush(int) noexcept { return {-1, FileError::unsupported}; }
     virtual FileResult lock(int,std::uint32_t) noexcept { return {-1, FileError::unsupported}; }
     // Success returns zero; every failure preserves the caller's output.
     virtual FileResult metadata(int, FileMetadata &) noexcept { return {-1, FileError::unsupported}; }
+    // Scoped path or held provider directory; no file-data access or descriptor
+    // publication. Success returns zero; every failure preserves output.
+    virtual FileResult metadata_path(const FilePathRef &, FilePathMetadata &) noexcept {
+        return {-1, FileError::unsupported};
+    }
     // One actual namespace removal. Success returns the positive opaque removed identity.
     // directory_required preserves the final slash's directory requirement without following a reparse point.
     virtual FileResult remove(FileAccessScope, std::string_view, FileRemoveMode, bool = false) noexcept {
@@ -210,9 +239,13 @@ class HostFileService final : public FileService {
     FileResult rename_path(const FilePathRef &source,const FilePathRef &destination,FileRenameInfo &output) noexcept override;
     FileResult read(int descriptor, std::span<std::uint8_t> output) noexcept override;
     FileResult write(int descriptor, std::span<const std::uint8_t> input) noexcept override;
+    FileResult truncate(int descriptor, std::uint64_t size) noexcept override;
+    FileResult read_at(int descriptor, std::uint64_t offset, std::span<std::uint8_t> output) noexcept override;
+    FileResult write_at(int descriptor, std::uint64_t offset, std::span<const std::uint8_t> input) noexcept override;
     FileResult close(int descriptor) noexcept override;
     FileResult flush(int descriptor) noexcept override;
     FileResult metadata(int descriptor, FileMetadata &output) noexcept override;
+    FileResult metadata_path(const FilePathRef &path, FilePathMetadata &output) noexcept override;
     FileResult remove(FileAccessScope scope, std::string_view name, FileRemoveMode mode, bool directory_required = false) noexcept override;
     FileResult seek(int descriptor, std::int64_t offset, unsigned whence) noexcept override;
     FileResult lock(int descriptor,std::uint32_t operation) noexcept override;

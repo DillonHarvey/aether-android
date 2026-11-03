@@ -5,8 +5,8 @@
     {
       "path": "third_party/dynarmic/src/dynarmic/backend/x64/block_of_code.cpp",
       "upstreamSha256": "978bca9c0d112b602bc99f5a5762d17350615dd6d5a9c4220054b98f679ccfd5",
-      "patchedSha256": "3ed4c173a179ae017740bff6659ae881d0c91b8a7fda3dcfca08d33790a69aca",
-      "reason": "Check Win32 commit/protection failures, ignore zero-size pre-commit protection, flush instruction cache on RX; protection failure terminates with diagnostic and 0xAEE00001 instead of returning through potentially non-executable dispatcher memory."
+      "patchedSha256": "ef5cd8c49150df35006e508c0bdc1f0898f21b4777766ab153f12c72c6cced15",
+      "reason": "Check Win32 commit/protection failures, ignore zero-size pre-commit protection, flush instruction cache on RX; protection failure terminates with diagnostic and 0xAEE00001 instead of returning through potentially non-executable dispatcher memory. Original Aether Windows no-execute exact-write page tracking (ADR0448): preallocated page/dirty state, exact prewrite ranges, new-tail-only commitment, immediate outside-epoch sealing, dirty-run RX protection/instruction-cache flush, fail-hard unsealed execution guard. Explicit constant-pool and allocated/direct unwind writes plus late callback mode restoration are covered. Existing non-Windows/unobserved behavior, licenses and revision retained; no guessed append window, RWX alias, flag or quota increase. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/interface/A64/config.h",
@@ -17,14 +17,14 @@
     {
       "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_interface.cpp",
       "upstreamSha256": "290ce9e654325ee5661e49059dfcbf9dd67a517b9428f73d177cb21ab089969d",
-      "patchedSha256": "3107400dad019ac1fd2faf1acde051772519c29642dea5826e2678af42320c3f",
-      "reason": "Invoke block observers on real cache hit/miss and after Emit seals generated code RX; measure compilation with steady_clock. Reject non-canonical raw program counters before descriptor masking can alias a valid cached code address. ADR0395: preserve queued cache invalidation across CPU Reset using the existing request mutex and authoritative pending state."
+      "patchedSha256": "cd92ee7decd06fbf76d257236c56aecfaa1c63ccd419e3a5dca1acd10e493819",
+      "reason": "Invoke block observers on real cache hit/miss and after Emit seals generated code RX; measure compilation with steady_clock. Reject non-canonical raw program counters before descriptor masking can alias a valid cached code address. ADR0395: preserve queued cache invalidation across CPU Reset using the existing request mutex and authoritative pending state. Aether checked-memory profiles skip interpreter-tail merging, preserving frontend <=256-cycle blocks and count-one single-step/fallback; unchecked profiles retain legacy merging. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.cpp",
       "upstreamSha256": "450e9bc6c6497c053e9f39223542b0d3cc247bec358783ce178615f4d65827b4",
-      "patchedSha256": "189b5699a37042c18069a4e7fa07fb73431170977ed509e79cdfc97fbf18b060",
-      "reason": "Initialize Windows exception metadata before PreludeComplete makes its code allocation RX. Also implements original live-SP alignment IR and terminal fault prefix-cycle accounting for the Windows x64/A64 profile (ADR0343). ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged."
+      "patchedSha256": "692f6308c7b07b3c46e17cd1624fecc78cfed31221f2ec32cfb651995e8b497d",
+      "reason": "Initialize Windows exception metadata before PreludeComplete makes its code allocation RX. Also implements original live-SP alignment IR and terminal fault prefix-cycle accounting for the Windows x64/A64 profile (ADR0343). ADR0346 adds a post-cache-callback MemoryAbort guard preserving fault PC and prefix charging before subsequent IR; successful cache behavior unchanged. Original Aether optional A64 FastDispatch storage (2026-11-01): allocate the unchanged stable-address 0x100000-by-16-byte table only when immutable FastDispatch configuration enables it; disabled profiles allocate no table. Enabled generated lookup and RSB-miss paths, initialization values and cache clearing are retained. No dependency refresh or code import; existing 0BSD notices retained. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh."
     },
     {
       "path": "third_party/dynarmic/src/dynarmic/common/spin_lock_x64.cpp",
@@ -127,6 +127,54 @@
       "upstreamSha256": "05060dd2cb457b9f19aaa3d78b5f7a83552a9ef2d9cb488b54060baa06026455",
       "patchedSha256": "e3d2594be5cfe65ad1b6ead54bb03db085e731b2892022bdee8955f3a6b81673",
       "reason": "Original Aether FCCMP/FCCMPE false-condition operand selection to benign+0 before comparison, retaining exact true operands and immediate NZCV fallback without accumulating false-path FP exceptions; ADR0347. Existing0BSDnotices retained."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/a64_emit_x64.h",
+      "upstreamSha256": "3ab331c1bf170deec2370d3d1b1277e88e4ccd37e6affabd755e1887d2767109",
+      "patchedSha256": "bcc9bb3993e3562d115e2e6fa1826c132eda40a09cb43e2af331468389aa54cc",
+      "reason": "Original Aether optional A64 FastDispatch storage (2026-11-01): allocate the unchanged stable-address 0x100000-by-16-byte table only when immutable FastDispatch configuration enables it; disabled profiles allocate no table. Enabled generated lookup and RSB-miss paths, initialization values and cache clearing are retained. No dependency refresh or code import; existing 0BSD notices retained. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh."
+    },
+    {
+      "path": "third_party/dynarmic/externals/xbyak/xbyak/xbyak.h",
+      "upstreamSha256": "65abe72489a2b8428c4ec57db07a008eafc6e08d7d1c57702bf70fb18bd97c40",
+      "patchedSha256": "211e0af16371e6fc55ae97f7da7d4ad84c3e4b47990e2fbc4786a691ed20882f",
+      "reason": "Original Aether optional fixed-buffer pre-write observer for exact Windows JIT dirty-page W^X. Null by default; db and complete rewrite ranges preflight before stores. Tracked AutoGrow registration is refused; unobserved behavior and constructor API are retained. No upstream code import or dependency refresh."
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/block_of_code.h",
+      "upstreamSha256": "a230d9a1bf4821cb20f154eed686275f77dbf334e6ceeb9eacac4012a7cca4cb",
+      "reason": " Original Aether Windows no-execute exact-write page tracking (ADR0448): preallocated page/dirty state, exact prewrite ranges, new-tail-only commitment, immediate outside-epoch sealing, dirty-run RX protection/instruction-cache flush, fail-hard unsealed execution guard. Explicit constant-pool and allocated/direct unwind writes plus late callback mode restoration are covered. Existing non-Windows/unobserved behavior, licenses and revision retained; no guessed append window, RWX alias, flag or quota increase. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh.",
+      "patchedSha256": "818def7f988313535d482998b79940c99f0e2bd7a153c1ffded602a9a6500bd4"
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/constant_pool.cpp",
+      "upstreamSha256": "3d1f463d4293cf6bef6f4d0cb19bd9d8f77dd971d4ef8c86e9be0c13406602ea",
+      "reason": " Original Aether Windows no-execute exact-write page tracking (ADR0448): preallocated page/dirty state, exact prewrite ranges, new-tail-only commitment, immediate outside-epoch sealing, dirty-run RX protection/instruction-cache flush, fail-hard unsealed execution guard. Explicit constant-pool and allocated/direct unwind writes plus late callback mode restoration are covered. Existing non-Windows/unobserved behavior, licenses and revision retained; no guessed append window, RWX alias, flag or quota increase.",
+      "patchedSha256": "cf96a112b9ae29f735ae869073b47f6a08d5cf696a6236e469419a6e8b833630"
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/exception_handler_windows.cpp",
+      "upstreamSha256": "a00c1e3c3cdd83dfdd6dc8afc193a3b15faafcf33ee4df168765b8dff9fb3c2d",
+      "reason": " Original Aether Windows no-execute exact-write page tracking (ADR0448): preallocated page/dirty state, exact prewrite ranges, new-tail-only commitment, immediate outside-epoch sealing, dirty-run RX protection/instruction-cache flush, fail-hard unsealed execution guard. Explicit constant-pool and allocated/direct unwind writes plus late callback mode restoration are covered. Existing non-Windows/unobserved behavior, licenses and revision retained; no guessed append window, RWX alias, flag or quota increase.",
+      "patchedSha256": "0b0f2d7dd4aaa45f5d907a11a7f21ac9ab6832f18483529abe37adf244cfe184"
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/emit_x64.cpp",
+      "upstreamSha256": "d795994cf03eb8ff3ec39702efd266a71c4a447db722e6880b2e0d0c84d67cb0",
+      "reason": " Original Aether demand-driven patch metadata: lookup an existing pending patch list without inserting an empty four-vector record for every compiled block. All actual patch writers and enabled-profile backpatch/invalidation behavior remain unchanged; no cap increase or dependency refresh. Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh.",
+      "patchedSha256": "a82a4e743a25651c286a3aec57bc5170bedd051addaa55ffe8d51911c8f904de"
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/interface/A64/a64.h",
+      "upstreamSha256": "63f2500083b070aaddd7d3676ffa602f73978b738a15a66036dc081236ccace9",
+      "reason": " Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh.",
+      "patchedSha256": "af10067ab9bb2c8d2669feb3f019b412202c62dbc4751eec2f52d0da015307d9"
+    },
+    {
+      "path": "third_party/dynarmic/src/dynarmic/backend/x64/emit_x64.h",
+      "upstreamSha256": "bf8bda4069afeabfb3e07f94b1f6820f8822880744ca52ff84201bd70aa5a488",
+      "reason": " Original Aether quiescent x64 translation-cache trimming (ADR0453): synchronous invalidation/RSB/dispatch reset, release empty metadata bucket storage, preserve semantic fallback markers/architecture/constants, and Windows full-page tail decommit beyond actual rounded prelude. Existing reservation, code-write protection/tracker and all resource limits retained. Owner must prove no active or parked compiled stack; alternate ARM64 backend is outside this implementation. No dependency import/refresh.",
+      "patchedSha256": "d4749c7b58f4412390e951ca5355107880969b1be9dc8fa3f59741f3f767baf8"
     }
   ]
 }

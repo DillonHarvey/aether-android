@@ -23,14 +23,20 @@ class ClassSource {
 };
 class ClassLoader {
   public:
-    ClassLoader(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits = {});
+    ClassLoader(DexImage &target, std::shared_ptr<ClassSource> source, LinkLimits limits = {},
+                Linker::ParentClass parent = {});
     ~ClassLoader();
     ClassLoader(const ClassLoader &) = delete;
     ClassLoader &operator=(const ClassLoader &) = delete;
     void ensure(std::string_view descriptor);
     const Class *definition(std::string_view descriptor);
+    // Exact trusted provider declarations only; no source load or guest work.
+    // Any failure blocks subsequent execution through check(), as with ensure.
+    Index intern_provider_method(std::string_view owner, std::string_view name,
+                                 std::string_view descriptor);
     void check() const;
-    // First allocation stage for the latest outer ensure, even after poisoning.
+    // First allocation stage for the latest ensure/provider admission, even
+    // after poisoning.
     ClassLoadAllocationPhase allocation_failure_phase() const noexcept;
 
   private:

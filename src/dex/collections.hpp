@@ -61,6 +61,29 @@ class ManagedQueue {
 };
 inline constexpr std::string_view live_iterator_type="Laether/internal/LiveArrayListIterator;";
 inline constexpr std::string_view live_list_iterator_type="Laether/internal/LiveArrayListListIterator;";
+inline constexpr std::string_view virtual_list_iterator_type="Laether/internal/AbstractListIterator;";
+inline constexpr std::string_view virtual_list_list_iterator_type="Laether/internal/AbstractListListIterator;";
+bool virtual_list_iterator_method(std::string_view name, std::string_view signature,
+                                  bool bidirectional) noexcept;
+// The runtime owns this state on a traced iterator object and traces backing().
+// Keep that iterator rooted across invocation: virtual backing methods may
+// reenter the interpreter and collect. No backing storage is copied or assumed.
+class VirtualListIterator {
+  public:
+    VirtualListIterator(ObjectId backing, std::uint32_t cursor, std::uint32_t expected_mod_count,
+                        bool bidirectional);
+    ObjectId backing() const noexcept { return backing_; }
+    std::optional<Value> invoke(ManagedRuntime &runtime, std::string_view name,
+                                std::string_view signature, std::span<const Value> args,
+                                // Trusted canonical base-field read; no guest
+                                // callbacks, allocation or iterator replacement.
+                                const std::function<std::uint32_t(ObjectId)> &read_mod_count);
+  private:
+    ObjectId backing_;
+    std::uint32_t cursor_, expected_mod_count_;
+    std::optional<std::uint32_t> last_;
+    const bool bidirectional_;
+};
 class ManagedList {
   public:
     explicit ManagedList(bool copy_on_write) : copy_on_write_(copy_on_write) {}

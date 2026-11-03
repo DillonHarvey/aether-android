@@ -19,9 +19,14 @@
 #endif
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <system_error>
 
 #include <mcl/assert.hpp>
 #include <mcl/bit/bit_field.hpp>
@@ -119,6 +124,24 @@ public:
 CustomXbyakAllocator s_allocator;
 
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+#    ifdef _WIN32
+[[noreturn]] void FailCodeWriteProtocol() {
+    std::fprintf(stderr, "AETHER_JIT_PROTECTION_FAILED: invalid code write epoch or range\n");
+    std::fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 0xAEE00001);
+    std::abort();
+}
+size_t ProtectionPageSize() {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t size = info.dwPageSize;
+    if (!size || (size & (size - 1))) FailCodeWriteProtocol();
+    return size;
+}
+size_t ProtectionPageCount(size_t size, size_t page) {
+    return size / page + (size % page != 0);
+}
+#    endif
 void ProtectMemory(const void* base, size_t size, bool is_executable) {
 #    ifdef _WIN32
     if (size == 0) {
@@ -237,8 +260,19 @@ BlockOfCode::BlockOfCode(RunCodeCallbacks cb, JitStateInfo jsi, size_t total_cod
         : Xbyak::CodeGenerator(total_code_size, nullptr, &s_allocator)
         , cb(std::move(cb))
         , jsi(jsi)
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+        , protection_page_size(ProtectionPageSize())
+        , writable_pages(ProtectionPageCount(total_code_size, protection_page_size) / 64 +
+                         (ProtectionPageCount(total_code_size, protection_page_size) % 64 != 0))
+        , dirty_pages(ProtectionPageCount(total_code_size, protection_page_size))
+#endif
         , constant_pool(*this, CONSTANT_POOL_SIZE)
         , host_features(GetHostFeatures()) {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    setWriteObserver(this, [](void* context, const void* address, size_t size) {
+        static_cast<BlockOfCode*>(context)->PrepareCodeWrite(address, size);
+    });
+#endif
     EnableWriting();
     EnsureMemoryCommitted(PRELUDE_COMMIT_SIZE);
     GenRunCode(rcp);
@@ -254,7 +288,7 @@ void BlockOfCode::PreludeComplete() {
 void BlockOfCode::EnableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
-    ProtectMemory(getCode(), committed_size, false);
+    writing_enabled = true; // Idempotent: never forget pages already opened.
 #    else
     ProtectMemory(getCode(), maxSize_, false);
 #    endif
@@ -264,16 +298,125 @@ void BlockOfCode::EnableWriting() {
 void BlockOfCode::DisableWriting() {
 #ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
 #    ifdef _WIN32
-    ProtectMemory(getCode(), committed_size, true);
+    if (!writing_enabled) {
+        if (dirty_count) FailCodeWriteProtocol();
+        return;
+    }
+    std::sort(dirty_pages.begin(), dirty_pages.begin() + static_cast<std::ptrdiff_t>(dirty_count));
+    for (size_t at = 0; at < dirty_count;) {
+        const size_t first = dirty_pages[at];
+        size_t last = first + 1;
+        ++at;
+        while (at < dirty_count && dirty_pages[at] == last) { ++last; ++at; }
+        ProtectMemory(getCode() + first * protection_page_size, (last - first) * protection_page_size, true);
+        for (size_t page = first; page < last; ++page)
+            writable_pages[page / 64] &= ~(u64{1} << (page % 64));
+    }
+    dirty_count = 0;
+    writing_enabled = false;
 #    else
     ProtectMemory(getCode(), maxSize_, true);
 #    endif
 #endif
 }
 
+bool BlockOfCode::IsWritingEnabled() const noexcept {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    return writing_enabled;
+#else
+    return true;
+#endif
+}
+
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+void BlockOfCode::MarkWritablePages(size_t first, size_t last) {
+    if (first > last || last > dirty_pages.size()) FailCodeWriteProtocol();
+    for (size_t page = first; page < last; ++page) {
+        const u64 bit = u64{1} << (page % 64);
+        if (writable_pages[page / 64] & bit) continue;
+        if (dirty_count == dirty_pages.size()) FailCodeWriteProtocol();
+        writable_pages[page / 64] |= bit;
+        dirty_pages[dirty_count++] = page;
+    }
+}
+void BlockOfCode::CommitCodeExtent(size_t required_size) {
+    if (required_size > maxSize_) FailCodeWriteProtocol();
+    const size_t count = ProtectionPageCount(required_size, protection_page_size);
+    if (count > std::numeric_limits<size_t>::max() / protection_page_size) FailCodeWriteProtocol();
+    const size_t end = count * protection_page_size;
+    if (end <= committed_size) return;
+    const size_t first = committed_size / protection_page_size;
+    const size_t bytes = end - committed_size;
+    void* const tail = top_ + committed_size;
+    if (!VirtualAlloc(tail, bytes, MEM_COMMIT, PAGE_READWRITE))
+        throw Xbyak::Error(Xbyak::ERR_CANT_ALLOC);
+    committed_size = end;
+    if (writing_enabled) MarkWritablePages(first, count);
+    else ProtectMemory(tail, bytes, true); // Outside Emit's scope: seal before returning.
+}
+#endif
+
+void BlockOfCode::PrepareCodeWrite(const void* address, size_t size) {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    if (!writing_enabled) FailCodeWriteProtocol();
+    const auto begin = reinterpret_cast<std::uintptr_t>(getCode());
+    const auto target = reinterpret_cast<std::uintptr_t>(address);
+    if (target < begin || target - begin > maxSize_ || size > maxSize_ - (target - begin)) FailCodeWriteProtocol();
+    if (!size) return;
+    const size_t offset = target - begin;
+    CommitCodeExtent(offset + size);
+    const size_t first = offset / protection_page_size;
+    const size_t last = ProtectionPageCount(offset + size, protection_page_size);
+    for (size_t at = first; at < last;) {
+        if (writable_pages[at / 64] & (u64{1} << (at % 64))) { ++at; continue; }
+        const size_t run = at++;
+        while (at < last && !(writable_pages[at / 64] & (u64{1} << (at % 64)))) ++at;
+        ProtectMemory(getCode() + run * protection_page_size, (at - run) * protection_page_size, false);
+        MarkWritablePages(run, at);
+    }
+#else
+    (void)address;
+    (void)size;
+#endif
+}
+
 void BlockOfCode::ClearCache() {
     ASSERT(prelude_complete);
     SetCodePtr(code_begin);
+}
+
+void BlockOfCode::TrimCache() {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    if (writing_enabled || dirty_count) FailCodeWriteProtocol();
+#endif
+    ClearCache();
+#ifdef _WIN32
+#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+    const size_t page_size = protection_page_size;
+#    else
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t page_size = info.dwPageSize;
+    if (!page_size || (page_size & (page_size - 1)))
+        throw std::runtime_error("Dynarmic code cache has an invalid Windows page size");
+#    endif
+    const size_t used = static_cast<size_t>(static_cast<const u8*>(code_begin) - getCode());
+    const size_t pages = used / page_size + (used % page_size != 0);
+    if (pages > std::numeric_limits<size_t>::max() / page_size)
+        throw std::overflow_error("Dynarmic prelude page extent overflow");
+    const size_t retained = pages * page_size;
+    if (retained > committed_size)
+        throw std::runtime_error("Dynarmic prelude exceeds committed code storage");
+    if (retained == committed_size) return;
+    // code_begin follows every prelude allocation, including constants and
+    // registered unwind/exception records. Keep its partial page intact.
+    if (!VirtualFree(top_ + retained, committed_size - retained, MEM_DECOMMIT))
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                                "Dynarmic code cache decommit failed");
+    committed_size = retained;
+    // Sealed tracker bits are already zero. Preserve the fully preallocated
+    // tracker arrays; subsequent exact prewrites recommit/open pages normally.
+#endif
 }
 
 size_t BlockOfCode::SpaceRemaining() const {
@@ -286,6 +429,13 @@ size_t BlockOfCode::SpaceRemaining() const {
 
 void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #ifdef _WIN32
+#    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
+    if (size_ > maxSize_) FailCodeWriteProtocol();
+    const size_t required = codesize > maxSize_ - size_ ? maxSize_ : size_ + codesize;
+    const size_t current = std::min(committed_size, maxSize_);
+    const size_t anticipated = codesize > maxSize_ - current ? maxSize_ : current + codesize;
+    if (required > committed_size) CommitCodeExtent(std::max(required, anticipated));
+#    else
     if (committed_size < size_ + codesize) {
         const size_t requested_size = std::min<size_t>(maxSize_, committed_size + codesize);
 #    ifdef DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT
@@ -298,14 +448,21 @@ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
         }
         committed_size = requested_size;
     }
+#    endif
 #endif
 }
 
 HaltReason BlockOfCode::RunCode(void* jit_state, CodePtr code_ptr) const {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    if (writing_enabled || dirty_count) FailCodeWriteProtocol();
+#endif
     return run_code(jit_state, code_ptr);
 }
 
 HaltReason BlockOfCode::StepCode(void* jit_state, CodePtr code_ptr) const {
+#if defined(_WIN32) && defined(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT)
+    if (writing_enabled || dirty_count) FailCodeWriteProtocol();
+#endif
     return step_code(jit_state, code_ptr);
 }
 
@@ -538,6 +695,7 @@ void* BlockOfCode::AllocateFromCodeSpace(size_t alloc_size) {
     EnsureMemoryCommitted(alloc_size);
 
     void* ret = getCurr<void*>();
+    PrepareCodeWrite(ret, alloc_size);
     size_ += alloc_size;
     memset(ret, 0, alloc_size);
     return ret;

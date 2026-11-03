@@ -1,11 +1,15 @@
 #pragma once
 #include "aether/android/selftest.hpp"
 #include "aether/security/installed_activity.hpp"
+#include "aether/host/window_observation.hpp"
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string_view>
 
 namespace aether::host {
+// Host-only fixed stage/code observations. Never pass guest text or input payloads.
+using WindowDiagnosticSink = std::function<void(std::string_view stage, std::string_view code)>;
 enum class InstalledCloseStatus { requested, no_eligible_window, partial_failure, unavailable };
 struct InstalledCloseResult {
     InstalledCloseStatus status = InstalledCloseStatus::unavailable;
@@ -45,6 +49,8 @@ struct WindowReport {
     std::uint32_t io_thread = 0;
     std::uint64_t coalesced_reads = 0, read_failures = 0, recovered_reads = 0, peak_pending = 0;
     std::uint64_t responsive_ticks = 0;
+    std::uint64_t diagnostic_retention_failures = 0;
+    WindowObservationSummary window_observations;
     std::string broker_audit = "[]";
     std::string durable_audit = "{}";
     android::FrameworkMetrics framework;
@@ -59,5 +65,9 @@ struct WindowReport {
 // Selftest uses a hidden real HWND, bounded message exercise, PNG evidence and automatic close.
 WindowReport run_fixture_window(const std::filesystem::path &apk, bool selftest,
                                 const std::filesystem::path &developer_output_root = {});
-WindowReport run_installed_window(security::InstalledActivity application);
+// The caller owns this host-only sink through both successful return and any
+// exception. It must not invoke guest code or use observations as write authority.
+WindowReport run_installed_window(security::InstalledActivity application, WindowDiagnosticSink diagnostics = {},
+                                  WindowObservationSink observations = {});
+std::string window_observation_summary_json(const WindowObservationSummary &);
 } // namespace aether::host

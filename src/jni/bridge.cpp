@@ -1,10 +1,17 @@
 #include "aether/jni/bridge.hpp"
 #include "aether/audio/guest.hpp"
+#include "aether/graphics/guest.hpp"
+#include "aether/android/native.hpp"
+#include "aether/android/native_window.hpp"
+#include "aether/android/native_activity.hpp"
+#include "aether/android/profile.hpp"
 #include "aether/common/thread_exit.hpp"
 #include "aether/host/process_info.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
+#include <exception>
 #include <map>
 #include <new>
 #include <thread>
@@ -18,7 +25,16 @@ using dex::ObjectId;
 using dex::Value;
 using Handle = std::uint64_t;
 constexpr Address tables = 0x60000, function_table = 0x61000, vm_table = 0x60800;
-constexpr Address trampolines = 0x62000, stacks = 0x32000000, stride = 0x11000, stack_size = 0x10000;
+// The observed constructor chain needs 131040 bytes, beyond the former
+// 61440 usable bytes. Match the already admitted native-thread default while
+// retaining lazy ownership, top headroom and an unmapped gap between slots.
+constexpr Address trampolines = 0x62000, stacks = 0x32000000, stride = 0x100000, stack_size = 0xf8000;
+static_assert(stride >= stack_size + 4096);
+static_assert(stacks + 32 * stride <= 0x36000000); // Managed TLS begins here.
+// NativeAssets uses the first 64 MiB at 1 TiB. Keep Activity incarnations
+// outside every existing low-address directory/stdio/TLS/heap/stack arena.
+constexpr Address native_activity_base = (Address{1} << 40) + 0x10000000;
+static_assert(native_activity_base + 32 * 0x20000 < a64::GuestMemory::address_limit);
 constexpr std::uint32_t first_service = 0x800, first_vm_service = 0xa00;
 constexpr std::size_t function_count = 233;
 std::atomic<std::uint64_t> next_handle{1};
@@ -101,13 +117,21 @@ std::u16string from_modified_utf8(std::string_view text) {
 class Imports final : public elf::ImportResolver {
     bionic::GuestPosixServices &posix;
     audio::GuestAudioServices *audio_services;
+    graphics::GuestGraphicsServices *graphics_services;
+    android::NativePlatformServices &platform;
   public:
-    Imports(bionic::GuestPosixServices &posix, audio::GuestAudioServices *audio) : posix(posix), audio_services(audio) {}
+    Imports(bionic::GuestPosixServices &posix, audio::GuestAudioServices *audio,
+            graphics::GuestGraphicsServices *graphics, android::NativePlatformServices &platform)
+        : posix(posix), audio_services(audio), graphics_services(graphics), platform(platform) {}
     bool has_library(std::string_view library) const noexcept override {
-        return posix.has_library(library) || (audio_services && audio_services->has_library(library));
+        return posix.has_library(library) || (audio_services && audio_services->has_library(library)) ||
+               (graphics_services && graphics_services->has_library(library)) || platform.has_library(library);
     }
     std::optional<elf::GuestSymbol> resolve(std::string_view library, std::string_view name,
                                            std::string_view version) const override {
+        if (graphics_services && graphics_services->has_library(library))
+            return graphics_services->resolve(library, name, version);
+        if (platform.has_library(library)) return platform.resolve(library, name, version);
         // Existing platform libraries retain their exact resolver/version rules.
         // Audio adds only its own registered library; unknown exports still fail.
         return audio_services && audio_services->has_library(library)
@@ -115,26 +139,91 @@ class Imports final : public elf::ImportResolver {
                    : posix.resolve(library, name, version);
     }
 };
+struct JniLocalFrame {
+    std::vector<Handle> handles;
+    std::size_t guaranteed_capacity = 0;
+    bool explicit_frame = false;
+    explicit JniLocalFrame(bool is_explicit = false) : explicit_frame(is_explicit) {
+        // Successful local-capacity promises have their backing before publication.
+        handles.reserve(1024);
+    }
+};
+// Selection remains synchronous: this aggregate is only exchanged by the
+// existing stack-owned LogicalScope/native-worker restoration below. It is not
+// a public parked-task capsule or permission to switch a live native fiber.
+struct JniExecutionState {
+    std::size_t native_depth = 0;
+    std::vector<JniLocalFrame> frames;
+    ObjectId pending = 0;
+    Address context = 0, current_environment = Bridge::environment;
+    bool attached = true;
+    ObjectId active_managed_thread = 0;
+    std::uint64_t active_execution_token = 0;
+    std::vector<ObjectId> *resolved_weak_roots = nullptr;
+    std::uint64_t native_charged_ticks = 0;
+};
+static_assert(std::is_nothrow_swappable_v<JniExecutionState>);
 } // namespace
-struct Bridge::Impl {
+struct Bridge::Impl : JniExecutionState {
     Bridge &bridge;
     dex::ManagedRuntime &runtime;
     a64::GuestMemory &memory;
     std::shared_ptr<ProcessState> process;
     bionic::GuestPosixServices posix;
     audio::GuestAudioServices *audio_services;
+    graphics::GuestGraphicsServices *graphics_services;
+    android::NativePlatformServices platform;
     Imports imports;
     elf::GuestLoader loader;
     a64::GuestCpu cpu;
+    struct MainWorkCpu;
+    std::unique_ptr<MainWorkCpu> main_work_cpu;
     std::string root, error;
     Metrics metrics;
     std::vector<std::string> loaded_roots;
+    // Structural NativeActivity ownership is not a Java System.loadLibrary
+    // publication. It survives Activity recreation and later JNI root changes.
+    std::string native_activity_root;
+    bool native_activity_initialized = false;
     unsigned load_state = 0;
     bool on_load_active = false;
+    void *initialization_context=nullptr;
+    elf::InitializationObserver initialization_observer=nullptr;
     ModuleProvider module_provider;
     bool dynamic_poisoned=false;
+    bool native_windows_bound = false;
+    std::shared_ptr<android::NativeWindows> native_windows;
+    android::NativeActivityInputCompletionFactory input_completion_factory;
+    android::NativeActivityHostWorkFactory host_work_factory;
+    std::string_view host_work_rejection;
+    std::uint64_t next_host_work = 1;
+    bool host_work_first = true;
+    bool native_configuration_bound = false;
+    bool native_closing=false,native_extension_active=false;
+    struct NativeActivityStorage {
+        ObjectId activity = 0, assets = 0, content = 0;
+        Handle clazz = 0, manager = 0, content_root = 0;
+        Address address = 0, paths = 0, saved = 0;
+        std::size_t path_size = 0, saved_size = 0;
+        std::optional<a64::GuestMemory::WordIdentity> identity, path_identity, saved_identity;
+        std::array<std::uint8_t, 80> canonical{};
+        std::vector<std::uint8_t> path_bytes;
+        std::string library, function;
+        std::uint64_t generation = 0;
+        std::shared_ptr<android::NativeWindowProducer> window;
+        std::uint64_t window_id = 0, queue = 0;
+        android::NativeWindowGeometry geometry;
+        bool window_destroy_started = false, queue_destroy_started = false;
+        bool created = false, destroy_started = false;
+        std::shared_ptr<android::NativeActivityHostWorkScope> work_scope = std::make_shared<android::NativeActivityHostWorkScope>();
+        std::array<android::NativeActivityHostWork, 64> work{};
+        std::size_t work_head = 0, work_count = 0;
+    };
+    std::unique_ptr<NativeActivityStorage> native_activity_storage;
+    std::uint32_t native_activity_incarnations = 0;
+    bool native_activity_dispatching = false, native_activity_failed = false;
+    std::shared_ptr<a64::ThreadRegisterState> graphics_owner;
     const std::thread::id owner_thread = std::this_thread::get_id();
-    std::size_t native_depth = 0;
     bool closed = false, shutdown_failed = false;
     bool attach_interface = true;
     struct Ref {
@@ -143,16 +232,7 @@ struct Bridge::Impl {
         bool global, weak = false;
         Address context;
     };
-    struct LocalFrame {
-        std::vector<Handle> handles;
-        std::size_t guaranteed_capacity = 0;
-        bool explicit_frame = false;
-        explicit LocalFrame(bool is_explicit = false) : explicit_frame(is_explicit) {
-            // Every published frame owns reusable backing for its full local
-            // bound. Push may fail here; successful Ensure never allocates.
-            handles.reserve(1024);
-        }
-    };
+    using LocalFrame = JniLocalFrame;
     static_assert(std::is_nothrow_move_constructible_v<LocalFrame>);
     static_assert(std::is_nothrow_move_constructible_v<std::pair<Handle, Ref>>);
     struct MethodId {
@@ -184,7 +264,6 @@ struct Bridge::Impl {
     // A weak argument is promoted only for its current JNI operation. Nested
     // callbacks keep independent scopes so an inner collection cannot retire
     // arguments still in use by a suspended outer operation.
-    std::vector<ObjectId> *resolved_weak_roots = nullptr;
     struct WeakRoots {
         Impl &owner;
         std::vector<ObjectId> values;
@@ -198,7 +277,6 @@ struct Bridge::Impl {
                 owner.runtime.release(id);
         }
     };
-    std::vector<LocalFrame> frames;
     std::map<Handle, MethodId> methods;
     // Field IDs identify runtime declarations, never JNI reference handles.
     std::map<Handle, dex::Index> fields;
@@ -206,23 +284,19 @@ struct Bridge::Impl {
     std::map<Address, Buffer> buffers;
     std::vector<Address> mappings;
     std::array<bool, 32> stack_owned{};
+    std::array<bool, 32> stack_leased{}; // Aggregate across all live JNI scopes.
     Address buffer_next = 0x50000000;
     std::size_t buffer_bytes = 0;
-    ObjectId pending = 0;
     ObjectId allocation_error = 0; // Borrowed runtime-owned OOME; never retained/released as a pending pin.
-    Address context=0,current_environment=Bridge::environment;
-    bool attached=true;
     struct ManagedBinding {ObjectId thread=0;Address tls=0;bool mapped=false;std::uint32_t tid=0;std::shared_ptr<a64::ThreadRegisterState> registers;};
     std::array<ManagedBinding,16> managed_bindings{};
     std::uint32_t next_managed_tid=0x40000000;
-    ObjectId active_managed_thread=0;
-    std::uint64_t active_execution_token=0;
     Impl(Bridge &bridge, dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
          const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
          host::FileService *files, bool attach_interface,std::string_view package,
-         audio::GuestAudioServices *audio)
+         audio::GuestAudioServices *audio, graphics::GuestGraphicsServices *graphics)
         : bridge(bridge), runtime(runtime), memory(memory), process(app.process_state), posix(memory, app, time, 1, files,nullptr,package),
-          audio_services(audio), imports(posix, audio), loader(memory, imports), cpu(memory, app, &bridge), root(std::move(root)),
+          audio_services(audio), graphics_services(graphics), platform(memory, app), imports(posix, audio, graphics, platform), loader(memory, imports), cpu(memory, app, &bridge), root(std::move(root)),
           attach_interface(attach_interface) {
         try {
             runtime.bind_process_state(process);process->checkpoint();
@@ -231,21 +305,44 @@ struct Bridge::Impl {
             reference_roots_token = runtime.register_native_roots(reference_roots);
             posix.set_managed_priority_service(runtime.thread_priority_baseline(),[this](std::optional<std::int32_t> nice){return this->runtime.thread_priority(nice);});
             cpu.set_thread_pointer(posix.thread_pointer());
-            posix.set_once_runner([this](Address entry,Address stack,Address tls,std::uint64_t budget){return cpu.call(entry,{},stack,budget,{},tls);});
+            posix.set_once_runner([this](Address entry,Address stack,Address tls,std::uint64_t budget){return execute_cpu_bounded(entry,{},stack,budget,{},tls);});
+            platform.bind_looper([this](std::string_view name, a64::ServiceState &state, bool full_frame) {
+                return posix.invoke_looper(name, state, full_frame);
+            }, [this] { return posix.last_rejection(); });
+            platform.bind_input_queue([this](std::string_view name, a64::ServiceState &state, bool full_frame) {
+                return posix.invoke_input_queue(name, state, full_frame);
+            }, [this] { return posix.last_rejection(); });
+            posix.set_looper_runner([this](Address entry, std::array<std::uint64_t,3> args,
+                                           Address stack, Address tls, std::uint64_t budget) {
+                const auto before = cpu.active_ticks();
+                auto result = execute_cpu_bounded(entry, args, stack, budget, {}, tls);
+                return bionic::GuestPosixServices::PhdrExecution{std::move(result), cpu.active_ticks() - before};
+            });
             posix.set_phdr_runner([this](Address entry,std::array<std::uint64_t,3> args,Address stack,Address tls,std::uint64_t budget){
-                const auto before=cpu.metrics().guest_ticks;
-                auto result=cpu.call(entry,args,stack,budget,{},tls);
-                return bionic::GuestPosixServices::PhdrExecution{std::move(result),cpu.metrics().guest_ticks-before};
+                const auto before=cpu.active_ticks();
+                auto result=execute_cpu_bounded(entry,args,stack,budget,{},tls);
+                return bionic::GuestPosixServices::PhdrExecution{std::move(result),cpu.active_ticks()-before};
+            });
+            platform.bind_activity_host_ops([this](std::string_view name, a64::ServiceState &state, bool) {
+                return admit_activity_host_work(name,state);
+            }, [this] { return host_work_rejection; });
+            posix.set_comparator_runner([this](Address entry,std::array<std::uint64_t,3> arguments,Address stack,Address tls,std::uint64_t budget){
+                const auto before=cpu.active_ticks();
+                auto result=execute_cpu_bounded(entry,std::span<const std::uint64_t>(arguments).first(2),stack,budget,{},tls);
+                return bionic::GuestPosixServices::PhdrExecution{std::move(result),cpu.active_ticks()-before};
             });
             posix.set_cxa_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget){
-                const auto before=cpu.metrics().guest_ticks;
-                auto result=cpu.call(entry,std::array{argument},stack,budget,{},tls);
-                return bionic::GuestPosixServices::CxaExecution{std::move(result),cpu.metrics().guest_ticks-before};
+                const auto before=cpu.active_ticks();
+                auto result=execute_cpu_bounded(entry,std::array{argument},stack,budget,{},tls);
+                return bionic::GuestPosixServices::CxaExecution{std::move(result),cpu.active_ticks()-before};
             });
-            posix.set_signal_runner([this](Address entry,std::uint32_t signal,Address stack,Address tls){return cpu.call(entry,std::array<std::uint64_t,1>{signal},stack,1'000'000,{},tls);});
-        posix.set_thread_runner([this](Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
-                return run_worker(entry,argument,stack,tls,budget);
+            posix.set_signal_runner([this](Address entry,std::uint32_t signal,Address stack,Address tls){return execute_cpu_bounded(entry,std::array<std::uint64_t,1>{signal},stack,1'000'000,{},tls);});
+            posix.set_fault_signal_runner([this](const a64::SignalEntry &entry,Address trusted_tls,std::uint64_t budget){
+                return execute_cpu_bounded(entry.state.pc,{},entry.state.sp,budget,{},trusted_tls,&entry);
             });
+        posix.set_thread_factory([this](const bionic::GuestPosixServices::ThreadSpec &spec){return std::make_unique<NativeTask>(*this,spec);});
+        posix.set_deferred_yield([this]{return active_native_task && cpu.request_execution_yield();});
+        posix.set_deferred_wait_admission([this]{return active_native_task && cpu.execution_progress_allowance().has_value() && native_depth<=1 && !resolved_weak_roots && !critical_active() && !native_closing && !native_extension_active && posix.native_switch_safe();});
             posix.set_address_lookup([this](Address address){return loader.address_info(address);});
             posix.set_program_header_lookup([this](std::size_t index){return loader.program_header_info(index);});
             loader.load(modules, this->root);
@@ -271,6 +368,15 @@ struct Bridge::Impl {
             memory.protect(trampolines, a64::read_execute);
             if (attach_interface)
                 runtime.set_native_interface(&bridge);
+            if(runtime.main_work_budget()) {
+                main_work_cpu=std::make_unique<MainWorkCpu>(*this);
+                loader.set_initializer_driver(this,
+                    [](void *driver_owner,a64::GuestCpu &,Address entry,std::span<const std::uint64_t> args,
+                       Address stack,std::optional<Address> tls) {
+                        auto &owner=*static_cast<Impl *>(driver_owner);
+                        return owner.execute_cpu(entry,args,stack,1'000'000,{},tls);
+                    });
+            }
         } catch (...) {
             cleanup();
             throw;
@@ -283,6 +389,14 @@ struct Bridge::Impl {
         mappings.push_back(address);
     }
     void cleanup() noexcept {
+        native_closing=true;
+        loader.set_initializer_driver(nullptr,nullptr);
+        main_work_cpu.reset();
+        posix.close_thread_tasks(); // All task stacks/capsules retire while CPU and JNI roots still live.
+        try { retire_native_activity(); } catch (...) { }
+        // Normal shutdown reaches here after native finalizers; constructor
+        // failure/destruction perform nonexecuting app-owned cleanup only.
+        try { platform.shutdown(); } catch (...) { }
         if (reference_roots_token) {
             // The runtime must never retain a span into destroyed Bridge
             // storage, even if later unrelated cleanup fails. Registration is
@@ -521,64 +635,522 @@ struct Bridge::Impl {
         const auto &binding=managed_bindings[slot];const auto tls=binding.tls;
         return {binding.tid,tls,tls+0x100,runtime.thread_initial_signal_mask(thread),binding.registers};
     }
+    struct NativeTask;
+    NativeTask *active_native_task=nullptr;
+    std::array<NativeTask*,16> native_tasks{};
+    struct NativeTask final : bionic::GuestPosixServices::PreparedThread {
+        using State=bionic::GuestPosixServices::ThreadTaskState;
+        using Slice=bionic::GuestPosixServices::ThreadSlice;
+        using Execution=bionic::GuestPosixServices::ThreadExecution;
+        Impl &p;bionic::GuestPosixServices::ThreadSpec spec;
+        std::unique_ptr<a64::GuestCpu::ExecutionContext> cpu_state;
+        JniExecutionState jni_state;
+        bionic::GuestPosixServices::ExecutionBinding binding;
+        dex::ManagedRuntime::TaskId id=0;
+        std::uint64_t allowance=0,ticks=0,reported=0,accounted_ticks=0,accounted_charge=0;
+        State cached=State::prepared;bool published=false,cancelled=false,entered=false;
+        std::optional<Execution> output;
+        std::shared_ptr<a64::DeferredService> waiting;
+        struct Entry final : dex::ManagedWorkerEntry {
+            NativeTask &task;explicit Entry(NativeTask &t):task(t){}
+            void run(dex::ManagedRuntime &) override {task.run();}
+            std::span<const Value> values() const noexcept override {return {};}
+            std::size_t bytes() const noexcept override {return sizeof(Entry)+sizeof(NativeTask);}
+        };
+        NativeTask(Impl &owner,const bionic::GuestPosixServices::ThreadSpec &value):p(owner),spec(value) {
+            if(p.native_closing)bad("STATE","Native task admission is closing");
+            // A running startup poll quantum is not this dormant child's
+            // permanent finite post-startup allowance.
+            allowance=p.runtime.main_work_budget()?p.runtime.deferred_native_worker_budget():
+                std::min(spec.allowance,p.runtime.native_thread_admission_budget());
+            if(!allowance)bad("BUDGET","No native task admission allowance");
+            const auto selected=p.posix.prepare_thread_execution(spec.id,spec.owner);
+            if(!selected)bad("THREAD","Native task identity is not admitted");
+            binding=*selected;
+            const auto slot=std::find(p.native_tasks.begin(),p.native_tasks.end(),nullptr);
+            if(slot==p.native_tasks.end())bad("THREAD","Native wait registry exhausted");
+            cpu_state=p.cpu.prepare_execution_context([this](const a64::GuestCpu::ExecutionBoundary &boundary){return boundary_step(boundary);},10000,
+                [this](const std::shared_ptr<a64::DeferredService> &operation){wait_for(operation);});
+            id=p.runtime.prepare_native_worker(std::make_unique<Entry>(*this),{this,enter,leave});
+            *slot=this;
+        }
+        ~NativeTask() noexcept override {close();for(auto &slot:p.native_tasks)if(slot==this)slot=nullptr;}
+        static State translate(dex::Scheduler::State state) noexcept {
+            using S=dex::Scheduler::State;
+            switch(state){case S::prepared:return State::prepared;case S::runnable:return State::runnable;case S::running:return State::running;
+            case S::sleeping:case S::parked:return State::waiting;case S::completed:return State::completed;case S::cancelled:return State::cancelled;case S::failed:return State::failed;}
+            return State::failed;
+        }
+        State state() const noexcept override {
+            if(!id)return cached;
+            try{
+                const auto value=translate(p.runtime.native_worker_state(id));
+                return value==State::waiting && waiting && waiting->ready()?State::runnable:value;
+            }catch(...){return State::failed;}
+        }
+        void wait_for(const std::shared_ptr<a64::DeferredService> &operation) {
+            if(p.active_native_task!=this || !operation || waiting || !p.posix.native_switch_safe() ||
+               p.critical_active() || p.resolved_weak_roots || p.native_closing || p.native_extension_active)
+                bad("NATIVE_WAIT_UNSUPPORTED","Native service cannot park across this provider boundary");
+            if(operation->ready())return;
+            waiting=operation;
+            struct Clear {NativeTask &n;~Clear(){n.waiting.reset();}} clear{*this};
+            // Alarm ownership/deadlines may change while another child runs.
+            // The host idle deadline query observes the live operation; do not
+            // freeze a cancelable alarm in the scheduler park record.
+            p.runtime.native_worker_park();
+        }
+        bool started() const noexcept override {return entered;}
+        bool publish() noexcept override {
+            if(!id || published || p.native_closing || !p.runtime.publish_worker(id))return false;
+            published=true;cached=State::runnable;return true;
+        }
+        bool root_ready() const noexcept {
+            const bool idle=p.cpu.execution_idle() && !p.native_depth && p.frames.empty();
+            const bool service=p.cpu.execution_progress_allowance().has_value() && p.native_depth<=1;
+            return (idle || service) && !p.resolved_weak_roots && !p.critical_active() &&
+                p.posix.native_switch_safe() && p.posix.execution_binding_valid(binding) &&
+                p.cpu.can_exchange_execution_context(*cpu_state);
+        }
+        static void enter(void *value,dex::Scheduler::TaskId task) noexcept {
+            auto &n=*static_cast<NativeTask*>(value);
+            if(task!=n.id || n.p.active_native_task || !n.root_ready())std::terminate();
+            n.p.cpu.commit_execution_context(*n.cpu_state);
+            n.p.exchange_jni_execution(n.jni_state);
+            n.p.posix.exchange_execution_binding(n.binding);
+            n.p.active_native_task=&n;
+        }
+        static void leave(void *value,dex::Scheduler::TaskId task) noexcept {
+            auto &n=*static_cast<NativeTask*>(value);
+            if(task!=n.id || n.p.active_native_task!=&n || !n.p.cpu.can_exchange_execution_context(*n.cpu_state) ||
+               !n.p.posix.execution_binding_valid(n.binding) || (!n.p.cpu.execution_idle() && !n.p.posix.native_switch_safe()))std::terminate();
+            n.ticks=n.p.cpu.active_ticks();
+            n.p.cpu.commit_execution_context(*n.cpu_state);
+            n.p.exchange_jni_execution(n.jni_state);
+            n.p.posix.exchange_execution_binding(n.binding);
+            n.p.active_native_task=nullptr;
+        }
+        std::uint64_t boundary_step(const a64::GuestCpu::ExecutionBoundary &boundary) {
+            const auto delta=boundary.ticks-accounted_ticks;
+            const auto nested=p.native_charged_ticks-accounted_charge;
+            const auto uncharged=delta>=nested?delta-nested:0;
+            const auto remaining=p.runtime.thread_instruction_budget();
+            const auto debit=std::min(uncharged,remaining);
+            p.runtime.charge_thread_instructions(debit);p.native_charged_ticks+=debit;
+            accounted_ticks=boundary.ticks;accounted_charge=p.native_charged_ticks;
+            auto dimensions=p.runtime.native_instruction_budget();
+            if(uncharged>remaining || !dimensions.retained || !dimensions.shared ||
+               (dimensions.slice && !*dimensions.slice))return 0;
+            auto work=std::min(dimensions.retained,dimensions.shared);
+            if(dimensions.slice)work=std::min(work,*dimensions.slice);
+            // This only narrows the original hard CPU-tick lease. Provider work
+            // consumes aggregate hard headroom, without inventing guest ticks.
+            if(!p.cpu.limit_execution_slice(work))std::terminate();
+            const bool need_quantum=dimensions.soft_quantum && !*dimensions.soft_quantum;
+            if((boundary.yield_requested || need_quantum) && boundary.can_yield){
+                if(p.posix.native_switch_safe() && !p.critical_active() && !p.resolved_weak_roots && !p.native_closing && !p.native_extension_active)
+                    p.runtime.native_worker_checkpoint();
+            }
+            // Soft expiry cannot unwind a nested/provider stack. Keep its real
+            // continuation until an actual parkable boundary; hard dimensions
+            // and the original CPU-tick lease remain authoritative throughout.
+            dimensions=p.runtime.native_instruction_budget();
+            if(!dimensions.retained || !dimensions.shared ||
+               (dimensions.slice && !*dimensions.slice))return 0;
+            work=std::min(dimensions.retained,dimensions.shared);
+            if(dimensions.slice)work=std::min(work,*dimensions.slice);
+            if(!p.cpu.limit_execution_slice(work))std::terminate();
+            return dimensions.retained; // A temporary work lease never truncates fatal allowance.
+        }
+        void run() {
+            entered=true;
+            struct Capture {NativeTask &n;~Capture(){n.ticks=n.p.cpu.active_ticks();}} capture{*this};
+            output=p.run_worker(spec.entry,spec.argument,spec.stack_top,spec.tls,allowance);
+        }
+        Slice resume_slice(std::uint64_t grant,std::int32_t priority) override {
+            auto current=state();
+            if(current==State::runnable){
+                if(cancelled){close();return {State::cancelled,0,{}};}
+                if(p.closed || p.native_closing || p.load_state!=2 || p.on_load_active || p.native_extension_active || !grant || !root_ready())
+                    bad("NATIVE_SLICE_UNSUPPORTED","Native peers require an idle root or authenticated ordinary parent service");
+                const auto scheduler_state=p.runtime.native_worker_state(id);
+                if(scheduler_state==dex::Scheduler::State::parked || scheduler_state==dex::Scheduler::State::sleeping){
+                    if(!waiting || !waiting->ready())return {State::waiting,0,{}};
+                    p.runtime.wake_native_worker(id);
+                }
+                const auto parent_cpu=p.cpu.execution_progress_allowance();
+                const auto requested=grant;
+                if(parent_cpu)grant=std::min(grant,*parent_cpu);
+                if(!grant || !p.runtime.native_thread_admission_budget())return {State::runnable,0,{},a64::Fault::budget};
+                if(!p.cpu.set_execution_slice_allowance(*cpu_state,grant))bad("THREAD","Invalid retained CPU slice state");
+                struct ParentCpuEnd {
+                    NativeTask &task;std::uint64_t before;bool live;
+                    ~ParentCpuEnd() noexcept {
+                        if(!live)return;
+                        if(task.ticks<before || !task.p.cpu.debit_external_progress(task.ticks-before))std::terminate();
+                        // The restored parent lease includes child Java work as
+                        // well as native ticks. Narrow its CPU headroom without
+                        // inventing ticks or replenishing a transient grant.
+                        if(const auto budget=task.p.runtime.native_progress_budget()){
+                            auto work=std::min(budget->retained,budget->shared);
+                            if(budget->slice)work=std::min(work,*budget->slice);
+                            if(!task.p.cpu.limit_external_progress(budget->retained,work))std::terminate();
+                        }
+                    }
+                };
+                {
+                    const auto before=ticks;
+                    ParentCpuEnd debit{*this,before,parent_cpu.has_value()};
+                    try{(void)p.runtime.run_native_worker(id,priority,requested);}
+                    catch(const dex::DexError &failure){
+                        if(failure.code=="AETHER_DEX_BUDGET" && ticks==before && state()==State::runnable)
+                            return {State::runnable,0,{},a64::Fault::budget};
+                        throw;
+                    }
+                }
+                current=state();
+            }
+            cached=current;
+            const auto spent=ticks-reported;reported=ticks;
+            if(current==State::completed || current==State::failed || current==State::cancelled){
+                if(!output){
+                    Execution failed;failed.result.fault=p.process->exit_status()?a64::Fault::process_exit:a64::Fault::unsupported_service;
+                    if(current==State::failed){
+                        try {if(const auto failure=p.runtime.native_worker_exception(id))std::rethrow_exception(failure);}
+                        catch(const dex::DexError &error){p.error=error.code+": "+error.what();failed.result.fault=error.code=="AETHER_DEX_BUDGET"?a64::Fault::budget:a64::Fault::windows_service;}
+                        catch(const std::exception &error){p.error=error.what();failed.result.fault=a64::Fault::windows_service;}
+                        catch(...){p.error="Native task failed during host execution";failed.result.fault=a64::Fault::windows_service;}
+                    }
+                    output=std::move(failed);
+                }
+                return {current,spent,output};
+            }
+            return {current,spent,{}};
+        }
+        void cancel() noexcept override {cancelled=true;}
+        void close() noexcept override {
+            if(!id)return;
+            try {
+                if(p.runtime.discard_prepared_worker(id)){id=0;cached=State::cancelled;return;}
+                auto current=state();
+                if(current!=State::completed && current!=State::failed && current!=State::cancelled){
+                    if(!root_ready())std::terminate();
+                    p.runtime.cancel_native_worker(id);
+                }
+                if(!p.runtime.release_native_worker(id))std::terminate();
+                id=0;cached=State::cancelled;
+            }catch(...){std::terminate();}
+        }
+    };
+    void exchange_jni_execution(JniExecutionState &stored) noexcept {
+        using std::swap;
+        swap(static_cast<JniExecutionState &>(*this),stored);
+    }
     struct LogicalScope {
         Impl &p;ObjectId owner;std::uint64_t token;bool switched=false;
-        std::vector<LocalFrame> frames;ObjectId pending=0;Address context=0,environment=0,tls=0;bool attached=false;
+        JniExecutionState previous;
+        Address tls=0;
         std::optional<bionic::GuestPosixServices::ThreadBinding> binding;
         explicit LogicalScope(Impl &p):p(p),owner(p.active_managed_thread),token(p.active_execution_token) {
             const auto thread=p.runtime.current_thread(),execution=dex::Scheduler::execution_token();
             if(p.native_depth && (owner!=thread || token!=execution))bad("THREAD","Native CPU belongs to another logical thread");
             const bool main=p.runtime.is_main_thread();
             if(!main) {
-                const auto selected=p.managed_binding(thread);
-                if(p.context!=selected.tls) {
-                    if(p.native_depth)bad("THREAD","Cannot switch a live native attachment");
-                    tls=p.posix.thread_pointer();p.cpu.set_thread_pointer(selected.tls);
-                    try{binding=p.posix.exchange_thread_binding(selected);}catch(...){p.cpu.set_thread_pointer(tls);throw;}
-                    frames=std::move(p.frames);pending=std::exchange(p.pending,0);context=p.context;environment=p.current_environment;attached=p.attached;
-                    p.context=selected.tls;p.current_environment=selected.tls+0x200;p.attached=true;p.frames.clear();switched=true;
+                // An attached pthread already owns this exact environment/TLS.
+                // Do not replace it with a separate managed-thread binding on
+                // a same-owner JNI -> managed -> native callback.
+                const bool reuse=owner==thread && token==execution && p.attached && p.context==p.posix.thread_pointer();
+                if(!reuse) {
+                    const auto selected=p.managed_binding(thread);
+                    if(p.context!=selected.tls) {
+                        if(p.native_depth)bad("THREAD","Cannot switch a live native attachment");
+                        tls=p.posix.thread_pointer();p.cpu.set_thread_pointer(selected.tls);
+                        try{binding=p.posix.exchange_thread_binding(selected);}catch(...){p.cpu.set_thread_pointer(tls);throw;}
+                        p.exchange_jni_execution(previous);
+                        p.context=selected.tls;p.current_environment=selected.tls+0x200;p.attached=true;switched=true;
+                    }
                 }
             } else if(p.context)bad("THREAD","Main entry cannot borrow a background attachment");
             p.active_managed_thread=thread;p.active_execution_token=execution;
         }
         ~LogicalScope(){
-            if(switched){while(!p.frames.empty())p.pop();p.pending_exception(0);p.frames=std::move(frames);p.pending=pending;p.context=context;p.current_environment=environment;p.attached=attached;p.posix.exchange_thread_binding(binding);p.cpu.set_thread_pointer(tls);}
+            if(switched){while(!p.frames.empty())p.pop();p.pending_exception(0);p.exchange_jni_execution(previous);p.posix.exchange_thread_binding(binding);p.cpu.set_thread_pointer(tls);}
             p.active_managed_thread=owner;p.active_execution_token=token;
         }
     };
     struct Scope {
         Impl &p;
-        std::size_t base;
-        explicit Scope(Impl &p, std::size_t capacity = 16) : p(p), base(p.frames.size()) {
-            if (p.native_depth >= 32)
-                bad("CALL_DEPTH", "Native stack depth exceeded");
+        std::size_t base, slot;
+        explicit Scope(Impl &p, std::size_t capacity = 16) : p(p), base(p.frames.size()),slot(0) {
+            while(slot<p.stack_leased.size() && p.stack_leased[slot])++slot;
+            if (p.native_depth >= 32 || slot==p.stack_leased.size())
+                bad("CALL_DEPTH", "Aggregate native stack slots exhausted");
             if (!p.allocation_reference([&] { p.push_frame(capacity); return Handle{1}; }))
                 p.check_pending();
+            p.stack_leased[slot]=true;
             ++p.native_depth;
         }
+        Scope(const Scope &)=delete;
+        Scope &operator=(const Scope &)=delete;
         ~Scope() {
             while (p.frames.size() > base)
                 p.pop();
             --p.native_depth;
+            p.stack_leased[slot]=false;
         }
         Address stack() const {
-            const auto depth = p.native_depth - 1;
-            const auto address = stacks + depth * stride;
-            if (!p.stack_owned[depth]) {
+            const auto address = stacks + slot * stride;
+            if (!p.stack_owned[slot]) {
                 // map() records ownership only after a successful, nonoverlapping
                 // allocation. Never adopt an existing guest mapping as a stack.
                 p.map(address, stack_size);
-                p.stack_owned[depth] = true;
+                p.stack_owned[slot] = true;
             }
             return address + stack_size - 4096;
         }
     };
+    // A synchronous native lifecycle has a real runtime invocation but no
+    // scheduler task. Keep its hard work grant and accounting at every CPU
+    // boundary, including nested JNI and fault handlers, without yielding.
+    // The logical-main entry retains this CPU and its actual host stack.
+    // While parked, root admits/resumes only this task, never another guest.
+    struct MainWorkCpu {
+        Impl &p;
+        std::unique_ptr<a64::GuestCpu::ExecutionContext> previous;
+        std::uint64_t accounted=0,witness=0;
+        bool installed=false;
+        explicit MainWorkCpu(Impl &owner):p(owner),witness(p.native_charged_ticks) {
+            const auto budget=p.runtime.main_work_budget();
+            if(!budget)bad("MAIN_WORK_STATE","Resource CPU requires the selected retained main entry");
+            previous=p.cpu.prepare_resource_execution_context(
+                [this](const a64::GuestCpu::ExecutionBoundary &boundary) {
+                    account(boundary.ticks);
+                    p.runtime.main_work_checkpoint(boundary.can_yield);
+                    const auto current=p.runtime.main_work_budget();
+                    if(!current)bad("MAIN_WORK_STATE","Retained main work lost its resource controller");
+                    return a64::GuestCpu::ResourceBudget{current->retained,current->quantum_remaining};
+                },4096,budget->retained);
+            if(!p.cpu.exchange_execution_context(*previous))
+                bad("MAIN_WORK_STATE","Resource CPU context requires an idle owned CPU");
+            // Prepared CPU contexts intentionally start without a logical TLS
+            // owner. Bind this retained main entry's actual owned TLS after
+            // installing its context, before any default-TLS initializer call.
+            try{p.cpu.set_thread_pointer(p.posix.thread_pointer());}
+            catch(...){
+                if(!p.cpu.exchange_execution_context(*previous))std::terminate();
+                throw;
+            }
+            installed=true;accounted=p.cpu.active_ticks();
+        }
+        void account(std::uint64_t ticks) {
+            if(ticks<accounted || p.native_charged_ticks<witness)std::terminate();
+            const auto elapsed=ticks-accounted,nested=p.native_charged_ticks-witness;
+            if(nested>elapsed)std::terminate();
+            const auto uncharged=elapsed-nested;
+            if(uncharged>UINT64_MAX-p.native_charged_ticks)
+                bad("BUDGET","Native main-work accounting exhausted");
+            if(uncharged)p.runtime.charge_thread_instructions(uncharged);
+            p.native_charged_ticks+=uncharged;
+            accounted=ticks;witness=p.native_charged_ticks;
+        }
+        void finish() {
+            if(!installed)return;
+            if(!p.cpu.execution_idle())bad("MAIN_WORK_STATE","Cannot retire a live retained CPU call");
+            if(p.cpu.active_ticks()!=accounted)
+                bad("MAIN_WORK_STATE","Native main-work tail was not settled before leaving its task");
+            if(!p.cpu.exchange_execution_context(*previous))
+                bad("MAIN_WORK_STATE","Cannot restore the owned root CPU context");
+            installed=false;
+        }
+        ~MainWorkCpu(){if(installed){try{finish();}catch(...){std::terminate();}}}
+    };
+    a64::ExecutionResult execute_cpu(Address entry,std::span<const std::uint64_t> args,Address stack,
+                                     std::uint64_t budget,std::span<const a64::Vector> floats={},
+                                     std::optional<Address> tls={},const a64::SignalEntry *signal=nullptr,bool bounded=false) {
+        if(!main_work_cpu)return cpu.call(entry,args,stack,budget,floats,tls,signal);
+        try {
+            auto result=cpu.call_resource_metered(entry,args,stack,floats,tls,signal,
+                bounded?std::optional<std::uint64_t>{budget}:std::nullopt);
+            main_work_cpu->account(cpu.active_ticks());
+            return result;
+        }catch(...){
+            const auto failure=std::current_exception();
+            main_work_cpu->account(cpu.active_ticks());
+            std::rethrow_exception(failure);
+        }
+    }
+    a64::ExecutionResult execute_cpu_bounded(Address entry,std::span<const std::uint64_t> args,Address stack,
+                                             std::uint64_t budget,std::span<const a64::Vector> floats={},
+                                             std::optional<Address> tls={},const a64::SignalEntry *signal=nullptr) {
+        return execute_cpu(entry,args,stack,budget,floats,tls,signal,true);
+    }
+    struct NativeActivityCpu {
+        Impl &p;
+        std::unique_ptr<a64::GuestCpu::ExecutionContext> state;
+        std::uint64_t accounted = 0, witness = 0;
+        bool installed = false;
+        explicit NativeActivityCpu(Impl &owner) : p(owner), witness(p.native_charged_ticks) {
+            const auto budget = p.runtime.native_instruction_budget();
+            auto grant = std::min(budget.retained, budget.shared);
+            if (budget.slice) grant = std::min(grant, *budget.slice);
+            if (!grant) bad("BUDGET", "NativeActivity has no remaining invocation allowance");
+            state = p.cpu.prepare_execution_context([this](const a64::GuestCpu::ExecutionBoundary &boundary) {
+                account(boundary.ticks);
+                const auto remaining = p.runtime.native_instruction_budget();
+                auto work = std::min(remaining.retained, remaining.shared);
+                if (remaining.slice) work = std::min(work, *remaining.slice);
+                if (!p.cpu.limit_execution_slice(work)) std::terminate();
+                return remaining.retained;
+            }, 0);
+            if (!p.cpu.set_execution_slice_allowance(*state, grant) || !p.cpu.exchange_execution_context(*state))
+                bad("NATIVE_ACTIVITY_STATE", "NativeActivity requires an idle owned CPU execution");
+            installed = true;
+        }
+        void account(std::uint64_t ticks) {
+            if (ticks < accounted || p.native_charged_ticks < witness) std::terminate();
+            const auto elapsed = ticks - accounted;
+            const auto nested = p.native_charged_ticks - witness;
+            if (nested > elapsed) std::terminate();
+            const auto uncharged = elapsed - nested;
+            const auto allowance = p.runtime.thread_instruction_budget();
+            const auto debit = std::min(uncharged, allowance);
+            if (debit > UINT64_MAX - p.native_charged_ticks) bad("BUDGET", "NativeActivity accounting exhausted");
+            p.runtime.charge_thread_instructions(debit);
+            p.native_charged_ticks += debit;
+            accounted = ticks;
+            witness = p.native_charged_ticks;
+            if (uncharged > allowance) bad("BUDGET", "NativeActivity exceeded its remaining invocation allowance");
+        }
+        void finish() { account(p.cpu.active_ticks()); }
+        ~NativeActivityCpu() {
+            if (installed && (!p.cpu.execution_idle() || !p.cpu.exchange_execution_context(*state))) std::terminate();
+        }
+    };
+    template<class Function> void native_activity_cpu(Function &&operation) {
+        if(main_work_cpu){operation();return;}
+        NativeActivityCpu execution(*this);
+        try { operation(); execution.finish(); }
+        catch (...) {
+            const auto failure = std::current_exception();
+            try { execution.finish(); } catch (...) { process->checkpoint(); }
+            std::rethrow_exception(failure);
+        }
+    }
+    bool native_activity_backing(Address address, std::size_t size,
+                                 const std::optional<a64::GuestMemory::WordIdentity> &identity,
+                                 a64::Permission permission) const noexcept {
+        if (!address || !size || !identity || !memory.accessible(address, size, permission)) return false;
+        for (std::size_t offset = 0; offset < size; offset += a64::GuestMemory::page_size) {
+            const auto current = memory.word_identity(address + offset, permission);
+            if (!current || !current->same_backing(*identity) ||
+                current->backing_offset() != identity->backing_offset() + offset) return false;
+        }
+        return true;
+    }
+    void native_activity_mapping(Address address, std::size_t size,
+                                 const std::optional<a64::GuestMemory::WordIdentity> &identity) {
+        if (!address) return;
+        // Retire only the allocation this record published, never a replacement
+        // guest mapping installed at the same numerical address.
+        if (native_activity_backing(address, size, identity, a64::Permission::read)) memory.unmap_range(address, size);
+        const auto entry = std::find(mappings.begin(), mappings.end(), address);
+        if (entry != mappings.end()) mappings.erase(entry);
+    }
+    void cancel_activity_host_work(NativeActivityStorage &storage) noexcept {
+        auto &scope=*storage.work_scope; scope.active=false;
+        for(auto &credit:scope.credits)if(credit.serial && !credit.posted){credit={};--scope.outstanding;}
+        storage.work={};storage.work_head=storage.work_count=0;
+    }
+    a64::Fault admit_activity_host_work(std::string_view name, a64::ServiceState &state) noexcept {
+        host_work_rejection={};
+        const auto refuse=[&](a64::Fault fault,std::string_view message){host_work_rejection=message;return fault;};
+        try {
+            if(std::this_thread::get_id()!=owner_thread || closed || native_closing || native_activity_failed ||
+                !native_activity_storage || cpu.execution_idle())
+                return refuse(a64::Fault::invalid_call,"Native Activity work requires an actual live native call owner");
+            if(active_native_task) {
+                if(!posix.execution_binding_valid(active_native_task->binding))
+                    return refuse(a64::Fault::invalid_call,"Native Activity work has a stale native thread binding");
+            } else if(!native_depth || frames.empty() || !attached || !posix.thread_register_state(posix.thread_pointer()))
+                return refuse(a64::Fault::invalid_call,"Native Activity work has no actual logical JNI/native owner");
+            auto &storage=*native_activity_storage;
+            if(state.registers[0]!=storage.address || storage.destroy_started || !storage.work_scope->active ||
+                (!storage.created && !(native_activity_dispatching && native_activity_initialized)))
+                return refuse(a64::Fault::invalid_call,"Native Activity work identifies a retired or different incarnation");
+            validate_native_activity();
+            android::NativeActivityHostOperation operation;
+            if(name=="ANativeActivity_finish")operation=android::NativeActivityHostOperation::finish;
+            else if(name=="ANativeActivity_hideSoftInput")operation=android::NativeActivityHostOperation::hide_soft_input;
+            else if(name=="ANativeActivity_showSoftInput")operation=android::NativeActivityHostOperation::show_soft_input;
+            else return refuse(a64::Fault::unsupported_service,"Native Activity window format/flags require an actual supported host policy consumer");
+            if(operation!=android::NativeActivityHostOperation::finish && static_cast<std::uint32_t>(state.registers[1]))
+                return refuse(a64::Fault::unsupported_service,"Native Activity soft input supports only actual flag-zero dispatch");
+            auto &scope=*storage.work_scope;
+            if(scope.outstanding>=scope.credits.size() || storage.work_count>=storage.work.size() || next_host_work==UINT64_MAX)
+                return refuse(a64::Fault::unsupported_service,"Native Activity queued-plus-posted work capacity exhausted");
+            const auto slot=std::find_if(scope.credits.begin(),scope.credits.end(),[](const auto &credit){return !credit.serial;});
+            if(slot==scope.credits.end())return refuse(a64::Fault::invalid_call,"Native Activity work credit invariant failed");
+            android::NativeActivityHostWork work;
+            work.activity=storage.activity;work.content=storage.content;work.window_generation=storage.generation;
+            work.serial=next_host_work++;work.credit_slot=static_cast<std::uint32_t>(slot-scope.credits.begin());
+            work.operation=operation;work.scope=storage.work_scope;
+            storage.work[(storage.work_head+storage.work_count)%storage.work.size()]=work;
+            *slot={work.serial,false};++scope.outstanding;++storage.work_count;
+            return a64::Fault::none;
+        }catch(...){return refuse(a64::Fault::unsupported_service,"Native Activity copied work admission failed before supported dispatch");}
+    }
+    void retire_native_activity() {
+        if (!native_activity_storage) return;
+        auto &storage = *native_activity_storage;
+        cancel_activity_host_work(storage);
+        if (storage.queue) {
+            if (posix.current_input_queue() != storage.queue)
+                bad("NATIVE_INPUT_STATE", "NativeActivity cannot retire another input queue incarnation");
+            posix.retire_input_queue(storage.queue);
+            storage.queue = 0;
+        }
+        if (storage.window) {
+            if (!native_windows) bad("NATIVE_ACTIVITY_WINDOW", "Native window registry is unavailable during retirement");
+            native_windows->release_activity(storage.window);
+            storage.window.reset(); storage.window_id = 0;
+        }
+        native_activity_mapping(storage.saved, storage.saved_size, storage.saved_identity);
+        native_activity_mapping(storage.paths, storage.path_size, storage.path_identity);
+        native_activity_mapping(storage.address, a64::GuestMemory::page_size, storage.identity);
+        for (const auto handle : {storage.manager, storage.clazz, storage.content_root}) {
+            const auto found = find_reference(handle);
+            if (found != refs.end() && found->second.global && !found->second.weak) erase(handle, true);
+        }
+        native_activity_storage.reset();
+    }
+    void validate_native_activity() {
+        if (!native_activity_storage) bad("NATIVE_ACTIVITY_STATE", "NativeActivity has no live backing");
+        const auto &storage = *native_activity_storage;
+        std::array<std::uint8_t, 80> actual{};
+        if (!native_activity_backing(storage.address, a64::GuestMemory::page_size, storage.identity, a64::read_write) ||
+            !memory.read(storage.address, actual))
+            bad("NATIVE_ACTIVITY_MAPPING", "NativeActivity ABI backing is no longer its owned writable allocation");
+        for (std::size_t i = 0; i < actual.size(); ++i)
+            if ((i < 56 || i >= 64) && actual[i] != storage.canonical[i])
+                bad("NATIVE_ACTIVITY_METADATA", "NativeActivity canonical metadata or callback-table pointer changed");
+        std::array<std::uint8_t, 8192> text{};
+        if (!native_activity_backing(storage.paths, storage.path_size, storage.path_identity, a64::Permission::read) ||
+            !memory.read(storage.paths, std::span(text).first(storage.path_bytes.size())) ||
+            !std::equal(storage.path_bytes.begin(), storage.path_bytes.end(), text.begin()) ||
+            resolve(storage.clazz) != storage.activity || resolve(storage.manager) != storage.assets ||
+            resolve(storage.content_root) != storage.content)
+            bad("NATIVE_ACTIVITY_METADATA", "NativeActivity canonical paths or global Java identities changed");
+    }
     void dynamic_open(std::string_view name) try {
+        if(native_extension_active)bad("LOAD_STATE","Recursive native extension is unsupported");
+        native_extension_active=true;
+        struct ExtensionEnd {Impl &p;~ExtensionEnd(){p.native_extension_active=false;}} extension_end{*this};
         process->checkpoint();
         if(std::this_thread::get_id()!=owner_thread || closed || dynamic_poisoned)
             throw elf::ElfError("AETHER_ELF_LOAD_STATE","Dynamic module owner is unavailable");
         if(imports.has_library(name))return;
-        for(const auto &module:loader.modules())if(module.image.soname==name && module.initialized)return;
+        for(const auto &module:loader.modules())
+            if((module.image.soname==name || module.image.declared_soname==name) && module.initialized)return;
         if(!module_provider)throw elf::ElfError("AETHER_ELF_SOURCE","No authorized module inventory");
         // Do not relax the constructor-time extension guard or expose provisional modules.
         for(const auto &module:loader.modules())if(!module.initialized)
@@ -600,15 +1172,22 @@ struct Bridge::Impl {
         }
         update_buffer_metrics();attached=false;
     }
-    std::uint64_t native_charged_ticks=0;
     bionic::GuestPosixServices::ThreadExecution thread_guest_call(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
         process->checkpoint();
-        const auto available=std::min(budget,runtime.thread_instruction_budget());
+        if(main_work_cpu){
+            const auto before=cpu.active_ticks();
+            auto result=execute_cpu_bounded(entry,std::array{argument},stack,budget,{},tls);
+            return {std::move(result),cpu.active_ticks()-before};
+        }
+        // Only the configured native root has an independent hard slice grant.
+        // Do not turn that transient grant into its permanent fatal allowance.
+        const bool retained_root=active_native_task && native_depth==1 && cpu.execution_idle();
+        const auto available=std::min(budget,retained_root?runtime.native_instruction_budget().retained:runtime.thread_instruction_budget());
         bionic::GuestPosixServices::ThreadExecution out;
         if(!available){out.result.fault=a64::Fault::budget;return out;}
-        const auto before=cpu.metrics().guest_ticks,charged_before=native_charged_ticks;
-        out.result=cpu.call(entry,std::array{argument},stack,available,{},tls);
-        out.ticks=cpu.metrics().guest_ticks-before;
+        const auto before=cpu.active_ticks(),charged_before=native_charged_ticks;
+        out.result=execute_cpu(entry,std::array{argument},stack,available,{},tls);
+        out.ticks=cpu.active_ticks()-before;
         // Nested native workers debit their context and its parent on return.
         // Their inclusive CPU ticks must not be charged again by this caller.
         const auto nested=native_charged_ticks-charged_before;
@@ -626,27 +1205,39 @@ struct Bridge::Impl {
         },budget);
     }
     bionic::GuestPosixServices::ThreadExecution run_worker(Address entry,Address argument,Address stack,Address tls,std::uint64_t budget) {
-        const auto before=cpu.metrics().guest_ticks;a64::ExecutionResult result;bool finalization_failed=false;
+        const auto before=cpu.active_ticks();a64::ExecutionResult result;bool finalization_failed=false;
         try {runtime.run_native_thread([&]{
-            auto parent_frames=std::move(frames);const auto parent_pending=std::exchange(pending,0);
-            const auto parent_context=context,parent_environment=current_environment;const auto parent_attached=attached;
-            context=tls;current_environment=tls+0x200;attached=false;frames.clear();
+            JniExecutionState previous;
+            exchange_jni_execution(previous);
+            // This native root uses its owned pthread stack, not a JNI Scope
+            // stack lease. The marker prevents borrowing a live attachment.
+            native_depth=1;context=tls;current_environment=tls+0x200;attached=false;
+            active_execution_token=dex::Scheduler::execution_token();
             struct Restore {
-                Impl &p;std::vector<LocalFrame> frames;ObjectId pending;Address context,environment;bool attached;
-                ~Restore(){p.clear_attachment();p.frames=std::move(frames);p.pending=pending;p.context=context;p.current_environment=environment;p.attached=attached;}
-            } restore{*this,std::move(parent_frames),parent_pending,parent_context,parent_environment,parent_attached};
+                Impl &p;JniExecutionState previous;
+                ~Restore(){
+                    p.clear_attachment();
+                    const auto charged=p.native_charged_ticks;
+                    p.exchange_jni_execution(previous);
+                    // Synchronous nested CPU ticks include this child. Runtime
+                    // already debits its parent; carry the charge witness once
+                    // so the enclosing thread_guest_call does not debit twice.
+                    if(charged>UINT64_MAX-p.native_charged_ticks)std::terminate();
+                    p.native_charged_ticks+=charged;
+                }
+            } restore{*this,std::move(previous)};
             write(current_environment,function_table,8);
             result=thread_guest_call(entry,argument,stack,tls,budget).result;
             if(result.returned || result.fault==a64::Fault::thread_exit){
                 runtime.run_thread_finalizers([&]{
-                    const auto spent=cpu.metrics().guest_ticks-before;
+                    const auto spent=cpu.active_ticks()-before;
                     const auto cleanup=finalize_bound_thread(stack,spent>=budget?0:budget-spent);
                     if(cleanup.finalization_failed){result=cleanup.result;result.returned=false;finalization_failed=true;}
                 });
             }
-        },[this](std::optional<std::int32_t> nice){return posix.current_thread_priority(nice);});}
+        },[this](std::optional<std::int32_t> nice){return posix.current_thread_priority(nice);},budget);}
         catch(const ThreadExit &exit){process->checkpoint();if(!finalization_failed){posix.request_thread_exit(exit.value);result.fault=a64::Fault::thread_exit;result.registers[0]=exit.value;}}
-        return {result,cpu.metrics().guest_ticks-before,finalization_failed};
+        return {result,cpu.active_ticks()-before,finalization_failed};
     }
     void pending_exception(ObjectId object) {
         if (object && object != allocation_error)
@@ -693,21 +1284,21 @@ struct Bridge::Impl {
         throw dex::JavaException(exception);
     }
     a64::ExecutionResult call(Address address, std::span<const std::uint64_t> args, Address stack,
-                              std::span<const a64::Vector> floats = {}) {
+                              std::span<const a64::Vector> floats = {}, std::uint64_t budget = 1'000'000,
+                              Address *returned_pointer = nullptr) {
         process->checkpoint();
-        const auto before=cpu.metrics().guest_ticks;
-        const auto result = cpu.call(address, args, stack, 1'000'000, floats,posix.thread_pointer());
+        const auto before=cpu.active_ticks();
+        const auto result = execute_cpu(address, args, stack, budget, floats,posix.thread_pointer());
         if(result.fault==a64::Fault::process_exit){process->request_exit(result.detail);process->checkpoint();}
         if(result.fault==a64::Fault::thread_exit)runtime.exit_current_thread(result.registers[0]);
         if (!result.returned)
             bad("NATIVE_EXECUTION", std::string(a64::fault_name(result.fault)) + ": " + error + "; " +
                                         std::string(posix.last_rejection()));
+        // Preserve a normally returned save pointer before later JNI checks.
+        if (returned_pointer) *returned_pointer = result.registers[0];
         if (critical_active())
             bad("CRITICAL", "Native return with an unreleased JNI critical copy");
-        const auto spent=cpu.metrics().guest_ticks-before;
-        const auto thread_fault=posix.run_pending_threads(spent>=1000000?0:1000000-spent);
-        if(thread_fault==a64::Fault::process_exit)process->checkpoint();
-        if(thread_fault!=a64::Fault::none)bad("NATIVE_EXECUTION",std::string(a64::fault_name(thread_fault))+": "+error+"; "+std::string(posix.last_rejection()));
+        (void)before; // Native factory peers run at the audited idle host pump.
         return result;
     }
     Value decode(std::uint64_t bits, std::string_view type) {
@@ -1563,15 +2154,16 @@ struct Bridge::Impl {
 Bridge::Bridge(dex::ManagedRuntime &runtime, a64::GuestMemory &memory, const a64::AppContext &app,
                const host::TimeService &time, std::span<const elf::ModuleInput> modules, std::string root,
                host::FileService *files, bool attach_interface,std::string_view package,
-               audio::GuestAudioServices *audio)
+               audio::GuestAudioServices *audio, graphics::GuestGraphicsServices *graphics)
     : impl_(std::make_unique<Impl>(*this, runtime, memory, app, time, modules, std::move(root), files,
-                                   attach_interface,package,audio)) {}
+                                   attach_interface,package,audio,graphics)) {}
 Bridge::~Bridge() {
     if (impl_ && impl_->attach_interface)
         impl_->runtime.set_native_interface(nullptr);
 }
 bool Bridge::has_library(std::string_view root) const noexcept {
-    return impl_->root == root || std::find(impl_->loaded_roots.begin(), impl_->loaded_roots.end(), root) != impl_->loaded_roots.end();
+    return impl_->root == root || (impl_->native_activity_initialized && impl_->native_activity_root == root) ||
+           std::find(impl_->loaded_roots.begin(), impl_->loaded_roots.end(), root) != impl_->loaded_roots.end();
 }
 void Bridge::add_library(std::span<const elf::ModuleInput> modules, std::string root) {
     auto &p = *impl_;p.process->checkpoint();
@@ -1610,6 +2202,423 @@ void Bridge::set_module_provider(ModuleProvider provider) {
         bad("LOAD_STATE","Module provider requires the idle bridge owner");
     p.module_provider=std::move(provider);
 }
+void Bridge::finish_main_work() {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.native_depth)
+        bad("MAIN_WORK_STATE","Main-work retirement requires the idle bridge owner");
+    if(p.main_work_cpu){p.main_work_cpu->finish();p.main_work_cpu.reset();}
+    p.loader.set_initializer_driver(nullptr,nullptr);
+}
+void Bridge::set_initialization_observer(void *context,elf::InitializationObserver observer) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_depth ||
+       p.load_state || p.active_native_task || !p.cpu.execution_idle())
+        bad("LOAD_STATE","Initialization observer requires the idle owner before guest initialization");
+    p.initialization_context=context;p.initialization_observer=observer;
+    p.loader.set_initialization_observer(context,observer);
+}
+void Bridge::set_assets(const apk::PackageView &package, std::function<bool(ObjectId)> validate_manager) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_depth || !validate_manager)
+        bad("ASSET_STATE", "Asset source requires the idle bridge owner and canonical manager check");
+    p.platform.bind_assets(package, [&p, validate_manager = std::move(validate_manager)](Address env, Handle object) {
+        if (p.closed || !p.attached || p.frames.empty() || env != p.current_environment || !object) return false;
+        return validate_manager(p.resolve(object));
+    });
+}
+void Bridge::set_assets(const apk::PackageView &package, ManagedAssetManagerAccess access) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_depth ||
+        !access.publish || !access.owns)
+        bad("ASSET_STATE", "Asset identities require the idle bridge owner and complete managed ownership checks");
+    android::NativeAssetManagerAccess native_access;
+    native_access.from_java = [&p, publish = std::move(access.publish)](Address env, Handle object) -> std::uint64_t {
+        if (p.closed || !p.attached || p.frames.empty() || env != p.current_environment || !object) return 0;
+        // A live weak referent needs no promotion here: publication consumes
+        // only its scalar identity, and the trusted producer cannot collect,
+        // allocate, run guests or retain the unrooted referent across return.
+        const auto identity = p.resolve(object, false);
+        return identity ? publish(identity) : 0;
+    };
+    native_access.owns = [&p, owns = std::move(access.owns)](std::uint64_t token) {
+        if (p.closed || std::this_thread::get_id() != p.owner_thread || !token) return false;
+        return owns(token);
+    };
+    p.platform.bind_assets(package, std::move(native_access));
+}
+void Bridge::set_display_configuration(const android::DisplayConfiguration &configuration) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_depth || !configuration.valid())
+        bad("CONFIGURATION_STATE", "Native configuration requires the idle owner and actual valid display facts");
+    p.process->checkpoint();
+    if(p.native_configuration_bound)p.platform.update_configuration(configuration);
+    else {p.platform.bind_configuration(configuration);p.native_configuration_bound=true;}
+}
+void Bridge::set_native_windows(std::shared_ptr<android::NativeWindows> windows,
+                               std::function<std::shared_ptr<android::NativeWindowProducer>(ObjectId)> resolve_surface) {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_depth || p.load_state ||
+        p.native_windows_bound || !windows || !windows->owned_by_current_thread() || !resolve_surface)
+        bad("WINDOW_STATE", "Native windows require the initial idle bridge owner and a genuine Surface resolver");
+    p.process->checkpoint();
+    windows->bind_java_resolver([&p, resolve_surface = std::move(resolve_surface)](Address env, Handle object)
+                                   -> std::shared_ptr<android::NativeWindowProducer> {
+        // Native dispatch creates WeakRoots before entering the platform. A
+        // direct registry call cannot bypass that JNI handle admission scope.
+        if (std::this_thread::get_id() != p.owner_thread || p.closed || !p.attached || p.frames.empty() ||
+            !p.resolved_weak_roots || env != p.current_environment || !object)
+            return {};
+        return resolve_surface(p.resolve(object));
+    });
+    try {
+        p.platform.bind_windows(windows);
+    } catch (...) {
+        windows->clear_java_resolver();
+        throw;
+    }
+    p.native_windows_bound = true;
+    p.native_windows = std::move(windows);
+}
+void Bridge::set_native_input_completion_factory(android::NativeActivityInputCompletionFactory factory) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_depth || p.load_state ||
+        p.input_completion_factory || !factory)
+        bad("NATIVE_INPUT_STATE", "Input completion requires the initial idle owner and an actual main entry factory");
+    p.process->checkpoint();
+    p.input_completion_factory=std::move(factory);
+}
+void Bridge::set_native_activity_host_work_factory(android::NativeActivityHostWorkFactory factory) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_depth || p.load_state || p.host_work_factory || !factory)
+        bad("NATIVE_ACTIVITY_STATE","Host work requires the initial idle owner and actual main factory");
+    p.process->checkpoint();p.host_work_factory=std::move(factory);
+}
+void Bridge::bind_main_looper() {
+    auto &p = *impl_;
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_depth ||
+        !p.posix.is_main_native_thread() || p.load_state)
+        bad("LOOPER_STATE", "Managed main Looper binding requires the idle initial native main owner");
+    a64::ServiceState state;
+    state.registers[0] = 0; // The Java MessageQueue's Looper does not allow non-callback registrations.
+    if (p.posix.invoke_looper("ALooper_prepare", state, false) != a64::Fault::none || !state.registers[0])
+        bad("LOOPER_STATE", "Cannot bind the existing managed main event loop to its native owner");
+}
+android::NativeActivityResult Bridge::native_activity(const android::NativeActivityRequest &request, std::string_view library,
+                             std::string_view function) {
+    using Stage = android::NativeActivityStage;
+    auto &p = *impl_;
+    android::NativeActivityResult saved_result;
+    p.process->checkpoint();
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_closing || p.native_depth ||
+        p.active_native_task || !p.cpu.execution_idle() || p.native_activity_dispatching || p.native_activity_failed ||
+        !p.runtime.is_main_thread() || !p.posix.is_main_native_thread())
+        bad("NATIVE_ACTIVITY_STATE", "NativeActivity lifecycle requires its idle live main owner");
+    if (!request.activity || !request.asset_manager || !request.content_view || !request.window_generation || !request.configuration.valid() ||
+        library.empty() || library.size() > 127 || function.empty() || function.size() > 4096 ||
+        function.find('\0') != std::string_view::npos ||
+        std::any_of(function.begin(), function.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }))
+        bad("NATIVE_ACTIVITY_METADATA", "NativeActivity requires actual owned identities and validated entry metadata");
+    Impl::LogicalScope logical(p);
+    if (p.current_environment != environment || p.context || !p.attached)
+        bad("NATIVE_ACTIVITY_THREAD", "NativeActivity callbacks cannot borrow a background JNIEnv");
+    p.check_pending();
+    Impl::Scope scope(p);
+    const auto stack = scope.stack();
+    p.native_activity_dispatching = true;
+    struct End { bool &active; ~End() { active = false; } } end{p.native_activity_dispatching};
+    try {
+        if (request.stage == Stage::create) {
+            if (!p.native_activity_root.empty() && p.native_activity_root != library)
+                bad("NATIVE_ACTIVITY_ROOT", "This NativeActivity package cannot change its prepared native root");
+            if (p.native_activity_storage || p.native_activity_incarnations >= 32 ||
+                request.saved_state.size() > 65536 || (!request.saved_state_present && !request.saved_state.empty()) ||
+                request.internal_data_path.empty() || request.internal_data_path.size() > 8191 ||
+                std::any_of(request.internal_data_path.begin(), request.internal_data_path.end(),
+                            [](unsigned char c) { return c < 0x20 || c == 0x7f; }) ||
+                !p.runtime.assignable(request.activity, "Landroid/app/NativeActivity;") ||
+                p.runtime.object_type(request.content_view) != "Landroid/app/NativeActivity$NativeContentView;" ||
+                std::none_of(p.loader.modules().begin(), p.loader.modules().end(),
+                             [&](const auto &module) { return module.image.soname == library; }))
+                bad("NATIVE_ACTIVITY_STATE", "NativeActivity creation requires fresh bounded owned backing");
+            if (p.native_activity_root.empty()) p.native_activity_root = library;
+            auto storage = std::make_unique<Impl::NativeActivityStorage>();
+            storage->activity = request.activity;
+            storage->assets = request.asset_manager;
+            storage->content = request.content_view;
+            storage->generation = request.window_generation;
+            storage->library = library;
+            storage->function = function;
+            storage->path_bytes.assign(request.internal_data_path.begin(), request.internal_data_path.end());
+            storage->path_bytes.push_back(0);
+            // Every attempted incarnation consumes a reserved address forever;
+            // deletion/remapping cannot turn a stale Activity pointer into a new one.
+            storage->address = native_activity_base + Address{p.native_activity_incarnations++} * 0x20000;
+            storage->paths = storage->address + a64::GuestMemory::page_size;
+            p.native_activity_storage = std::move(storage);
+            auto &created = *p.native_activity_storage;
+            p.map(created.address, a64::GuestMemory::page_size);
+            created.identity = p.memory.word_identity(created.address, a64::read_write);
+            created.path_size = (created.path_bytes.size() + 4095) & ~std::size_t{4095};
+            p.map(created.paths, created.path_size);
+            created.path_identity = p.memory.word_identity(created.paths, a64::read_write);
+            if (!p.memory.write(created.paths, created.path_bytes)) bad("NATIVE_ACTIVITY_MAPPING", "Cannot publish owned logical paths");
+            p.memory.protect(created.paths, a64::Permission::read);
+            created.clazz = p.reference(request.activity, true);
+            created.manager = p.reference(request.asset_manager, true);
+            created.content_root = p.reference(request.content_view, true);
+            const auto manager = p.platform.publish_asset_manager(p.current_environment, created.manager);
+            const std::array<std::uint8_t, 128> empty_callbacks{};
+            if (!p.memory.write(created.address + 128, empty_callbacks))
+                bad("NATIVE_ACTIVITY_MAPPING", "Cannot initialize the owned callback table");
+            p.write(created.address, created.address + 128, 8);
+            p.write(created.address + 8, java_vm, 8);
+            p.write(created.address + 16, environment, 8);
+            p.write(created.address + 24, created.clazz, 8);
+            p.write(created.address + 32, created.paths, 8);
+            p.write(created.address + 40, 0, 8); // No hosted external volume.
+            p.write(created.address + 48, android::compatibility_sdk, 4);
+            p.write(created.address + 52, 0, 4);
+            p.write(created.address + 56, 0, 8); // App-owned instance field.
+            p.write(created.address + 64, manager, 8);
+            p.write(created.address + 72, 0, 8); // No hosted OBB volume.
+            if (!p.memory.read(created.address, created.canonical)) bad("NATIVE_ACTIVITY_MAPPING", "Cannot retain canonical ABI fields");
+            if (request.saved_state_present) {
+                created.saved = created.address + 0x4000;
+                created.saved_size = (std::max(request.saved_state.size(), std::size_t{1}) + 4095) & ~std::size_t{4095};
+                p.map(created.saved, created.saved_size);
+                created.saved_identity = p.memory.word_identity(created.saved, a64::read_write);
+                if (!request.saved_state.empty() && !p.memory.write(created.saved, request.saved_state))
+                    bad("NATIVE_ACTIVITY_MAPPING", "Cannot copy the actual saved-state input");
+            }
+            p.native_activity_cpu([&] {
+                if (p.load_state == 0) {
+                    p.load_state = 1;
+                    try { p.loader.initialize(p.cpu, stack, p.posix.thread_pointer()); p.load_state = 2; }
+                    catch (...) { p.load_state = 3; throw; }
+                } else if (p.load_state != 2) bad("LOAD_STATE", "NativeActivity cannot reuse a recursive or failed library initialization");
+                p.check_pending();
+                if (std::none_of(p.loader.modules().begin(), p.loader.modules().end(),
+                                 [&](const auto &module) { return module.image.soname == created.library && module.initialized; }))
+                    bad("LOAD_STATE", "NativeActivity root has not completed structural initialization");
+                p.native_activity_initialized = true;
+                const auto entry = p.loader.lookup(created.library, created.function);
+                if (!entry || entry->type == 1 || !entry->address || entry->address % 4 ||
+                    !p.memory.accessible(entry->address, 4, a64::Permission::execute))
+                    bad("NATIVE_ACTIVITY_ENTRY", "Prepared NativeActivity entry is not an aligned executable function");
+                p.validate_native_activity();
+                const std::array<std::uint64_t, 3> arguments{created.address, created.saved, request.saved_state.size()};
+                const auto budget = p.main_work_cpu?std::uint64_t{1'000'000}:
+                    std::min(std::uint64_t{1'000'000}, p.runtime.native_instruction_budget().retained);
+                if (!budget) bad("BUDGET", "NativeActivity entry has no retained invocation allowance");
+                (void)p.call(entry->address, arguments, stack, {}, budget);
+                p.check_pending();
+                p.validate_native_activity();
+            });
+            if (p.load_state != 2) bad("LOAD_STATE", "NativeActivity entry left a failed native library initialization");
+            created.created = true;
+            p.native_activity_mapping(created.saved, created.saved_size, created.saved_identity);
+            created.saved = 0;
+            created.saved_identity.reset();
+            return {};
+        }
+        p.validate_native_activity();
+        auto &storage = *p.native_activity_storage;
+        if (p.load_state != 2 || !storage.created || storage.destroy_started || storage.activity != request.activity ||
+            storage.assets != request.asset_manager || storage.content != request.content_view || storage.generation != request.window_generation ||
+            storage.library != library || storage.function != function)
+            bad("NATIVE_ACTIVITY_STATE", "NativeActivity lifecycle belongs to a stale or different incarnation");
+        unsigned slot = 0;
+        std::uint64_t secondary = request.focused;
+        bool has_secondary = request.stage == Stage::window_focus;
+        const auto geometry_matches = [](const android::NativeWindowGeometry &left, const android::NativeWindowGeometry &right) {
+            return left.width == right.width && left.height == right.height && left.format == right.format;
+        };
+        const auto validate_window = [&] {
+            if (!p.native_windows || !request.window_producer || storage.window != request.window_producer || !storage.window_id)
+                bad("NATIVE_ACTIVITY_WINDOW", "Native window callback does not identify its retained producer");
+            const auto binding = p.native_windows->resolve_for_egl(storage.window_id);
+            if (!binding || binding->retained != storage.window || !geometry_matches(binding->geometry, request.window_geometry))
+                bad("NATIVE_ACTIVITY_WINDOW", "Native window callback differs from its actual admitted producer geometry");
+        };
+        switch (request.stage) {
+        case Stage::start: slot = 0; break;
+        case Stage::resume: slot = 1; break;
+        case Stage::save_state: slot = 2; break;
+        case Stage::pause: slot = 3; break;
+        case Stage::stop: slot = 4; break;
+        case Stage::destroy:
+            if (storage.window || storage.queue)
+                bad("NATIVE_ACTIVITY_STATE", "Native window and input queue must retire before Activity destruction");
+            slot = 5; storage.destroy_started = true; break;
+        case Stage::window_focus: slot = 6; break;
+        case Stage::configuration_changed: slot = 14; break;
+        case Stage::low_memory: slot = 15; break;
+        case Stage::window_created:
+            if (!p.native_windows || !request.window_producer || storage.window)
+                bad("NATIVE_ACTIVITY_WINDOW", "Native window creation requires a fresh actual admitted producer");
+            storage.window_id = p.native_windows->retain_activity(request.window_producer);
+            storage.window = request.window_producer;
+            storage.window_destroy_started = false;
+            validate_window();
+            storage.geometry = request.window_geometry;
+            slot = 7; secondary = storage.window_id; has_secondary = true; break;
+        case Stage::window_resized:
+            if (storage.window_destroy_started) bad("NATIVE_ACTIVITY_WINDOW", "Native window destruction has already begun");
+            validate_window();
+            storage.geometry = request.window_geometry;
+            slot = 8; secondary = storage.window_id; has_secondary = true; break;
+        case Stage::window_destroyed:
+            if (storage.window_destroy_started) bad("NATIVE_ACTIVITY_WINDOW", "Native window destruction cannot be repeated");
+            validate_window();
+            if (!geometry_matches(storage.geometry, request.window_geometry))
+                bad("NATIVE_ACTIVITY_WINDOW", "Native window retirement changed the retained geometry");
+            storage.window_destroy_started = true;
+            slot = 10; secondary = storage.window_id; has_secondary = true; break;
+        case Stage::input_queue_created:
+            if (storage.queue || storage.queue_destroy_started || p.posix.current_input_queue())
+                bad("NATIVE_INPUT_STATE", "NativeActivity requires one fresh owned input queue");
+            storage.queue = p.posix.create_input_queue();
+            if (!storage.queue || p.posix.current_input_queue() != storage.queue)
+                bad("NATIVE_INPUT_STATE", "Native input queue creation did not publish its actual identity");
+            slot = 11; secondary = storage.queue; has_secondary = true; break;
+        case Stage::input_queue_destroyed:
+            if (!storage.queue || storage.queue_destroy_started || p.posix.current_input_queue() != storage.queue)
+                bad("NATIVE_INPUT_STATE", "Native input queue destruction is stale or repeated");
+            storage.queue_destroy_started = true;
+            slot = 12; secondary = storage.queue; has_secondary = true; break;
+        default: bad("NATIVE_ACTIVITY_STATE", "NativeActivity lifecycle stage is invalid");
+        }
+        const auto callback = p.read(storage.address + 128 + slot * 8, 8);
+
+        if (callback) {
+            if (callback % 4 || !p.memory.accessible(callback, 4, a64::Permission::execute))
+                bad("NATIVE_ACTIVITY_CALLBACK", "NativeActivity callback is not an aligned executable guest function");
+            const bool saving = request.stage == Stage::save_state;
+            struct SavedReturn {
+                bionic::GuestPosixServices &posix;
+                Address address = 0;
+                ~SavedReturn() { if (address) (void)posix.copy_release_owned_heap(address, {}); }
+            } returned{p.posix};
+            if (saving) {
+                // Owned ABI struct0..79, callbacks128..255, aligned size_t256..263.
+                saved_result.saved_state.resize(65536);
+                secondary = storage.address + 256; has_secondary = true;
+                p.write(secondary, 0, 8);
+            }
+            p.native_activity_cpu([&] {
+                const std::array<std::uint64_t, 2> arguments{storage.address, secondary};
+                const auto budget = p.main_work_cpu?std::uint64_t{1'000'000}:
+                    std::min(std::uint64_t{1'000'000}, p.runtime.native_instruction_budget().retained);
+                if (!budget) bad("BUDGET", "NativeActivity callback has no retained invocation allowance");
+                (void)p.call(callback, std::span(arguments).first(has_secondary ? 2 : 1), stack, {}, budget, saving ? &returned.address : nullptr);
+                p.check_pending();
+                p.validate_native_activity();
+            });
+            // Strict guest tail accounting completes before output publication.
+            // No further guest work occurs before exact owned copy and free.
+            if (saving) {
+                p.validate_native_activity();
+                const auto size = p.read(secondary, 8);
+                if (size > 65536) bad("NATIVE_ACTIVITY_STATE_LIMIT", "Native saved-state output exceeds 65536 bytes");
+                if (!returned.address) {
+                    if (size) bad("NATIVE_ACTIVITY_SAVE", "Native saved-state size has no returned buffer");
+                    saved_result.saved_state.clear();
+                } else {
+                    const auto fault = p.posix.copy_release_owned_heap(returned.address,
+                        std::span(saved_result.saved_state).first(static_cast<std::size_t>(size)));
+                    if (fault != a64::Fault::none)
+                        bad("NATIVE_ACTIVITY_SAVE", "Native saved-state output is not an exact readable malloc allocation: " + std::string(a64::fault_name(fault)));
+                    returned.address = 0;
+                    saved_result.saved_state.resize(static_cast<std::size_t>(size));
+                    saved_result.saved_state_present = size != 0;
+                }
+            }
+        }
+        if (request.stage == Stage::window_destroyed) {
+            p.native_windows->release_activity(storage.window);
+            storage.window.reset(); storage.window_id = 0;
+        }
+        if (request.stage == Stage::input_queue_destroyed) {
+            p.posix.retire_input_queue(storage.queue);
+            storage.queue = 0;
+        }
+        // As on Android, the application synchronizes window/worker access in
+        // its real destroy callback. Activity recreation does not cancel app-
+        // global pthreads. Whole-Bridge cleanup cancels all retained task stacks
+        // before it retires any remaining ABI backing or JNI globals.
+        if (request.stage == Stage::destroy) p.retire_native_activity();
+        return saved_result;
+    } catch (...) {
+        p.native_activity_failed = true;
+        if(p.native_activity_storage)p.cancel_activity_host_work(*p.native_activity_storage);
+        throw;
+    }
+}
+bool Bridge::native_activity_pointer(const android::NativeActivityPointerInput &input) {
+    auto &p = *impl_;
+    p.process->checkpoint();
+    if (std::this_thread::get_id() != p.owner_thread || p.closed || p.native_closing ||
+        p.active_native_task || p.native_activity_failed ||
+        !p.runtime.is_main_thread() || !p.posix.is_main_native_thread() || p.context || !p.attached ||
+        p.current_environment != environment || (!input.synthetic_cancel &&
+            (p.native_depth || !p.cpu.execution_idle() || p.native_activity_dispatching || p.resolved_weak_roots || p.critical_active())))
+        bad("NATIVE_INPUT_STATE", "Native pointer capture requires its live main owner and ordinary idle capture or trusted cancellation");
+    if (!p.native_activity_storage) return false;
+    auto &storage = *p.native_activity_storage;
+    const auto &sample = input.sample;
+    if (!storage.created || storage.destroy_started || storage.window_destroy_started || storage.queue_destroy_started ||
+        !storage.queue || p.posix.current_input_queue() != storage.queue || !storage.window || !p.native_windows ||
+        input.activity != storage.activity || input.root != storage.content || input.window_generation != storage.generation ||
+        sample.root != storage.content || !sample.native_producer || sample.capture_dpi < 48 || sample.capture_dpi > 960 ||
+        static_cast<std::uint32_t>(sample.action) > 3 || sample.pointer > 31 ||
+        (sample.source != 0x2002 && sample.source != 0x1002) || !input.input_generation || !input.down_time_known ||
+        input.down_time_ms > std::uint64_t{INT64_MAX} || !std::isfinite(sample.x) || !std::isfinite(sample.y) ||
+        std::abs(sample.x) > 65536 || std::abs(sample.y) > 65536) return false;
+    if (input.synthetic_cancel) {
+        if (sample.action != android::PointerAction::cancel ||
+            (sample.time_known ? (sample.down_time_ms != input.down_time_ms || sample.event_time_ms < input.down_time_ms ||
+                sample.event_time_ms > std::uint64_t{INT64_MAX}) : (sample.down_time_ms || sample.event_time_ms))) return false;
+    } else if (!sample.time_known || !android::valid_pointer_context(sample) || sample.down_time_ms != input.down_time_ms)
+        return false;
+    p.validate_native_activity();
+    const auto binding = p.native_windows->resolve_for_egl(storage.window_id);
+    if (!binding || binding->retained != storage.window || binding->incarnation != sample.native_producer ||
+        binding->geometry.width != sample.native_width || binding->geometry.height != sample.native_height ||
+        storage.geometry.width != sample.native_width || storage.geometry.height != sample.native_height ||
+        storage.geometry.format != binding->geometry.format) return false;
+    return p.posix.enqueue_input_queue(storage.queue, input);
+}
+bool Bridge::native_activity_key(const android::NativeActivityKeyInput &input) {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread)
+        bad("NATIVE_INPUT_STATE", "Native key capture belongs to another host owner");
+    if(!p.native_activity_storage)return false;
+    auto &storage=*p.native_activity_storage;
+    // Cancellation is a pure revocation of an owned continuation reservation.
+    // It remains available during teardown and never calls a process/provider.
+    if(input.stage==android::NativeKeyStage::cancel) {
+        if(!storage.queue || input.activity!=storage.activity || input.sample.root!=storage.content ||
+            input.sample.window_generation!=storage.generation)return false;
+        return p.posix.enqueue_key_input_queue(storage.queue,input);
+    }
+    p.process->checkpoint();
+    if(p.closed || p.native_closing || p.active_native_task || p.native_activity_failed ||
+        p.native_depth || !p.cpu.execution_idle() || p.native_activity_dispatching ||
+        p.resolved_weak_roots || p.critical_active() || !p.runtime.is_main_thread() ||
+        !p.posix.is_main_native_thread() || p.context || !p.attached || p.current_environment!=environment)
+        bad("NATIVE_INPUT_STATE", "Native key admission requires its actual idle main owner");
+    const auto &sample=input.sample;
+    if(!storage.created || storage.destroy_started || storage.window_destroy_started || storage.queue_destroy_started ||
+        !storage.queue || p.posix.current_input_queue()!=storage.queue || !storage.window || !p.native_windows ||
+        input.activity!=storage.activity || sample.root!=storage.content || sample.window_generation!=storage.generation ||
+        !input.request || !android::valid_key_input(sample) || !sample.event_time_known || !sample.source_known ||
+        (input.stage!=android::NativeKeyStage::pre_ime && input.stage!=android::NativeKeyStage::post_ime))return false;
+    p.validate_native_activity();
+    const auto binding=p.native_windows->resolve_for_egl(storage.window_id);
+    if(!binding || binding->retained!=storage.window || binding->geometry.width!=storage.geometry.width ||
+        binding->geometry.height!=storage.geometry.height || binding->geometry.format!=storage.geometry.format)return false;
+    return p.posix.enqueue_key_input_queue(storage.queue,input);
+}
 void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name) {
     auto &p = *impl_;p.process->checkpoint();
     if (std::this_thread::get_id() != p.owner_thread)
@@ -1620,21 +2629,27 @@ void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name
     const auto requested = "lib" + ascii(name) + ".so";
     if (p.load_state == 3) bad("LOAD_STATE", "Previously failed JNI library load");
     if (std::find(p.loaded_roots.begin(), p.loaded_roots.end(), requested) != p.loaded_roots.end()) return;
-    if (requested != p.root)
-        bad("LIBRARY_UNSUPPORTED", "Additional native root lib"+ascii(name)+".so requires another dependency graph; active root is "+p.root);
-    if (p.load_state == 2)
-        return;
+    if (p.native_extension_active) bad("LOAD_STATE", "JNI root publication cannot interrupt native module extension");
+    if (requested != p.root) {
+        if (p.load_state != 2 || p.on_load_active || !p.native_activity_initialized || requested != p.native_activity_root)
+            bad("LIBRARY_UNSUPPORTED", "Additional native root lib"+ascii(name)+".so requires another dependency graph; active root is "+p.root);
+        // This exact resident root was admitted and initialized for the one
+        // immutable NativeActivity package. Select it for actual JNI_OnLoad
+        // and recursive JNI resolution, without extending/initializing again.
+        p.root = p.native_activity_root;
+    }
+    const bool initialized = p.load_state == 2;
     // FindClass in JNI_OnLoad can initialize another class that loads this library.
     // This VM has one owner thread; ELF initialization has already finished here.
     if (p.load_state == 1 && p.on_load_active)
         return;
-    if (p.load_state)
+    if (p.load_state && !initialized)
         bad("LOAD_STATE", "Recursive or previously failed JNI library load");
     p.load_state = 1;
     Impl::Scope scope(p);
     try {
-        p.loader.initialize(p.cpu, scope.stack());
-        if(const auto fault=p.posix.run_pending_threads();fault!=a64::Fault::none){p.process->checkpoint();bad("NATIVE_EXECUTION",std::string(a64::fault_name(fault))+": "+std::string(p.posix.last_rejection()));}
+        if (!initialized) p.loader.initialize(p.cpu, scope.stack());
+        // Constructor/OnLoad peers remain dormant until the idle host pump.
         std::optional<Address> on_load;
         try {
             on_load = p.loader.symbol(p.root, "JNI_OnLoad").address;
@@ -1650,7 +2665,13 @@ void Bridge::load_library(dex::ManagedRuntime &runtime, std::u16string_view name
                 Impl &p;
                 ~EndOnLoad() { p.on_load_active = false; }
             } end_on_load{p};
+            const bool observed=p.initialization_observer && *on_load%4==0 &&
+                p.memory.accessible(*on_load,4,a64::Permission::execute);
+            if(observed)p.initialization_observer(p.initialization_context,
+                {elf::InitializationStage::jni_on_load_begin,p.root,*on_load});
             const auto result = p.call(*on_load, args, scope.stack());
+            if(observed)p.initialization_observer(p.initialization_context,
+                {elf::InitializationStage::jni_on_load_end,p.root,*on_load});
             p.check_pending();
             if (result.registers[0] != 0x10006)
                 bad("VERSION", "JNI_OnLoad must return the supported JNI 1.6 version");
@@ -1748,6 +2769,14 @@ Value Bridge::invoke(dex::ManagedRuntime &runtime, dex::Index index, std::span<c
 }
 std::optional<std::uint64_t> Bridge::thread_exit_value(Address tls) const noexcept {return impl_->posix.thread_exit_value(tls);}
 std::shared_ptr<a64::ThreadRegisterState> Bridge::thread_register_state(Address trusted_tls) const {return impl_->posix.thread_register_state(trusted_tls);}
+a64::CpuFaultAction Bridge::synchronous_fault(const a64::CpuException &exception,a64::ArchitecturalState &candidate,
+                                               const a64::CpuFaultBoundary &boundary) noexcept {
+    if(impl_->closed)return a64::CpuFaultAction::unhandled;
+    return impl_->posix.synchronous_fault(exception,candidate,boundary);
+}
+bool Bridge::pending_signal_entry(const a64::SignalEntry &entry,Address trusted_tls,std::uint64_t invocation) const noexcept {
+    return !impl_->closed && impl_->posix.pending_signal_entry(entry,trusted_tls,invocation);
+}
 bool Bridge::event_pending() noexcept {return impl_->posix.event_pending();}
 a64::Fault Bridge::checkpoint(a64::ServiceState &state) noexcept {return impl_->posix.checkpoint(state);}
 
@@ -1778,6 +2807,21 @@ a64::Fault Bridge::Impl::invoke_service(std::uint32_t service, Address instructi
         if (service < first_service)
             return p.posix.invoke_frame(service, instruction, state);
         WeakRoots weak_roots(p);
+        if (android::NativePlatformServices::handles_service(service)) {
+            const auto fault = full_frame ? p.platform.invoke_frame(service, instruction, state)
+                                          : p.platform.invoke(service, instruction, state.registers);
+            if (fault != a64::Fault::none) p.error = p.platform.last_error();
+            return fault;
+        }
+        if (p.graphics_services && graphics::GuestGraphicsServices::handles_service(service)) {
+            const auto owner=p.posix.thread_register_state(p.posix.thread_pointer());
+            if(!owner)bad("GRAPHICS_OWNER","Graphics owner is not live");
+            if(p.graphics_owner && p.graphics_owner!=owner)bad("GRAPHICS_OWNER_UNSUPPORTED","Multiple logical EGL/GLES owners require explicit binding restoration");
+            if(!p.graphics_owner)p.graphics_owner=owner;
+            const auto fault = p.graphics_services->invoke_frame(service, instruction, state);
+            if (fault != a64::Fault::none) p.error = p.graphics_services->last_error();
+            return fault;
+        }
         if (p.audio_services && audio::GuestAudioServices::handles_service(service)) {
             const auto fault = p.audio_services->invoke(service, instruction, state.registers);
             if (fault != a64::Fault::none)
@@ -1805,13 +2849,14 @@ a64::Fault Bridge::Impl::invoke_service(std::uint32_t service, Address instructi
             if(slot==4 || slot==7) {
                 if(!p.attached) {
                     if(state.registers[2])bad("THREAD_ATTRIBUTES_UNSUPPORTED","Custom native attachment arguments are not implemented");
-                    p.runtime.current_thread();
+                    const auto thread=p.runtime.current_thread();
                     if (!p.allocation_reference([&] { p.push_frame(16); return Handle{1}; })) {
                         p.write(state.registers[1], 0, 8);
                         state.registers[0] = static_cast<std::uint32_t>(-1);
                         return a64::Fault::none;
                     }
-                    p.attached=true;
+                    p.attached=true;p.active_managed_thread=thread;
+                    p.active_execution_token=dex::Scheduler::execution_token();
                 }
                 p.write(state.registers[1],p.current_environment,8);state.registers[0]=0;
             } else if(state.registers[2]!=0x10006) {
@@ -1858,6 +2903,75 @@ a64::Fault Bridge::Impl::invoke_service(std::uint32_t service, Address instructi
     ++p.metrics.rejected_calls;
     return a64::Fault::unsupported_service;
 }
+std::optional<std::chrono::steady_clock::time_point> Bridge::next_native_deadline() const {
+    std::optional<std::chrono::steady_clock::time_point> result;
+    for(const auto *task:impl_->native_tasks)if(task && task->waiting){
+        const auto deadline=task->waiting->deadline();
+        if(deadline && (!result || *deadline<*result))result=deadline;
+    }
+    return result;
+}
+bool Bridge::pump_native_tasks(dex::ManagedRuntime &runtime) {
+    auto &p=*impl_;
+    if(&runtime!=&p.runtime || p.closed || p.native_closing || p.load_state!=2 || p.on_load_active || p.native_extension_active)return false;
+    if(std::this_thread::get_id()!=p.owner_thread || p.native_depth || p.active_native_task ||
+        !p.cpu.execution_idle() || !p.frames.empty() || p.resolved_weak_roots || p.critical_active() ||
+        p.native_activity_dispatching || p.context || !p.attached || p.current_environment!=environment ||
+        !p.posix.native_switch_safe() || !runtime.is_main_thread() || !p.posix.is_main_native_thread())
+        bad("NATIVE_INPUT_STATE", "Native idle pump requires its actual idle main owner");
+    bool progress=false;
+    if(p.posix.has_pending_threads()) {
+        const auto fault=p.posix.run_pending_threads(1000000);
+        if(fault==a64::Fault::process_exit)p.process->checkpoint();
+        if(fault!=a64::Fault::none)bad("NATIVE_EXECUTION",std::string(a64::fault_name(fault))+": "+std::string(p.posix.last_rejection()));
+        progress=true;
+    }
+    const auto post_host_work = [&]() -> bool {
+    if(p.native_activity_storage && p.native_activity_storage->created && !p.native_activity_failed) {
+        auto &storage=*p.native_activity_storage;
+        if(storage.work_count) {
+            if(!p.host_work_factory)bad("NATIVE_ACTIVITY_STATE","Queued host work has no managed main consumer");
+            const auto work=storage.work[storage.work_head];
+            auto entry=p.host_work_factory(work);
+            const bool posted = static_cast<bool>(entry);
+            try {if(entry)runtime.post_main(std::move(entry));}
+            catch(const dex::DexError &error){if(error.code=="AETHER_DEX_MAIN_CALLBACK_LIMIT")return false;throw;}
+            auto &credit=storage.work_scope->credits[work.credit_slot];
+            if(credit.serial!=work.serial || credit.posted)bad("NATIVE_ACTIVITY_STATE","Host work lost its exact queued credit");
+            if(entry)std::terminate(); // Ownership must have moved when a live entry was returned.
+            // post_main does not run guest code; arm destructor accounting only now.
+            if(posted)credit.posted=true;
+            else {credit={};--storage.work_scope->outstanding;}
+            storage.work[storage.work_head]={};storage.work_head=(storage.work_head+1)%storage.work.size();--storage.work_count;
+            return true;
+        }
+    }
+        return false;
+    };
+    const bool host_first = p.host_work_first; p.host_work_first = !p.host_work_first;
+    if(host_first)progress = post_host_work() || progress;
+    // finishEvent only publishes an ordered outcome. Posting occurs here after
+    // native frames have returned, never across a service/provider boundary.
+    const auto completion=p.posix.peek_input_completion();
+    if(completion) {
+        if(!p.input_completion_factory)
+            bad("NATIVE_INPUT_STATE", "Native input completion has no bound managed main receiver");
+        auto entry=p.input_completion_factory(*completion);
+        // A null entry is the trusted factory's stale-receiver cancellation.
+        try { if(entry)runtime.post_main(std::move(entry)); }
+        catch(const dex::DexError &error) {
+            if(error.code=="AETHER_DEX_MAIN_CALLBACK_LIMIT")return progress;
+            throw;
+        }
+        // post_main cannot execute guest code. Successful transfer or trusted
+        // stale cancellation permits exact head retirement.
+        if(!p.posix.commit_input_completion(completion->queue,completion->event))
+            bad("NATIVE_INPUT_STATE", "Posted input completion lost its exact ordered queue head");
+        progress=true;
+    }
+    if(!host_first)progress = post_host_work() || progress;
+    return progress;
+}
 std::uint64_t Bridge::capture_signal_mask(dex::ManagedRuntime &runtime) {
     auto &p=*impl_;
     if(&runtime!=&p.runtime)throw a64::GuestError("AETHER_JNI_THREAD","Signal-mask capture from another runtime refused");
@@ -1868,9 +2982,29 @@ std::uint64_t Bridge::capture_signal_mask(dex::ManagedRuntime &runtime) {
 }
 const Metrics &Bridge::metrics() const noexcept { return impl_->metrics; }
 const a64::Metrics &Bridge::cpu_metrics() const noexcept { return impl_->cpu.metrics(); }
+bool Bridge::trim_translation_cache() {
+    auto &p=*impl_;
+    if(std::this_thread::get_id()!=p.owner_thread || p.closed || p.native_closing ||
+       p.native_depth || !p.frames.empty() || p.pending || p.resolved_weak_roots ||
+       p.critical_active() || p.active_native_task || p.on_load_active ||
+       p.native_extension_active || p.native_activity_dispatching || !p.cpu.execution_idle())return false;
+    if(p.local_frame_count || std::any_of(p.stack_leased.begin(),p.stack_leased.end(),[](bool used){return used;}))
+        return false;
+    // A different task may have retained its real native C++ stack while the
+    // currently selected CPU is idle. Do not turn that parked state into an
+    // idle maintenance admission; dormant, never-started children are harmless.
+    using TaskState=bionic::GuestPosixServices::ThreadTaskState;
+    for(const auto *task:p.native_tasks)
+        if(task && task->entered && task->cached!=TaskState::completed &&
+           task->cached!=TaskState::cancelled && task->cached!=TaskState::failed)return false;
+    return p.cpu.trim_translation_cache();
+}
 std::string_view Bridge::last_error() const noexcept { return impl_->error; }
 void Bridge::shutdown() {
     auto &p = *impl_;
+    if(p.active_native_task || p.native_depth || !p.cpu.execution_idle())bad("STATE","Native shutdown requires an idle owner");
+    p.native_closing=true;
+    p.posix.close_thread_tasks();
     if (p.closed)
         return;
     if(p.process->exit_status()){p.closed=true;if(p.attach_interface)p.runtime.set_native_interface(nullptr);p.cleanup();return;}

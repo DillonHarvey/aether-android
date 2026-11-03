@@ -18,14 +18,30 @@ void ArchiveSource::charge() {
     budget_->scanned_bytes += size_;
 }
 std::vector<std::uint8_t> ArchiveSource::read(std::uint64_t offset, std::size_t size) {
-    if (offset > size_ || size > size_ - offset || size > 16 * 1024 * 1024)
-        throw ElfError("AETHER_ELF_BOUNDS", "Native metadata read exceeds its source or retained bound");
+    const std::array ranges{ModuleRange{offset, size}};
+    auto result = read_ranges(ranges);
+    return std::move(result.front());
+}
+std::vector<std::vector<std::uint8_t>> ArchiveSource::read_ranges(std::span<const ModuleRange> ranges) {
+    constexpr std::uint64_t maximum = 16ULL * 1024 * 1024;
+    if (ranges.size() > 16)
+        throw ElfError("AETHER_ELF_LIMIT", "Native metadata batch exceeds 16 read ranges");
+    std::array<apk::ArchiveRange, 16> selected{};
+    std::uint64_t retained = 0;
+    for (std::size_t n = 0; n < ranges.size(); ++n) {
+        const auto &range = ranges[n];
+        if (range.offset > size_ || range.size > size_ - range.offset || range.size > maximum - retained)
+            throw ElfError("AETHER_ELF_BOUNDS", "Native metadata batch exceeds its source or 16 MiB retained bound");
+        retained += range.size;
+        selected[n] = {range.offset, range.size};
+    }
+    if (ranges.empty())
+        return {};
     charge();
-    const std::array ranges{apk::ArchiveRange{offset, size}};
-    auto result = archive_.read_ranges(index_, ranges, true);
+    auto result = archive_.read_ranges(index_, std::span(selected).first(ranges.size()), true);
     if (result.sha256 != expected_)
         throw ElfError("AETHER_ELF_INTEGRITY", "Native source differs from the inspected APK member");
-    return std::move(result.ranges.front());
+    return std::move(result.ranges);
 }
 void ArchiveSource::stream(const std::function<void(std::uint64_t, Bytes)> &visitor) {
     charge();
